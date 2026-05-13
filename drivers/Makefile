@@ -22,7 +22,6 @@ obj-y				+= leds/
 
 obj-y				+= pci/
 
-obj-$(CONFIG_PARISC)		+= parisc/
 obj-$(CONFIG_RAPIDIO)		+= rapidio/
 obj-y				+= video/
 obj-y				+= idle/
@@ -79,7 +78,6 @@ obj-y				+= dax/
 obj-$(CONFIG_DMA_SHARED_BUFFER) += dma-buf/
 obj-$(CONFIG_NUBUS)		+= nubus/
 obj-y				+= cxl/
-obj-y				+= macintosh/
 obj-y				+= scsi/
 obj-y				+= nvme/
 obj-$(CONFIG_ATA)		+= ata/
@@ -197,4 +195,3 @@ obj-$(CONFIG_DPLL)		+= dpll/
 obj-y				+= resctrl/
 
 obj-$(CONFIG_DIBS)		+= dibs/
-obj-$(CONFIG_S390)		+= s390/

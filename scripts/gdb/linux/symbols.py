@@ -50,7 +50,6 @@ if hasattr(gdb, 'Breakpoint'):
             return False
 
 
-def get_vmcore_s390():
     with utils.qemu_phy_mem_mode():
         vmcore_info = 0x0e0c
         paddr_vmcoreinfo_note = gdb.parse_and_eval("*(unsigned long long *)" +
@@ -75,9 +74,7 @@ def get_vmcore_s390():
 
 
 def get_kerneloffset():
-    if utils.is_target_arch('s390'):
         try:
-            vmcore_str = get_vmcore_s390()
         except gdb.error as e:
             gdb.write("{}\n".format(e))
             return None
@@ -85,7 +82,6 @@ def get_kerneloffset():
     return None
 
 
-def is_in_s390_decompressor():
     # DAT is always off in decompressor. Use this as an indicator.
     # Note that in the kernel, DAT can be off during kexec() or restart.
     # Accept this imprecision in order to avoid complicating things.
@@ -95,8 +91,6 @@ def is_in_s390_decompressor():
 
 
 def skip_decompressor():
-    if utils.is_target_arch("s390"):
-        if is_in_s390_decompressor():
             # The address of the jump_to_kernel function is statically placed
             # into svc_old_psw.addr (see ipl_data.c); read it from there. DAT
             # is off, so we do not need to care about lowcore relocation.
@@ -105,7 +99,6 @@ def skip_decompressor():
                                                     hex(svc_old_pswa)))
             gdb.execute("tbreak *" + hex(jump_to_kernel))
             gdb.execute("continue")
-            while is_in_s390_decompressor():
                 gdb.execute("stepi")
 
 
@@ -191,8 +184,6 @@ are loaded as well."""
             module_file = self._get_module_file(module_name)
 
         if module_file:
-            if utils.is_target_arch('s390'):
-                # Module text is preceded by PLT stubs on s390.
                 module_arch = module['arch']
                 plt_offset = int(module_arch['plt_offset'])
                 plt_size = int(module_arch['plt_size'])

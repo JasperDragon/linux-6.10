@@ -72,7 +72,6 @@ obj-$(CONFIG_PINCTRL_BERLIN)	+= berlin/
 obj-y				+= cirrus/
 obj-y				+= cix/
 obj-y				+= freescale/
-obj-$(CONFIG_X86)		+= intel/
 obj-y				+= mediatek/
 obj-$(CONFIG_PINCTRL_MESON)	+= meson/
 obj-y				+= microchip/

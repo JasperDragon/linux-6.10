@@ -6,16 +6,16 @@
 #	Copyright Joern Engel <joern@lazybastard.org>
 #	Inspired by Linus Torvalds
 #	Original idea maybe from Keith Owens
-#	s390 port and big speedup by Arnd Bergmann <arnd@bergmann-dalldorf.de>
+#	 <arnd@bergmann-dalldorf.de>
 #	Mips port by Juan Quintela <quintela@mandrakesoft.com>
 #	Arm port by Holger Schurig
 #	Random bits by Matt Mackall <mpm@selenic.com>
 #	M68k port by Geert Uytterhoeven and Andreas Schwab
 #	AArch64, PARISC ports by Kyle McMartin
-#	sparc port by Martin Habets <errandir_news@mph.eclipse.co.uk>
+#	 <errandir_news@mph.eclipse.co.uk>
 #	ppc64le port by Breno Leitao <leitao@debian.org>
-#	riscv port by Wadim Mueller <wafgo01@gmail.com>
-#	loongarch port by Youling Tang <tangyouling@kylinos.cn>
+#	 <wafgo01@gmail.com>
+#	 <tangyouling@kylinos.cn>
 #
 #	Usage:
 #	objdump -d vmlinux | scripts/checkstack.pl [arch] [min_stack]
@@ -62,49 +62,6 @@ my (@stack, $re, $dre, $sub, $x, $xs, $funcre, $min_stack);
 		#c0008ffc:	e24dd064	sub	sp, sp, #100	; 0x64
 		$re = qr/.*sub.*sp, sp, #([0-9]{1,4})/o;
 		$sub = \&arm_push_handling;
-	} elsif ($arch =~ /^x86(_64)?$/ || $arch =~ /^i[3456]86$/) {
-		#c0105234:       81 ec ac 05 00 00       sub    $0x5ac,%esp
-		# or
-		#    2f60:    48 81 ec e8 05 00 00       sub    $0x5e8,%rsp
-		$re = qr/^.*[as][du][db]    \$(0x$x{1,8}),\%(e|r)sp$/o;
-		$dre = qr/^.*[as][du][db]    (%.*),\%(e|r)sp$/o;
-	} elsif ($arch eq 'm68k') {
-		#    2b6c:       4e56 fb70       linkw %fp,#-1168
-		#  1df770:       defc ffe4       addaw #-28,%sp
-		$re = qr/.*(?:linkw %fp,|addaw )#-([0-9]{1,4})(?:,%sp)?$/o;
-	} elsif ($arch eq 'mips64') {
-		#8800402c:       67bdfff0        daddiu  sp,sp,-16
-		$re = qr/.*daddiu.*sp,sp,-([0-9]{1,8})/o;
-	} elsif ($arch eq 'mips') {
-		#88003254:       27bdffe0        addiu   sp,sp,-32
-		$re = qr/.*addiu.*sp,sp,-([0-9]{1,8})/o;
-	} elsif ($arch eq 'nios2') {
-		#25a8:	defffb04 	addi	sp,sp,-20
-		$re = qr/.*addi.*sp,sp,-([0-9]{1,8})/o;
-	} elsif ($arch eq 'openrisc') {
-		# c000043c:       9c 21 fe f0     l.addi r1,r1,-272
-		$re = qr/.*l\.addi.*r1,r1,-([0-9]{1,8})/o;
-	} elsif ($arch eq 'parisc' || $arch eq 'parisc64') {
-		$re = qr/.*ldo ($x{1,8})\(sp\),sp/o;
-	} elsif ($arch eq 'powerpc' || $arch =~ /^ppc(64)?(le)?$/ ) {
-		# powerpc    : 94 21 ff 30     stwu    r1,-208(r1)
-		# ppc64(le)  : 81 ff 21 f8     stdu    r1,-128(r1)
-		$re = qr/.*st[dw]u.*r1,-($x{1,8})\(r1\)/o;
-	} elsif ($arch =~ /^s390x?$/) {
-		#   11160:       a7 fb ff 60             aghi   %r15,-160
-		# or
-		#  100092:	 e3 f0 ff c8 ff 71	 lay	 %r15,-56(%r15)
-		$re = qr/.*(?:lay|ag?hi).*\%r15,-([0-9]+)(?:\(\%r15\))?$/o;
-	} elsif ($arch eq 'sparc' || $arch eq 'sparc64') {
-		# f0019d10:       9d e3 bf 90     save  %sp, -112, %sp
-		$re = qr/.*save.*%sp, -([0-9]{1,8}), %sp/o;
-	} elsif ($arch =~ /^riscv(64)?$/) {
-		#ffffffff8036e868:	c2010113          	addi	sp,sp,-992
-		$re = qr/.*addi.*sp,sp,-([0-9]{1,8})/o;
-	} elsif ($arch =~ /^loongarch(32|64)?$/) {
-		#9000000000224708:	02ff4063		addi.d  $sp, $sp, -48(0xfd0)
-		$re = qr/.*addi\..*sp, .*sp, -([0-9]{1,8}).*/o;
-	} else {
 		print("wrong or unknown architecture \"$arch\"\n");
 		exit
 	}

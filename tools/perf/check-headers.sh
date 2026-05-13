@@ -30,34 +30,10 @@ declare -a FILES=(
   "include/linux/hash.h"
   "include/linux/list-sort.h"
   "include/uapi/linux/hw_breakpoint.h"
-  "arch/x86/include/asm/cpufeatures.h"
-  "arch/x86/include/asm/inat_types.h"
-  "arch/x86/include/asm/emulate_prefix.h"
-  "arch/x86/include/asm/msr-index.h"
-  "arch/x86/lib/x86-opcode-map.txt"
-  "arch/x86/tools/gen-insn-attr-x86.awk"
   "arch/arm/include/uapi/asm/perf_regs.h"
   "arch/arm64/include/uapi/asm/perf_regs.h"
-  "arch/loongarch/include/uapi/asm/perf_regs.h"
-  "arch/mips/include/uapi/asm/perf_regs.h"
-  "arch/powerpc/include/uapi/asm/perf_regs.h"
-  "arch/s390/include/uapi/asm/perf_regs.h"
-  "arch/x86/include/uapi/asm/perf_regs.h"
-  "arch/x86/include/uapi/asm/kvm.h"
-  "arch/x86/include/uapi/asm/svm.h"
-  "arch/x86/include/uapi/asm/unistd.h"
-  "arch/x86/include/uapi/asm/vmx.h"
-  "arch/powerpc/include/uapi/asm/kvm.h"
-  "arch/s390/include/uapi/asm/kvm.h"
-  "arch/s390/include/uapi/asm/sie.h"
   "arch/arm64/include/uapi/asm/kvm.h"
   "arch/alpha/include/uapi/asm/errno.h"
-  "arch/mips/include/asm/errno.h"
-  "arch/mips/include/uapi/asm/errno.h"
-  "arch/parisc/include/uapi/asm/errno.h"
-  "arch/powerpc/include/uapi/asm/errno.h"
-  "arch/sparc/include/uapi/asm/errno.h"
-  "arch/x86/include/uapi/asm/errno.h"
   "include/asm-generic/bitops/arch_hweight.h"
   "include/asm-generic/bitops/const_hweight.h"
   "include/asm-generic/bitops/__fls.h"
@@ -73,10 +49,6 @@ declare -a FILES=(
 )
 
 declare -a SYNC_CHECK_FILES=(
-  "arch/x86/include/asm/inat.h"
-  "arch/x86/include/asm/insn.h"
-  "arch/x86/lib/inat.c"
-  "arch/x86/lib/insn.c"
 )
 
 # These copies are under tools/perf/trace/beauty/ as they are not used to in
@@ -85,8 +57,6 @@ declare -a SYNC_CHECK_FILES=(
 # tables (and the reverse lookup as well: string -> id)
 
 declare -a BEAUTY_FILES=(
-  "arch/x86/include/asm/irq_vectors.h"
-  "arch/x86/include/uapi/asm/prctl.h"
   "include/uapi/drm/drm.h"
   "include/uapi/drm/i915_drm.h"
   "include/linux/socket.h"
@@ -184,9 +154,6 @@ do
 done
 
 # diff with extra ignore lines
-check arch/x86/lib/memcpy_64.S        '-I "^EXPORT_SYMBOL" -I "^#include <asm/export.h>" -I"^SYM_FUNC_START\(_LOCAL\)*(memcpy_\(erms\|orig\))" -I"^#include <linux/cfi_types.h>"'
-check arch/x86/lib/memset_64.S        '-I "^EXPORT_SYMBOL" -I "^#include <asm/export.h>" -I"^SYM_FUNC_START\(_LOCAL\)*(memset_\(erms\|orig\))"'
-check arch/x86/include/asm/amd/ibs.h  '-I "^#include .*/msr-index.h"'
 check include/linux/unaligned.h '-I "^#include <linux/unaligned/packed_struct.h>" -I "^#include <asm/byteorder.h>" -I "^#pragma GCC diagnostic"'
 check include/uapi/asm-generic/mman.h '-I "^#include <\(uapi/\)*asm-generic/mman-common\(-tools\)*.h>"'
 check include/uapi/linux/mman.h       '-I "^#include <\(uapi/\)*asm/mman.h>"'
@@ -195,17 +162,10 @@ check include/linux/ctype.h	      '-I "isdigit("'
 check lib/ctype.c		      '-I "^EXPORT_SYMBOL" -I "^#include <linux/export.h>" -B'
 
 # diff non-symmetric files
-check_2 tools/perf/arch/x86/entry/syscalls/syscall_32.tbl arch/x86/entry/syscalls/syscall_32.tbl
-check_2 tools/perf/arch/x86/entry/syscalls/syscall_64.tbl arch/x86/entry/syscalls/syscall_64.tbl
-check_2 tools/perf/arch/powerpc/entry/syscalls/syscall.tbl arch/powerpc/kernel/syscalls/syscall.tbl
-check_2 tools/perf/arch/s390/entry/syscalls/syscall.tbl arch/s390/kernel/syscalls/syscall.tbl
-check_2 tools/perf/arch/mips/entry/syscalls/syscall_n64.tbl arch/mips/kernel/syscalls/syscall_n64.tbl
 check_2 tools/perf/arch/arm/entry/syscalls/syscall.tbl arch/arm/tools/syscall.tbl
 check_2 tools/perf/arch/sh/entry/syscalls/syscall.tbl arch/sh/kernel/syscalls/syscall.tbl
-check_2 tools/perf/arch/sparc/entry/syscalls/syscall.tbl arch/sparc/kernel/syscalls/syscall.tbl
 check_2 tools/perf/arch/xtensa/entry/syscalls/syscall.tbl arch/xtensa/kernel/syscalls/syscall.tbl
 check_2 tools/perf/arch/alpha/entry/syscalls/syscall.tbl arch/alpha/entry/syscalls/syscall.tbl
-check_2 tools/perf/arch/parisc/entry/syscalls/syscall.tbl arch/parisc/entry/syscalls/syscall.tbl
 check_2 tools/perf/arch/arm64/entry/syscalls/syscall_32.tbl arch/arm64/entry/syscalls/syscall_32.tbl
 check_2 tools/perf/arch/arm64/entry/syscalls/syscall_64.tbl arch/arm64/entry/syscalls/syscall_64.tbl
 

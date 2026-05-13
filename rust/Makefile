@@ -608,7 +608,6 @@ ifdef CONFIG_ARM
 		__aeabi_dadd __aeabi_dmul __aeabi_dcmple __aeabi_dcmplt __aeabi_dcmpun \
 		__aeabi_uldivmod
 endif
-ifneq ($(or $(CONFIG_ARM64),$(and $(CONFIG_RISCV),$(CONFIG_64BIT))),)
 	# These intrinsics are defined for ARM64 and RISCV64
 	redirect-intrinsics += \
 		__ashrti3 \

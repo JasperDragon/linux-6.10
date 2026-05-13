@@ -617,40 +617,27 @@ config TI_PRUSS_INTC
 	  The PRUSS INTC enables various interrupts to be routed to multiple
 	  different processors within the SoC.
 
-config RISCV_INTC
 	bool
-	depends on RISCV
 	select IRQ_DOMAIN_HIERARCHY
 
-config RISCV_APLIC
 	bool
-	depends on RISCV
 	select IRQ_DOMAIN_HIERARCHY
 
-config RISCV_APLIC_MSI
 	bool
-	depends on RISCV_APLIC
 	select GENERIC_MSI_IRQ
-	default RISCV_APLIC
 
-config RISCV_IMSIC
 	bool
-	depends on RISCV
 	select IRQ_DOMAIN_HIERARCHY
 	select GENERIC_IRQ_MATRIX_ALLOCATOR
 	select GENERIC_MSI_IRQ
 	select IRQ_MSI_LIB
 
-config RISCV_RPMI_SYSMSI
 	bool
-	depends on RISCV && MAILBOX
 	select IRQ_DOMAIN_HIERARCHY
 	select GENERIC_MSI_IRQ
-	default RISCV
 
 config SIFIVE_PLIC
 	bool
-	depends on RISCV
 	select IRQ_DOMAIN_HIERARCHY
 	select GENERIC_IRQ_EFFECTIVE_AFF_MASK if SMP
 
@@ -667,7 +654,6 @@ config STARFIVE_JH8100_INTC
 
 config ACLINT_SSWI
 	bool "RISC-V ACLINT S-mode IPI Interrupt Controller"
-	depends on RISCV
 	depends on SMP
 	select IRQ_DOMAIN_HIERARCHY
 	select GENERIC_IRQ_IPI_MUX
@@ -705,7 +691,6 @@ config IRQ_LOONGARCH_CPU
 	help
 	  Support for the LoongArch CPU Interrupt Controller. For details of
 	  irq chip hierarchy on LoongArch platforms please read the document
-	  Documentation/arch/loongarch/irq-chip-model.rst.
 
 config LOONGSON_LIOINTC
 	bool "Loongson Local I/O Interrupt Controller"

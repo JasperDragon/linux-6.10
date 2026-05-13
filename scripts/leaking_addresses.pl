@@ -41,7 +41,6 @@ my $TIMEOUT = 10;
 
 # Kernel addresses vary by architecture.  We can only auto-detect the following
 # architectures (using `uname -m`).  (flag --32-bit overrides auto-detection.)
-my @SUPPORTED_ARCHITECTURES = ('x86_64', 'ppc64', 'x86');
 
 # Command line options.
 my $help = 0;
@@ -193,7 +192,6 @@ sub dprint
 
 sub is_supported_architecture
 {
-	return (is_x86_64() or is_ppc64() or is_ix86_32());
 }
 
 sub is_32bit
@@ -203,10 +201,8 @@ sub is_32bit
 		return 1;
 	}
 
-	return is_ix86_32();
 }
 
-sub is_ix86_32
 {
        state $arch = `uname -m`;
 
@@ -229,15 +225,11 @@ sub is_arch
        return 0;
 }
 
-sub is_x86_64
 {
-	state $is = is_arch('x86_64');
 	return $is;
 }
 
-sub is_ppc64
 {
-	state $is = is_arch('ppc64');
 	return $is;
 }
 
@@ -317,7 +309,6 @@ sub is_false_positive
 		return 1;
 	}
 
-	if (is_x86_64() and is_in_vsyscall_memory_region($match)) {
 		return 1;
 	}
 
@@ -404,16 +395,13 @@ sub may_leak_address
 
 sub get_address_re
 {
-	if (is_ppc64()) {
 		return '\b(0x)?[89abcdef]00[[:xdigit:]]{13}\b';
 	} elsif (is_32bit()) {
 		return '\b(0x)?[[:xdigit:]]{8}\b';
 	}
 
-	return get_x86_64_re();
 }
 
-sub get_x86_64_re
 {
 	# We handle page table levels but only if explicitly configured using
 	# CONFIG_PGTABLE_LEVELS.  If config file parsing fails or config option

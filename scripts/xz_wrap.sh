@@ -6,22 +6,11 @@
 #
 # Author: Lasse Collin <lasse.collin@tukaani.org>
 
-# This has specialized settings for the following archs. However,
-# XZ-compressed kernel isn't currently supported on every listed arch.
+# This has specialized settings for the following archs.
 #
 #   Arch        Align   Notes
 #   arm          2/4    ARM and ARM-Thumb2
 #   arm64         4
-#   csky          2
-#   loongarch     4
-#   mips         2/4    MicroMIPS is 2-byte aligned
-#   parisc        4
-#   powerpc       4     Uses its own wrapper for compressors instead of this.
-#   riscv        2/4
-#   s390          2
-#   sh            2
-#   sparc         4
-#   x86           1
 
 # A few archs use 2-byte or 4-byte aligned instructions depending on
 # the kernel config. This function is used to check if the relevant
@@ -67,69 +56,6 @@ case $SRCARCH in
 		fi
 		;;
 
-	csky)
-		ALIGN=2
-		;;
-
-	loongarch)
-		ALIGN=4
-		;;
-
-	mips)
-		if is_enabled CONFIG_CPU_MICROMIPS; then
-			ALIGN=2
-		else
-			ALIGN=4
-		fi
-		;;
-
-	parisc)
-		ALIGN=4
-		;;
-
-	powerpc)
-		ALIGN=4
-
-		# The filter is only for big endian instruction encoding.
-		if is_enabled CONFIG_CPU_BIG_ENDIAN; then
-			BCJ=--powerpc
-		fi
-		;;
-
-	riscv)
-		if is_enabled CONFIG_RISCV_ISA_C; then
-			ALIGN=2
-		else
-			ALIGN=4
-		fi
-
-		# RISC-V filter was added in XZ Utils 5.6.0.
-		if [ "$XZ_VERSION" -ge 50060002 ]; then
-			BCJ=--riscv
-		else
-			echo "$0: Upgrading to xz >= 5.6.0" \
-				"would enable the RISC-V filter" \
-				"for better compression" >&2
-		fi
-		;;
-
-	s390)
-		ALIGN=2
-		;;
-
-	sh)
-		ALIGN=2
-		;;
-
-	sparc)
-		ALIGN=4
-		BCJ=--sparc
-		;;
-
-	x86)
-		ALIGN=1
-		BCJ=--x86
-		;;
 
 	*)
 		echo "$0: Arch-specific tuning is missing for '$SRCARCH'" >&2

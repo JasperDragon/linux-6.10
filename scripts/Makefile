@@ -15,15 +15,6 @@ hostprogs-always-$(CONFIG_TRACEPOINTS)			+= tracepoint-update
 
 sorttable-objs := sorttable.o elf-parse.o
 tracepoint-update-objs := tracepoint-update.o elf-parse.o
-
-ifneq ($(or $(CONFIG_X86_64),$(CONFIG_X86_32)),)
-always-$(CONFIG_RUST)					+= target.json
-filechk_rust_target = $< < include/config/auto.conf
-
-$(obj)/target.json: scripts/generate_rust_target include/config/auto.conf FORCE
-	$(call filechk,rust_target)
-endif
-
 hostprogs += generate_rust_target
 generate_rust_target-rust := y
 rustdoc_test_builder-rust := y
@@ -39,12 +30,6 @@ HOSTCFLAGS_sign-file.o += -I$(srctree)/tools/include/uapi/
 HOSTLDLIBS_sign-file = $(shell $(HOSTPKG_CONFIG) --libs libcrypto 2> /dev/null || echo -lcrypto)
 
 ifdef CONFIG_UNWINDER_ORC
-ifeq ($(ARCH),x86_64)
-SRCARCH := x86
-endif
-ifeq ($(ARCH),loongarch)
-SRCARCH := loongarch
-endif
 HOSTCFLAGS_sorttable.o += -I$(srctree)/tools/arch/$(SRCARCH)/include
 HOSTCFLAGS_sorttable.o += -DUNWINDER_ORC_ENABLED
 endif
