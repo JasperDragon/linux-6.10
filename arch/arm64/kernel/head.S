@@ -43,6 +43,45 @@
 #endif
 
 /*
+ * ============================================================================
+ *  ARM64 内核启动入口文件
+ * ============================================================================
+ *
+ * 整体启动流程:
+ *   primary_entry                         -- 主核入口 (MMU=off)
+ *     ├─ record_mmu_state                 -- 记录 MMU/缓存 初始状态
+ *     ├─ preserve_boot_args               -- 保存 bootloader 传入的参数 (x0~x3)
+ *     ├─ __pi_create_init_idmap           -- 在物理地址空间创建初始恒等映射
+ *     ├─ 缓存维护 (根据 MMU 状态)
+ *     ├─ init_kernel_el                   -- 确定异常级别并初始化
+ *     ├─ __cpu_setup                      -- CPU 特定初始化 (TCR/MAIR 等)
+ *     └─ __primary_switch                 -- MMU 开启 + 内核映射 + 重定位
+ *           ├─ __enable_mmu               -- 加载 TTBR，开启 MMU
+ *           ├─ __pi_early_map_kernel      -- 映射内核镜像、FDT、清除 BSS
+ *           └─ __primary_switched         -- MMU 开启后第一个虚拟地址
+ *                 ├─ init_cpu_task        -- 初始化任务上下文 (sp_el0, stack, per-CPU)
+ *                 ├─ 设置 VBAR_EL1        -- 加载异常向量表
+ *                 ├─ 保存 FDT 指针、虚拟偏移
+ *                 ├─ kasan_early_init     -- KASAN 早期初始化
+ *                 ├─ finalise_el2         -- 确定最终 EL2 配置 (VHE)
+ *                 └─ start_kernel()       -- 进入 C 代码!
+ *
+ * 从核启动 (SMP):
+ *   secondary_holding_pen                 -- 从核轮询等待释放信号
+ *     └─ secondary_startup               -- 从核正式启动
+ *           ├─ __cpu_secondary_check52bitva  -- [可选] 52位 VA检查
+ *           ├─ __cpu_setup               -- CPU 初始化
+ *           ├─ __enable_mmu              -- 开启 MMU
+ *           └─ __secondary_switched      -- 加载任务 + 进入 secondary_start_kernel
+ *
+ * 被调用方保存寄存器 (callee-saved registers) 的使用约定:
+ *   寄存器    使用范围                        用途
+ *   x19       primary_entry() .. start_kernel()       MMU 是否在入口时开启
+ *   x20       primary_entry() .. __primary_switch()    CPU 启动模式 (EL1/EL2)
+ *   x21       primary_entry() .. start_kernel()       FDT 物理地址 (来自 x0)
+ */
+
+/*
  * Kernel startup entry point.
  * ---------------------------
  *
@@ -57,6 +96,17 @@
 	__HEAD
 	/*
 	 * DO NOT MODIFY. Image header expected by Linux boot-loaders.
+	 *
+	 * 内核镜像头部 (Image header)，bootloader 通过此头部识别内核镜像。
+	 * 结构:
+	 *   [0]   efi_signature_nop   - PE/COFF 签名 NOP (EFI 启动标识)
+	 *   [4]   b primary_entry     - 跳转指令，跳到内核入口
+	 *   [8]   .quad 0             - Image 在 RAM 中的加载偏移 (小端)
+	 *   [16]  _kernel_size_le     - 内核镜像有效大小 (小端)
+	 *   [24]  _kernel_flags_le    - 内核标志 (小端，如 PAGE_SIZE, 字节序)
+	 *   [32]  .quad 0 (×3)        - 保留字段
+	 *   [56]  ARM64_IMAGE_MAGIC   - 魔数 "ARM\x64" 用于校验
+	 *   [60]  PE header offset    - PE 头部偏移 (用于 EFI 启动)
 	 */
 	efi_signature_nop			// special NOP to identity as PE/COFF executable
 	b	primary_entry			// branch to kernel start, magic
@@ -71,6 +121,13 @@
 
 	__EFI_PE_HEADER
 
+	/*
+	 * .idmap.text 段: 恒等映射文本段
+	 *
+	 * 此段中的代码在 MMU 开启前后的虚拟地址空间变化中都能正确执行，
+	 * 因为 __create_init_idmap 为此段创建了恒等映射 (VA==PA)。
+	 * 所有在 MMU 开启瞬间及前后执行的代码必须放在此段中。
+	 */
 	.section ".idmap.text","a"
 
 	/*
@@ -83,22 +140,51 @@
 	 *  x21        primary_entry() .. start_kernel()        FDT pointer passed at boot in x0
 	 */
 SYM_CODE_START(primary_entry)
-	bl	record_mmu_state
-	bl	preserve_boot_args
+	/*
+	 * primary_entry: 主核入口点
+	 * 输入: x0 = FDT 物理地址
+	 * 状态: MMU=off, D-cache=off
+	 */
+	bl	record_mmu_state		// ★ 步骤1: 记录 MMU/缓存/字节序初始状态
+	bl	preserve_boot_args		// ★ 步骤2: 保存 bootloader 参数 (FDT地址存入x21)
 
+	/*
+	 * 设置早期启动栈 (early_init_stack)
+	 * 此时 MMU 仍未开启，使用物理地址访问栈
+	 */
 	adrp	x1, early_init_stack
 	mov	sp, x1
-	mov	x29, xzr
+	mov	x29, xzr			// fp=0，终止帧链回溯
+
+	/*
+	 * ★ 步骤3: 创建初始恒等映射 (identity mapping)
+	 * 输入: x0 = __pi_init_idmap_pg_dir (初始页表目录物理地址)
+	 *       x1 = 0 (不使用)
+	 *
+	 * 此函数在 MMU 关闭的情况下运行 (PI = position independent)，
+	 * 为内核镜像区域建立恒等映射:
+	 *   - .head.text ~ __initdata_begin → 只读可执行映射
+	 *   - __initdata_begin ~ _end       → 读写数据映射
+	 * 返回: x0 = 已使用的页表区域末尾地址
+	 */
 	adrp	x0, __pi_init_idmap_pg_dir
 	mov	x1, xzr
 	bl	__pi_create_init_idmap
 
 	/*
-	 * If the page tables have been populated with non-cacheable
-	 * accesses (MMU disabled), invalidate those tables again to
-	 * remove any speculatively loaded cache lines.
+	 * ★ 步骤4: 缓存维护
+	 * 如果页表是通过 non-cacheable 访问填充的 (MMU=off)，
+	 * 需要将页表缓存行无效化以清除可能被投机加载的脏行。
+	 *
+	 * 如果进入时 MMU 和缓存已开启，则需要将恒等映射区域的
+	 * 代码 clean 到 PoC (Point of Coherency)，以确保在 MMU
+	 * 关闭后可以安全执行这些代码。
 	 */
-	cbnz	x19, 0f
+	cbnz	x19, 0f				// x19!=0 表示进入时 MMU 已开启
+	/*
+	 * MMU 关闭路径: 无效化初始页表区域的 D-cache
+	 * 范围: [__pi_init_idmap_pg_dir, x0)  (x0 是 create_init_idmap 的返回值)
+	 */
 	dmb     sy
 	mov	x1, x0				// end of used region
 	adrp    x0, __pi_init_idmap_pg_dir
@@ -107,49 +193,86 @@ SYM_CODE_START(primary_entry)
 	b	1f
 
 	/*
-	 * If we entered with the MMU and caches on, clean the ID mapped part
-	 * of the primary boot code to the PoC so we can safely execute it with
-	 * the MMU off.
+	 * MMU 开启路径: 将恒等映射区域的代码 Clean 到 PoC
+	 * 以确保关闭 MMU 后仍能正确取指
+	 * 范围: [__idmap_text_start, __idmap_text_end)
 	 */
 0:	adrp	x0, __idmap_text_start
 	adr_l	x1, __idmap_text_end
 	adr_l	x2, dcache_clean_poc
 	blr	x2
 
+	/*
+	 * ★ 步骤5: 初始化异常级别
+	 * 输入: x0 = x19 (MMU 进入时状态)
+	 *
+	 * 确定当前异常级别 (EL1 或 EL2)，配置 CPU 运行在
+	 * 内核支持的最高可达异常级别。
+	 * - 如果在 EL2: 配置 EL2 后，通过 ERET 降到 EL1
+	 * - 如果在 EL1: 直接配置 EL1
+	 * 返回: w0 = BOOT_CPU_MODE_EL1 或 BOOT_CPU_MODE_EL2
+	 */
 1:	mov	x0, x19
 	bl	init_kernel_el			// w0=cpu_boot_mode
-	mov	x20, x0
+	mov	x20, x0				// x20 保存启动模式
 
 	/*
-	 * The following calls CPU setup code, see arch/arm64/mm/proc.S for
-	 * details.
-	 * On return, the CPU will be ready for the MMU to be turned on and
-	 * the TCR will have been set.
+	 * ★ 步骤6: CPU 特定设置
+	 * 配置 TCR (Translation Control Register)、MAIR (Memory Attribute
+	 * Indirection Register)、SCTLR 等系统寄存器。
+	 * 返回后 CPU 已准备好开启 MMU。
+	 * 实现位于 arch/arm64/mm/proc.S
 	 */
 	bl	__cpu_setup			// initialise processor
+
+	/*
+	 * ★ 步骤7: 主核切换
+	 * 开启 MMU，映射内核，重定位到虚拟地址空间，
+	 * 最终跳转到 __primary_switched
+	 */
 	b	__primary_switch
 SYM_CODE_END(primary_entry)
 
 	__INIT
+/*
+ * record_mmu_state: 记录 MMU 和缓存的初始状态
+ *
+ * 结果存入 x19:
+ *   x19 = 0:                     MMU 关闭 (正常冷启动)
+ *   x19 = SCTLR_ELx_M:           MMU 开启 (如 EFI 启动)
+ *   x19 = SCTLR_ELx_M|SCTLR_ELx_C: MMU 和缓存都开启
+ *
+ * 如果当前字节序与内核不一致，还会修正字节序。
+ * 注意: 修正字节序后 MMU 必须关闭，否则恒等映射会按错误的字节序解释。
+ */
 SYM_CODE_START_LOCAL(record_mmu_state)
-	mrs	x19, CurrentEL
+	mrs	x19, CurrentEL			// 读取当前异常级别
 	cmp	x19, #CurrentEL_EL2
-	mrs	x19, sctlr_el1
-	b.ne	0f
-	mrs	x19, sctlr_el2
+	mrs	x19, sctlr_el1			// 先读 SCTLR_EL1
+	b.ne	0f				// 不在 EL2 → 使用 EL1 的值
+	mrs	x19, sctlr_el2			// 在 EL2 → 使用 SCTLR_EL2
 0:
+	/*
+	 * 字节序检查
+	 * CPU_LE (小端): 如果 EE 位为 1，说明当前是大端，需修正
+	 * CPU_BE (大端): 如果 EE 位为 0，说明当前是小端，需修正
+	 */
 CPU_LE( tbnz	x19, #SCTLR_ELx_EE_SHIFT, 1f	)
 CPU_BE( tbz	x19, #SCTLR_ELx_EE_SHIFT, 1f	)
+	/*
+	 * 字节序匹配: 提取 M 位 (MMU 状态) 和 C 位 (D-cache 状态)
+	 *   x19 = 0:                MMU=off, D-cache=off
+	 *   x19 = SCTLR_ELx_M:      MMU=on,  D-cache=off
+	 *   x19 = SCTLR_ELx_M|C:    MMU=on,  D-cache=on
+	 */
 	tst	x19, #SCTLR_ELx_C		// Z := (C == 0)
 	and	x19, x19, #SCTLR_ELx_M		// isolate M bit
 	csel	x19, xzr, x19, eq		// clear x19 if Z
 	ret
 
 	/*
-	 * Set the correct endianness early so all memory accesses issued
-	 * before init_kernel_el() occur in the correct byte order. Note that
-	 * this means the MMU must be disabled, or the active ID map will end
-	 * up getting interpreted with the wrong byte order.
+	 * 字节序不匹配: 修正字节序
+	 * 翻转 EE 位，清除 M 位（必须关闭 MMU），然后写回 SCTLR
 	 */
 1:	eor	x19, x19, #SCTLR_ELx_EE
 	bic	x19, x19, #SCTLR_ELx_M
@@ -160,67 +283,99 @@ CPU_BE( tbz	x19, #SCTLR_ELx_EE_SHIFT, 1f	)
 2:	pre_disable_mmu_workaround
 	msr	sctlr_el1, x19
 3:	isb
-	mov	x19, xzr
+	mov	x19, xzr			// 强制表示 MMU=off
 	ret
 SYM_CODE_END(record_mmu_state)
 
 /*
- * Preserve the arguments passed by the bootloader in x0 .. x3
+ * preserve_boot_args: 保存 bootloader 传入的参数
+ *
+ * 将 x0~x3 保存到 boot_args[] 数组中。
+ * x0 = FDT 物理地址 → x21  (被调用方保存，启动全程使用)
+ *
+ * 如果 MMU 关闭 (x19==0)，还需要 DMB 后无效化 boot_args 所在缓存行，
+ * 确保后续 MMU 开启后通过虚拟地址能读到正确的值。
  */
 SYM_CODE_START_LOCAL(preserve_boot_args)
-	mov	x21, x0				// x21=FDT
+	mov	x21, x0				// x21=FDT (被调用方保存，boot全程使用)
 
-	adr_l	x0, boot_args			// record the contents of
-	stp	x21, x1, [x0]			// x0 .. x3 at kernel entry
-	stp	x2, x3, [x0, #16]
+	adr_l	x0, boot_args			// 将 x0~x3 保存到 boot_args[]
+	stp	x21, x1, [x0]			// boot_args[0]=FDT, [1]=x1
+	stp	x2, x3, [x0, #16]		// boot_args[2]=x2,  [3]=x3
 
-	cbnz	x19, 0f				// skip cache invalidation if MMU is on
-	dmb	sy				// needed before dc ivac with
-						// MMU off
+	cbnz	x19, 0f				// MMU 开启则跳过缓存无效化
+	dmb	sy				// MMU 关闭时需要 DMB
+						// 确保之前的存储对 dc ivac 可见
 
-	add	x1, x0, #0x20			// 4 x 8 bytes
-	b	dcache_inval_poc		// tail call
-0:	str_l   x19, mmu_enabled_at_boot, x0
+	add	x1, x0, #0x20			// 4 × 8 bytes
+	b	dcache_inval_poc		// tail call: 无效化 boot_args 的缓存行
+0:	str_l   x19, mmu_enabled_at_boot, x0	// 保存 MMU 启动状态到全局变量
 	ret
 SYM_CODE_END(preserve_boot_args)
 
 	/*
-	 * Initialize CPU registers with task-specific and cpu-specific context.
+	 * init_cpu_task: 初始化 CPU 任务上下文
 	 *
-	 * Create a final frame record at task_pt_regs(current)->stackframe, so
-	 * that the unwinder can identify the final frame record of any task by
-	 * its location in the task stack. We reserve the entire pt_regs space
-	 * for consistency with user tasks and kthreads.
+	 * 为当前 CPU 设置:
+	 * 1. sp_el0 → 指向任务结构体 (用于用户态访问)
+	 * 2. 栈指针 → task.stack + THREAD_SIZE - PT_REGS_SIZE
+	 * 3. 帧记录 → 创建最终帧 (final frame)，栈回溯的终点
+	 * 4. SCS (Shadow Call Stack) → 加载影子调用栈
+	 * 5. per-CPU 偏移 → set_this_cpu_offset
+	 *
+	 * 输入:
+	 *   tsk  = 任务结构体指针
+	 *   tmp1, tmp2 = 临时寄存器
 	 */
 	.macro	init_cpu_task tsk, tmp1, tmp2
-	msr	sp_el0, \tsk
+	msr	sp_el0, \tsk			// 设置用户态栈指针指向 task_struct
 
-	ldr	\tmp1, [\tsk, #TSK_STACK]
-	add	sp, \tmp1, #THREAD_SIZE
-	sub	sp, sp, #PT_REGS_SIZE
+	ldr	\tmp1, [\tsk, #TSK_STACK]	// \tmp1 = task->stack
+	add	sp, \tmp1, #THREAD_SIZE		// sp = 栈顶 (栈向下增长)
+	sub	sp, sp, #PT_REGS_SIZE		// 预留 pt_regs 空间 (栈底)
 
+	/*
+	 * 创建最终帧记录 (final frame record)
+	 * 栈回溯器 (unwinder) 通过栈底位置识别最终帧
+	 * 此处 x29(fp) 和 x30(lr) 均为 0，标识调用链的终点
+	 */
 	stp	xzr, xzr, [sp, #S_STACKFRAME]
 	mov	\tmp1, #FRAME_META_TYPE_FINAL
 	str	\tmp1, [sp, #S_STACKFRAME_TYPE]
-	add	x29, sp, #S_STACKFRAME
+	add	x29, sp, #S_STACKFRAME		// fp 指向帧记录
 
-	scs_load_current
+	scs_load_current			// [可选] 加载影子调用栈
 
+	/*
+	 * 设置 per-CPU 偏移量
+	 * 内核通过 this_cpu_offset 访问 per-CPU 变量:
+	 *   per_cpu_var = base + this_cpu_offset[cpu]
+	 */
 	adr_l	\tmp1, __per_cpu_offset
-	ldr	w\tmp2, [\tsk, #TSK_TI_CPU]
-	ldr	\tmp1, [\tmp1, \tmp2, lsl #3]
+	ldr	w\tmp2, [\tsk, #TSK_TI_CPU]	// w\tmp2 = CPU number
+	ldr	\tmp1, [\tmp1, \tmp2, lsl #3]	// \tmp1 = __per_cpu_offset[cpu]
 	set_this_cpu_offset \tmp1
 	.endm
 
 /*
- * The following fragment of code is executed with the MMU enabled.
+ * __primary_switched: MMU 开启后的第一个虚拟地址
  *
- *   x0 = __pa(KERNEL_START)
+ * 此时:
+ * - MMU 已开启，运行在虚拟地址空间
+ * - 恒等映射仍然存在 (idmap_pg_dir)
+ * - 内核已被映射到 swapper_pg_dir
+ *
+ * 输入:
+ *   x0 = __pa(KERNEL_START)   -- 内核物理起始地址
  */
 SYM_FUNC_START_LOCAL(__primary_switched)
-	adr_l	x4, init_task
-	init_cpu_task x4, x5, x6
+	adr_l	x4, init_task			// x4 = &init_task (swapper进程)
+	init_cpu_task x4, x5, x6		// ★ 初始化 init_task 的 CPU 上下文
 
+	/*
+	 * ★ 加载异常向量表
+	 * 将虚拟地址空间中的异常向量表基址写入 VBAR_EL1
+	 */
 	adr_l	x8, vectors			// load VBAR_EL1 with virtual
 	msr	vbar_el1, x8			// vector table address
 	isb
@@ -228,23 +383,30 @@ SYM_FUNC_START_LOCAL(__primary_switched)
 	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
 
-	str_l	x21, __fdt_pointer, x5		// Save FDT pointer
+	/*
+	 * ★ 保存关键全局变量
+	 */
+	str_l	x21, __fdt_pointer, x5		// 保存 FDT 指针供后续 setup_arch 使用
 
-	adrp	x4, _text			// Save the offset between
-	sub	x4, x4, x0			// the kernel virtual and
-	str_l	x4, kimage_voffset, x5		// physical mappings
+	adrp	x4, _text			// 计算内核虚拟地址偏移:
+	sub	x4, x4, x0			//   kimage_voffset = virt_addr - phys_addr
+	str_l	x4, kimage_voffset, x5		// 供后续 phys_to_virt/virt_to_phys 使用
 
+	/*
+	 * ★ 设置 CPU 启动模式标志
+	 * 将 boot_cpu_mode 写入 __boot_cpu_mode
+	 */
 	mov	x0, x20
 	bl	set_cpu_boot_mode_flag
 
 #if defined(CONFIG_KASAN_GENERIC) || defined(CONFIG_KASAN_SW_TAGS)
-	bl	kasan_early_init
+	bl	kasan_early_init		// ★ KASAN 早期初始化 (阴影内存映射)
 #endif
 	mov	x0, x20
-	bl	finalise_el2			// Prefer VHE if possible
+	bl	finalise_el2			// ★ 最终化 EL2 配置: 如果支持 VHE 则启用
 	ldp	x29, x30, [sp], #16
-	bl	start_kernel
-	ASM_BUG()
+	bl	start_kernel			// ★★★ 进入 C 代码! init/main.c
+	ASM_BUG()				// start_kernel 不应返回，否则触发 BUG
 SYM_FUNC_END(__primary_switched)
 
 /*
@@ -254,157 +416,239 @@ SYM_FUNC_END(__primary_switched)
 	.section ".idmap.text","a"
 
 /*
- * Starting from EL2 or EL1, configure the CPU to execute at the highest
- * reachable EL supported by the kernel in a chosen default state. If dropping
- * from EL2 to EL1, configure EL2 before configuring EL1.
+ * init_kernel_el: 初始化内核异常级别
  *
- * Since we cannot always rely on ERET synchronizing writes to sysregs (e.g. if
- * SCTLR_ELx.EOS is clear), we place an ISB prior to ERET.
+ * 功能: 从 EL2 或 EL1 启动，配置 CPU 运行在内核支持的最高可达异常级别。
+ * 如果从 EL2 降到 EL1，先配 EL2 再配 EL1。
  *
- * Returns either BOOT_CPU_MODE_EL1 or BOOT_CPU_MODE_EL2 in x0 if
- * booted in EL1 or EL2 respectively, with the top 32 bits containing
- * potential context flags. These flags are *not* stored in __boot_cpu_mode.
+ * 注意: 由于不能保证 ERET 同步写回系统寄存器 (SCTLR_ELx.EOS 可能为0)，
+ * 在 ERET 前插入 ISB 进行同步。
  *
- * x0: whether we are being called from the primary boot path with the MMU on
+ * 输入: x0 = 是否从主启动路径调用且 MMU 已开启
+ * 返回: w0 = BOOT_CPU_MODE_EL1 或 BOOT_CPU_MODE_EL2
+ *       高32位可能包含上下文标志 (如 BOOT_CPU_FLAG_E2H)
+ *
+ * 流程:
+ *   CurrentEL==EL2? → init_el2 (配EL2 → ERET到EL1)
+ *   CurrentEL==EL1? → init_el1 (直接配EL1 → ERET到EL1)
  */
 SYM_FUNC_START(init_kernel_el)
 	mrs	x1, CurrentEL
 	cmp	x1, #CurrentEL_EL2
-	b.eq	init_el2
+	b.eq	init_el2			// 在 EL2 → 初始化 EL2
 
+	/*
+	 * init_el1: 在 EL1 启动的初始化
+	 *
+	 * 1. 将 SCTLR_EL1 设为已知安全状态 (MMU=off)
+	 * 2. 设置 SPSR_EL1 为 EL1 初始 PSTATE (所有异常屏蔽)
+	 * 3. 设置 ELR_EL1 为返回地址 (lr)
+	 * 4. 通过 ERET "返回"到 EL1 (实际上就是停留在 EL1)
+	 * 5. 返回 BOOT_CPU_MODE_EL1
+	 */
 SYM_INNER_LABEL(init_el1, SYM_L_LOCAL)
-	mov_q	x0, INIT_SCTLR_EL1_MMU_OFF
+	mov_q	x0, INIT_SCTLR_EL1_MMU_OFF	// 安全默认: MMU=off, 对齐检查=off
 	pre_disable_mmu_workaround
 	msr	sctlr_el1, x0
 	isb
-	mov_q	x0, INIT_PSTATE_EL1
-	msr	spsr_el1, x0
-	msr	elr_el1, lr
-	mov	w0, #BOOT_CPU_MODE_EL1
+	mov_q	x0, INIT_PSTATE_EL1		// 初始处理器状态: D/A/I/F 全屏蔽
+	msr	spsr_el1, x0			// ERET 时将此值加载到 PSTATE
+	msr	elr_el1, lr			// ERET 返回地址 = 调用者
+	mov	w0, #BOOT_CPU_MODE_EL1		// 返回 BOOT_CPU_MODE_EL1
 	eret
 
+	/*
+	 * init_el2: 在 EL2 启动的初始化
+	 *
+	 * 流程:
+	 * 1. 设置 ELR_EL2 为返回地址
+	 * 2. [MMU=on] 将 HYP 代码 Clean 到 PoC
+	 * 3. 将 SCTLR_EL2 设为安全状态 (MMU=off)
+	 * 4. 配置 HCR_EL2 (Hypervisor Configuration Register)
+	 * 5. 配置 EL2 系统寄存器 (通过 init_el2_state 宏)
+	 * 6. 安装 HYP 桩向量表 (__hyp_stub_vectors)
+	 * 7. 配置 SCTLR_EL1 (通过 VHE 路径或直接)
+	 * 8. 设置 SPSR_EL2 为 EL1 模式
+	 * 9. ERET → 降到 EL1
+	 * 10. 返回 BOOT_CPU_MODE_EL2 (可能带 E2H 标志)
+	 */
 SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
-	msr	elr_el2, lr
+	msr	elr_el2, lr			// ERET 返回地址
 
-	// clean all HYP code to the PoC if we booted at EL2 with the MMU on
-	cbz	x0, 0f
+	/*
+	 * 如果以 MMU 开启的状态进入 EL2 (如 EFI 启动)，
+	 * 需要将 HYP 代码 Clean 到 PoC，以确保关闭 MMU 后
+	 * 可以安全执行。
+	 * 范围: [__hyp_idmap_text_start, __hyp_text_end)
+	 */
+	cbz	x0, 0f				// MMU=off 则跳过
 	adrp	x0, __hyp_idmap_text_start
 	adr_l	x1, __hyp_text_end
 	adr_l	x2, dcache_clean_poc
 	blr	x2
 
-	mov_q	x0, INIT_SCTLR_EL2_MMU_OFF
+	mov_q	x0, INIT_SCTLR_EL2_MMU_OFF	// 安全默认
 	pre_disable_mmu_workaround
 	msr	sctlr_el2, x0
 	isb
 0:
-
+	/*
+	 * 配置 HCR_EL2:
+	 * HCR_HOST_NVHE_FLAGS: 将大部分异常路由到 EL2 (非 VHE 模式)
+	 * HCR_ATA: 允许 EL1 使用地址认证 (PAC)
+	 */
 	init_el2_hcr	HCR_HOST_NVHE_FLAGS | HCR_ATA
-	init_el2_state
+	init_el2_state				// 初始化 EL2 系统寄存器
 
-	/* Hypervisor stub */
+	/* Hypervisor stub: 安装 EL2 异常向量表 */
 	adr_l	x0, __hyp_stub_vectors
 	msr	vbar_el2, x0
 	isb
 
-	mov_q	x1, INIT_SCTLR_EL1_MMU_OFF
+	mov_q	x1, INIT_SCTLR_EL1_MMU_OFF	// 准备 EL1 的 SCTLR
 
+	/*
+	 * 检查是否支持 VHE (Virtualization Host Extensions)
+	 * VHE 允许内核直接运行在 EL2，减少虚拟化开销。
+	 *
+	 * HCR_E2H=1 → VHE 路径: SCTLR_EL1 通过 SCTLR_EL12 设置 ("影子"访问)
+	 * HCR_E2H=0 → 非VHE路径: 直接写 SCTLR_EL1
+	 */
 	mrs	x0, hcr_el2
 	and	x0, x0, #HCR_E2H
 	cbz	x0, 2f
 
-	/* Set a sane SCTLR_EL1, the VHE way */
+	/* VHE 路径: 使用 _EL12 访问器设置 SCTLR_EL1 */
 	msr_s	SYS_SCTLR_EL12, x1
-	mov	x2, #BOOT_CPU_FLAG_E2H
+	mov	x2, #BOOT_CPU_FLAG_E2H		// 标记: 支持 VHE
 	b	3f
 
 2:
+	/* 非 VHE 路径: 直接写 SCTLR_EL1 */
 	msr	sctlr_el1, x1
-	mov	x2, xzr
+	mov	x2, xzr				// 无 E2H 标志
 3:
-	mov	x0, #INIT_PSTATE_EL1
+	mov	x0, #INIT_PSTATE_EL1		// SPSR: 将目标设为 EL1 (D/A/I/F 屏蔽)
 	msr	spsr_el2, x0
 
-	mov	w0, #BOOT_CPU_MODE_EL2
-	orr	x0, x0, x2
-	eret
+	mov	w0, #BOOT_CPU_MODE_EL2		// 返回 BOOT_CPU_MODE_EL2
+	orr	x0, x0, x2			// 合并 E2H 标志
+	eret					// ★ ERET: 降级到 EL1，开始执行 EL1 代码
 SYM_FUNC_END(init_kernel_el)
 
 	/*
-	 * This provides a "holding pen" for platforms to hold all secondary
-	 * cores are held until we're ready for them to initialise.
+	 * secondary_holding_pen: 从核"等候区"
+	 *
+	 * 平台可以在此持有所有从核，直到主核准备好。
+	 * 原理: 每个从核轮询检查 secondary_holding_pen_release 全局变量，
+	 * 当该值等于自己的 MPIDR 时，跳转到 secondary_startup。
+	 *
+	 * 主核通过 smp_prepare_cpus() → 写 secondary_holding_pen_release 释放从核。
 	 */
 SYM_FUNC_START(secondary_holding_pen)
-	mov	x0, xzr
+	mov	x0, xzr				// MMU=off 调用 init_kernel_el
 	bl	init_kernel_el			// w0=cpu_boot_mode
-	mrs	x2, mpidr_el1
+	mrs	x2, mpidr_el1			// 读取自己的 MPIDR (CPU 唯一ID)
 	mov_q	x1, MPIDR_HWID_BITMASK
-	and	x2, x2, x1
+	and	x2, x2, x1			// 提取硬件 ID
 	adr_l	x3, secondary_holding_pen_release
-pen:	ldr	x4, [x3]
-	cmp	x4, x2
-	b.eq	secondary_startup
-	wfe
-	b	pen
+pen:	ldr	x4, [x3]			// 读取释放信号
+	cmp	x4, x2				// 是释放我吗?
+	b.eq	secondary_startup		// 是 → 启动
+	wfe					// Wait For Event: 等待中断唤醒
+	b	pen				// 继续轮询
 SYM_FUNC_END(secondary_holding_pen)
 
 	/*
-	 * Secondary entry point that jumps straight into the kernel. Only to
-	 * be used where CPUs are brought online dynamically by the kernel.
+	 * secondary_entry: 从核直接入口
+	 *
+	 * 仅适用于内核动态上线 CPU 的场景 (如 hotplug)。
+	 * 无需轮询等待，直接初始化并启动。
 	 */
 SYM_FUNC_START(secondary_entry)
-	mov	x0, xzr
+	mov	x0, xzr				// MMU=off
 	bl	init_kernel_el			// w0=cpu_boot_mode
 	b	secondary_startup
 SYM_FUNC_END(secondary_entry)
 
-SYM_FUNC_START_LOCAL(secondary_startup)
 	/*
-	 * Common entry point for secondary CPUs.
+	 * secondary_startup: 从核通用启动路径
+	 *
+	 * 输入: x0 = cpu_boot_mode
+	 *
+	 * 流程:
+	 * 1. [可选] 检查 52 位 VA 支持
+	 * 2. __cpu_setup: CPU 特定初始化 (TCR/MAIR 等)
+	 * 3. __enable_mmu: 开启 MMU (使用主核准备好的 swapper_pg_dir)
+	 * 4. 跳转到 __secondary_switched (虚拟地址)
 	 */
+SYM_FUNC_START_LOCAL(secondary_startup)
 	mov	x20, x0				// preserve boot mode
 
 #ifdef CONFIG_ARM64_VA_BITS_52
+	/*
+	 * 52位 VA 支持检查
+	 * 如果主核支持 52位 VA 但从核不支持，则卡住该从核。
+	 */
 alternative_if ARM64_HAS_VA52
 	bl	__cpu_secondary_check52bitva
 alternative_else_nop_endif
 #endif
 
 	bl	__cpu_setup			// initialise processor
+
+	/*
+	 * 从核使用主核已建立好的页表:
+	 * x1 = swapper_pg_dir (内核全局页表, 用于 TTBR1)
+	 * x2 = idmap_pg_dir   (恒等映射页表, 用于 TTBR0)
+	 */
 	adrp	x1, swapper_pg_dir
 	adrp	x2, idmap_pg_dir
-	bl	__enable_mmu
-	ldr	x8, =__secondary_switched
+	bl	__enable_mmu			// ★ 开启 MMU
+	ldr	x8, =__secondary_switched	// MMU 开启后的目标虚拟地址
 	br	x8
 SYM_FUNC_END(secondary_startup)
 
 	.text
+/*
+ * __secondary_switched: 从核 MMU 开启后
+ *
+ * 此时运行在虚拟地址空间，使用主核的 swapper_pg_dir。
+ */
 SYM_FUNC_START_LOCAL(__secondary_switched)
 	mov	x0, x20
-	bl	set_cpu_boot_mode_flag
+	bl	set_cpu_boot_mode_flag		// 记录启动模式
 
 	mov	x0, x20
-	bl	finalise_el2
+	bl	finalise_el2			// 最终化 EL2 配置
 
-	str_l	xzr, __early_cpu_boot_status, x3
+	str_l	xzr, __early_cpu_boot_status, x3	// 清除启动状态标志
 	adr_l	x5, vectors
-	msr	vbar_el1, x5
+	msr	vbar_el1, x5			// 加载异常向量表
 	isb
 
+	/*
+	 * 加载从核任务
+	 * secondary_data.task 由主核在 __cpu_up() 中设置
+	 */
 	adr_l	x0, secondary_data
-	ldr	x2, [x0, #CPU_BOOT_TASK]
-	cbz	x2, __secondary_too_slow
+	ldr	x2, [x0, #CPU_BOOT_TASK]	// x2 = secondary_data.task
+	cbz	x2, __secondary_too_slow	// 任务还未准备好 → 卡住
 
-	init_cpu_task x2, x1, x3
+	init_cpu_task x2, x1, x3		// 初始化 CPU 任务上下文
 
 #ifdef CONFIG_ARM64_PTR_AUTH
-	ptrauth_keys_init_cpu x2, x3, x4, x5
+	ptrauth_keys_init_cpu x2, x3, x4, x5	// 初始化指针认证密钥
 #endif
 
-	bl	secondary_start_kernel
+	bl	secondary_start_kernel		// ★ 进入从核 C 入口
 	ASM_BUG()
 SYM_FUNC_END(__secondary_switched)
 
+/*
+ * __secondary_too_slow: 从核任务未就绪
+ * 主核尚未设置 secondary_data.task，该从核进入低功耗等待循环。
+ */
 SYM_FUNC_START_LOCAL(__secondary_too_slow)
 	wfe
 	wfi
@@ -412,77 +656,120 @@ SYM_FUNC_START_LOCAL(__secondary_too_slow)
 SYM_FUNC_END(__secondary_too_slow)
 
 /*
- * Sets the __boot_cpu_mode flag depending on the CPU boot mode passed
- * in w0. See arch/arm64/include/asm/virt.h for more info.
+ * set_cpu_boot_mode_flag: 设置 __boot_cpu_mode 标志
+ *
+ * 输入: w0 = BOOT_CPU_MODE_EL1 或 BOOT_CPU_MODE_EL2
+ *
+ * __boot_cpu_mode 是一个 64 位值，分为两个 32 位:
+ * [31:0]  = 当前 CPU 的启动模式
+ * [63:32] = 如果多个 CPU 启动模式不一致时的冲突值
+ *
+ * 由于 CPU 不支持非对齐原子访问，所以在不同偏移写入:
+ * BOOT_CPU_MODE_EL2 → [x1+4] (高32位)
+ * BOOT_CPU_MODE_EL1 → [x1]   (低32位)
  */
 SYM_FUNC_START_LOCAL(set_cpu_boot_mode_flag)
 	adr_l	x1, __boot_cpu_mode
 	cmp	w0, #BOOT_CPU_MODE_EL2
 	b.ne	1f
-	add	x1, x1, #4
-1:	str	w0, [x1]			// Save CPU boot mode
+	add	x1, x1, #4			// EL2 → 写入高32位
+1:	str	w0, [x1]			// 保存启动模式
 	ret
 SYM_FUNC_END(set_cpu_boot_mode_flag)
 
 /*
- * The booting CPU updates the failed status @__early_cpu_boot_status,
- * with MMU turned off.
+ * update_early_cpu_boot_status: 更新 early_cpu_boot_status 并确保写入内存
  *
- * update_early_cpu_boot_status tmp, status
- *  - Corrupts tmp1, tmp2
- *  - Writes 'status' to __early_cpu_boot_status and makes sure
- *    it is committed to memory.
+ * 宏参数:
+ *   status: 要写入的状态值
+ *   tmp1, tmp2: 临时寄存器
+ *
+ * 使用 DMB + DC IVAC 确保即使在 MMU 关闭时，
+ * 写入也能被其他 CPU 看到。
  */
-
 	.macro	update_early_cpu_boot_status status, tmp1, tmp2
 	mov	\tmp2, #\status
 	adr_l	\tmp1, __early_cpu_boot_status
 	str	\tmp2, [\tmp1]
-	dmb	sy
-	dc	ivac, \tmp1			// Invalidate potentially stale cache line
+	dmb	sy				// 确保 store 对所有观察者可见
+	dc	ivac, \tmp1			// 无效化可能存在的过期缓存行
 	.endm
 
 /*
- * Enable the MMU.
+ * __enable_mmu: 开启 MMU
  *
- *  x0  = SCTLR_EL1 value for turning on the MMU.
- *  x1  = TTBR1_EL1 value
- *  x2  = ID map root table address
+ * 输入:
+ *   x0 = SCTLR_EL1 的值 (用于开启 MMU)
+ *   x1 = TTBR1_EL1 的值 (swapper_pg_dir 页表基址)
+ *   x2 = ID map 根页表地址 → TTBR0_EL1
  *
- * Returns to the caller via x30/lr. This requires the caller to be covered
- * by the .idmap.text section.
+ * 返回: 通过 x30/lr 返回
+ * 要求: 调用者必须在 .idmap.text 段中 (由恒等映射覆盖)
  *
- * Checks if the selected granule size is supported by the CPU.
- * If it isn't, park the CPU
+ * 在执行 MMU 开启前，校验 CPU 是否支持当前选择的内存颗粒大小:
+ *   - 支持: 加载 TTBR0/TTBR1，写 SCTLR_EL1 开启 MMU
+ *   - 不支持: 跳转到 __no_granule_support (卡住 CPU)
  */
 	.section ".idmap.text","a"
 SYM_FUNC_START(__enable_mmu)
+	/*
+	 * ★ 内存颗粒大小支持检查
+	 * 读取 ID_AA64MMFR0_EL1 的 TGRAN 字段，检查是否支持
+	 * 内核配置的内存颗粒大小 (4KB/16KB/64KB)
+	 */
 	mrs	x3, ID_AA64MMFR0_EL1
 	ubfx	x3, x3, #ID_AA64MMFR0_EL1_TGRAN_SHIFT, 4
 	cmp     x3, #ID_AA64MMFR0_EL1_TGRAN_SUPPORTED_MIN
-	b.lt    __no_granule_support
+	b.lt    __no_granule_support		// 不支持 → 卡住 CPU
 	cmp     x3, #ID_AA64MMFR0_EL1_TGRAN_SUPPORTED_MAX
-	b.gt    __no_granule_support
+	b.gt    __no_granule_support		// 不支持 → 卡住 CPU
+
+	/*
+	 * 加载页表基址:
+	 * TTBR0_EL1: ID map (恒等映射, 低虚拟地址)
+	 * TTBR1_EL1: swapper_pg_dir (内核映射, 高虚拟地址)
+	 *
+	 * phys_to_ttbr 将物理地址转换为 TTBR 格式 (设置 CnP 等属性位)
+	 */
 	phys_to_ttbr x2, x2
 	msr	ttbr0_el1, x2			// load TTBR0
 	load_ttbr1 x1, x1, x3
 
+	/*
+	 * ★ 写 SCTLR_EL1 — MMU 在此刻开启!
+	 *
+	 * set_sctlr_el1 宏处理了 errata 规避 (如 nGnRE 强制写入)
+	 * 此指令执行后:
+	 *   - MMU 开启，虚拟地址空间生效
+	 *   - TTBR0 用于低地址 (idmap_pg_dir)
+	 *   - TTBR1 用于高地址 (swapper_pg_dir)
+	 *   - 当前 PC 仍在 idmap 恒等映射区域，因此不会断裂
+	 */
 	set_sctlr_el1	x0
 
 	ret
 SYM_FUNC_END(__enable_mmu)
 
 #ifdef CONFIG_ARM64_VA_BITS_52
+/*
+ * __cpu_secondary_check52bitva: 检查从核是否支持 52 位 VA
+ *
+ * 52 位虚拟地址需要 LPA2 支持:
+ * - 非 LPA2: 检查 ID_AA64MMFR2_EL1.VARange 是否非零
+ * - LPA2:   检查是否支持 LPA2 颗粒大小 (TGRAN_LPA2)
+ *
+ * 如果不支持，将该 CPU 标记为 STUCK 并卡住。
+ */
 SYM_FUNC_START(__cpu_secondary_check52bitva)
 #ifndef CONFIG_ARM64_LPA2
 	mrs_s	x0, SYS_ID_AA64MMFR2_EL1
 	and	x0, x0, ID_AA64MMFR2_EL1_VARange_MASK
-	cbnz	x0, 2f
+	cbnz	x0, 2f				// 支持 → 正常返回
 #else
 	mrs	x0, id_aa64mmfr0_el1
 	sbfx	x0, x0, #ID_AA64MMFR0_EL1_TGRAN_SHIFT, 4
 	cmp	x0, #ID_AA64MMFR0_EL1_TGRAN_LPA2
-	b.ge	2f
+	b.ge	2f				// 支持 → 正常返回
 #endif
 
 	update_early_cpu_boot_status \
@@ -495,8 +782,13 @@ SYM_FUNC_START(__cpu_secondary_check52bitva)
 SYM_FUNC_END(__cpu_secondary_check52bitva)
 #endif
 
+/*
+ * __no_granule_support: 内存颗粒大小不支持
+ *
+ * 当前 CPU 不支持内核配置的内存颗粒大小 (4KB/16KB/64KB)。
+ * 标记 CPU 为 STUCK 并进入低功耗死循环。
+ */
 SYM_FUNC_START_LOCAL(__no_granule_support)
-	/* Indicate that this CPU can't boot and is stuck in the kernel */
 	update_early_cpu_boot_status \
 		CPU_STUCK_IN_KERNEL | CPU_STUCK_REASON_NO_GRAN, x1, x2
 1:
@@ -505,18 +797,61 @@ SYM_FUNC_START_LOCAL(__no_granule_support)
 	b	1b
 SYM_FUNC_END(__no_granule_support)
 
+/*
+ * __primary_switch: 主核 MMU 开启 + 内核映射 + 重定位
+ *
+ * 此函数在 .idmap.text 段中，由恒等映射覆盖。
+ *
+ * 流程:
+ * 1. __enable_mmu:
+ *      x1 = reserved_pg_dir → TTBR1 (暂时指向保留页表)
+ *      x2 = __pi_init_idmap_pg_dir → TTBR0 (恒等映射)
+ *      开启 MMU
+ *
+ * 2. __pi_early_map_kernel (PI = position independent):
+ *      映射 FDT、清除 BSS、映射内核各段 (text/rodata/init/data)
+ *      将 TTBR1 切换为 init_pg_dir
+ *      将最终的 swapper_pg_dir 准备好
+ *
+ * 3. 跳转到 __primary_switched (虚拟地址)
+ */
 SYM_FUNC_START_LOCAL(__primary_switch)
+	/*
+	 * 暂时将 TTBR1 指向 reserved_pg_dir (空页表)
+	 * TTBR0 指向初始 ID map 页表
+	 */
 	adrp	x1, reserved_pg_dir
 	adrp	x2, __pi_init_idmap_pg_dir
-	bl	__enable_mmu
+	bl	__enable_mmu			// ★ 开启 MMU
 
+	/*
+	 * MMU 已开启，重新设置栈 (使用虚拟地址)
+	 */
 	adrp	x1, early_init_stack
 	mov	sp, x1
 	mov	x29, xzr
+
 	mov	x0, x20				// pass the full boot status
-	mov	x1, x21				// pass the FDT
+	mov	x1, x21				// pass the FDT (物理地址)
+	/*
+	 * ★ 映射内核到虚拟地址空间
+	 * __pi_early_map_kernel 完成:
+	 *   - map_fdt():       映射 FDT 到虚拟地址
+	 *   - 清除 BSS 和初始页表区域
+	 *   - 处理 KASLR 随机化种子
+	 *   - map_kernel():    映射内核各段 (text/rodata/inittext/initdata/data)
+	 *                     使用 init_pg_dir 作为临时页表
+	 *   - 将 TTBR1 切换到 init_pg_dir
+	 *   - 可选: 使用连续描述符重映射 text 段 (性能优化)
+	 *   - 拷贝根页表到 swapper_pg_dir (最终页表)
+	 *   - [LPA2] 重建 ID map 以支持 LPA2 描述符
+	 */
 	bl	__pi_early_map_kernel		// Map and relocate the kernel
 
+	/*
+	 * ★ 跳转到 __primary_switched
+	 * x0 = KERNEL_START 的物理地址 (__pa)
+	 */
 	ldr	x8, =__primary_switched
 	adrp	x0, KERNEL_START		// __pa(KERNEL_START)
 	br	x8
