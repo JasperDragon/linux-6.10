@@ -370,16 +370,16 @@ static int spi_match_device(struct device *dev, const struct device_driver *drv)
 	const struct spi_driver	*sdrv = to_spi_driver(drv);
 	int ret;
 
-	/* Check override first, and if set, only use the named driver */
+	/* 先检查 override；如果设置了，就只使用指定名称的驱动。 */
 	ret = device_match_driver_override(dev, drv);
 	if (ret >= 0)
 		return ret;
 
-	/* Attempt an OF style match */
+	/* 尝试进行 OF 风格匹配。 */
 	if (of_driver_match_device(dev, drv))
 		return 1;
 
-	/* Then try ACPI */
+	/* 然后再尝试 ACPI。 */
 	if (acpi_driver_match_device(dev, drv))
 		return 1;
 
@@ -462,12 +462,13 @@ const struct bus_type spi_bus_type = {
 EXPORT_SYMBOL_GPL(spi_bus_type);
 
 /**
- * __spi_register_driver - register a SPI driver
- * @owner: owner module of the driver to register
- * @sdrv: the driver to register
+ * __spi_register_driver - 注册一个 SPI 驱动
+ * @owner: 待注册驱动所属的模块
+ * @sdrv: 待注册的驱动
  * Context: can sleep
  *
- * Return: zero on success, else a negative error code.
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 int __spi_register_driver(struct module *owner, struct spi_driver *sdrv)
 {
@@ -517,10 +518,10 @@ EXPORT_SYMBOL_GPL(__spi_register_driver);
 /*-------------------------------------------------------------------------*/
 
 /*
- * SPI devices should normally not be created by SPI device drivers; that
- * would make them board-specific.  Similarly with SPI controller drivers.
- * Device registration normally goes into like arch/.../mach.../board-YYY.c
- * with other readonly (flashable) information about mainboard devices.
+ * SPI 设备通常不应该由 SPI 设备驱动自己创建，否则会变成
+ * 板级绑定逻辑。SPI 控制器驱动也是同理。
+ * 设备注册通常放在 arch/.../mach.../board-YYY.c 之类的地方，
+ * 和主板设备的只读（可固化）信息放在一起。
  */
 
 struct boardinfo {
@@ -532,28 +533,26 @@ static LIST_HEAD(board_list);
 static LIST_HEAD(spi_controller_list);
 
 /*
- * Used to protect add/del operation for board_info list and
- * spi_controller list, and their matching process also used
- * to protect object of type struct idr.
+ * 用于保护 board_info 列表和 spi_controller 列表的增删操作，
+ * 以及它们的匹配过程，同时也保护 struct idr 对象。
  */
 static DEFINE_MUTEX(board_lock);
 
 /**
- * spi_alloc_device - Allocate a new SPI device
- * @ctlr: Controller to which device is connected
+ * spi_alloc_device - 分配一个新的 SPI 设备
+ * @ctlr: 设备所属的控制器
  * Context: can sleep
  *
- * Allows a driver to allocate and initialize a spi_device without
- * registering it immediately.  This allows a driver to directly
- * fill the spi_device with device parameters before calling
- * spi_add_device() on it.
+ * 允许驱动先分配并初始化一个 spi_device，但不立即注册。
+ * 这样驱动就可以在调用 spi_add_device() 之前，直接给 spi_device
+ * 填好设备参数。
  *
- * Caller is responsible to call spi_add_device() on the returned
- * spi_device structure to add it to the SPI controller.  If the caller
- * needs to discard the spi_device without adding it, then it should
- * call spi_dev_put() on it.
+ * 调用者需要在返回的 spi_device 上继续调用 spi_add_device()，
+ * 才能把它挂到 SPI 控制器上。如果调用者最终不想添加这个设备，
+ * 则应调用 spi_dev_put() 释放它。
  *
- * Return: a pointer to the new device, or NULL.
+ * 返回：
+ * 成功时返回新设备指针，失败返回 NULL。
  */
 struct spi_device *spi_alloc_device(struct spi_controller *ctlr)
 {
@@ -686,7 +685,7 @@ static int __spi_add_device(struct spi_device *spi, struct spi_device *parent)
 	}
 
 	for (idx = 0; idx < spi->num_chipselect; idx++) {
-		/* Chipselects are numbered 0..max; validate. */
+		/* chipselect 的编号范围是 0..max，这里做校验。 */
 		cs = spi_get_chipselect(spi, idx);
 		if (cs >= ctlr->num_chipselect) {
 			dev_err(dev, "cs%d >= max %d\n", spi_get_chipselect(spi, idx),
@@ -696,8 +695,8 @@ static int __spi_add_device(struct spi_device *spi, struct spi_device *parent)
 	}
 
 	/*
-	 * Make sure that multiple logical CS doesn't map to the same physical CS.
-	 * For example, spi->chip_select[0] != spi->chip_select[1] and so on.
+	 * 确保多个逻辑 CS 不会映射到同一个物理 CS。
+	 * 例如，spi->chip_select[0] 不能等于 spi->chip_select[1]。
 	 */
 	if (!spi_controller_is_target(ctlr)) {
 		for (idx = 0; idx < spi->num_chipselect; idx++) {
@@ -715,9 +714,8 @@ static int __spi_add_device(struct spi_device *spi, struct spi_device *parent)
 	spi_dev_set_name(spi);
 
 	/*
-	 * We need to make sure there's no other device with this
-	 * chipselect **BEFORE** we call setup(), else we'll trash
-	 * its configuration.
+	 * 必须在调用 setup() 之前确认没有其它设备占用这个 chipselect，
+	 * 否则会破坏对方的配置。
 	 */
 	check_info.new_spi = spi;
 	check_info.parent = parent;
@@ -725,7 +723,7 @@ static int __spi_add_device(struct spi_device *spi, struct spi_device *parent)
 	if (status)
 		return status;
 
-	/* Controller may unregister concurrently */
+	/* 控制器可能会并发注销。 */
 	if (IS_ENABLED(CONFIG_SPI_DYNAMIC) &&
 	    !device_is_registered(&ctlr->dev)) {
 		return -ENODEV;
@@ -752,7 +750,7 @@ static int __spi_add_device(struct spi_device *spi, struct spi_device *parent)
 		return status;
 	}
 
-	/* Device may be bound to an active driver when this returns */
+	/* 返回时，该设备可能已经绑定到一个正在工作的驱动。 */
 	status = device_add(&spi->dev);
 	if (status < 0) {
 		dev_err(dev, "can't add %s, status %d\n",
@@ -766,20 +764,21 @@ static int __spi_add_device(struct spi_device *spi, struct spi_device *parent)
 }
 
 /**
- * spi_add_device - Add spi_device allocated with spi_alloc_device
- * @spi: spi_device to register
+ * spi_add_device - 注册通过 spi_alloc_device 分配的 spi_device
+ * @spi: 要注册的 spi_device
  *
- * Companion function to spi_alloc_device.  Devices allocated with
- * spi_alloc_device can be added onto the SPI bus with this function.
+ * 这是 spi_alloc_device 的配套函数。通过 spi_alloc_device 分配的设备，
+ * 可以用这个接口挂到 SPI 总线上。
  *
- * Return: 0 on success; negative errno on failure
+ * 返回：
+ * 成功返回 0，失败返回负 errno。
  */
 int spi_add_device(struct spi_device *spi)
 {
 	struct spi_controller *ctlr = spi->controller;
 	int status;
 
-	/* Set the bus ID string */
+	/* 设置总线 ID 字符串。 */
 	spi_dev_set_name(spi);
 
 	mutex_lock(&ctlr->add_lock);
@@ -790,18 +789,19 @@ int spi_add_device(struct spi_device *spi)
 EXPORT_SYMBOL_GPL(spi_add_device);
 
 /**
- * spi_new_device - instantiate one new SPI device
- * @ctlr: Controller to which device is connected
- * @chip: Describes the SPI device
+ * spi_new_device - 实例化一个新的 SPI 设备
+ * @ctlr: 设备所属的控制器
+ * @chip: SPI 设备描述信息
  * Context: can sleep
  *
- * On typical mainboards, this is purely internal; and it's not needed
- * after board init creates the hard-wired devices.  Some development
- * platforms may not be able to use spi_register_board_info though, and
- * this is exported so that for example a USB or parport based adapter
- * driver could add devices (which it would learn about out-of-band).
+ * 在典型主板上，这个接口主要用于内部板级初始化；
+ * 一旦板级代码把硬连线设备创建完成，通常就不再需要它。
+ * 但有些开发平台可能无法使用 spi_register_board_info()，
+ * 因此这里导出该接口，方便例如基于 USB 或并口的适配器驱动
+ * 在运行时添加它们通过其它途径获知的设备。
  *
- * Return: the new device, or NULL.
+ * 返回：
+ * 新设备指针，失败返回 NULL。
  */
 struct spi_device *spi_new_device(struct spi_controller *ctlr,
 				  struct spi_board_info *chip)
@@ -810,11 +810,11 @@ struct spi_device *spi_new_device(struct spi_controller *ctlr,
 	int			status;
 
 	/*
-	 * NOTE:  caller did any chip->bus_num checks necessary.
+	 * 注意：调用者已经完成了对 chip->bus_num 的必要检查。
 	 *
-	 * Also, unless we change the return value convention to use
-	 * error-or-pointer (not NULL-or-pointer), troubleshootability
-	 * suggests syslogged diagnostics are best here (ugh).
+	 * 另外，除非我们把返回值约定改成 error-or-pointer
+	 * （而不是 NULL-or-pointer），否则从可调试性考虑，
+	 * 这里最好还是打印日志诊断信息。
 	 */
 
 	proxy = spi_alloc_device(ctlr);
@@ -823,7 +823,7 @@ struct spi_device *spi_new_device(struct spi_controller *ctlr,
 
 	WARN_ON(strlen(chip->modalias) >= sizeof(proxy->modalias));
 
-	/* Use provided chip-select for proxy device */
+	/* 代理设备使用传入的 chip-select。 */
 	spi_set_chipselect(proxy, 0, chip->chip_select);
 
 	proxy->max_speed_hz = chip->max_speed_hz;
@@ -834,8 +834,8 @@ struct spi_device *spi_new_device(struct spi_controller *ctlr,
 	proxy->controller_data = chip->controller_data;
 	proxy->controller_state = NULL;
 	/*
-	 * By default spi->chip_select[0] will hold the physical CS number,
-	 * so set bit 0 in spi->cs_index_mask.
+	 * 默认情况下，spi->chip_select[0] 保存物理 CS 编号，
+	 * 因此要在 spi->cs_index_mask 里设置 bit 0。
 	 */
 	proxy->cs_index_mask = BIT(0);
 
@@ -862,11 +862,11 @@ err_dev_put:
 EXPORT_SYMBOL_GPL(spi_new_device);
 
 /**
- * spi_unregister_device - unregister a single SPI device
- * @spi: spi_device to unregister
+ * spi_unregister_device - 注销单个 SPI 设备
+ * @spi: 要注销的 spi_device
  *
- * Start making the passed SPI device vanish. Normally this would be handled
- * by spi_unregister_controller().
+ * 开始让传入的 SPI 设备消失。通常这类工作会由
+ * spi_unregister_controller() 统一处理。
  */
 void spi_unregister_device(struct spi_device *spi)
 {
@@ -904,25 +904,25 @@ static void spi_match_controller_to_boardinfo(struct spi_controller *ctlr,
 }
 
 /**
- * spi_register_board_info - register SPI devices for a given board
- * @info: array of chip descriptors
- * @n: how many descriptors are provided
+ * spi_register_board_info - 为指定板子注册 SPI 设备
+ * @info: 芯片描述数组
+ * @n: 描述符数量
  * Context: can sleep
  *
- * Board-specific early init code calls this (probably during arch_initcall)
- * with segments of the SPI device table.  Any device nodes are created later,
- * after the relevant parent SPI controller (bus_num) is defined.  We keep
- * this table of devices forever, so that reloading a controller driver will
- * not make Linux forget about these hard-wired devices.
+ * 板级早期初始化代码会调用这个接口（通常是在 arch_initcall 阶段），
+ * 并传入 SPI 设备表的一部分。等到对应的父 SPI 控制器
+ * （bus_num）定义完成之后，设备节点才会在后续创建。
+ * 我们会永久保存这张设备表，这样即使重新加载控制器驱动，
+ * Linux 也不会忘记这些硬连线设备。
  *
- * Other code can also call this, e.g. a particular add-on board might provide
- * SPI devices through its expansion connector, so code initializing that board
- * would naturally declare its SPI devices.
+ * 其他代码也可以调用这个接口，例如某些扩展板会通过扩展连接器
+ * 提供 SPI 设备，那么初始化该扩展板的代码自然也可以声明这些设备。
  *
- * The board info passed can safely be __initdata ... but be careful of
- * any embedded pointers (platform_data, etc), they're copied as-is.
+ * 传入的 board info 可以安全地放在 __initdata 中；不过要注意其中
+ * 的嵌入指针（如 platform_data 等）会按原样拷贝。
  *
- * Return: zero on success, else a negative error code.
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 int spi_register_board_info(struct spi_board_info const *info, unsigned n)
 {
@@ -954,21 +954,21 @@ int spi_register_board_info(struct spi_board_info const *info, unsigned n)
 
 /*-------------------------------------------------------------------------*/
 
-/* Core methods for SPI resource management */
+/* SPI 资源管理的核心方法。 */
 
 /**
- * spi_res_alloc - allocate a spi resource that is life-cycle managed
- *                 during the processing of a spi_message while using
- *                 spi_transfer_one
- * @spi:     the SPI device for which we allocate memory
- * @release: the release code to execute for this resource
- * @size:    size to alloc and return
- * @gfp:     GFP allocation flags
+ * spi_res_alloc - 分配一个由 spi_message 生命周期管理的 SPI 资源
+ *                该资源在使用 spi_transfer_one 处理消息期间有效
+ * @spi:     为哪个 SPI 设备分配内存
+ * @release: 释放该资源时要执行的回调
+ * @size:    需要分配并返回的大小
+ * @gfp:     GFP 分配标志
  *
- * Return: the pointer to the allocated data
+ * 返回：
+ * 指向已分配数据的指针。
  *
- * This may get enhanced in the future to allocate from a memory pool
- * of the @spi_device or @spi_controller to avoid repeated allocations.
+ * 未来这里也许会扩展为从 @spi_device 或 @spi_controller 的内存池
+ * 中分配，以减少重复分配。
  */
 static void *spi_res_alloc(struct spi_device *spi, spi_res_release_t release,
 			   size_t size, gfp_t gfp)
@@ -986,8 +986,8 @@ static void *spi_res_alloc(struct spi_device *spi, spi_res_release_t release,
 }
 
 /**
- * spi_res_free - free an SPI resource
- * @res: pointer to the custom data of a resource
+ * spi_res_free - 释放一个 SPI 资源
+ * @res: 资源自定义数据的指针
  */
 static void spi_res_free(void *res)
 {
@@ -998,9 +998,9 @@ static void spi_res_free(void *res)
 }
 
 /**
- * spi_res_add - add a spi_res to the spi_message
- * @message: the SPI message
- * @res:     the spi_resource
+ * spi_res_add - 把一个 spi_res 添加到 spi_message
+ * @message: SPI 消息
+ * @res:     spi 资源
  */
 static void spi_res_add(struct spi_message *message, void *res)
 {
@@ -1011,9 +1011,9 @@ static void spi_res_add(struct spi_message *message, void *res)
 }
 
 /**
- * spi_res_release - release all SPI resources for this message
- * @ctlr:  the @spi_controller
- * @message: the @spi_message
+ * spi_res_release - 释放该消息相关的所有 SPI 资源
+ * @ctlr:  @spi_controller
+ * @message: @spi_message
  */
 static void spi_res_release(struct spi_controller *ctlr, struct spi_message *message)
 {
@@ -1075,10 +1075,10 @@ static void spi_set_cs(struct spi_device *spi, bool enable, bool force)
 	bool activate = enable;
 	u8 idx;
 
-	/*
-	 * Avoid calling into the driver (or doing delays) if the chip select
-	 * isn't actually changing from the last time this was called.
-	 */
+		/*
+		 * 如果 chip select 和上次调用相比并没有真正变化，就不要再调用驱动，
+		 * 也不要重复做延迟处理。
+		 */
 	if (!force && (enable == spi_is_last_cs(spi)) &&
 	    (spi->controller->last_cs_index_mask == spi->cs_index_mask) &&
 	    (spi->controller->last_cs_mode_high == (spi->mode & SPI_CS_HIGH)))
@@ -1255,7 +1255,7 @@ static int __spi_map_msg(struct spi_controller *ctlr, struct spi_message *msg)
 
 	ret = -ENOMSG;
 	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
-		/* The sync is done before each transfer. */
+			/* 每个 transfer 之前都要先完成同步。 */
 		unsigned long attrs = DMA_ATTR_SKIP_CPU_SYNC;
 
 		if (!ctlr->can_dma(ctlr, msg->spi, xfer))
@@ -1287,7 +1287,7 @@ static int __spi_map_msg(struct spi_controller *ctlr, struct spi_message *msg)
 			xfer->rx_sg_mapped = true;
 		}
 	}
-	/* No transfer has been mapped, bail out with success */
+	/* 没有任何 transfer 被映射，直接成功返回。 */
 	if (ret)
 		return 0;
 
@@ -1304,7 +1304,7 @@ static int __spi_unmap_msg(struct spi_controller *ctlr, struct spi_message *msg)
 	struct spi_transfer *xfer;
 
 	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
-		/* The sync has already been done after each transfer. */
+		/* 每个 transfer 之后的同步已经完成。 */
 		unsigned long attrs = DMA_ATTR_SKIP_CPU_SYNC;
 
 		if (xfer->rx_sg_mapped)
@@ -1458,17 +1458,16 @@ static int spi_transfer_wait(struct spi_controller *ctlr,
 			speed_hz = 100000;
 
 		/*
-		 * For each byte we wait for 8 cycles of the SPI clock.
-		 * Since speed is defined in Hz and we want milliseconds,
-		 * use respective multiplier, but before the division,
-		 * otherwise we may get 0 for short transfers.
+		 * 每个字节都要等待 8 个 SPI 时钟周期。
+		 * 由于速度单位是 Hz，而这里需要的是毫秒，
+		 * 计算时要先乘再除，否则短传输可能会得到 0。
 		 */
 		ms = 8LL * MSEC_PER_SEC * xfer->len;
 		do_div(ms, speed_hz);
 
 		/*
-		 * Increase it twice and add 200 ms tolerance, use
-		 * predefined maximum in case of overflow.
+		 * 再把估算值乘 2 并加上 200ms 容差，
+		 * 如果发生溢出则使用预定义的最大值。
 		 */
 		ms += ms + 200;
 		if (ms > UINT_MAX)
@@ -1519,10 +1518,10 @@ int spi_delay_to_ns(struct spi_delay *_delay, struct spi_transfer *xfer)
 		delay *= NSEC_PER_USEC;
 		break;
 	case SPI_DELAY_UNIT_NSECS:
-		/* Nothing to do here */
+		/* 这里不需要额外处理。 */
 		break;
 	case SPI_DELAY_UNIT_SCK:
-		/* Clock cycles need to be obtained from spi_transfer */
+		/* 时钟周期需要从 spi_transfer 中获取。 */
 		if (!xfer)
 			return -EINVAL;
 		/*
@@ -1595,11 +1594,10 @@ void spi_transfer_cs_change_delay_exec(struct spi_message *msg,
 EXPORT_SYMBOL_GPL(spi_transfer_cs_change_delay_exec);
 
 /*
- * spi_transfer_one_message - Default implementation of transfer_one_message()
+ * spi_transfer_one_message - transfer_one_message() 的默认实现
  *
- * This is a standard implementation of transfer_one_message() for
- * drivers which implement a transfer_one() operation.  It provides
- * standard handling of delays and chip select management.
+ * 这是给只实现了 transfer_one() 的控制器驱动准备的标准
+ * transfer_one_message() 实现。它统一处理延迟和 chip select 管理。
  */
 static int spi_transfer_one_message(struct spi_controller *ctlr,
 				    struct spi_message *msg)
@@ -1714,12 +1712,12 @@ out:
 }
 
 /**
- * spi_finalize_current_transfer - report completion of a transfer
- * @ctlr: the controller reporting completion
+ * spi_finalize_current_transfer - 报告一次传输已经完成
+ * @ctlr: 报告完成的控制器
  *
- * Called by SPI drivers using the core transfer_one_message()
- * implementation to notify it that the current interrupt driven
- * transfer has finished and the next one may be scheduled.
+ * 使用 core transfer_one_message() 实现的 SPI 驱动会调用它，
+ * 通知 core 当前这个由中断驱动的传输已经结束，下一次传输
+ * 可以安排执行了。
  */
 void spi_finalize_current_transfer(struct spi_controller *ctlr)
 {
@@ -1802,19 +1800,17 @@ static int __spi_pump_transfer_message(struct spi_controller *ctlr,
 		}
 	}
 
-	/*
-	 * Drivers implementation of transfer_one_message() must arrange for
-	 * spi_finalize_current_message() to get called. Most drivers will do
-	 * this in the calling context, but some don't. For those cases, a
-	 * completion is used to guarantee that this function does not return
-	 * until spi_finalize_current_message() is done accessing
-	 * ctlr->cur_msg.
-	 * Use of the following two flags enable to opportunistically skip the
-	 * use of the completion since its use involves expensive spin locks.
-	 * In case of a race with the context that calls
-	 * spi_finalize_current_message() the completion will always be used,
-	 * due to strict ordering of these flags using barriers.
-	 */
+		/*
+		 * 驱动实现 transfer_one_message() 时，必须安排调用
+		 * spi_finalize_current_message()。多数驱动会在当前调用上下文
+		 * 中完成这件事，但也有一些不会。对于这些情况，这里会使用
+		 * completion，确保在 spi_finalize_current_message() 完成对
+		 * ctlr->cur_msg 的访问之前，本函数不会返回。
+		 * 下面这两个标志允许在合适情况下跳过 completion，因为
+		 * completion 的开销里包含昂贵的自旋锁。
+		 * 如果与调用 spi_finalize_current_message() 的上下文发生竞态，
+		 * 由于这些标志通过屏障严格排序，最终仍会回退到 completion。
+		 */
 	WRITE_ONCE(ctlr->cur_msg_incomplete, true);
 	WRITE_ONCE(ctlr->cur_msg_need_completion, false);
 	reinit_completion(&ctlr->cur_msg_completion);
@@ -1836,17 +1832,15 @@ static int __spi_pump_transfer_message(struct spi_controller *ctlr,
 }
 
 /**
- * __spi_pump_messages - function which processes SPI message queue
- * @ctlr: controller to process queue for
- * @in_kthread: true if we are in the context of the message pump thread
+ * __spi_pump_messages - 处理 SPI 消息队列的函数
+ * @ctlr: 要处理队列的控制器
+ * @in_kthread: 如果当前处于消息泵线程上下文，则为 true
  *
- * This function checks if there is any SPI message in the queue that
- * needs processing and if so call out to the driver to initialize hardware
- * and transfer each message.
+ * 该函数会检查队列里是否有需要处理的 SPI message；如果有，
+ * 就调用驱动初始化硬件并依次传输这些 message。
  *
- * Note that it is called both from the kthread itself and also from
- * inside spi_sync(); the queue extraction handling at the top of the
- * function should deal with this safely.
+ * 注意，它既可能从 kthread 本身调用，也可能从 spi_sync()
+ * 内部调用；函数开头的队列提取逻辑必须同时安全地处理这两种情况。
  */
 static void __spi_pump_messages(struct spi_controller *ctlr, bool in_kthread)
 {
@@ -1923,7 +1917,7 @@ static void __spi_pump_messages(struct spi_controller *ctlr, bool in_kthread)
 
 	mutex_unlock(&ctlr->io_mutex);
 
-	/* Prod the scheduler in case transfer_one() was busy waiting */
+	/* 如果 transfer_one() 一直忙等，就唤醒调度器。 */
 	if (!ret)
 		cond_resched();
 	return;
@@ -1934,8 +1928,8 @@ out_unlock:
 }
 
 /**
- * spi_pump_messages - kthread work function which processes spi message queue
- * @work: pointer to kthread work struct contained in the controller struct
+ * spi_pump_messages - 处理 SPI 消息队列的 kthread 工作函数
+ * @work: 控制器结构体中包含的 kthread work 指针
  */
 static void spi_pump_messages(struct kthread_work *work)
 {
@@ -1946,24 +1940,21 @@ static void spi_pump_messages(struct kthread_work *work)
 }
 
 /**
- * spi_take_timestamp_pre - helper to collect the beginning of the TX timestamp
- * @ctlr: Pointer to the spi_controller structure of the driver
- * @xfer: Pointer to the transfer being timestamped
- * @progress: How many words (not bytes) have been transferred so far
- * @irqs_off: If true, will disable IRQs and preemption for the duration of the
- *	      transfer, for less jitter in time measurement. Only compatible
- *	      with PIO drivers. If true, must follow up with
- *	      spi_take_timestamp_post or otherwise system will crash.
- *	      WARNING: for fully predictable results, the CPU frequency must
- *	      also be under control (governor).
+ * spi_take_timestamp_pre - 采集发送时间戳开始点的辅助函数
+ * @ctlr: 驱动的 spi_controller 结构体指针
+ * @xfer: 需要采样时间戳的传输
+ * @progress: 当前已经传输了多少个 word（不是 byte）
+ * @irqs_off: 如果为 true，则在整个采样期间关闭 IRQ 和抢占，
+ *	      以减小时间测量抖动。该模式只适用于 PIO 驱动。
+ *	      若启用，则必须随后调用 spi_take_timestamp_post，
+ *	      否则系统可能崩溃。
+ *	      警告：如果要获得完全可预测的结果，还必须把 CPU
+ *	      频率控制住（governor）。
  *
- * This is a helper for drivers to collect the beginning of the TX timestamp
- * for the requested byte from the SPI transfer. The frequency with which this
- * function must be called (once per word, once for the whole transfer, once
- * per batch of words etc) is arbitrary as long as the @tx buffer offset is
- * greater than or equal to the requested byte at the time of the call. The
- * timestamp is only taken once, at the first such call. It is assumed that
- * the driver advances its @tx buffer pointer monotonically.
+ * 这是驱动用来采集 SPI 传输中请求字节对应发送时间戳开始点的辅助函数。
+ * 调用频率可以按 word、按整条传输，或者按一批 word 来定，只要在调用
+ * 时 @tx 缓冲区偏移已经大于或等于所请求的字节即可。时间戳只会在第一次
+ * 满足条件的调用时采样一次。这里假定驱动会单调地推进 @tx 缓冲区指针。
  */
 void spi_take_timestamp_pre(struct spi_controller *ctlr,
 			    struct spi_transfer *xfer,
@@ -1991,16 +1982,15 @@ void spi_take_timestamp_pre(struct spi_controller *ctlr,
 EXPORT_SYMBOL_GPL(spi_take_timestamp_pre);
 
 /**
- * spi_take_timestamp_post - helper to collect the end of the TX timestamp
- * @ctlr: Pointer to the spi_controller structure of the driver
- * @xfer: Pointer to the transfer being timestamped
- * @progress: How many words (not bytes) have been transferred so far
- * @irqs_off: If true, will re-enable IRQs and preemption for the local CPU.
+ * spi_take_timestamp_post - 采集发送时间戳结束点的辅助函数
+ * @ctlr: 驱动的 spi_controller 结构体指针
+ * @xfer: 需要采样时间戳的传输
+ * @progress: 当前已经传输了多少个 word（不是 byte）
+ * @irqs_off: 如果为 true，则重新为本地 CPU 使能 IRQ 和抢占。
  *
- * This is a helper for drivers to collect the end of the TX timestamp for
- * the requested byte from the SPI transfer. Can be called with an arbitrary
- * frequency: only the first call where @tx exceeds or is equal to the
- * requested word will be timestamped.
+ * 这是驱动用来采集 SPI 传输中请求字节对应发送时间戳结束点的辅助函数。
+ * 调用频率可以任意：只有第一次满足 @tx 已经超过或等于目标 word 的调用
+ * 会真正采样时间戳。
  */
 void spi_take_timestamp_post(struct spi_controller *ctlr,
 			     struct spi_transfer *xfer,
@@ -2030,19 +2020,16 @@ void spi_take_timestamp_post(struct spi_controller *ctlr,
 EXPORT_SYMBOL_GPL(spi_take_timestamp_post);
 
 /**
- * spi_set_thread_rt - set the controller to pump at realtime priority
- * @ctlr: controller to boost priority of
+ * spi_set_thread_rt - 将控制器消息泵设置为实时优先级
+ * @ctlr: 需要提升优先级的控制器
  *
- * This can be called because the controller requested realtime priority
- * (by setting the ->rt value before calling spi_register_controller()) or
- * because a device on the bus said that its transfers needed realtime
- * priority.
+ * 可以在控制器请求实时优先级时调用（即在调用
+ * spi_register_controller() 之前把 ->rt 设为 true），也可以在
+ * 总线上的某个设备声明其传输需要实时优先级时调用。
  *
- * NOTE: at the moment if any device on a bus says it needs realtime then
- * the thread will be at realtime priority for all transfers on that
- * controller.  If this eventually becomes a problem we may see if we can
- * find a way to boost the priority only temporarily during relevant
- * transfers.
+ * 注意：目前只要总线上有任何设备要求实时优先级，那么该控制器上
+ * 的所有传输都会由实时优先级线程处理。如果以后这成为问题，可能
+ * 需要寻找一种只在相关传输期间临时提升优先级的方法。
  */
 static void spi_set_thread_rt(struct spi_controller *ctlr)
 {
@@ -2066,11 +2053,10 @@ static int spi_init_queue(struct spi_controller *ctlr)
 	kthread_init_work(&ctlr->pump_messages, spi_pump_messages);
 
 	/*
-	 * Controller config will indicate if this controller should run the
-	 * message pump with high (realtime) priority to reduce the transfer
-	 * latency on the bus by minimising the delay between a transfer
-	 * request and the scheduling of the message pump thread. Without this
-	 * setting the message pump thread will remain at default priority.
+	 * 控制器配置会指明是否应该让消息泵以高优先级（实时）
+	 * 运行，以通过尽量缩短传输请求和消息泵线程调度之间的
+	 * 延迟来降低总线传输延迟。如果没有这个设置，消息泵线程
+	 * 会保持默认优先级。
 	 */
 	if (ctlr->rt)
 		spi_set_thread_rt(ctlr);
@@ -2079,21 +2065,20 @@ static int spi_init_queue(struct spi_controller *ctlr)
 }
 
 /**
- * spi_get_next_queued_message() - called by driver to check for queued
- * messages
- * @ctlr: the controller to check for queued messages
+ * spi_get_next_queued_message() - 由驱动调用，用于检查队列中的消息
+ * @ctlr: 要检查消息队列的控制器
  *
- * If there are more messages in the queue, the next message is returned from
- * this call.
+ * 如果队列中还有消息，这个接口会返回下一条消息。
  *
- * Return: the next message in the queue, else NULL if the queue is empty.
+ * 返回：
+ * 队列中的下一条消息；如果队列为空则返回 NULL。
  */
 struct spi_message *spi_get_next_queued_message(struct spi_controller *ctlr)
 {
 	struct spi_message *next;
 	unsigned long flags;
 
-	/* Get a pointer to the next message, if any */
+	/* 获取下一条消息的指针（如果存在）。 */
 	spin_lock_irqsave(&ctlr->queue_lock, flags);
 	next = list_first_entry_or_null(&ctlr->queue, struct spi_message,
 					queue);
@@ -2108,11 +2093,10 @@ EXPORT_SYMBOL_GPL(spi_get_next_queued_message);
  *                            and spi_maybe_unoptimize_message()
  * @msg: the message to unoptimize
  *
- * Peripheral drivers should use spi_unoptimize_message() and callers inside
- * core should use spi_maybe_unoptimize_message() rather than calling this
- * function directly.
+ * 外设驱动应使用 spi_unoptimize_message()，而 core 内部调用者应
+ * 使用 spi_maybe_unoptimize_message()，不要直接调用这个函数。
  *
- * It is not valid to call this on a message that is not currently optimized.
+ * 不能对当前并未处于优化状态的消息调用这个函数。
  */
 static void __spi_unoptimize_message(struct spi_message *msg)
 {
@@ -2128,11 +2112,11 @@ static void __spi_unoptimize_message(struct spi_message *msg)
 }
 
 /*
- * spi_maybe_unoptimize_message - unoptimize msg not managed by a peripheral
- * @msg: the message to unoptimize
+ * spi_maybe_unoptimize_message - 仅在消息由 core 优化时才执行反优化
+ * @msg: 需要反优化的消息
  *
- * This function is used to unoptimize a message if and only if it was
- * optimized by the core (via spi_maybe_optimize_message()).
+ * 该函数只会在消息确实由 core 通过 spi_maybe_optimize_message()
+ * 优化过时，才对其执行反优化。
  */
 static void spi_maybe_unoptimize_message(struct spi_message *msg)
 {
@@ -2142,11 +2126,11 @@ static void spi_maybe_unoptimize_message(struct spi_message *msg)
 }
 
 /**
- * spi_finalize_current_message() - the current message is complete
- * @ctlr: the controller to return the message to
+ * spi_finalize_current_message() - 当前消息已经完成
+ * @ctlr: 需要把消息归还给的控制器
  *
- * Called by the driver to notify the core that the message in the front of the
- * queue is complete and can be removed from the queue.
+ * 驱动调用它来通知 core：队列头部的这条消息已经完成，
+ * 可以从队列中移除了。
  */
 void spi_finalize_current_message(struct spi_controller *ctlr)
 {
@@ -2182,7 +2166,7 @@ void spi_finalize_current_message(struct spi_controller *ctlr)
 	spi_maybe_unoptimize_message(mesg);
 
 	WRITE_ONCE(ctlr->cur_msg_incomplete, false);
-	smp_mb(); /* See __spi_pump_transfer_message()... */
+	smp_mb(); /* 参见 __spi_pump_transfer_message()... */
 	if (READ_ONCE(ctlr->cur_msg_need_completion))
 		complete(&ctlr->cur_msg_completion);
 
@@ -2220,10 +2204,10 @@ static int spi_stop_queue(struct spi_controller *ctlr)
 	unsigned long flags;
 
 	/*
-	 * This is a bit lame, but is optimized for the common execution path.
-	 * A wait_queue on the ctlr->busy could be used, but then the common
-	 * execution path (pump_messages) would be required to call wake_up or
-	 * friends on every SPI message. Do this instead.
+	 * 这个实现不算优雅，但它针对常见执行路径做了优化。
+	 * 也可以在 ctlr->busy 上使用 wait_queue，但那样的话，常见路径
+	 * （pump_messages）就必须在每条 SPI message 上调用 wake_up 或
+	 * 类似函数。这里选择了另一种实现方式。
 	 */
 	do {
 		spin_lock_irqsave(&ctlr->queue_lock, flags);
@@ -2246,10 +2230,9 @@ static int spi_destroy_queue(struct spi_controller *ctlr)
 	ret = spi_stop_queue(ctlr);
 
 	/*
-	 * kthread_flush_worker will block until all work is done.
-	 * If the reason that stop_queue timed out is that the work will never
-	 * finish, then it does no good to call flush/stop thread, so
-	 * return anyway.
+	 * kthread_flush_worker 会一直阻塞到所有 work 执行完毕。
+	 * 如果 stop_queue 超时的原因是 work 根本不会结束，
+	 * 那么此时再去 flush/stop 线程也没有意义，所以直接返回即可。
 	 */
 	if (ret) {
 		dev_err(&ctlr->dev, "problem destroying queue\n");
@@ -2287,11 +2270,12 @@ static int __spi_queued_transfer(struct spi_device *spi,
 }
 
 /**
- * spi_queued_transfer - transfer function for queued transfers
- * @spi: SPI device which is requesting transfer
- * @msg: SPI message which is to handled is queued to driver queue
+ * spi_queued_transfer - 队列化传输使用的传输函数
+ * @spi: 请求传输的 SPI 设备
+ * @msg: 将要交给驱动队列处理的 SPI 消息
  *
- * Return: zero on success, else a negative error code.
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 static int spi_queued_transfer(struct spi_device *spi, struct spi_message *msg)
 {
@@ -2328,14 +2312,12 @@ err_init_queue:
 }
 
 /**
- * spi_flush_queue - Send all pending messages in the queue from the callers'
- *		     context
- * @ctlr: controller to process queue for
+ * spi_flush_queue - 从调用者上下文发送完队列里所有待处理消息
+ * @ctlr: 要处理队列的控制器
  *
- * This should be used when one wants to ensure all pending messages have been
- * sent before doing something. Is used by the spi-mem code to make sure SPI
- * memory operations do not preempt regular SPI transfers that have been queued
- * before the spi-mem operation.
+ * 当希望在执行某个操作之前，确保所有待处理消息都已经发出时，
+ * 应该使用这个接口。spi-mem 代码会使用它，确保 SPI memory 操作
+ * 不会抢占那些在它之前已经排队的普通 SPI 传输。
  */
 void spi_flush_queue(struct spi_controller *ctlr)
 {
@@ -2624,7 +2606,7 @@ of_register_spi_device(struct spi_controller *ctlr, struct device_node *nc)
 		goto err_out;
 	}
 
-	/* Select device driver */
+	/* 选择设备驱动。 */
 	rc = of_alias_from_compatible(nc, spi->modalias,
 				      sizeof(spi->modalias));
 	if (rc < 0) {
@@ -2658,11 +2640,11 @@ err_out:
 }
 
 /**
- * of_register_spi_devices() - Register child devices onto the SPI bus
- * @ctlr:	Pointer to spi_controller device
+ * of_register_spi_devices() - 把子设备注册到 SPI 总线上
+ * @ctlr:	spi_controller 设备指针
  *
- * Registers an spi_device for each child node of controller node which
- * represents a valid SPI target device.
+ * 为控制器节点下每一个表示有效 SPI 目标设备的子节点注册一个
+ * spi_device。
  */
 static void of_register_spi_devices(struct spi_controller *ctlr)
 {
@@ -2685,16 +2667,17 @@ static void of_register_spi_devices(struct spi_controller *ctlr) { }
 #endif
 
 /**
- * spi_new_ancillary_device() - Register ancillary SPI device
- * @spi:         Pointer to the main SPI device registering the ancillary device
- * @chip_select: Chip Select of the ancillary device
+ * spi_new_ancillary_device() - 注册辅助 SPI 设备
+ * @spi:         注册该辅助设备的主 SPI 设备指针
+ * @chip_select: 辅助设备的 chip select
  *
- * Register an ancillary SPI device; for example some chips have a chip-select
- * for normal device usage and another one for setup/firmware upload.
+ * 注册一个辅助 SPI 设备；例如有些芯片会有一个 chip select
+ * 用于正常工作，另一个则用于初始化或固件下载。
  *
- * This may only be called from main SPI device's probe routine.
+ * 这个接口只能在主 SPI 设备的 probe 过程中调用。
  *
- * Return: 0 on success; negative errno on failure
+ * 返回：
+ * 成功返回 0，失败返回负 errno。
  */
 struct spi_device *spi_new_ancillary_device(struct spi_device *spi,
 					     u8 chip_select)
@@ -2703,7 +2686,7 @@ struct spi_device *spi_new_ancillary_device(struct spi_device *spi,
 	struct spi_device *ancillary;
 	int rc;
 
-	/* Alloc an spi_device */
+	/* 分配一个 spi_device。 */
 	ancillary = spi_alloc_device(ctlr);
 	if (!ancillary) {
 		rc = -ENOMEM;
@@ -2712,21 +2695,24 @@ struct spi_device *spi_new_ancillary_device(struct spi_device *spi,
 
 	strscpy(ancillary->modalias, "dummy", sizeof(ancillary->modalias));
 
-	/* Use provided chip-select for ancillary device */
+	/* 辅助设备使用传入的 chip-select。 */
 	spi_set_chipselect(ancillary, 0, chip_select);
 
-	/* Take over SPI mode/speed from SPI main device */
+	/* 继承主 SPI 设备的 mode / 速率配置。 */
 	ancillary->max_speed_hz = spi->max_speed_hz;
 	ancillary->mode = spi->mode;
 	/*
-	 * By default spi->chip_select[0] will hold the physical CS number,
-	 * so set bit 0 in spi->cs_index_mask.
+	 * 默认情况下 spi->chip_select[0] 保存物理 CS 编号，
+	 * 因此要在 spi->cs_index_mask 中设置 bit 0。
 	 */
 	ancillary->cs_index_mask = BIT(0);
 
 	WARN_ON(!mutex_is_locked(&ctlr->add_lock));
 
-	/* Register the new device, passing the parent to skip CS conflict check */
+	/*
+	 * 注册这个新设备，并传入 parent 以跳过与父设备的
+	 * chip select 冲突检查。
+	 */
 	rc = __spi_add_device(ancillary, spi);
 	if (rc) {
 		dev_err(&spi->dev, "failed to register ancillary device\n");
@@ -2747,20 +2733,20 @@ static void devm_spi_unregister_device(void *spi)
 }
 
 /**
- * devm_spi_new_ancillary_device() - Register managed ancillary SPI device
- * @spi:         Pointer to the main SPI device registering the ancillary device
- * @chip_select: Chip Select of the ancillary device
+ * devm_spi_new_ancillary_device() - 注册受管理的辅助 SPI 设备
+ * @spi:         注册该辅助设备的主 SPI 设备指针
+ * @chip_select: 辅助设备的 chip select
  *
- * Register an ancillary SPI device; for example some chips have a chip-select
- * for normal device usage and another one for setup/firmware upload.
+ * 注册一个辅助 SPI 设备；例如有些芯片会有一个 chip select
+ * 用于正常工作，另一个则用于初始化或固件下载。
  *
- * This is the managed version of spi_new_ancillary_device(). The ancillary
- * device will be unregistered automatically when the parent SPI device is
- * unregistered.
+ * 这是 spi_new_ancillary_device() 的受管理版本。主 SPI 设备注销时，
+ * 该辅助设备也会被自动注销。
  *
- * This may only be called from main SPI device's probe routine.
+ * 这个接口只能在主 SPI 设备的 probe 过程中调用。
  *
- * Return: Pointer to new ancillary device on success; ERR_PTR on failure
+ * 返回：
+ * 成功返回新的辅助设备指针；失败返回 ERR_PTR。
  */
 struct spi_device *devm_spi_new_ancillary_device(struct spi_device *spi,
 						 u8 chip_select)
@@ -2811,11 +2797,11 @@ static int acpi_spi_count(struct acpi_resource *ares, void *data)
 }
 
 /**
- * acpi_spi_count_resources - Count the number of SpiSerialBus resources
- * @adev:	ACPI device
+ * acpi_spi_count_resources - 统计 SpiSerialBus 资源数量
+ * @adev:	ACPI 设备
  *
- * Return: the number of SpiSerialBus resources in the ACPI-device's
- * resource-list; or a negative error code.
+ * 返回：
+ * ACPI 设备资源列表中的 SpiSerialBus 数量；或者返回负错误码。
  */
 int acpi_spi_count_resources(struct acpi_device *adev)
 {
@@ -2903,11 +2889,10 @@ static int acpi_spi_add_resource(struct acpi_resource *ares, void *data)
 			}
 
 			/*
-			 * ACPI DeviceSelection numbering is handled by the
-			 * host controller driver in Windows and can vary
-			 * from driver to driver. In Linux we always expect
-			 * 0 .. max - 1 so we need to ask the driver to
-			 * translate between the two schemes.
+			 * ACPI 的 DeviceSelection 编号方式由 Windows 中的 host
+			 * controller driver 决定，而且不同驱动之间可能不一致。
+			 * 在 Linux 中，我们始终期望使用 0 .. max - 1 这套编号，
+			 * 因此需要让驱动在两套方案之间做转换。
 			 */
 			if (ctlr->fw_translate_cs) {
 				int cs = ctlr->fw_translate_cs(ctlr,
@@ -2941,20 +2926,20 @@ static int acpi_spi_add_resource(struct acpi_resource *ares, void *data)
 }
 
 /**
- * acpi_spi_device_alloc - Allocate a spi device, and fill it in with ACPI information
- * @ctlr: controller to which the spi device belongs
- * @adev: ACPI Device for the spi device
- * @index: Index of the spi resource inside the ACPI Node
+ * acpi_spi_device_alloc - 分配一个 SPI 设备并填入 ACPI 信息
+ * @ctlr: 该 SPI 设备所属的控制器
+ * @adev: 该 SPI 设备对应的 ACPI 设备
+ * @index: ACPI 节点中 SPI 资源的索引
  *
- * This should be used to allocate a new SPI device from and ACPI Device node.
- * The caller is responsible for calling spi_add_device to register the SPI device.
+ * 应使用这个接口从 ACPI 设备节点中分配一个新的 SPI 设备。
+ * 调用者负责随后调用 spi_add_device() 来注册该 SPI 设备。
  *
- * If ctlr is set to NULL, the Controller for the SPI device will be looked up
- * using the resource.
- * If index is set to -1, index is not used.
- * Note: If index is -1, ctlr must be set.
+ * 如果 ctlr 设为 NULL，则会根据资源反查该 SPI 设备所属的控制器。
+ * 如果 index 设为 -1，则不使用索引。
+ * 注意：如果 index 为 -1，则必须设置 ctlr。
  *
- * Return: a pointer to the new device, or ERR_PTR on error.
+ * 返回：
+ * 成功时返回新设备指针；出错时返回 ERR_PTR。
  */
 struct spi_device *acpi_spi_device_alloc(struct spi_controller *ctlr,
 					 struct acpi_device *adev,
@@ -3038,13 +3023,13 @@ static acpi_status acpi_register_spi_device(struct spi_controller *ctlr,
 			  sizeof(spi->modalias));
 
 	/*
-	 * This gets re-tried in spi_probe() for -EPROBE_DEFER handling in case
-	 * the GPIO controller does not have a driver yet. This needs to be done
-	 * here too, because this call sets the GPIO direction and/or bias.
-	 * Setting these needs to be done even if there is no driver, in which
-	 * case spi_probe() will never get called.
-	 * TODO: ideally the setup of the GPIO should be handled in a generic
-	 * manner in the ACPI/gpiolib core code.
+	 * 这里会在 spi_probe() 中为了处理 -EPROBE_DEFER 再重试一次，
+	 * 因为 GPIO 控制器此时可能还没有驱动。
+	 * 之所以必须在这里做，是因为这个调用会设置 GPIO 方向和/或偏置。
+	 * 即使没有驱动，这些设置也必须完成；在那种情况下，spi_probe()
+	 * 根本不会被调用。
+	 * TODO：理想情况下，GPIO 的设置应该由 ACPI/gpiolib core 以
+	 * 更通用的方式来处理。
 	 */
 	if (spi->irq < 0)
 		spi->irq = acpi_dev_gpio_irq_get(adev, 0);
@@ -3113,8 +3098,8 @@ static const struct class spi_controller_class = {
 
 #ifdef CONFIG_SPI_SLAVE
 /**
- * spi_target_abort - abort the ongoing transfer request on an SPI target controller
- * @spi: device used for the current transfer
+ * spi_target_abort - 中止 SPI target 控制器上正在进行的传输请求
+ * @spi: 当前传输所使用的设备
  */
 int spi_target_abort(struct spi_device *spi)
 {
@@ -3208,29 +3193,28 @@ extern struct class spi_target_class;	/* dummy */
 #endif
 
 /**
- * __spi_alloc_controller - allocate an SPI host or target controller
- * @dev: the controller, possibly using the platform_bus
- * @size: how much zeroed driver-private data to allocate; the pointer to this
- *	memory is in the driver_data field of the returned device, accessible
- *	with spi_controller_get_devdata(); the memory is cacheline aligned;
- *	drivers granting DMA access to portions of their private data need to
- *	round up @size using ALIGN(size, dma_get_cache_alignment()).
- * @target: flag indicating whether to allocate an SPI host (false) or SPI target (true)
- *	controller
+ * __spi_alloc_controller - 分配一个 SPI host 或 target 控制器
+ * @dev: 控制器所属的设备，可能挂在 platform_bus 上
+ * @size: 需要分配多少清零的驱动私有数据；返回设备的 driver_data
+ *	字段会指向这块内存，可通过 spi_controller_get_devdata() 访问；
+ *	这块内存按 cacheline 对齐；如果驱动要让 DMA 访问其私有数据的
+ *	某些部分，则需要使用 ALIGN(size, dma_get_cache_alignment())
+ *	对 @size 向上对齐。
+ * @target: 表示是分配 SPI host（false）还是 SPI target（true）
  * Context: can sleep
  *
- * This call is used only by SPI controller drivers, which are the
- * only ones directly touching chip registers.  It's how they allocate
- * an spi_controller structure, prior to calling spi_register_controller().
+ * 这个接口只供 SPI 控制器驱动使用，因为只有它们会直接接触芯片寄存器。
+ * 这也是它们在调用 spi_register_controller() 之前分配 spi_controller
+ * 结构体的方式。
  *
- * This must be called from context that can sleep.
+ * 该函数必须在可睡眠上下文中调用。
  *
- * The caller is responsible for assigning the bus number and initializing the
- * controller's methods before calling spi_register_controller(); and (after
- * errors adding the device) calling spi_controller_put() to prevent a memory
- * leak.
+ * 调用者负责在调用 spi_register_controller() 之前设置总线号并初始化
+ * 控制器的方法；如果后续添加设备失败，还需要调用 spi_controller_put()
+ * 来避免内存泄漏。
  *
- * Return: the SPI controller structure on success, else NULL.
+ * 返回：
+ * 成功时返回 SPI 控制器结构体，失败返回 NULL。
  */
 struct spi_controller *__spi_alloc_controller(struct device *dev,
 					      unsigned int size, bool target)
@@ -3283,19 +3267,19 @@ static void devm_spi_release_controller(void *ctlr)
 }
 
 /**
- * __devm_spi_alloc_controller - resource-managed __spi_alloc_controller()
- * @dev: physical device of SPI controller
- * @size: how much zeroed driver-private data to allocate
- * @target: whether to allocate an SPI host (false) or SPI target (true) controller
+ * __devm_spi_alloc_controller - 受资源管理的 __spi_alloc_controller()
+ * @dev: SPI 控制器的物理设备
+ * @size: 需要分配多少清零的驱动私有数据
+ * @target: 是否分配 SPI host（false）还是 SPI target（true）控制器
  * Context: can sleep
  *
- * Allocate an SPI controller and automatically release a reference on it
- * when @dev is unbound from its driver.  Drivers are thus relieved from
- * having to call spi_controller_put().
+ * 分配一个 SPI 控制器，并在 @dev 从驱动解绑时自动释放对它的引用。
+ * 这样驱动就不需要手动调用 spi_controller_put() 了。
  *
- * The arguments to this function are identical to __spi_alloc_controller().
+ * 这个函数的参数与 __spi_alloc_controller() 完全一致。
  *
- * Return: the SPI controller structure on success, else NULL.
+ * 返回：
+ * 成功时返回 SPI 控制器结构体，失败返回 NULL。
  */
 struct spi_controller *__devm_spi_alloc_controller(struct device *dev,
 						   unsigned int size,
@@ -3319,8 +3303,8 @@ struct spi_controller *__devm_spi_alloc_controller(struct device *dev,
 EXPORT_SYMBOL_GPL(__devm_spi_alloc_controller);
 
 /**
- * spi_get_gpio_descs() - grab chip select GPIOs for the controller
- * @ctlr: The SPI controller to grab GPIO descriptors for
+ * spi_get_gpio_descs() - 为控制器获取 chip select 的 GPIO 描述符
+ * @ctlr: 需要获取 GPIO 描述符的 SPI 控制器
  */
 static int spi_get_gpio_descs(struct spi_controller *ctlr)
 {
@@ -3332,7 +3316,7 @@ static int spi_get_gpio_descs(struct spi_controller *ctlr)
 
 	nb = gpiod_count(dev, "cs");
 	if (nb < 0) {
-		/* No GPIOs at all is fine, else return the error */
+		/* 完全没有 GPIO 也是允许的，否则就返回错误。 */
 		if (nb == -ENOENT)
 			return 0;
 		return nb;
@@ -3347,13 +3331,12 @@ static int spi_get_gpio_descs(struct spi_controller *ctlr)
 	ctlr->cs_gpiods = cs;
 
 	for (i = 0; i < nb; i++) {
-		/*
-		 * Most chipselects are active low, the inverted
-		 * semantics are handled by special quirks in gpiolib,
-		 * so initializing them GPIOD_OUT_LOW here means
-		 * "unasserted", in most cases this will drive the physical
-		 * line high.
-		 */
+			/*
+			 * 大多数 chip select 都是低有效的，gpiolib 会通过
+			 * 特殊 quirks 处理反相语义，所以这里用 GPIOD_OUT_LOW
+			 * 初始化，表示“未选中”；在大多数情况下，这会把
+			 * 物理引脚拉高。
+			 */
 		cs[i] = devm_gpiod_get_index_optional(dev, "cs", i,
 						      GPIOD_OUT_LOW);
 		if (IS_ERR(cs[i]))
@@ -3361,8 +3344,8 @@ static int spi_get_gpio_descs(struct spi_controller *ctlr)
 
 		if (cs[i]) {
 			/*
-			 * If we find a CS GPIO, name it after the device and
-			 * chip select line.
+			 * 如果找到了 CS GPIO，就按设备名和 chip select
+			 * 编号给它命名。
 			 */
 			char *gpioname;
 
@@ -3396,11 +3379,10 @@ static int spi_get_gpio_descs(struct spi_controller *ctlr)
 static int spi_controller_check_ops(struct spi_controller *ctlr)
 {
 	/*
-	 * The controller may implement only the high-level SPI-memory like
-	 * operations if it does not support regular SPI transfers, and this is
-	 * valid use case.
-	 * If ->mem_ops or ->mem_ops->exec_op is NULL, we request that at least
-	 * one of the ->transfer_xxx() method be implemented.
+	 * 如果控制器不支持普通 SPI 传输，也可以只实现高层的
+	 * SPI-memory 类操作，这在某些场景下是完全合法的。
+	 * 但如果 ->mem_ops 或 ->mem_ops->exec_op 为空，
+	 * 那么至少要实现一种 ->transfer_xxx() 方法。
 	 */
 	if (!ctlr->mem_ops || !ctlr->mem_ops->exec_op) {
 		if (!ctlr->transfer && !ctlr->transfer_one &&
@@ -3412,7 +3394,7 @@ static int spi_controller_check_ops(struct spi_controller *ctlr)
 	return 0;
 }
 
-/* Allocate dynamic bus number using Linux idr */
+/* 使用 Linux idr 分配动态总线号。 */
 static int spi_controller_id_alloc(struct spi_controller *ctlr, int start, int end)
 {
 	int id;
@@ -3427,27 +3409,26 @@ static int spi_controller_id_alloc(struct spi_controller *ctlr, int start, int e
 }
 
 /**
- * spi_register_controller - register SPI host or target controller
- * @ctlr: initialized controller, originally from spi_alloc_host() or
+ * spi_register_controller - 注册 SPI host 或 target 控制器
+ * @ctlr: 已初始化的控制器，通常来自 spi_alloc_host() 或
  *	spi_alloc_target()
  * Context: can sleep
  *
- * SPI controllers connect to their drivers using some non-SPI bus,
- * such as the platform bus.  The final stage of probe() in that code
- * includes calling spi_register_controller() to hook up to this SPI bus glue.
+ * SPI 控制器通常通过其它非 SPI 总线与驱动连接，例如 platform bus。
+ * 对应驱动的 probe() 最后阶段会调用 spi_register_controller()，
+ * 将控制器挂接到这层 SPI glue 上。
  *
- * SPI controllers use board specific (often SOC specific) bus numbers,
- * and board-specific addressing for SPI devices combines those numbers
- * with chip select numbers.  Since SPI does not directly support dynamic
- * device identification, boards need configuration tables telling which
- * chip is at which address.
+ * SPI 控制器通常使用板级（往往也是 SoC 相关的）总线号；
+ * SPI 设备的板级寻址会把这些总线号和 chip select 号组合起来。
+ * 由于 SPI 本身不直接支持动态设备发现，因此板子需要配置表来
+ * 指明哪颗芯片挂在哪个地址上。
  *
- * This must be called from context that can sleep.
+ * 这个接口必须在可睡眠上下文中调用。
  *
- * After a successful return, the caller is responsible for calling
- * spi_unregister_controller().
+ * 成功返回后，调用者需要负责再调用 spi_unregister_controller()。
  *
- * Return: zero on success, else a negative error code.
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 int spi_register_controller(struct spi_controller *ctlr)
 {
@@ -3461,8 +3442,7 @@ int spi_register_controller(struct spi_controller *ctlr)
 		return -ENODEV;
 
 	/*
-	 * Make sure all necessary hooks are implemented before registering
-	 * the SPI controller.
+	 * 在注册 SPI 控制器之前，先确认必要的钩子都已经实现。
 	 */
 	status = spi_controller_check_ops(ctlr);
 	if (status)
@@ -3471,7 +3451,7 @@ int spi_register_controller(struct spi_controller *ctlr)
 	if (ctlr->bus_num < 0)
 		ctlr->bus_num = of_alias_get_id(ctlr->dev.of_node, "spi");
 	if (ctlr->bus_num >= 0) {
-		/* Devices with a fixed bus num must check-in with the num */
+		/* 固定总线号的设备必须直接使用该编号登记。 */
 		status = spi_controller_id_alloc(ctlr, ctlr->bus_num, ctlr->bus_num + 1);
 		if (status)
 			return status;
@@ -3494,8 +3474,8 @@ int spi_register_controller(struct spi_controller *ctlr)
 		ctlr->max_dma_len = INT_MAX;
 
 	/*
-	 * Register the device, then userspace will see it.
-	 * Registration fails if the bus ID is in use.
+	 * 先注册设备，用户态随后就能看到它。
+	 * 如果总线 ID 已被占用，注册会失败。
 	 */
 	dev_set_name(&ctlr->dev, "spi%u", ctlr->bus_num);
 
@@ -3504,22 +3484,20 @@ int spi_register_controller(struct spi_controller *ctlr)
 		if (status)
 			goto free_bus_id;
 		/*
-		 * A controller using GPIO descriptors always
-		 * supports SPI_CS_HIGH if need be.
+		 * 使用 GPIO 描述符的控制器在需要时总是支持 SPI_CS_HIGH。
 		 */
 		ctlr->mode_bits |= SPI_CS_HIGH;
 	}
 
 	/*
-	 * Even if it's just one always-selected device, there must
-	 * be at least one chipselect.
+	 * 即使只有一个始终被选中的设备，也至少必须有一个 chipselect。
 	 */
 	if (!ctlr->num_chipselect) {
 		status = -EINVAL;
 		goto free_bus_id;
 	}
 
-	/* Setting last_cs to SPI_INVALID_CS means no chip selected */
+	/* 把 last_cs 设为 SPI_INVALID_CS 表示当前没有选中任何 chip。 */
 	for (idx = 0; idx < SPI_DEVICE_CS_CNT_MAX; idx++)
 		ctlr->last_cs[idx] = SPI_INVALID_CS;
 
@@ -3531,9 +3509,8 @@ int spi_register_controller(struct spi_controller *ctlr)
 			dev_name(&ctlr->dev));
 
 	/*
-	 * If we're using a queued driver, start the queue. Note that we don't
-	 * need the queueing logic if the driver is only supporting high-level
-	 * memory operations.
+	 * 如果使用的是队列化驱动，就启动队列。
+	 * 注意，如果驱动只支持高层 memory 操作，就不需要队列逻辑。
 	 */
 	if (ctlr->transfer) {
 		dev_info(dev, "controller is unqueued, this is deprecated\n");
@@ -3549,7 +3526,9 @@ int spi_register_controller(struct spi_controller *ctlr)
 		spi_match_controller_to_boardinfo(ctlr, &bi->board_info);
 	mutex_unlock(&board_lock);
 
-	/* Register devices from the device tree and ACPI */
+	/*
+	 * 从设备树和 ACPI 注册设备。
+	 */
 	of_register_spi_devices(ctlr);
 	acpi_register_spi_devices(ctlr);
 	return status;
@@ -3570,17 +3549,18 @@ static void devm_spi_unregister_controller(void *ctlr)
 }
 
 /**
- * devm_spi_register_controller - register managed SPI host or target controller
- * @dev:    device managing SPI controller
- * @ctlr: initialized controller, originally from spi_alloc_host() or
+ * devm_spi_register_controller - 注册受管理的 SPI host 或 target 控制器
+ * @dev:    管理该 SPI 控制器的设备
+ * @ctlr: 已初始化的控制器，通常来自 spi_alloc_host() 或
  *	spi_alloc_target()
- * Context: can sleep
+ * Context: 可以睡眠
  *
- * Register a SPI device as with spi_register_controller() which will
- * automatically be unregistered (and freed unless it has been allocated using
- * devm_spi_alloc_host/target()).
+ * 以 spi_register_controller() 的方式注册一个 SPI 控制器，
+ * 并在设备释放时自动注销；如果它不是通过 devm_spi_alloc_host/target()
+ * 分配的，还会同时释放。
  *
- * Return: zero on success, else a negative error code.
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 int devm_spi_register_controller(struct device *dev,
 				 struct spi_controller *ctlr)
@@ -3592,9 +3572,9 @@ int devm_spi_register_controller(struct device *dev,
 		return ret;
 
 	/*
-	 * Prevent controller from being freed by spi_unregister_controller()
-	 * if devm_add_action_or_reset() fails for a non-devres allocated
-	 * controller.
+	 * 如果 devm_add_action_or_reset() 失败，而控制器又不是由
+	 * devres 分配的，就要避免它被 spi_unregister_controller()
+	 * 提前释放掉。
 	 */
 	spi_controller_get(ctlr);
 
@@ -3614,30 +3594,29 @@ static int __unregister(struct device *dev, void *null)
 }
 
 /**
- * spi_unregister_controller - unregister SPI host or target controller
- * @ctlr: the controller being unregistered
+ * spi_unregister_controller - 注销 SPI host 或 target 控制器
+ * @ctlr: 要注销的控制器
  * Context: can sleep
  *
- * This call is used only by SPI controller drivers, which are the
- * only ones directly touching chip registers.
+ * 这个接口只供 SPI 控制器驱动使用，因为只有它们会直接操作芯片寄存器。
  *
- * This must be called from context that can sleep.
+ * 该函数必须在可睡眠上下文中调用。
  *
- * Note that this function also drops a reference to the controller unless it
- * has been allocated using devm_spi_alloc_host/target().
+ * 注意，除非控制器是通过 devm_spi_alloc_host/target() 分配的，
+ * 否则该函数还会额外释放一个控制器引用。
  */
 void spi_unregister_controller(struct spi_controller *ctlr)
 {
 	struct spi_controller *found;
 	int id = ctlr->bus_num;
 
-	/* Prevent addition of new devices, unregister existing ones */
+	/* 阻止新增设备，并注销已有设备。 */
 	if (IS_ENABLED(CONFIG_SPI_DYNAMIC))
 		mutex_lock(&ctlr->add_lock);
 
 	device_for_each_child(&ctlr->dev, NULL, __unregister);
 
-	/* First make sure that this controller was ever added */
+	/* 先确认这个控制器确实曾经注册过。 */
 	mutex_lock(&board_lock);
 	found = idr_find(&spi_controller_idr, id);
 	mutex_unlock(&board_lock);
@@ -3651,7 +3630,7 @@ void spi_unregister_controller(struct spi_controller *ctlr)
 
 	device_del(&ctlr->dev);
 
-	/* Free bus id */
+	/* 释放总线编号。 */
 	mutex_lock(&board_lock);
 	if (found == ctlr)
 		idr_remove(&spi_controller_idr, id);
@@ -3661,8 +3640,8 @@ void spi_unregister_controller(struct spi_controller *ctlr)
 		mutex_unlock(&ctlr->add_lock);
 
 	/*
-	 * Release the last reference on the controller if its driver
-	 * has not yet been converted to devm_spi_alloc_host/target().
+	 * 如果驱动还没有迁移到 devm_spi_alloc_host/target()，
+	 * 那就在这里释放控制器的最后一个引用。
 	 */
 	if (!ctlr->devm_allocated)
 		put_device(&ctlr->dev);
@@ -3692,7 +3671,7 @@ int spi_controller_suspend(struct spi_controller *ctlr)
 {
 	int ret = 0;
 
-	/* Basically no-ops for non-queued controllers */
+	/* 对非队列化控制器来说，基本上是空操作。 */
 	if (ctlr->queued) {
 		ret = spi_stop_queue(ctlr);
 		if (ret)
@@ -3721,7 +3700,7 @@ EXPORT_SYMBOL_GPL(spi_controller_resume);
 
 /*-------------------------------------------------------------------------*/
 
-/* Core methods for spi_message alterations */
+/* spi_message 变更相关的核心方法。 */
 
 static void __spi_replace_transfers_release(struct spi_controller *ctlr,
 					    struct spi_message *msg,
@@ -3730,32 +3709,31 @@ static void __spi_replace_transfers_release(struct spi_controller *ctlr,
 	struct spi_replaced_transfers *rxfer = res;
 	size_t i;
 
-	/* Call extra callback if requested */
+	/* 如有需要，先调用额外回调。 */
 	if (rxfer->release)
 		rxfer->release(ctlr, msg, res);
 
-	/* Insert replaced transfers back into the message */
+	/* 把被替换掉的 transfers 插回 message。 */
 	list_splice(&rxfer->replaced_transfers, rxfer->replaced_after);
 
-	/* Remove the formerly inserted entries */
+	/* 移除先前插入的条目。 */
 	for (i = 0; i < rxfer->inserted; i++)
 		list_del(&rxfer->inserted_transfers[i].transfer_list);
 }
 
 /**
- * spi_replace_transfers - replace transfers with several transfers
- *                         and register change with spi_message.resources
- * @msg:           the spi_message we work upon
- * @xfer_first:    the first spi_transfer we want to replace
- * @remove:        number of transfers to remove
- * @insert:        the number of transfers we want to insert instead
- * @release:       extra release code necessary in some circumstances
- * @extradatasize: extra data to allocate (with alignment guarantees
- *                 of struct @spi_transfer)
- * @gfp:           gfp flags
+ * spi_replace_transfers - 用多个 transfer 替换一组 transfer，并把变更登记到 spi_message.resources
+ * @msg:           当前正在处理的 spi_message
+ * @xfer_first:    需要被替换的第一个 spi_transfer
+ * @remove:        需要移除的 transfer 数量
+ * @insert:        需要插入的 transfer 数量
+ * @release:       某些场景下需要的额外释放回调
+ * @extradatasize: 要额外分配的数据大小（会保证与 struct @spi_transfer 对齐）
+ * @gfp:           GFP 分配标志
  *
- * Returns: pointer to @spi_replaced_transfers,
- *          PTR_ERR(...) in case of errors.
+ * 返回：
+ * 成功时返回 @spi_replaced_transfers 指针，
+ * 出错时返回 PTR_ERR(...)。
  */
 static struct spi_replaced_transfers *spi_replace_transfers(
 	struct spi_message *msg,
@@ -3770,7 +3748,7 @@ static struct spi_replaced_transfers *spi_replace_transfers(
 	struct spi_transfer *xfer;
 	size_t i;
 
-	/* Allocate the structure using spi_res */
+	/* 使用 spi_res 分配该结构。 */
 	rxfer = spi_res_alloc(msg->spi, __spi_replace_transfers_release,
 			      struct_size(rxfer, inserted_transfers, insert)
 			      + extradatasize,
@@ -3778,77 +3756,75 @@ static struct spi_replaced_transfers *spi_replace_transfers(
 	if (!rxfer)
 		return ERR_PTR(-ENOMEM);
 
-	/* The release code to invoke before running the generic release */
+	/* 在执行通用释放逻辑前要调用的释放回调。 */
 	rxfer->release = release;
 
-	/* Assign extradata */
+	/* 设置额外数据区。 */
 	if (extradatasize)
 		rxfer->extradata =
 			&rxfer->inserted_transfers[insert];
 
-	/* Init the replaced_transfers list */
+	/* 初始化 replaced_transfers 链表。 */
 	INIT_LIST_HEAD(&rxfer->replaced_transfers);
 
 	/*
-	 * Assign the list_entry after which we should reinsert
-	 * the @replaced_transfers - it may be spi_message.messages!
+	 * 记录应该在其后重新插入 @replaced_transfers 的 list_entry；
+	 * 它甚至可能是 spi_message.messages 本身。
 	 */
 	rxfer->replaced_after = xfer_first->transfer_list.prev;
 
-	/* Remove the requested number of transfers */
+	/* 移除请求数量的 transfer。 */
 	for (i = 0; i < remove; i++) {
 		/*
-		 * If the entry after replaced_after it is msg->transfers
-		 * then we have been requested to remove more transfers
-		 * than are in the list.
+		 * 如果 replaced_after 后面已经是 msg->transfers，
+		 * 那么说明请求移除的 transfer 数量超过了链表中实际数量。
 		 */
 		if (rxfer->replaced_after->next == &msg->transfers) {
 			dev_err(&msg->spi->dev,
 				"requested to remove more spi_transfers than are available\n");
-			/* Insert replaced transfers back into the message */
+			/* 把已替换的 transfers 插回 message。 */
 			list_splice(&rxfer->replaced_transfers,
 				    rxfer->replaced_after);
 
-			/* Free the spi_replace_transfer structure... */
+			/* 释放 spi_replace_transfer 结构体。 */
 			spi_res_free(rxfer);
 
-			/* ...and return with an error */
+			/* ...然后返回错误。 */
 			return ERR_PTR(-EINVAL);
 		}
 
 		/*
-		 * Remove the entry after replaced_after from list of
-		 * transfers and add it to list of replaced_transfers.
+		 * 把 replaced_after 后面的那个 transfer 从原列表中移除，
+		 * 并加入 replaced_transfers 列表。
 		 */
 		list_move_tail(rxfer->replaced_after->next,
 			       &rxfer->replaced_transfers);
 	}
 
 	/*
-	 * Create copy of the given xfer with identical settings
-	 * based on the first transfer to get removed.
+	 * 根据要移除的第一个 transfer，创建若干个设置完全相同的副本。
 	 */
 	for (i = 0; i < insert; i++) {
-		/* We need to run in reverse order */
+		/* 这里需要逆序处理。 */
 		xfer = &rxfer->inserted_transfers[insert - 1 - i];
 
-		/* Copy all spi_transfer data */
+		/* 复制所有 spi_transfer 数据。 */
 		memcpy(xfer, xfer_first, sizeof(*xfer));
 
-		/* Add to list */
+		/* 加入链表。 */
 		list_add(&xfer->transfer_list, rxfer->replaced_after);
 
-		/* Clear cs_change and delay for all but the last */
+		/* 除最后一个外，清除 cs_change 和 delay。 */
 		if (i) {
 			xfer->cs_change = false;
 			xfer->delay.value = 0;
 		}
 	}
 
-	/* Set up inserted... */
+	/* 设置插入数量。 */
 	rxfer->inserted = insert;
 
-	/* ...and register it with spi_res/spi_message */
+	/* ...然后把它登记到 spi_res / spi_message 中。 */
 	spi_res_add(msg, rxfer);
 
 	return rxfer;
@@ -3864,48 +3840,46 @@ static int __spi_split_transfer_maxsize(struct spi_controller *ctlr,
 	size_t offset;
 	size_t count, i;
 
-	/* Calculate how many we have to replace */
+	/* 计算需要替换多少个 transfer。 */
 	count = DIV_ROUND_UP(xfer->len, maxsize);
 
-	/* Create replacement */
+	/* 创建替换项。 */
 	srt = spi_replace_transfers(msg, xfer, 1, count, NULL, 0, GFP_KERNEL);
 	if (IS_ERR(srt))
 		return PTR_ERR(srt);
 	xfers = srt->inserted_transfers;
 
 	/*
-	 * Now handle each of those newly inserted spi_transfers.
-	 * Note that the replacements spi_transfers all are preset
-	 * to the same values as *xferp, so tx_buf, rx_buf and len
-	 * are all identical (as well as most others)
-	 * so we just have to fix up len and the pointers.
+	 * 接下来处理每个新插入的 spi_transfer。
+	 * 注意，这些替换出来的 spi_transfer 一开始都和 *xferp
+	 * 保持相同的设置，因此 tx_buf、rx_buf 和 len 等大多相同；
+	 * 我们只需要修正 len 和指针即可。
 	 */
 
 	/*
-	 * The first transfer just needs the length modified, so we
-	 * run it outside the loop.
+	 * 第一个 transfer 只需要修改长度，因此单独处理。
 	 */
 	xfers[0].len = min_t(size_t, maxsize, xfer[0].len);
 
-	/* All the others need rx_buf/tx_buf also set */
+	/* 其余的 transfer 还需要设置 rx_buf / tx_buf。 */
 	for (i = 1, offset = maxsize; i < count; offset += maxsize, i++) {
-		/* Update rx_buf, tx_buf and DMA */
+		/* 更新 rx_buf、tx_buf 和 DMA 相关指针。 */
 		if (xfers[i].rx_buf)
 			xfers[i].rx_buf += offset;
 		if (xfers[i].tx_buf)
 			xfers[i].tx_buf += offset;
 
-		/* Update length */
+		/* 更新长度。 */
 		xfers[i].len = min(maxsize, xfers[i].len - offset);
 	}
 
 	/*
-	 * We set up xferp to the last entry we have inserted,
-	 * so that we skip those already split transfers.
+	 * 将 xferp 指向我们插入的最后一个条目，
+	 * 这样后面就会跳过已经拆分过的 transfers。
 	 */
 	*xferp = &xfers[count - 1];
 
-	/* Increment statistics counters */
+	/* 增加统计计数。 */
 	SPI_STATISTICS_INCREMENT_FIELD(ctlr->pcpu_statistics,
 				       transfers_split_maxsize);
 	SPI_STATISTICS_INCREMENT_FIELD(msg->spi->pcpu_statistics,
@@ -3915,18 +3889,16 @@ static int __spi_split_transfer_maxsize(struct spi_controller *ctlr,
 }
 
 /**
- * spi_split_transfers_maxsize - split spi transfers into multiple transfers
- *                               when an individual transfer exceeds a
- *                               certain size
- * @ctlr:    the @spi_controller for this transfer
- * @msg:   the @spi_message to transform
- * @maxsize:  the maximum when to apply this
+ * spi_split_transfers_maxsize - 当单个 transfer 超过指定大小时，将其拆成多个 transfer
+ * @ctlr:    处理该 transfer 的 @spi_controller
+ * @msg:     需要转换的 @spi_message
+ * @maxsize: 拆分所使用的最大大小
  *
- * This function allocates resources that are automatically freed during the
- * spi message unoptimize phase so this function should only be called from
- * optimize_message callbacks.
+ * 该函数分配的资源会在 spi message unoptimize 阶段自动释放，
+ * 因此它只应该从 optimize_message 回调中调用。
  *
- * Return: status of transformation
+ * 返回：
+ * 转换状态。
  */
 int spi_split_transfers_maxsize(struct spi_controller *ctlr,
 				struct spi_message *msg,
@@ -3936,11 +3908,10 @@ int spi_split_transfers_maxsize(struct spi_controller *ctlr,
 	int ret;
 
 	/*
-	 * Iterate over the transfer_list,
-	 * but note that xfer is advanced to the last transfer inserted
-	 * to avoid checking sizes again unnecessarily (also xfer does
-	 * potentially belong to a different list by the time the
-	 * replacement has happened).
+	 * 遍历 transfer_list。
+	 * 注意 xfer 会前进到最后插入的 transfer，
+	 * 这样就不会重复检查大小；而且在替换完成后，
+	 * xfer 可能已经属于另一个链表。
 	 */
 	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
 		if (xfer->len > maxsize) {
@@ -3957,18 +3928,16 @@ EXPORT_SYMBOL_GPL(spi_split_transfers_maxsize);
 
 
 /**
- * spi_split_transfers_maxwords - split SPI transfers into multiple transfers
- *                                when an individual transfer exceeds a
- *                                certain number of SPI words
- * @ctlr:     the @spi_controller for this transfer
- * @msg:      the @spi_message to transform
- * @maxwords: the number of words to limit each transfer to
+ * spi_split_transfers_maxwords - 当单个 transfer 超过指定 word 数时，将其拆成多个 transfer
+ * @ctlr:     处理该 transfer 的 @spi_controller
+ * @msg:      需要转换的 @spi_message
+ * @maxwords: 每个 transfer 允许的最大 word 数
  *
- * This function allocates resources that are automatically freed during the
- * spi message unoptimize phase so this function should only be called from
- * optimize_message callbacks.
+ * 该函数分配的资源会在 spi message unoptimize 阶段自动释放，
+ * 因此它只应该从 optimize_message 回调中调用。
  *
- * Return: status of transformation
+ * 返回：
+ * 转换状态。
  */
 int spi_split_transfers_maxwords(struct spi_controller *ctlr,
 				 struct spi_message *msg,
@@ -3977,11 +3946,10 @@ int spi_split_transfers_maxwords(struct spi_controller *ctlr,
 	struct spi_transfer *xfer;
 
 	/*
-	 * Iterate over the transfer_list,
-	 * but note that xfer is advanced to the last transfer inserted
-	 * to avoid checking sizes again unnecessarily (also xfer does
-	 * potentially belong to a different list by the time the
-	 * replacement has happened).
+	 * 遍历 transfer_list。
+	 * 注意 xfer 会前进到最后插入的 transfer，
+	 * 这样就不会重复检查大小；而且在替换完成后，
+	 * xfer 可能已经属于另一个链表。
 	 */
 	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
 		size_t maxsize;
@@ -4003,15 +3971,15 @@ EXPORT_SYMBOL_GPL(spi_split_transfers_maxwords);
 /*-------------------------------------------------------------------------*/
 
 /*
- * Core methods for SPI controller protocol drivers. Some of the
- * other core methods are currently defined as inline functions.
+ * SPI 控制器协议驱动的核心方法。
+ * 其它一些核心方法当前以内联函数形式定义。
  */
 
 static int __spi_validate_bits_per_word(struct spi_controller *ctlr,
 					u8 bits_per_word)
 {
 	if (ctlr->bits_per_word_mask) {
-		/* Only 32 bits fit in the mask */
+		/* 掩码里最多只能放下 32 位。 */
 		if (bits_per_word > 32)
 			return -EINVAL;
 		if (!(ctlr->bits_per_word_mask & SPI_BPW_MASK(bits_per_word)))
@@ -4022,10 +3990,11 @@ static int __spi_validate_bits_per_word(struct spi_controller *ctlr,
 }
 
 /**
- * spi_set_cs_timing - configure CS setup, hold, and inactive delays
- * @spi: the device that requires specific CS timing configuration
+ * spi_set_cs_timing - 配置 CS 的 setup / hold / inactive 延迟
+ * @spi: 需要特定 CS 时序配置的设备
  *
- * Return: zero on success, else a negative error code.
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 static int spi_set_cs_timing(struct spi_device *spi)
 {
@@ -4057,8 +4026,8 @@ static int __spi_setup(struct spi_device *spi, bool initial_setup)
 	int		status;
 
 	/*
-	 * Check mode to prevent that any two of DUAL, QUAD and NO_MOSI/MISO
-	 * are set at the same time.
+	 * 检查 mode，避免 DUAL、QUAD 和 NO_MOSI/MISO 里的任意两个
+	 * 同时被设置。
 	 */
 	if ((hweight_long(spi->mode &
 		(SPI_TX_DUAL | SPI_TX_QUAD | SPI_NO_TX)) > 1) ||
@@ -4068,22 +4037,20 @@ static int __spi_setup(struct spi_device *spi, bool initial_setup)
 		"setup: can not select any two of dual, quad and no-rx/tx at the same time\n");
 		return -EINVAL;
 	}
-	/* If it is SPI_3WIRE mode, DUAL and QUAD should be forbidden */
+	/* 如果是 SPI_3WIRE 模式，则禁止 DUAL 和 QUAD。 */
 	if ((spi->mode & SPI_3WIRE) && (spi->mode &
 		(SPI_TX_DUAL | SPI_TX_QUAD | SPI_TX_OCTAL |
 		 SPI_RX_DUAL | SPI_RX_QUAD | SPI_RX_OCTAL)))
 		return -EINVAL;
-	/* Check against conflicting MOSI idle configuration */
+	/* 检查是否配置了互相冲突的 MOSI 空闲电平。 */
 	if ((spi->mode & SPI_MOSI_IDLE_LOW) && (spi->mode & SPI_MOSI_IDLE_HIGH)) {
 		dev_err(&spi->dev,
 			"setup: MOSI configured to idle low and high at the same time.\n");
 		return -EINVAL;
 	}
 	/*
-	 * Help drivers fail *cleanly* when they need options
-	 * that aren't supported with their current controller.
-	 * SPI_CS_WORD has a fallback software implementation,
-	 * so it is ignored here.
+	 * 帮助驱动在需要当前控制器不支持的选项时干净地失败。
+	 * SPI_CS_WORD 有软件回退实现，所以这里忽略它。
 	 */
 	bad_bits = spi->mode & ~(spi->controller->mode_bits | SPI_CS_WORD |
 				 SPI_NO_TX | SPI_NO_RX);
@@ -4107,8 +4074,8 @@ static int __spi_setup(struct spi_device *spi, bool initial_setup)
 		spi->bits_per_word = 8;
 	} else {
 		/*
-		 * Some controllers may not support the default 8 bits-per-word
-		 * so only perform the check when this is explicitly provided.
+		 * 某些控制器可能不支持默认的 8 bits-per-word，
+		 * 因此只有在显式指定时才执行检查。
 		 */
 		status = __spi_validate_bits_per_word(spi->controller,
 						      spi->bits_per_word);
@@ -4149,10 +4116,9 @@ static int __spi_setup(struct spi_device *spi, bool initial_setup)
 		}
 
 		/*
-		 * We do not want to return positive value from pm_runtime_get,
-		 * there are many instances of devices calling spi_setup() and
-		 * checking for a non-zero return value instead of a negative
-		 * return value.
+		 * 我们不希望 pm_runtime_get 返回正值，因为很多设备驱动
+		 * 调用 spi_setup() 时会把“非零”误当作失败，而不是检查
+		 * 负错误码。
 		 */
 		status = 0;
 
@@ -4190,24 +4156,22 @@ err_cleanup:
 }
 
 /**
- * spi_setup - setup SPI mode and clock rate
- * @spi: the device whose settings are being modified
- * Context: can sleep, and no requests are queued to the device
+ * spi_setup - 设置 SPI 模式和时钟速率
+ * @spi: 需要修改设置的设备
+ * Context: can sleep，且该设备当前没有排队请求
  *
- * SPI protocol drivers may need to update the transfer mode if the
- * device doesn't work with its default.  They may likewise need
- * to update clock rates or word sizes from initial values.  This function
- * changes those settings, and must be called from a context that can sleep.
- * Except for SPI_CS_HIGH, which takes effect immediately, the changes take
- * effect the next time the device is selected and data is transferred to
- * or from it.  When this function returns, the SPI device is deselected.
+ * 如果设备无法按默认设置工作，SPI 协议驱动可能需要更新传输模式。
+ * 同样地，它们也可能需要从初始值修改时钟速率或每字位数。这个函数
+ * 负责修改这些设置，而且必须在可睡眠上下文中调用。除了 SPI_CS_HIGH
+ * 之外，其它更改会在下一次设备被选中并进行数据传输时生效。该函数
+ * 返回时，SPI 设备会处于取消选择状态。
  *
- * Note that this call will fail if the protocol driver specifies an option
- * that the underlying controller or its driver does not support.  For
- * example, not all hardware supports wire transfers using nine bit words,
- * LSB-first wire encoding, or active-high chipselects.
+ * 注意，如果协议驱动指定了底层控制器或其驱动不支持的选项，
+ * 这个调用就会失败。例如，并不是所有硬件都支持 9 位字传输、
+ * LSB 优先编码，或者高有效 chip select。
  *
- * Return: zero on success, else a negative error code.
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 int spi_setup(struct spi_device *spi)
 {
@@ -4247,10 +4211,9 @@ static int __spi_validate(struct spi_device *spi, struct spi_message *message)
 	message->spi = spi;
 
 	/*
-	 * Half-duplex links include original MicroWire, and ones with
-	 * only one data pin like SPI_3WIRE (switches direction) or where
-	 * either MOSI or MISO is missing.  They can also be caused by
-	 * software limitations.
+	 * 半双工链路包括原始的 MicroWire，以及只有一根数据线的接口，
+	 * 例如 SPI_3WIRE（需要切换方向），或者缺少 MOSI / MISO 的情况。
+	 * 软件限制也可能把链路限制成半双工。
 	 */
 	if ((ctlr->flags & SPI_CONTROLLER_HALF_DUPLEX) ||
 	    (spi->mode & SPI_3WIRE)) {
@@ -4267,12 +4230,11 @@ static int __spi_validate(struct spi_device *spi, struct spi_message *message)
 	}
 
 	/*
-	 * Set transfer bits_per_word and max speed as spi device default if
-	 * it is not set for this transfer.
-	 * Set transfer tx_nbits and rx_nbits as single transfer default
-	 * (SPI_NBITS_SINGLE) if it is not set for this transfer.
-	 * Ensure transfer word_delay is at least as long as that required by
-	 * device itself.
+	 * 如果 transfer 没有设置 bits_per_word 和最大速率，就使用 spi_device
+	 * 的默认值。
+	 * 如果 transfer 没有设置 tx_nbits / rx_nbits，就默认使用单线传输
+	 * （SPI_NBITS_SINGLE）。
+	 * 同时确保 transfer 的 word_delay 不短于设备自身要求。
 	 */
 	message->frame_length = 0;
 	list_for_each_entry(xfer, &message->transfers, transfer_list) {
@@ -4290,20 +4252,21 @@ static int __spi_validate(struct spi_device *spi, struct spi_message *message)
 		if (__spi_validate_bits_per_word(ctlr, xfer->bits_per_word))
 			return -EINVAL;
 
-		/* DDR mode is supported only if controller has dtr_caps=true.
-		 * default considered as SDR mode for SPI and QSPI controller.
-		 * Note: This is applicable only to QSPI controller.
+		/*
+		 * 只有控制器的 dtr_caps=true 时才支持 DDR 模式。
+		 * 默认把 SPI / QSPI 控制器视为 SDR 模式。
+		 * 注意：这里只适用于 QSPI 控制器。
 		 */
 		if (xfer->dtr_mode && !ctlr->dtr_caps)
 			return -EINVAL;
 
 		/*
-		 * SPI transfer length should be multiple of SPI word size
-		 * where SPI word size should be power-of-two multiple.
+		 * SPI transfer 长度必须是 SPI word size 的整数倍，
+		 * 而 SPI word size 本身应为 2 的幂倍数。
 		 */
 		w_size = spi_bpw_to_bytes(xfer->bits_per_word);
 
-		/* No partial transfers accepted */
+		/* 不接受部分传输。 */
 		if (xfer->len % w_size)
 			return -EINVAL;
 
@@ -4316,9 +4279,9 @@ static int __spi_validate(struct spi_device *spi, struct spi_message *message)
 		if (xfer->rx_buf && !xfer->rx_nbits)
 			xfer->rx_nbits = SPI_NBITS_SINGLE;
 		/*
-		 * Check transfer tx/rx_nbits:
-		 * 1. check the value matches one of single, dual and quad
-		 * 2. check tx/rx_nbits match the mode in spi_device
+		 * 检查 transfer 的 tx/rx_nbits：
+		 * 1. 值必须是 single / dual / quad / octal 之一
+		 * 2. tx/rx_nbits 必须与 spi_device 的 mode 匹配
 		 */
 		if (xfer->tx_buf) {
 			if (spi->mode & SPI_NO_TX)
@@ -4338,7 +4301,7 @@ static int __spi_validate(struct spi_device *spi, struct spi_message *message)
 				!(spi->mode & SPI_TX_OCTAL))
 				return -EINVAL;
 		}
-		/* Check transfer rx_nbits */
+		/* 检查 transfer 的 rx_nbits。 */
 		if (xfer->rx_buf) {
 			if (spi->mode & SPI_NO_RX)
 				return -EINVAL;
@@ -4361,7 +4324,7 @@ static int __spi_validate(struct spi_device *spi, struct spi_message *message)
 		if (_spi_xfer_word_delay_update(xfer, spi))
 			return -EINVAL;
 
-		/* Make sure controller supports required offload features. */
+		/* 确认控制器支持所需的 offload 特性。 */
 		if (xfer->offload_flags) {
 			if (!message->offload)
 				return -EINVAL;
@@ -4377,19 +4340,19 @@ static int __spi_validate(struct spi_device *spi, struct spi_message *message)
 }
 
 /*
- * spi_split_transfers - generic handling of transfer splitting
- * @msg: the message to split
+ * spi_split_transfers - 传输拆分的通用处理
+ * @msg: 需要拆分的消息
  *
- * Under certain conditions, a SPI controller may not support arbitrary
- * transfer sizes or other features required by a peripheral. This function
- * will split the transfers in the message into smaller transfers that are
- * supported by the controller.
+ * 在某些条件下，SPI 控制器可能不支持任意长度的 transfer，
+ * 或者不支持外设需要的某些特性。这个函数会把 message 里的 transfer
+ * 拆成控制器能支持的更小 transfer。
  *
- * Controllers with special requirements not covered here can also split
- * transfers in the optimize_message() callback.
+ * 这里没覆盖到的特殊控制器，也可以在 optimize_message() 回调里
+ * 自己做拆分。
  *
- * Context: can sleep
- * Return: zero on success, else a negative error code
+ * Context: 可以睡眠
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 static int spi_split_transfers(struct spi_message *msg)
 {
@@ -4398,11 +4361,10 @@ static int spi_split_transfers(struct spi_message *msg)
 	int ret;
 
 	/*
-	 * If an SPI controller does not support toggling the CS line on each
-	 * transfer (indicated by the SPI_CS_WORD flag) or we are using a GPIO
-	 * for the CS line, we can emulate the CS-per-word hardware function by
-	 * splitting transfers into one-word transfers and ensuring that
-	 * cs_change is set for each transfer.
+	 * 如果 SPI 控制器不支持每个 transfer 都切换 CS（SPI_CS_WORD），
+	 * 或者 CS 线是通过 GPIO 实现的，就可以把 transfer 拆成单 word
+	 * transfer，并确保每个 transfer 都设置 cs_change，来模拟
+	 * “每个 word 都切一次 CS”的硬件行为。
 	 */
 	if ((msg->spi->mode & SPI_CS_WORD) &&
 	    (!(ctlr->mode_bits & SPI_CS_WORD) || spi_is_csgpiod(msg->spi))) {
@@ -4411,7 +4373,7 @@ static int spi_split_transfers(struct spi_message *msg)
 			return ret;
 
 		list_for_each_entry(xfer, &msg->transfers, transfer_list) {
-			/* Don't change cs_change on the last entry in the list */
+			/* 不要修改链表最后一个元素的 cs_change。 */
 			if (list_is_last(&xfer->transfer_list, &msg->transfers))
 				break;
 
@@ -4428,17 +4390,18 @@ static int spi_split_transfers(struct spi_message *msg)
 }
 
 /*
- * __spi_optimize_message - shared implementation for spi_optimize_message()
- *                          and spi_maybe_optimize_message()
- * @spi: the device that will be used for the message
- * @msg: the message to optimize
+ * __spi_optimize_message - spi_optimize_message() 与
+ *                          spi_maybe_optimize_message() 的共享实现
+ * @spi: 这条消息将使用的设备
+ * @msg: 需要优化的消息
  *
- * Peripheral drivers will call spi_optimize_message() and the spi core will
- * call spi_maybe_optimize_message() instead of calling this directly.
+ * 外设驱动会调用 spi_optimize_message()，而 spi core 会调用
+ * spi_maybe_optimize_message()，不会直接调用这个内部函数。
  *
- * It is not valid to call this on a message that has already been optimized.
+ * 已经优化过的消息不能再调用这个函数。
  *
- * Return: zero on success, else a negative error code
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 static int __spi_optimize_message(struct spi_device *spi,
 				  struct spi_message *msg)
@@ -4468,10 +4431,12 @@ static int __spi_optimize_message(struct spi_device *spi,
 }
 
 /*
- * spi_maybe_optimize_message - optimize message if it isn't already pre-optimized
- * @spi: the device that will be used for the message
- * @msg: the message to optimize
- * Return: zero on success, else a negative error code
+ * spi_maybe_optimize_message - 如果消息还没预优化，就执行优化
+ * @spi: 这条消息将使用的设备
+ * @msg: 需要优化的消息
+ *
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 static int spi_maybe_optimize_message(struct spi_device *spi,
 				      struct spi_message *msg)
@@ -4488,32 +4453,28 @@ static int spi_maybe_optimize_message(struct spi_device *spi,
 }
 
 /**
- * spi_optimize_message - do any one-time validation and setup for a SPI message
- * @spi: the device that will be used for the message
- * @msg: the message to optimize
+ * spi_optimize_message - 对 SPI 消息做一次性校验和准备
+ * @spi: 这条消息将使用的设备
+ * @msg: 需要优化的消息
  *
- * Peripheral drivers that reuse the same message repeatedly may call this to
- * perform as much message prep as possible once, rather than repeating it each
- * time a message transfer is performed to improve throughput and reduce CPU
- * usage.
+ * 反复重用同一条消息的外设驱动可以调用这个接口，把尽量多的消息准备
+ * 工作一次性做完，而不是每次传输时都重复做，以提高吞吐并减少 CPU 开销。
  *
- * Once a message has been optimized, it cannot be modified with the exception
- * of updating the contents of any xfer->tx_buf (the pointer can't be changed,
- * only the data in the memory it points to).
+ * 一旦消息被优化，除了修改 xfer->tx_buf 指向的内存内容之外，
+ * 不能再修改消息本身（指针本身不能改）。
  *
- * Calls to this function must be balanced with calls to spi_unoptimize_message()
- * to avoid leaking resources.
+ * 调用该函数必须与 spi_unoptimize_message() 成对使用，避免资源泄漏。
  *
- * Context: can sleep
- * Return: zero on success, else a negative error code
+ * Context: 可以睡眠
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 int spi_optimize_message(struct spi_device *spi, struct spi_message *msg)
 {
 	int ret;
 
 	/*
-	 * Pre-optimization is not supported and optimization is deferred e.g.
-	 * when using spi-mux.
+	 * 不支持预优化；当使用 spi-mux 时，优化会被延后。
 	 */
 	if (spi->controller->defer_optimize_message)
 		return 0;
@@ -4523,10 +4484,9 @@ int spi_optimize_message(struct spi_device *spi, struct spi_message *msg)
 		return ret;
 
 	/*
-	 * This flag indicates that the peripheral driver called spi_optimize_message()
-	 * and therefore we shouldn't unoptimize message automatically when finalizing
-	 * the message but rather wait until spi_unoptimize_message() is called
-	 * by the peripheral driver.
+	 * 这个标志表示外设驱动调用过 spi_optimize_message()，
+	 * 因此在消息结束时不应自动反优化，而应该等驱动显式调用
+	 * spi_unoptimize_message()。
 	 */
 	msg->pre_optimized = true;
 
@@ -4535,12 +4495,12 @@ int spi_optimize_message(struct spi_device *spi, struct spi_message *msg)
 EXPORT_SYMBOL_GPL(spi_optimize_message);
 
 /**
- * spi_unoptimize_message - releases any resources allocated by spi_optimize_message()
- * @msg: the message to unoptimize
+ * spi_unoptimize_message - 释放 spi_optimize_message() 分配的资源
+ * @msg: 需要反优化的消息
  *
- * Calls to this function must be balanced with calls to spi_optimize_message().
+ * 调用该函数必须与 spi_optimize_message() 成对使用。
  *
- * Context: can sleep
+ * Context: 可以睡眠
  */
 void spi_unoptimize_message(struct spi_message *msg)
 {
@@ -4558,8 +4518,7 @@ static int __spi_async(struct spi_device *spi, struct spi_message *message)
 	struct spi_transfer *xfer;
 
 	/*
-	 * Some controllers do not support doing regular SPI transfers. Return
-	 * ENOTSUPP when this is the case.
+	 * 某些控制器不支持普通 SPI 传输。遇到这种情况返回 ENOTSUPP。
 	 */
 	if (!ctlr->transfer)
 		return -ENOTSUPP;
@@ -4585,14 +4544,15 @@ static void devm_spi_unoptimize_message(void *msg)
 }
 
 /**
- * devm_spi_optimize_message - managed version of spi_optimize_message()
- * @dev: the device that manages @msg (usually @spi->dev)
- * @spi: the device that will be used for the message
- * @msg: the message to optimize
- * Return: zero on success, else a negative error code
+ * devm_spi_optimize_message - spi_optimize_message() 的受管理版本
+ * @dev: 管理 @msg 的设备（通常是 @spi->dev）
+ * @spi: 这条消息将使用的设备
+ * @msg: 需要优化的消息
  *
- * spi_unoptimize_message() will automatically be called when the device is
- * removed.
+ * 设备移除时会自动调用 spi_unoptimize_message()。
+ *
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 int devm_spi_optimize_message(struct device *dev, struct spi_device *spi,
 			      struct spi_message *msg)
@@ -4608,35 +4568,32 @@ int devm_spi_optimize_message(struct device *dev, struct spi_device *spi,
 EXPORT_SYMBOL_GPL(devm_spi_optimize_message);
 
 /**
- * spi_async - asynchronous SPI transfer
- * @spi: device with which data will be exchanged
- * @message: describes the data transfers, including completion callback
- * Context: any (IRQs may be blocked, etc)
+ * spi_async - 异步 SPI 传输
+ * @spi: 交换数据所使用的设备
+ * @message: 描述数据传输的消息，包括完成回调
+ * Context: 任意上下文（可以在 IRQ 等不能睡眠的环境中调用）
  *
- * This call may be used in_irq and other contexts which can't sleep,
- * as well as from task contexts which can sleep.
+ * 这个接口既可以在 in_irq 以及其他不能睡眠的上下文中使用，
+ * 也可以在普通任务上下文中使用。
  *
- * The completion callback is invoked in a context which can't sleep.
- * Before that invocation, the value of message->status is undefined.
- * When the callback is issued, message->status holds either zero (to
- * indicate complete success) or a negative error code.  After that
- * callback returns, the driver which issued the transfer request may
- * deallocate the associated memory; it's no longer in use by any SPI
- * core or controller driver code.
+ * 完成回调会在不能睡眠的上下文中执行。
+ * 在回调执行之前，message->status 的值是不确定的。
+ * 回调触发时，message->status 要么是 0（表示完全成功），要么是负错误码。
+ * 回调返回后，提交传输请求的驱动可以释放相关内存；SPI core 和
+ * controller 驱动都不会再使用它。
  *
- * Note that although all messages to a spi_device are handled in
- * FIFO order, messages may go to different devices in other orders.
- * Some device might be higher priority, or have various "hard" access
- * time requirements, for example.
+ * 虽然同一个 spi_device 的消息会按 FIFO 顺序处理，但不同设备之间
+ * 的消息顺序不一定一样。例如某些设备可能优先级更高，或者有严格的
+ * 访问时序要求。
  *
- * On detection of any fault during the transfer, processing of
- * the entire message is aborted, and the device is deselected.
- * Until returning from the associated message completion callback,
- * no other spi_message queued to that device will be processed.
- * (This rule applies equally to all the synchronous transfer calls,
- * which are wrappers around this core asynchronous primitive.)
+ * 传输期间一旦检测到任何错误，整条 message 的处理都会被中止，并且
+ * 设备会被取消选择。
+ * 在关联的消息完成回调返回之前，排队到该设备的其它 spi_message 不会
+ * 被处理。
+ * 这一规则对所有同步传输接口同样适用，因为它们只是这个异步原语的封装。
  *
- * Return: zero on success, else a negative error code.
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 int spi_async(struct spi_device *spi, struct spi_message *message)
 {
@@ -4695,9 +4652,8 @@ static void __spi_transfer_message_noqueue(struct spi_controller *ctlr, struct s
 /*-------------------------------------------------------------------------*/
 
 /*
- * Utility methods for SPI protocol drivers, layered on
- * top of the core.  Some other utility methods are defined as
- * inline functions.
+ * SPI 协议驱动的辅助方法，建立在 core 之上。
+ * 其他一些辅助方法会以内联函数形式定义。
  */
 
 static void spi_complete(void *arg)
@@ -4725,10 +4681,9 @@ static int __spi_sync(struct spi_device *spi, struct spi_message *message)
 	SPI_STATISTICS_INCREMENT_FIELD(spi->pcpu_statistics, spi_sync);
 
 	/*
-	 * Checking queue_empty here only guarantees async/sync message
-	 * ordering when coming from the same context. It does not need to
-	 * guard against reentrancy from a different context. The io_mutex
-	 * will catch those cases.
+	 * 这里检查 queue_empty 只能保证来自同一上下文的 async/sync
+	 * 消息顺序一致。
+	 * 它不需要防止来自不同上下文的重入，那些情况会由 io_mutex 处理。
 	 */
 	if (READ_ONCE(ctlr->queue_empty) && !ctlr->must_async) {
 		message->actual_length = 0;
@@ -4745,10 +4700,8 @@ static int __spi_sync(struct spi_device *spi, struct spi_message *message)
 	}
 
 	/*
-	 * There are messages in the async queue that could have originated
-	 * from the same context, so we need to preserve ordering.
-	 * Therefor we send the message to the async queue and wait until they
-	 * are completed.
+	 * async 队列里可能有来自同一上下文的消息，所以必须保序。
+	 * 因此这里把消息送入 async 队列，然后等待它完成。
 	 */
 	message->complete = spi_complete;
 	message->context = &done;
@@ -4768,25 +4721,22 @@ static int __spi_sync(struct spi_device *spi, struct spi_message *message)
 }
 
 /**
- * spi_sync - blocking/synchronous SPI data transfers
- * @spi: device with which data will be exchanged
- * @message: describes the data transfers
- * Context: can sleep
+ * spi_sync - 阻塞式 / 同步 SPI 数据传输
+ * @spi: 交换数据所使用的设备
+ * @message: 描述数据传输的消息
+ * Context: 可以睡眠
  *
- * This call may only be used from a context that may sleep.  The sleep
- * is non-interruptible, and has no timeout.  Low-overhead controller
- * drivers may DMA directly into and out of the message buffers.
+ * 这个接口只能在可以睡眠的上下文中使用。这里的睡眠不可中断，也没有
+ * 超时。低开销的控制器驱动可以直接 DMA 到 message buffer 中。
  *
- * Note that the SPI device's chip select is active during the message,
- * and then is normally disabled between messages.  Drivers for some
- * frequently-used devices may want to minimize costs of selecting a chip,
- * by leaving it selected in anticipation that the next message will go
- * to the same chip.  (That may increase power usage.)
+ * 注意，SPI 设备在 message 期间会保持片选有效，通常在两条消息之间才
+ * 解除片选。某些高频使用的设备驱动可能希望尽量减少选片成本，
+ * 因而会在预期下一条消息仍然发给同一芯片时保持片选，但这可能增加功耗。
  *
- * Also, the caller is guaranteeing that the memory associated with the
- * message will not be freed before this call returns.
+ * 此外，调用者需要保证和 message 关联的内存不会在本调用返回前被释放。
  *
- * Return: zero on success, else a negative error code.
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 int spi_sync(struct spi_device *spi, struct spi_message *message)
 {
@@ -4801,20 +4751,19 @@ int spi_sync(struct spi_device *spi, struct spi_message *message)
 EXPORT_SYMBOL_GPL(spi_sync);
 
 /**
- * spi_sync_locked - version of spi_sync with exclusive bus usage
- * @spi: device with which data will be exchanged
- * @message: describes the data transfers
- * Context: can sleep
+ * spi_sync_locked - 带独占总线使用的 spi_sync 版本
+ * @spi: 交换数据所使用的设备
+ * @message: 描述数据传输的消息
+ * Context: 可以睡眠
  *
- * This call may only be used from a context that may sleep.  The sleep
- * is non-interruptible, and has no timeout.  Low-overhead controller
- * drivers may DMA directly into and out of the message buffers.
+ * 这个接口只能在可以睡眠的上下文中使用。这里的睡眠不可中断，也没有
+ * 超时。低开销的控制器驱动可以直接 DMA 到 message buffer 中。
  *
- * This call should be used by drivers that require exclusive access to the
- * SPI bus. It has to be preceded by a spi_bus_lock call. The SPI bus must
- * be released by a spi_bus_unlock call when the exclusive access is over.
+ * 这个接口适合需要独占 SPI 总线的驱动使用。它必须先调用 spi_bus_lock()，
+ * 独占访问结束后必须调用 spi_bus_unlock() 释放总线。
  *
- * Return: zero on success, else a negative error code.
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 int spi_sync_locked(struct spi_device *spi, struct spi_message *message)
 {
@@ -4823,19 +4772,19 @@ int spi_sync_locked(struct spi_device *spi, struct spi_message *message)
 EXPORT_SYMBOL_GPL(spi_sync_locked);
 
 /**
- * spi_bus_lock - obtain a lock for exclusive SPI bus usage
- * @ctlr: SPI bus controller that should be locked for exclusive bus access
- * Context: can sleep
+ * spi_bus_lock - 获取 SPI 总线独占锁
+ * @ctlr: 需要被锁定以供独占访问的 SPI 总线控制器
+ * Context: 可以睡眠
  *
- * This call may only be used from a context that may sleep.  The sleep
- * is non-interruptible, and has no timeout.
+ * 这个接口只能在可以睡眠的上下文中使用。这里的睡眠不可中断，也没有
+ * 超时。
  *
- * This call should be used by drivers that require exclusive access to the
- * SPI bus. The SPI bus must be released by a spi_bus_unlock call when the
- * exclusive access is over. Data transfer must be done by spi_sync_locked
- * and spi_async_locked calls when the SPI bus lock is held.
+ * 需要独占访问 SPI 总线的驱动应该使用这个接口。独占访问结束后必须
+ * 调用 spi_bus_unlock() 释放。持有 SPI 总线锁时，数据传输必须通过
+ * spi_sync_locked() 和 spi_async_locked() 完成。
  *
- * Return: always zero.
+ * 返回：
+ * 始终返回 0。
  */
 int spi_bus_lock(struct spi_controller *ctlr)
 {
@@ -4847,24 +4796,24 @@ int spi_bus_lock(struct spi_controller *ctlr)
 	ctlr->bus_lock_flag = 1;
 	spin_unlock_irqrestore(&ctlr->bus_lock_spinlock, flags);
 
-	/* Mutex remains locked until spi_bus_unlock() is called */
+	/* 这个 mutex 会一直保持锁定，直到调用 spi_bus_unlock()。 */
 
 	return 0;
 }
 EXPORT_SYMBOL_GPL(spi_bus_lock);
 
 /**
- * spi_bus_unlock - release the lock for exclusive SPI bus usage
- * @ctlr: SPI bus controller that was locked for exclusive bus access
- * Context: can sleep
+ * spi_bus_unlock - 释放 SPI 总线独占锁
+ * @ctlr: 之前被独占锁锁定的 SPI 总线控制器
+ * Context: 可以睡眠
  *
- * This call may only be used from a context that may sleep.  The sleep
- * is non-interruptible, and has no timeout.
+ * 这个接口只能在可以睡眠的上下文中使用。这里的睡眠不可中断，也没有
+ * 超时。
  *
- * This call releases an SPI bus lock previously obtained by an spi_bus_lock
- * call.
+ * 该接口释放之前通过 spi_bus_lock() 获取的 SPI 总线锁。
  *
- * Return: always zero.
+ * 返回：
+ * 始终返回 0。
  */
 int spi_bus_unlock(struct spi_controller *ctlr)
 {
@@ -4876,30 +4825,30 @@ int spi_bus_unlock(struct spi_controller *ctlr)
 }
 EXPORT_SYMBOL_GPL(spi_bus_unlock);
 
-/* Portable code must never pass more than 32 bytes */
+/* 可移植代码传输时不要超过 32 字节。 */
 #define	SPI_BUFSIZ	max(32, SMP_CACHE_BYTES)
 
 static u8	*buf;
 
 /**
- * spi_write_then_read - SPI synchronous write followed by read
- * @spi: device with which data will be exchanged
- * @txbuf: data to be written (need not be DMA-safe)
- * @n_tx: size of txbuf, in bytes
- * @rxbuf: buffer into which data will be read (need not be DMA-safe)
- * @n_rx: size of rxbuf, in bytes
- * Context: can sleep
+ * spi_write_then_read - SPI 同步写后读
+ * @spi: 交换数据所使用的设备
+ * @txbuf: 要写出的数据（不要求 DMA-safe）
+ * @n_tx: txbuf 的字节数
+ * @rxbuf: 用于读取数据的缓冲区（不要求 DMA-safe）
+ * @n_rx: rxbuf 的字节数
+ * Context: 可以睡眠
  *
- * This performs a half duplex MicroWire style transaction with the
- * device, sending txbuf and then reading rxbuf.  The return value
- * is zero for success, else a negative errno status code.
- * This call may only be used from a context that may sleep.
+ * 该接口对设备执行一次半双工 MicroWire 风格的事务：先发送 txbuf，
+ * 再读取 rxbuf。返回值成功时为 0，否则为负 errno。
+ * 这个接口只能在可以睡眠的上下文中使用。
  *
- * Parameters to this routine are always copied using a small buffer.
- * Performance-sensitive or bulk transfer code should instead use
- * spi_{async,sync}() calls with DMA-safe buffers.
+ * 这个接口的参数总是通过一个小缓冲区拷贝完成。
+ * 对性能敏感或大批量传输的代码应改用 spi_{async,sync}() 并配合
+ * DMA-safe buffer。
  *
- * Return: zero on success, else a negative error code.
+ * 返回：
+ * 成功返回 0，否则返回负错误码。
  */
 int spi_write_then_read(struct spi_device *spi,
 		const void *txbuf, unsigned n_tx,
@@ -4913,10 +4862,9 @@ int spi_write_then_read(struct spi_device *spi,
 	u8			*local_buf;
 
 	/*
-	 * Use preallocated DMA-safe buffer if we can. We can't avoid
-	 * copying here, (as a pure convenience thing), but we can
-	 * keep heap costs out of the hot path unless someone else is
-	 * using the pre-allocated buffer or the transfer is too large.
+	 * 如果可以，就使用预分配的 DMA-safe 缓冲区。
+	 * 这里无法避免拷贝（这是为了方便），但可以把堆分配成本挡在热路径之外，
+	 * 除非别的调用正在占用这个预分配缓冲区，或者传输长度太大。
 	 */
 	if ((n_tx + n_rx) > SPI_BUFSIZ || !mutex_trylock(&lock)) {
 		local_buf = kmalloc(max((unsigned)SPI_BUFSIZ, n_tx + n_rx),
@@ -4942,7 +4890,7 @@ int spi_write_then_read(struct spi_device *spi,
 	x[0].tx_buf = local_buf;
 	x[1].rx_buf = local_buf + n_tx;
 
-	/* Do the I/O */
+	/* 执行 I/O。 */
 	status = spi_sync(spi, &message);
 	if (status == 0)
 		memcpy(rxbuf, x[1].rx_buf, n_rx);
@@ -4959,7 +4907,7 @@ EXPORT_SYMBOL_GPL(spi_write_then_read);
 /*-------------------------------------------------------------------------*/
 
 #if IS_ENABLED(CONFIG_OF)
-/* The spi controllers are not using spi_bus, so we find it with another way */
+/* SPI 控制器不使用 spi_bus，因此这里要通过别的方式查找。 */
 struct spi_controller *of_find_spi_controller_by_node(struct device_node *node)
 {
 	struct device *dev;
@@ -4970,14 +4918,14 @@ struct spi_controller *of_find_spi_controller_by_node(struct device_node *node)
 	if (!dev)
 		return NULL;
 
-	/* Reference got in class_find_device */
+	/* class_find_device() 已经帮我们拿到了一次引用。 */
 	return container_of(dev, struct spi_controller, dev);
 }
 EXPORT_SYMBOL_GPL(of_find_spi_controller_by_node);
 #endif
 
 #if IS_ENABLED(CONFIG_OF_DYNAMIC)
-/* Must call put_device() when done with returned spi_device device */
+/* 用完返回的 spi_device 后必须调用 put_device()。 */
 static struct spi_device *of_find_spi_device_by_node(struct device_node *node)
 {
 	struct device *dev = bus_find_device_by_of_node(&spi_bus_type, node);
@@ -5004,8 +4952,8 @@ static int of_spi_notify(struct notifier_block *nb, unsigned long action,
 		}
 
 		/*
-		 * Clear the flag before adding the device so that fw_devlink
-		 * doesn't skip adding consumers to this device.
+		 * 在添加设备之前先清除该标志，这样 fw_devlink 就不会跳过
+		 * 为该设备添加消费者。
 		 */
 		fwnode_clear_flag(&rd->dn->fwnode, FWNODE_FLAG_NOT_DEVICE);
 		spi = of_register_spi_device(ctlr, rd->dn);
@@ -5020,19 +4968,19 @@ static int of_spi_notify(struct notifier_block *nb, unsigned long action,
 		break;
 
 	case OF_RECONFIG_CHANGE_REMOVE:
-		/* Already depopulated? */
+		/* 已经完成 depopulate 了吗？ */
 		if (!of_node_check_flag(rd->dn, OF_POPULATED))
 			return NOTIFY_OK;
 
-		/* Find our device by node */
+		/* 通过节点找到对应设备。 */
 		spi = of_find_spi_device_by_node(rd->dn);
 		if (spi == NULL)
 			return NOTIFY_OK;	/* No? not meant for us */
 
-		/* Unregister takes one ref away */
+		/* unregister 会减少一个引用计数。 */
 		spi_unregister_device(spi);
 
-		/* And put the reference of the find */
+		/* 然后释放查找时拿到的引用。 */
 		put_device(&spi->dev);
 		break;
 	}
@@ -5159,11 +5107,11 @@ err0:
 }
 
 /*
- * A board_info is normally registered in arch_initcall(),
- * but even essential drivers wait till later.
+ * board_info 通常在 arch_initcall() 期间注册，
+ * 但即使是关键驱动也可能要等到更晚才初始化。
  *
- * REVISIT only boardinfo really needs static linking. The rest (device and
- * driver registration) _could_ be dynamically linked (modular) ... Costs
- * include needing to have boardinfo data structures be much more public.
+ * 这里值得重新考虑的是：真正需要静态链接的可能只有 boardinfo。
+ * 其余部分（设备和驱动注册）其实可以动态链接（模块化）……
+ * 代价是需要让 boardinfo 数据结构暴露得更多。
  */
 postcore_initcall(spi_init);

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Simple synchronous userspace interface to SPI devices
+ * 面向 SPI 设备的简单同步用户态接口
  *
  * Copyright (C) 2006 SWAPP
  *	Andrea Paterniani <a.paterniani@swapp-eng.it>
@@ -28,17 +28,16 @@
 
 
 /*
- * This supports access to SPI devices using normal userspace I/O calls.
- * Note that while traditional UNIX/POSIX I/O semantics are half duplex,
- * and often mask message boundaries, full SPI support requires full duplex
- * transfers.  There are several kinds of internal message boundaries to
- * handle chipselect management and other protocol options.
+ * 这个驱动通过普通的用户态 I/O 调用来访问 SPI 设备。
+ * 需要注意的是，传统 UNIX/POSIX I/O 语义通常偏向半双工，
+ * 而且常常会掩盖消息边界；但完整的 SPI 访问往往需要全双工
+ * 传输。为此，驱动内部要显式处理消息边界、片选切换以及
+ * 其它协议选项。
  *
- * SPI has a character major number assigned.  We allocate minor numbers
- * dynamically using a bitmask.  You must use hotplug tools, such as udev
- * (or mdev with busybox) to create and destroy the /dev/spidevB.C device
- * nodes, since there is no fixed association of minor numbers with any
- * particular SPI bus or device.
+ * SPI 已经分配了字符设备主设备号。这里通过位图动态分配
+ * 次设备号。由于次设备号与具体的 SPI 总线或设备没有固定
+ * 对应关系，因此必须依赖 udev 或 mdev 这类热插拔工具来
+ * 创建和删除 /dev/spidevB.C 节点。
  */
 #define SPIDEV_MAJOR			153	/* assigned */
 #define N_SPI_MINORS			32	/* ... up to 256 */
@@ -47,17 +46,15 @@ static DECLARE_BITMAP(minors, N_SPI_MINORS);
 
 static_assert(N_SPI_MINORS > 0 && N_SPI_MINORS <= 256);
 
-/* Bit masks for spi_device.mode management.  Note that incorrect
- * settings for some settings can cause *lots* of trouble for other
- * devices on a shared bus:
+/* spi_device.mode 的位掩码。错误的设置会给共享总线上的其他设备
+ * 带来很大麻烦：
  *
- *  - CS_HIGH ... this device will be active when it shouldn't be
- *  - 3WIRE ... when active, it won't behave as it should
- *  - NO_CS ... there will be no explicit message boundaries; this
- *	is completely incompatible with the shared bus model
- *  - READY ... transfers may proceed when they shouldn't.
+ *  - CS_HIGH ... 设备会在不该激活时被激活
+ *  - 3WIRE ... 设备激活时不会按预期工作
+ *  - NO_CS ... 没有明确的消息边界；这与共享总线模型完全冲突
+ *  - READY ... 传输可能在不该继续时继续
  *
- * REVISIT should changing those flags be privileged?
+ * 是否应该把这些标志的修改限制为特权操作，仍然值得重新评估。
  */
 #define SPI_MODE_MASK		(SPI_MODE_X_MASK | SPI_CS_HIGH \
 				| SPI_LSB_FIRST | SPI_3WIRE | SPI_LOOP \
@@ -73,7 +70,7 @@ struct spidev_data {
 	struct spi_device	*spi;
 	struct list_head	device_entry;
 
-	/* TX/RX buffers are NULL unless this device is open (users > 0) */
+	/* 除非设备已打开（users > 0），否则 TX/RX 缓冲区保持为 NULL。 */
 	unsigned		users;
 	u8			*tx_buffer;
 	u8			*rx_buffer;
@@ -135,14 +132,14 @@ spidev_sync_read(struct spidev_data *spidev, size_t len)
 
 /*-------------------------------------------------------------------------*/
 
-/* Read-only message with current device setup */
+/* 基于当前设备配置执行只读消息。 */
 static ssize_t
 spidev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
 {
 	struct spidev_data	*spidev;
 	ssize_t			status = -ESHUTDOWN;
 
-	/* chipselect only toggles at start or end of operation */
+	/* 片选只在操作开始或结束时翻转。 */
 	if (count > bufsiz)
 		return -EMSGSIZE;
 
@@ -170,7 +167,7 @@ err_spi_removed:
 	return status;
 }
 
-/* Write-only message with current device setup */
+/* 基于当前设备配置执行只写消息。 */
 static ssize_t
 spidev_write(struct file *filp, const char __user *buf,
 		size_t count, loff_t *f_pos)
@@ -179,7 +176,7 @@ spidev_write(struct file *filp, const char __user *buf,
 	ssize_t			status = -ESHUTDOWN;
 	unsigned long		missing;
 
-	/* chipselect only toggles at start or end of operation */
+	/* 片选只在操作开始或结束时翻转。 */
 	if (count > bufsiz)
 		return -EMSGSIZE;
 
@@ -218,9 +215,9 @@ static int spidev_message(struct spidev_data *spidev,
 	if (k_xfers == NULL)
 		return -ENOMEM;
 
-	/* Construct spi_message, copying any tx data to bounce buffer.
-	 * We walk the array of user-provided transfers, using each one
-	 * to initialize a kernel version of the same transfer.
+	/* 构造 spi_message，并把所有发送数据复制到 bounce buffer。
+	 * 我们遍历用户提供的 transfer 数组，为每一项生成对应的
+	 * 内核态 transfer 结构。
 	 */
 	tx_buf = spidev->tx_buffer;
 	rx_buf = spidev->rx_buffer;
@@ -230,18 +227,15 @@ static int spidev_message(struct spidev_data *spidev,
 	for (n = n_xfers, k_tmp = k_xfers, u_tmp = u_xfers;
 			n;
 			n--, k_tmp++, u_tmp++) {
-		/* Ensure that also following allocations from rx_buf/tx_buf will meet
-		 * DMA alignment requirements.
-		 */
+		/* 确保后续从 rx_buf/tx_buf 继续分配时也满足 DMA 对齐要求。 */
 		unsigned int len_aligned = ALIGN(u_tmp->len, ARCH_DMA_MINALIGN);
 
 		k_tmp->len = u_tmp->len;
 
 		total += k_tmp->len;
-		/* Since the function returns the total length of transfers
-		 * on success, restrict the total to positive int values to
-		 * avoid the return value looking like an error.  Also check
-		 * each transfer length to avoid arithmetic overflow.
+		/* 由于函数成功时返回总传输长度，因此必须把总长度限制在
+		 * 正的 int 范围内，避免返回值看起来像错误码。同时还要检查
+		 * 每个 transfer 的长度，防止算术溢出。
 		 */
 		if (total > INT_MAX || k_tmp->len > INT_MAX) {
 			status = -EMSGSIZE;
@@ -249,7 +243,7 @@ static int spidev_message(struct spidev_data *spidev,
 		}
 
 		if (u_tmp->rx_buf) {
-			/* this transfer needs space in RX bounce buffer */
+			/* 这个 transfer 需要 RX bounce buffer 空间。 */
 			rx_total += len_aligned;
 			if (rx_total > bufsiz) {
 				status = -EMSGSIZE;
@@ -259,7 +253,7 @@ static int spidev_message(struct spidev_data *spidev,
 			rx_buf += len_aligned;
 		}
 		if (u_tmp->tx_buf) {
-			/* this transfer needs space in TX bounce buffer */
+			/* 这个 transfer 需要 TX bounce buffer 空间。 */
 			tx_total += len_aligned;
 			if (tx_total > bufsiz) {
 				status = -EMSGSIZE;
@@ -303,7 +297,7 @@ static int spidev_message(struct spidev_data *spidev,
 	if (status < 0)
 		goto done;
 
-	/* copy any rx data out of bounce buffer */
+	/* 将收到的数据从 bounce buffer 拷贝出去。 */
 	for (n = n_xfers, k_tmp = k_xfers, u_tmp = u_xfers;
 			n;
 			n--, k_tmp++, u_tmp++) {
@@ -329,7 +323,7 @@ spidev_get_ioc_message(unsigned int cmd, struct spi_ioc_transfer __user *u_ioc,
 {
 	u32	tmp;
 
-	/* Check type, command number and direction */
+	/* 检查类型、命令号和方向。 */
 	if (_IOC_TYPE(cmd) != SPI_IOC_MAGIC
 			|| _IOC_NR(cmd) != _IOC_NR(SPI_IOC_MESSAGE(0))
 			|| _IOC_DIR(cmd) != _IOC_WRITE)
@@ -342,7 +336,7 @@ spidev_get_ioc_message(unsigned int cmd, struct spi_ioc_transfer __user *u_ioc,
 	if (*n_ioc == 0)
 		return NULL;
 
-	/* copy into scratch area */
+	/* 拷贝到临时缓冲区。 */
 	return memdup_user(u_ioc, tmp);
 }
 
@@ -357,13 +351,11 @@ spidev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	unsigned		n_ioc;
 	struct spi_ioc_transfer	*ioc;
 
-	/* Check type and command number */
+	/* 检查类型和命令号。 */
 	if (_IOC_TYPE(cmd) != SPI_IOC_MAGIC)
 		return -ENOTTY;
 
-	/* guard against device removal before, or while,
-	 * we issue this ioctl.
-	 */
+	/* 防止在执行 ioctl 之前或执行期间设备被移除。 */
 	spidev = filp->private_data;
 	mutex_lock(&spidev->spi_lock);
 	spi = spi_dev_get(spidev->spi);
@@ -375,7 +367,7 @@ spidev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	ctlr = spi->controller;
 
 	switch (cmd) {
-	/* read requests */
+	/* 读请求。 */
 	case SPI_IOC_RD_MODE:
 	case SPI_IOC_RD_MODE32:
 		tmp = spi->mode & SPI_MODE_MASK;
@@ -399,7 +391,7 @@ spidev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		retval = put_user(spidev->speed_hz, (__u32 __user *)arg);
 		break;
 
-	/* write requests */
+	/* 写请求。 */
 	case SPI_IOC_WR_MODE:
 	case SPI_IOC_WR_MODE32:
 		if (cmd == SPI_IOC_WR_MODE)
@@ -480,8 +472,8 @@ spidev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	}
 	default:
-		/* segmented and/or full-duplex I/O request */
-		/* Check message and copy into scratch area */
+		/* 分段和/或全双工 I/O 请求。 */
+		/* 检查消息并拷贝到临时缓冲区。 */
 		ioc = spidev_get_ioc_message(cmd,
 				(struct spi_ioc_transfer __user *)arg, &n_ioc);
 		if (IS_ERR(ioc)) {
@@ -491,7 +483,7 @@ spidev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (!ioc)
 			break;	/* n_ioc is also 0 */
 
-		/* translate to spi_message, execute */
+		/* 转换为 spi_message 并执行。 */
 		retval = spidev_message(spidev, ioc, n_ioc);
 		kfree(ioc);
 		break;
@@ -516,9 +508,7 @@ spidev_compat_ioc_message(struct file *filp, unsigned int cmd,
 
 	u_ioc = (struct spi_ioc_transfer __user *) compat_ptr(arg);
 
-	/* guard against device removal before, or while,
-	 * we issue this ioctl.
-	 */
+	/* 防止在执行 ioctl 之前或执行期间设备被移除。 */
 	spidev = filp->private_data;
 	mutex_lock(&spidev->spi_lock);
 	spi = spi_dev_get(spidev->spi);
@@ -527,7 +517,7 @@ spidev_compat_ioc_message(struct file *filp, unsigned int cmd,
 		return -ESHUTDOWN;
 	}
 
-	/* Check message and copy into scratch area */
+	/* 检查消息并拷贝到临时缓冲区。 */
 	ioc = spidev_get_ioc_message(cmd, u_ioc, &n_ioc);
 	if (IS_ERR(ioc)) {
 		retval = PTR_ERR(ioc);
@@ -536,13 +526,13 @@ spidev_compat_ioc_message(struct file *filp, unsigned int cmd,
 	if (!ioc)
 		goto done;	/* n_ioc is also 0 */
 
-	/* Convert buffer pointers */
+	/* 转换缓冲区指针。 */
 	for (n = 0; n < n_ioc; n++) {
 		ioc[n].rx_buf = (uintptr_t) compat_ptr(ioc[n].rx_buf);
 		ioc[n].tx_buf = (uintptr_t) compat_ptr(ioc[n].tx_buf);
 	}
 
-	/* translate to spi_message, execute */
+	/* 转换为 spi_message 并执行。 */
 	retval = spidev_message(spidev, ioc, n_ioc);
 	kfree(ioc);
 
@@ -627,11 +617,11 @@ static int spidev_release(struct inode *inode, struct file *filp)
 	filp->private_data = NULL;
 
 	mutex_lock(&spidev->spi_lock);
-	/* ... after we unbound from the underlying device? */
+	/* ... 在我们从底层设备解绑之后？ */
 	dofree = (spidev->spi == NULL);
 	mutex_unlock(&spidev->spi_lock);
 
-	/* last close? */
+	/* 最后一次关闭？ */
 	spidev->users--;
 	if (!spidev->users) {
 
@@ -657,9 +647,8 @@ static int spidev_release(struct inode *inode, struct file *filp)
 
 static const struct file_operations spidev_fops = {
 	.owner =	THIS_MODULE,
-	/* REVISIT switch to aio primitives, so that userspace
-	 * gets more complete API coverage.  It'll simplify things
-	 * too, except for the locking.
+	/* 仍需考虑切换到 AIO 原语，这样用户态能获得更完整的 API 覆盖；
+	 * 除了锁处理之外，整体实现也会更简洁。
 	 */
 	.write =	spidev_write,
 	.read =		spidev_read,
@@ -671,9 +660,8 @@ static const struct file_operations spidev_fops = {
 
 /*-------------------------------------------------------------------------*/
 
-/* The main reason to have this class is to make mdev/udev create the
- * /dev/spidevB.C character device nodes exposing our userspace API.
- * It also simplifies memory management.
+/* 这个 class 的主要作用是让 mdev/udev 创建 /dev/spidevB.C 字符设备，
+ * 以暴露用户态 API。同时它也简化了内存管理。
  */
 
 static const struct class spidev_class = {
@@ -681,8 +669,8 @@ static const struct class spidev_class = {
 };
 
 /*
- * The spi device ids are expected to match the device names of the
- * spidev_dt_ids array below. Both arrays are kept in the same ordering.
+ * 这里的 spi device id 需要与下面 spidev_dt_ids 数组里的设备名对应，
+ * 并且两个数组的顺序必须保持一致。
  */
 static const struct spi_device_id spidev_spi_ids[] = {
 	{ .name = /* abb */ "spi-sensor" },
@@ -706,8 +694,8 @@ static const struct spi_device_id spidev_spi_ids[] = {
 MODULE_DEVICE_TABLE(spi, spidev_spi_ids);
 
 /*
- * spidev should never be referenced in DT without a specific compatible string,
- * it is a Linux implementation thing rather than a description of the hardware.
+ * 在设备树里不应该直接引用 spidev，除非有明确的 compatible 字符串。
+ * 因为它是 Linux 的实现细节，而不是硬件本身的描述。
  */
 static int spidev_of_check(struct device *dev)
 {
@@ -739,7 +727,7 @@ static const struct of_device_id spidev_dt_ids[] = {
 };
 MODULE_DEVICE_TABLE(of, spidev_dt_ids);
 
-/* Dummy SPI devices not to be used in production systems */
+/* 这些只是演示/调试用的 SPI 设备，不应用于生产系统。 */
 static int spidev_acpi_check(struct device *dev)
 {
 	dev_warn(dev, "do not use this driver in production systems!\n");
@@ -748,10 +736,9 @@ static int spidev_acpi_check(struct device *dev)
 
 static const struct acpi_device_id spidev_acpi_ids[] = {
 	/*
-	 * The ACPI SPT000* devices are only meant for development and
-	 * testing. Systems used in production should have a proper ACPI
-	 * description of the connected peripheral and they should also use
-	 * a proper driver instead of poking directly to the SPI bus.
+	 * ACPI 的 SPT000* 设备仅用于开发和测试。
+	 * 生产系统应该为外设提供完整的 ACPI 描述，并使用正式驱动，
+	 * 而不是直接去操作 SPI 总线。
 	 */
 	{ "SPT0001", (kernel_ulong_t)&spidev_acpi_check },
 	{ "SPT0002", (kernel_ulong_t)&spidev_acpi_check },
@@ -776,19 +763,19 @@ static int spidev_probe(struct spi_device *spi)
 			return status;
 	}
 
-	/* Allocate driver data */
+	/* 分配驱动私有数据。 */
 	spidev = kzalloc_obj(*spidev);
 	if (!spidev)
 		return -ENOMEM;
 
-	/* Initialize the driver data */
+	/* 初始化驱动数据。 */
 	spidev->spi = spi;
 	mutex_init(&spidev->spi_lock);
 
 	INIT_LIST_HEAD(&spidev->device_entry);
 
-	/* If we can allocate a minor number, hook up this device.
-	 * Reusing minors is fine so long as udev or mdev is working.
+	/* 如果能分配到次设备号，就把该设备挂上去。
+	 * 只要 udev 或 mdev 正常工作，复用次设备号是没问题的。
 	 */
 	mutex_lock(&device_list_lock);
 	minor = find_first_zero_bit(minors, N_SPI_MINORS);
@@ -824,9 +811,9 @@ static void spidev_remove(struct spi_device *spi)
 {
 	struct spidev_data	*spidev = spi_get_drvdata(spi);
 
-	/* prevent new opens */
+	/* 阻止新的打开。 */
 	mutex_lock(&device_list_lock);
-	/* make sure ops on existing fds can abort cleanly */
+	/* 确保现有文件描述符上的操作能够干净地中止。 */
 	mutex_lock(&spidev->spi_lock);
 	spidev->spi = NULL;
 	mutex_unlock(&spidev->spi_lock);
@@ -849,10 +836,9 @@ static struct spi_driver spidev_spi_driver = {
 	.remove =	spidev_remove,
 	.id_table =	spidev_spi_ids,
 
-	/* NOTE:  suspend/resume methods are not necessary here.
-	 * We don't do anything except pass the requests to/from
-	 * the underlying controller.  The refrigerator handles
-	 * most issues; the controller driver handles the rest.
+	/* 注意：这里不需要 suspend/resume 方法。
+	 * 我们只是把请求转发给/转回底层控制器，本身并不做额外处理。
+	 * 大部分挂起/恢复问题由 refrigerator 处理，其余由控制器驱动处理。
 	 */
 };
 
@@ -862,9 +848,8 @@ static int __init spidev_init(void)
 {
 	int status;
 
-	/* Claim our 256 reserved device numbers.  Then register a class
-	 * that will key udev/mdev to add/remove /dev nodes.  Last, register
-	 * the driver which manages those device numbers.
+	/* 先申请保留的 256 个设备号，再注册 class 以便 udev/mdev
+	 * 增删 /dev 节点，最后注册管理这些设备号的驱动。
 	 */
 	status = register_chrdev(SPIDEV_MAJOR, "spi", &spidev_fops);
 	if (status < 0)

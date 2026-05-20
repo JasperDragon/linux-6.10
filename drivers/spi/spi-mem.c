@@ -20,21 +20,19 @@
 #define SPI_MEM_MAX_BUSWIDTH		8
 
 /**
- * spi_controller_dma_map_mem_op_data() - DMA-map the buffer attached to a
- *					  memory operation
- * @ctlr: the SPI controller requesting this dma_map()
- * @op: the memory operation containing the buffer to map
- * @sgt: a pointer to a non-initialized sg_table that will be filled by this
- *	 function
+ * spi_controller_dma_map_mem_op_data() - 为 memory operation 关联的缓冲区做 DMA 映射
+ * @ctlr: 请求执行 dma_map() 的 SPI 控制器
+ * @op: 包含待映射缓冲区的 memory operation
+ * @sgt: 一个尚未初始化的 sg_table 指针，本函数会把它填好
  *
- * Some controllers might want to do DMA on the data buffer embedded in @op.
- * This helper prepares everything for you and provides a ready-to-use
- * sg_table. This function is not intended to be called from spi drivers.
- * Only SPI controller drivers should use it.
- * Note that the caller must ensure the memory region pointed by
- * op->data.buf.{in,out} is DMA-able before calling this function.
+ * 某些控制器希望直接对 @op 里嵌入的数据缓冲区做 DMA。
+ * 这个 helper 会把相关准备工作都做好，并提供可直接使用的
+ * sg_table。它不应该由普通 SPI 协议驱动调用，只应由 SPI
+ * 控制器驱动使用。
+ * 需要注意的是，调用前必须确保 op->data.buf.{in,out} 指向的
+ * 内存区域可以被 DMA 访问。
  *
- * Return: 0 in case of success, a negative error code otherwise.
+ * Return: 成功返回 0，否则返回负错误码。
  */
 int spi_controller_dma_map_mem_op_data(struct spi_controller *ctlr,
 				       const struct spi_mem_op *op,
@@ -62,25 +60,21 @@ int spi_controller_dma_map_mem_op_data(struct spi_controller *ctlr,
 EXPORT_SYMBOL_GPL(spi_controller_dma_map_mem_op_data);
 
 /**
- * spi_controller_dma_unmap_mem_op_data() - DMA-unmap the buffer attached to a
- *					    memory operation
- * @ctlr: the SPI controller requesting this dma_unmap()
- * @op: the memory operation containing the buffer to unmap
- * @sgt: a pointer to an sg_table previously initialized by
- *	 spi_controller_dma_map_mem_op_data()
+ * spi_controller_dma_unmap_mem_op_data() - 取消 memory operation 关联缓冲区的 DMA 映射
+ * @ctlr: 请求执行 dma_unmap() 的 SPI 控制器
+ * @op: 包含待取消映射缓冲区的 memory operation
+ * @sgt: 之前由 spi_controller_dma_map_mem_op_data() 初始化过的 sg_table 指针
  *
- * Some controllers might want to do DMA on the data buffer embedded in @op.
- * This helper prepares things so that the CPU can access the
- * op->data.buf.{in,out} buffer again.
+ * 某些控制器会对 @op 中嵌入的数据缓冲区做 DMA。
+ * 这个 helper 会把映射收回，以便 CPU 能再次访问
+ * op->data.buf.{in,out} 缓冲区。
  *
- * This function is not intended to be called from SPI drivers. Only SPI
- * controller drivers should use it.
+ * 它不应由普通 SPI 协议驱动调用，只应由 SPI 控制器驱动使用。
  *
- * This function should be called after the DMA operation has finished and is
- * only valid if the previous spi_controller_dma_map_mem_op_data() call
- * returned 0.
+ * 该函数必须在 DMA 操作完成后调用，并且只有在之前
+ * spi_controller_dma_map_mem_op_data() 成功返回 0 时才有效。
  *
- * Return: 0 in case of success, a negative error code otherwise.
+ * Return: 成功返回 0，否则返回负错误码。
  */
 void spi_controller_dma_unmap_mem_op_data(struct spi_controller *ctlr,
 					  const struct spi_mem_op *op,
@@ -178,7 +172,7 @@ bool spi_mem_default_supports_op(struct spi_mem *mem,
 		if (op->data.swap16 && !spi_mem_controller_is_capable(ctlr, swap16))
 			return false;
 
-		/* Extra 8D-8D-8D limitations */
+		/* 额外的 8D-8D-8D 限制。 */
 		if (op->cmd.dtr && op->cmd.buswidth == 8) {
 			if (op->cmd.nbytes != 2)
 				return false;
@@ -239,7 +233,7 @@ static int spi_mem_check_op(const struct spi_mem_op *op)
 	    !spi_mem_buswidth_is_valid(op->data.buswidth))
 		return -EINVAL;
 
-	/* Buffers must be DMA-able. */
+	/* 缓冲区必须可以用于 DMA。 */
 	if (WARN_ON_ONCE(op->data.dir == SPI_MEM_DATA_IN &&
 			 object_is_on_stack(op->data.buf.in)))
 		return -EINVAL;
@@ -263,23 +257,21 @@ static bool spi_mem_internal_supports_op(struct spi_mem *mem,
 }
 
 /**
- * spi_mem_supports_op() - Check if a memory device and the controller it is
- *			   connected to support a specific memory operation
- * @mem: the SPI memory
- * @op: the memory operation to check
+ * spi_mem_supports_op() - 检查 memory 设备及其所连接的控制器是否支持某个内存操作
+ * @mem: SPI memory 对象
+ * @op: 需要检查的 memory operation
  *
- * Some controllers are only supporting Single or Dual IOs, others might only
- * support specific opcodes, or it can even be that the controller and device
- * both support Quad IOs but the hardware prevents you from using it because
- * only 2 IO lines are connected.
+ * 有些控制器只支持单线或双线 IO；有些只支持特定 opcode；
+ * 甚至可能控制器和设备都支持 Quad IO，但由于硬件只接了两根 IO 线，
+ * 实际上仍然不能使用。
  *
- * This function checks whether a specific operation is supported.
+ * 这个函数用于检查某个具体操作是否受支持。
  *
- * Return: true if @op is supported, false otherwise.
+ * Return: 如果 @op 支持则返回 true，否则返回 false。
  */
 bool spi_mem_supports_op(struct spi_mem *mem, const struct spi_mem_op *op)
 {
-	/* Make sure the operation frequency is correct before going futher */
+	/* 在继续之前先确保操作频率正确。 */
 	spi_mem_adjust_op_freq(mem, (struct spi_mem_op *)op);
 
 	if (spi_mem_check_op(op))
@@ -294,8 +286,8 @@ static int spi_mem_access_start(struct spi_mem *mem)
 	struct spi_controller *ctlr = mem->spi->controller;
 
 	/*
-	 * Flush the message queue before executing our SPI memory
-	 * operation to prevent preemption of regular SPI transfers.
+	 * 在执行 SPI memory 操作之前先刷新消息队列，
+	 * 以避免普通 SPI 传输抢占该操作。
 	 */
 	spi_flush_queue(ctlr);
 
@@ -338,28 +330,27 @@ static void spi_mem_add_op_stats(struct spi_statistics __percpu *pcpu_stats,
 	u64_stats_update_begin(&stats->syncp);
 
 	/*
-	 * We do not have the concept of messages or transfers. Let's consider
-	 * that one operation is equivalent to one message and one transfer.
+	 * 这里没有 message 或 transfer 的概念，可以把一次 operation
+	 * 等价看成一条 message 和一个 transfer。
 	 */
 	u64_stats_inc(&stats->messages);
 	u64_stats_inc(&stats->transfers);
 
-	/* Use the sum of all lengths as bytes count and histogram value. */
+	/* 用所有长度之和作为字节计数和直方图统计值。 */
 	len = op->cmd.nbytes + op->addr.nbytes;
 	len += op->dummy.nbytes + op->data.nbytes;
 	u64_stats_add(&stats->bytes, len);
 	l2len = min(fls(len), SPI_STATISTICS_HISTO_SIZE) - 1;
 	u64_stats_inc(&stats->transfer_bytes_histo[l2len]);
 
-	/* Only account for data bytes as transferred bytes. */
+	/* 只把 data 字节统计到 transferred bytes 中。 */
 	if (op->data.nbytes && op->data.dir == SPI_MEM_DATA_OUT)
 		u64_stats_add(&stats->bytes_tx, op->data.nbytes);
 	if (op->data.nbytes && op->data.dir == SPI_MEM_DATA_IN)
 		u64_stats_add(&stats->bytes_rx, op->data.nbytes);
 
 	/*
-	 * A timeout is not an error, following the same behavior as
-	 * spi_transfer_one_message().
+	 * 超时不算错误，这里沿用 spi_transfer_one_message() 的行为。
 	 */
 	if (exec_op_ret == -ETIMEDOUT)
 		u64_stats_inc(&stats->timedout);
@@ -371,16 +362,13 @@ static void spi_mem_add_op_stats(struct spi_statistics __percpu *pcpu_stats,
 }
 
 /**
- * spi_mem_exec_op() - Execute a memory operation
- * @mem: the SPI memory
- * @op: the memory operation to execute
+ * spi_mem_exec_op() - 执行一个 memory operation
+ * @mem: SPI memory 对象
+ * @op: 需要执行的 memory operation
  *
- * Executes a memory operation.
+ * 该函数会先检查 @op 是否受支持，然后尝试执行它。
  *
- * This function first checks that @op is supported and then tries to execute
- * it.
- *
- * Return: 0 in case of success, a negative error code otherwise.
+ * Return: 成功返回 0，否则返回负错误码。
  */
 int spi_mem_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
 {
@@ -391,7 +379,7 @@ int spi_mem_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
 	u8 *tmpbuf;
 	int ret;
 
-	/* Make sure the operation frequency is correct before going futher */
+	/* 在继续之前先确保操作频率正确。 */
 	spi_mem_adjust_op_freq(mem, (struct spi_mem_op *)op);
 
 	dev_vdbg(&mem->spi->dev, "[cmd: 0x%02x][%dB addr: %#8llx][%2dB dummy][%4dB data %s] %d%c-%d%c-%d%c-%d%c @ %uHz\n",
@@ -424,9 +412,8 @@ int spi_mem_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
 		spi_mem_access_end(mem);
 
 		/*
-		 * Some controllers only optimize specific paths (typically the
-		 * read path) and expect the core to use the regular SPI
-		 * interface in other cases.
+		 * 有些控制器只优化特定路径（通常是读路径），
+		 * 其它情况则希望 core 回退到普通 SPI 接口。
 		 */
 		if (!ret || (ret != -ENOTSUPP && ret != -EOPNOTSUPP)) {
 			spi_mem_add_op_stats(ctlr->pcpu_statistics, op, ret);
@@ -439,9 +426,8 @@ int spi_mem_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
 	tmpbufsize = op->cmd.nbytes + op->addr.nbytes + op->dummy.nbytes;
 
 	/*
-	 * Allocate a buffer to transmit the CMD, ADDR cycles with kmalloc() so
-	 * we're guaranteed that this buffer is DMA-able, as required by the
-	 * SPI layer.
+	 * 用 kmalloc() 分配一个缓冲区来承载 CMD / ADDR 周期，
+	 * 这样可以保证该缓冲区可以被 DMA 访问，符合 SPI 层要求。
 	 */
 	tmpbuf = kzalloc(tmpbufsize, GFP_KERNEL | GFP_DMA);
 	if (!tmpbuf)
@@ -517,16 +503,13 @@ int spi_mem_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
 EXPORT_SYMBOL_GPL(spi_mem_exec_op);
 
 /**
- * spi_mem_get_name() - Return the SPI mem device name to be used by the
- *			upper layer if necessary
- * @mem: the SPI memory
+ * spi_mem_get_name() - 返回上层在需要时可使用的 SPI mem 设备名
+ * @mem: SPI memory 对象
  *
- * This function allows SPI mem users to retrieve the SPI mem device name.
- * It is useful if the upper layer needs to expose a custom name for
- * compatibility reasons.
+ * 这个函数允许 SPI mem 使用者获取 SPI mem 设备名。
+ * 当上层为了兼容性需要暴露自定义名称时，它很有用。
  *
- * Return: a string containing the name of the memory device to be used
- *	   by the SPI mem user
+ * Return: 返回 SPI mem 使用者应使用的设备名字符串。
  */
 const char *spi_mem_get_name(struct spi_mem *mem)
 {
@@ -535,19 +518,17 @@ const char *spi_mem_get_name(struct spi_mem *mem)
 EXPORT_SYMBOL_GPL(spi_mem_get_name);
 
 /**
- * spi_mem_adjust_op_size() - Adjust the data size of a SPI mem operation to
- *			      match controller limitations
- * @mem: the SPI memory
- * @op: the operation to adjust
+ * spi_mem_adjust_op_size() - 调整 SPI mem 操作的数据大小以适配控制器限制
+ * @mem: SPI memory 对象
+ * @op: 需要调整的操作
  *
- * Some controllers have FIFO limitations and must split a data transfer
- * operation into multiple ones, others require a specific alignment for
- * optimized accesses. This function allows SPI mem drivers to split a single
- * operation into multiple sub-operations when required.
+ * 某些控制器存在 FIFO 限制，必须把一次数据传输拆成多次；
+ * 另一些控制器则要求特定对齐以获得更好的访问性能。
+ * 这个函数允许 SPI mem 驱动在需要时把单次操作拆成多个子操作。
  *
- * Return: a negative error code if the controller can't properly adjust @op,
- *	   0 otherwise. Note that @op->data.nbytes will be updated if @op
- *	   can't be handled in a single step.
+ * Return: 如果控制器无法正确调整 @op，则返回负错误码；
+ *	   否则返回 0。注意，如果 @op 需要被拆分，
+ *	   @op->data.nbytes 会被更新为可执行的长度。
  */
 int spi_mem_adjust_op_size(struct spi_mem *mem, struct spi_mem_op *op)
 {
@@ -576,14 +557,12 @@ int spi_mem_adjust_op_size(struct spi_mem *mem, struct spi_mem_op *op)
 EXPORT_SYMBOL_GPL(spi_mem_adjust_op_size);
 
 /**
- * spi_mem_adjust_op_freq() - Adjust the frequency of a SPI mem operation to
- *			      match controller, PCB and chip limitations
- * @mem: the SPI memory
- * @op: the operation to adjust
+ * spi_mem_adjust_op_freq() - 调整 SPI mem 操作频率以适配控制器、PCB 和芯片限制
+ * @mem: SPI memory 对象
+ * @op: 需要调整的操作
  *
- * Some chips have per-op frequency limitations and must adapt the maximum
- * speed. This function allows SPI mem drivers to set @op->max_freq to the
- * maximum supported value.
+ * 某些芯片对不同操作有各自的频率限制，必须调整最大速率。
+ * 这个函数允许 SPI mem 驱动把 @op->max_freq 设为可支持的最大值。
  */
 void spi_mem_adjust_op_freq(struct spi_mem *mem, struct spi_mem_op *op)
 {
@@ -593,23 +572,20 @@ void spi_mem_adjust_op_freq(struct spi_mem *mem, struct spi_mem_op *op)
 EXPORT_SYMBOL_GPL(spi_mem_adjust_op_freq);
 
 /**
- * spi_mem_calc_op_duration() - Derives the theoretical length (in ns) of an
- *			        operation. This helps finding the best variant
- *			        among a list of possible choices.
- * @mem: the SPI memory
- * @op: the operation to benchmark
+ * spi_mem_calc_op_duration() - 估算一个操作的理论持续时间（纳秒）
+ *			       以便在多个候选方案中选出最优解。
+ * @mem: SPI memory 对象
+ * @op: 需要评估的操作
  *
- * Some chips have per-op frequency limitations, PCBs usually have their own
- * limitations as well, and controllers can support dual, quad or even octal
- * modes, sometimes in DTR. All these combinations make it impossible to
- * statically list the best combination for all situations. If we want something
- * accurate, all these combinations should be rated (eg. with a time estimate)
- * and the best pick should be taken based on these calculations.
+ * 某些芯片对不同操作有频率限制，PCB 也会带来额外约束；
+ * 控制器则可能支持 dual、quad 甚至 octal 模式，有时还支持 DTR。
+ * 这些组合太多，无法静态地为所有场景列出最佳方案。
+ * 如果想要准确，就必须给这些组合打分（例如估算时间），
+ * 然后基于这些估算挑出最优解。
  *
- * Returns a ns estimate for the time this op would take, except if no
- * frequency limit has been set, in this case we return the number of
- * cycles nevertheless to allow callers to distinguish which operation
- * would be the fastest at iso-frequency.
+ * Return: 返回该操作耗时的纳秒估计值。
+ *         如果没有设置频率限制，则返回的是周期数，
+ *         方便调用者在相同频率条件下比较不同方案的快慢。
  */
 u64 spi_mem_calc_op_duration(struct spi_mem *mem, struct spi_mem_op *op)
 {
@@ -622,22 +598,22 @@ u64 spi_mem_calc_op_duration(struct spi_mem *mem, struct spi_mem_op *op)
 		ps_per_cycles = 1000000000000ULL;
 		do_div(ps_per_cycles, op->max_freq);
 	} else {
-		/* In this case, the unit is no longer a time unit */
+		/* 在这种情况下，单位不再是时间单位。 */
 		ps_per_cycles = 1;
 	}
 
 	ncycles += ((op->cmd.nbytes * 8) / op->cmd.buswidth) / (op->cmd.dtr ? 2 : 1);
 	ncycles += ((op->addr.nbytes * 8) / op->addr.buswidth) / (op->addr.dtr ? 2 : 1);
 
-	/* Dummy bytes are optional for some SPI flash memory operations */
+	/* 对某些 SPI flash 操作来说，dummy bytes 是可选的。 */
 	if (op->dummy.nbytes)
 		ncycles += ((op->dummy.nbytes * 8) / op->dummy.buswidth) / (op->dummy.dtr ? 2 : 1);
 
 	ncycles += ((op->data.nbytes * 8) / op->data.buswidth) / (op->data.dtr ? 2 : 1);
 
-	/* Derive the duration in ps */
+	/* 先计算皮秒级持续时间。 */
 	duration = ncycles * ps_per_cycles;
-	/* Convert into ns */
+	/* 再换算成纳秒。 */
 	do_div(duration, 1000);
 
 	return duration;
@@ -685,17 +661,16 @@ static ssize_t spi_mem_no_dirmap_write(struct spi_mem_dirmap_desc *desc,
 }
 
 /**
- * spi_mem_dirmap_create() - Create a direct mapping descriptor
- * @mem: SPI mem device this direct mapping should be created for
- * @info: direct mapping information
+ * spi_mem_dirmap_create() - 创建一个直接映射描述符
+ * @mem: 需要创建直接映射的 SPI mem 设备
+ * @info: 直接映射信息
  *
- * This function is creating a direct mapping descriptor which can then be used
- * to access the memory using spi_mem_dirmap_read() or spi_mem_dirmap_write().
- * If the SPI controller driver does not support direct mapping, this function
- * falls back to an implementation using spi_mem_exec_op(), so that the caller
- * doesn't have to bother implementing a fallback on his own.
+ * 该函数会创建一个直接映射描述符，之后可通过
+ * spi_mem_dirmap_read() 或 spi_mem_dirmap_write() 访问内存。
+ * 如果 SPI 控制器驱动不支持直接映射，本函数会回退到
+ * spi_mem_exec_op() 的实现，这样调用者就不用自己再写 fallback。
  *
- * Return: a valid pointer in case of success, and ERR_PTR() otherwise.
+ * Return: 成功时返回有效指针，失败时返回 ERR_PTR() 封装的错误指针。
  */
 struct spi_mem_dirmap_desc *
 spi_mem_dirmap_create(struct spi_mem *mem,
@@ -705,11 +680,11 @@ spi_mem_dirmap_create(struct spi_mem *mem,
 	struct spi_mem_dirmap_desc *desc;
 	int ret = -ENOTSUPP;
 
-	/* Make sure the number of address cycles is between 1 and 8 bytes. */
+	/* 确保地址周期数在 1 到 8 字节之间。 */
 	if (!info->op_tmpl.addr.nbytes || info->op_tmpl.addr.nbytes > 8)
 		return ERR_PTR(-EINVAL);
 
-	/* data.dir should either be SPI_MEM_DATA_IN or SPI_MEM_DATA_OUT. */
+	/* data.dir 必须是 SPI_MEM_DATA_IN 或 SPI_MEM_DATA_OUT。 */
 	if (info->op_tmpl.data.dir == SPI_MEM_NO_DATA)
 		return ERR_PTR(-EINVAL);
 
@@ -749,11 +724,10 @@ spi_mem_dirmap_create(struct spi_mem *mem,
 EXPORT_SYMBOL_GPL(spi_mem_dirmap_create);
 
 /**
- * spi_mem_dirmap_destroy() - Destroy a direct mapping descriptor
- * @desc: the direct mapping descriptor to destroy
+ * spi_mem_dirmap_destroy() - 销毁直接映射描述符
+ * @desc: 需要销毁的直接映射描述符
  *
- * This function destroys a direct mapping descriptor previously created by
- * spi_mem_dirmap_create().
+ * 这个函数销毁之前由 spi_mem_dirmap_create() 创建的直接映射描述符。
  */
 void spi_mem_dirmap_destroy(struct spi_mem_dirmap_desc *desc)
 {
@@ -774,16 +748,15 @@ static void devm_spi_mem_dirmap_release(struct device *dev, void *res)
 }
 
 /**
- * devm_spi_mem_dirmap_create() - Create a direct mapping descriptor and attach
- *				  it to a device
- * @dev: device the dirmap desc will be attached to
- * @mem: SPI mem device this direct mapping should be created for
- * @info: direct mapping information
+ * devm_spi_mem_dirmap_create() - 创建直接映射描述符并把它挂到设备上
+ * @dev: 这个 dirmap 描述符将要挂载到的设备
+ * @mem: 需要创建直接映射的 SPI mem 设备
+ * @info: 直接映射信息
  *
- * devm_ variant of the spi_mem_dirmap_create() function. See
- * spi_mem_dirmap_create() for more details.
+ * spi_mem_dirmap_create() 的 devm 版本。更多细节请参考
+ * spi_mem_dirmap_create()。
  *
- * Return: a valid pointer in case of success, and ERR_PTR() otherwise.
+ * Return: 成功时返回有效指针，失败时返回 ERR_PTR() 封装的错误指针。
  */
 struct spi_mem_dirmap_desc *
 devm_spi_mem_dirmap_create(struct device *dev, struct spi_mem *mem,
@@ -819,13 +792,12 @@ static int devm_spi_mem_dirmap_match(struct device *dev, void *res, void *data)
 }
 
 /**
- * devm_spi_mem_dirmap_destroy() - Destroy a direct mapping descriptor attached
- *				   to a device
- * @dev: device the dirmap desc is attached to
- * @desc: the direct mapping descriptor to destroy
+ * devm_spi_mem_dirmap_destroy() - 销毁挂在设备上的直接映射描述符
+ * @dev: 这个 dirmap 描述符所属的设备
+ * @desc: 需要销毁的直接映射描述符
  *
- * devm_ variant of the spi_mem_dirmap_destroy() function. See
- * spi_mem_dirmap_destroy() for more details.
+ * spi_mem_dirmap_destroy() 的 devm 版本。更多细节请参考
+ * spi_mem_dirmap_destroy()。
  */
 void devm_spi_mem_dirmap_destroy(struct device *dev,
 				 struct spi_mem_dirmap_desc *desc)
@@ -836,20 +808,19 @@ void devm_spi_mem_dirmap_destroy(struct device *dev,
 EXPORT_SYMBOL_GPL(devm_spi_mem_dirmap_destroy);
 
 /**
- * spi_mem_dirmap_read() - Read data through a direct mapping
- * @desc: direct mapping descriptor
- * @offs: offset to start reading from. Note that this is not an absolute
- *	  offset, but the offset within the direct mapping which already has
- *	  its own offset
- * @len: length in bytes
- * @buf: destination buffer. This buffer must be DMA-able
+ * spi_mem_dirmap_read() - 通过直接映射读取数据
+ * @desc: 直接映射描述符
+ * @offs: 开始读取的偏移量。注意这不是绝对偏移，而是直接映射内部
+ *        的偏移；该映射本身已经带有自己的基地址偏移。
+ * @len: 长度，单位字节
+ * @buf: 目的缓冲区。该缓冲区必须可用于 DMA
  *
- * This function reads data from a memory device using a direct mapping
- * previously instantiated with spi_mem_dirmap_create().
+ * 该函数使用之前通过 spi_mem_dirmap_create() 创建的直接映射
+ * 从内存设备读取数据。
  *
- * Return: the amount of data read from the memory device or a negative error
- * code. Note that the returned size might be smaller than @len, and the caller
- * is responsible for calling spi_mem_dirmap_read() again when that happens.
+ * Return: 返回从内存设备读取的数据量，或者一个负错误码。
+ *         注意，返回值可能小于 @len；遇到这种情况时，需要调用者
+ *         再次调用 spi_mem_dirmap_read() 继续读取剩余数据。
  */
 ssize_t spi_mem_dirmap_read(struct spi_mem_dirmap_desc *desc,
 			    u64 offs, size_t len, void *buf)
@@ -882,20 +853,19 @@ ssize_t spi_mem_dirmap_read(struct spi_mem_dirmap_desc *desc,
 EXPORT_SYMBOL_GPL(spi_mem_dirmap_read);
 
 /**
- * spi_mem_dirmap_write() - Write data through a direct mapping
- * @desc: direct mapping descriptor
- * @offs: offset to start writing from. Note that this is not an absolute
- *	  offset, but the offset within the direct mapping which already has
- *	  its own offset
- * @len: length in bytes
- * @buf: source buffer. This buffer must be DMA-able
+ * spi_mem_dirmap_write() - 通过直接映射写入数据
+ * @desc: 直接映射描述符
+ * @offs: 开始写入的偏移量。注意这不是绝对偏移，而是直接映射内部
+ *        的偏移；该映射本身已经带有自己的基地址偏移。
+ * @len: 长度，单位字节
+ * @buf: 源缓冲区。该缓冲区必须可用于 DMA
  *
- * This function writes data to a memory device using a direct mapping
- * previously instantiated with spi_mem_dirmap_create().
+ * 该函数使用之前通过 spi_mem_dirmap_create() 创建的直接映射
+ * 向内存设备写入数据。
  *
- * Return: the amount of data written to the memory device or a negative error
- * code. Note that the returned size might be smaller than @len, and the caller
- * is responsible for calling spi_mem_dirmap_write() again when that happens.
+ * Return: 返回写入内存设备的数据量，或者一个负错误码。
+ *         注意，返回值可能小于 @len；遇到这种情况时，需要调用者
+ *         再次调用 spi_mem_dirmap_write() 继续写入剩余数据。
  */
 ssize_t spi_mem_dirmap_write(struct spi_mem_dirmap_desc *desc,
 			     u64 offs, size_t len, const void *buf)
@@ -952,20 +922,20 @@ static int spi_mem_read_status(struct spi_mem *mem,
 }
 
 /**
- * spi_mem_poll_status() - Poll memory device status
- * @mem: SPI memory device
- * @op: the memory operation to execute
- * @mask: status bitmask to ckeck
- * @match: (status & mask) expected value
- * @initial_delay_us: delay in us before starting to poll
- * @polling_delay_us: time to sleep between reads in us
- * @timeout_ms: timeout in milliseconds
+ * spi_mem_poll_status() - 轮询内存设备状态
+ * @mem: SPI memory 设备
+ * @op: 要执行的 memory operation
+ * @mask: 需要检查的状态位掩码
+ * @match: 期望满足的 (status & mask) 值
+ * @initial_delay_us: 开始轮询前先等待的微秒数
+ * @polling_delay_us: 两次读取之间的睡眠时间，单位微秒
+ * @timeout_ms: 超时时间，单位毫秒
  *
- * This function polls a status register and returns when
- * (status & mask) == match or when the timeout has expired.
+ * 该函数轮询状态寄存器，当 (status & mask) == match
+ * 或者超时后返回。
  *
- * Return: 0 in case of success, -ETIMEDOUT in case of error,
- *         -EOPNOTSUPP if not supported.
+ * Return: 成功返回 0，超时返回 -ETIMEDOUT，
+ *         不支持时返回 -EOPNOTSUPP。
  */
 int spi_mem_poll_status(struct spi_mem *mem,
 			const struct spi_mem_op *op,
@@ -1061,13 +1031,13 @@ static void spi_mem_shutdown(struct spi_device *spi)
 }
 
 /**
- * spi_mem_driver_register_with_owner() - Register a SPI memory driver
- * @memdrv: the SPI memory driver to register
- * @owner: the owner of this driver
+ * spi_mem_driver_register_with_owner() - 注册 SPI memory 驱动
+ * @memdrv: 需要注册的 SPI memory 驱动
+ * @owner: 该驱动的所有者
  *
- * Registers a SPI memory driver.
+ * 注册一个 SPI memory 驱动。
  *
- * Return: 0 in case of success, a negative error core otherwise.
+ * Return: 成功返回 0，否则返回负错误码。
  */
 
 int spi_mem_driver_register_with_owner(struct spi_mem_driver *memdrv,
@@ -1082,10 +1052,10 @@ int spi_mem_driver_register_with_owner(struct spi_mem_driver *memdrv,
 EXPORT_SYMBOL_GPL(spi_mem_driver_register_with_owner);
 
 /**
- * spi_mem_driver_unregister() - Unregister a SPI memory driver
- * @memdrv: the SPI memory driver to unregister
+ * spi_mem_driver_unregister() - 注销 SPI memory 驱动
+ * @memdrv: 需要注销的 SPI memory 驱动
  *
- * Unregisters a SPI memory driver.
+ * 注销一个 SPI memory 驱动。
  */
 void spi_mem_driver_unregister(struct spi_mem_driver *memdrv)
 {
