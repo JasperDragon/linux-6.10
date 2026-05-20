@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0
  *
- * linux/sound/soc-dapm.h -- ALSA SoC Dynamic Audio Power Management
+ * linux/sound/soc-dapm.h -- ALSA SoC 动态音频电源管理
  *
  * Author:	Liam Girdwood
  * Created:	Aug 11th 2005
@@ -22,33 +22,28 @@ struct snd_pcm_substream;
 struct snd_soc_pcm_runtime;
 struct snd_soc_dapm_context;
 
-/* widget has no PM register bit */
+/* 该 widget 没有 PM 寄存器位。 */
 #define SND_SOC_NOPM	-1
 
 /*
- * SoC dynamic audio power management
+ * DAPM = Dynamic Audio Power Management。
+ * 作用是根据“当前真正连通的音频路径”动态开关 codec / path / stream /
+ * 板级电源，尽量减少功耗和 pop/click。
  *
- * We can have up to 4 power domains
- *  1. Codec domain - VREF, VMID
- *     Usually controlled at codec probe/remove, although can be set
- *     at stream time if power is not needed for sidetone, etc.
- *  2. Platform/Machine domain - physically connected inputs and outputs
- *     Is platform/machine and user action specific, is set in the machine
- *     driver and by userspace e.g when HP are inserted
- *  3. Path domain - Internal codec path mixers
- *     Are automatically set when mixer and mux settings are
- *     changed by the user.
- *  4. Stream domain - DAC's and ADC's.
- *     Enabled when stream playback/capture is started.
+ * 常见可理解成四个电源域：
+ * 1. Codec 域：VREF/VMID 等基础偏置电源
+ * 2. Platform/Machine 域：耳机、喇叭、麦克风、GPIO、regulator 等板级资源
+ * 3. Path 域：codec 内部 mixer/mux/pga 路径
+ * 4. Stream 域：ADC/DAC、AIF 相关的流域
  */
 
-/* codec domain */
+/* codec 域 widget：表示偏置、基准电压等基础电源状态。 */
 #define SND_SOC_DAPM_VMID(wname) \
 (struct snd_soc_dapm_widget) { \
 	.id = snd_soc_dapm_vmid, .name = wname, .kcontrol_news = NULL, \
 	.num_kcontrols = 0}
 
-/* platform domain */
+/* platform 域 widget：板级输入输出端口、GPIO、机壳设备等。 */
 #define SND_SOC_DAPM_SIGGEN(wname) \
 (struct snd_soc_dapm_widget) { \
 	.id = snd_soc_dapm_siggen, .name = wname, .kcontrol_news = NULL, \
@@ -90,7 +85,7 @@ struct snd_soc_dapm_context;
 	.reg = wreg, .mask = 1, .shift = wshift, \
 	.on_val = winvert ? 0 : 1, .off_val = winvert ? 1 : 0
 
-/* path domain */
+/* path 域 widget：codec 内部路径中的放大器、混音器、开关。 */
 #define SND_SOC_DAPM_PGA(wname, wreg, wshift, winvert,\
 	 wcontrols, wncontrols) \
 (struct snd_soc_dapm_widget) { \
@@ -137,7 +132,7 @@ struct snd_soc_dapm_context;
 	SND_SOC_DAPM_INIT_REG_VAL(wreg, wshift, winvert), \
 	.kcontrol_news = wcontrols, .num_kcontrols = 1}
 
-/* Simplified versions of above macros, assuming wncontrols = ARRAY_SIZE(wcontrols) */
+/* 简化版宏：默认控件数组长度就是 ARRAY_SIZE(wcontrols)。 */
 #define SOC_PGA_ARRAY(wname, wreg, wshift, winvert,\
 	 wcontrols) \
 (struct snd_soc_dapm_widget) { \
@@ -157,7 +152,7 @@ struct snd_soc_dapm_context;
 	SND_SOC_DAPM_INIT_REG_VAL(wreg, wshift, winvert), \
 	.kcontrol_news = wcontrols, .num_kcontrols = ARRAY_SIZE(wcontrols)}
 
-/* path domain with event - event handler must return 0 for success */
+/* 带事件回调的 path widget。事件回调必须返回 0 表示成功。 */
 #define SND_SOC_DAPM_PGA_E(wname, wreg, wshift, winvert, wcontrols, \
 	wncontrols, wevent, wflags) \
 (struct snd_soc_dapm_widget) { \
@@ -201,7 +196,7 @@ struct snd_soc_dapm_context;
 	.kcontrol_news = wcontrols, .num_kcontrols = 1, \
 	.event = wevent, .event_flags = wflags}
 
-/* additional sequencing control within an event type */
+/* 同一类事件下，再细分顺序编号。 */
 #define SND_SOC_DAPM_PGA_S(wname, wsubseq, wreg, wshift, winvert, \
 	wevent, wflags) \
 (struct snd_soc_dapm_widget) { \
@@ -216,7 +211,7 @@ struct snd_soc_dapm_context;
 	SND_SOC_DAPM_INIT_REG_VAL(wreg, wshift, winvert), \
 	.event = wevent, .event_flags = wflags, .subseq = wsubseq}
 
-/* Simplified versions of above macros, assuming wncontrols = ARRAY_SIZE(wcontrols) */
+/* 上面宏的简化版：默认 wncontrols = ARRAY_SIZE(wcontrols)。 */
 #define SOC_PGA_E_ARRAY(wname, wreg, wshift, winvert, wcontrols, \
 	wevent, wflags) \
 (struct snd_soc_dapm_widget) { \
@@ -239,7 +234,7 @@ struct snd_soc_dapm_context;
 	.kcontrol_news = wcontrols, .num_kcontrols = ARRAY_SIZE(wcontrols), \
 	.event = wevent, .event_flags = wflags}
 
-/* events that are pre and post DAPM */
+/* DAPM 前后置事件类型。 */
 #define SND_SOC_DAPM_PRE(wname, wevent) \
 (struct snd_soc_dapm_widget) { \
 	.id = snd_soc_dapm_pre, .name = wname, .kcontrol_news = NULL, \
@@ -251,7 +246,7 @@ struct snd_soc_dapm_context;
 	.num_kcontrols = 0, .reg = SND_SOC_NOPM, .event = wevent, \
 	.event_flags = SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_POST_PMD}
 
-/* stream domain */
+/* stream 域 widget：与 AIF/ADC/DAC 等流相关。 */
 #define SND_SOC_DAPM_AIF_IN(wname, stname, wchan, wreg, wshift, winvert) \
 (struct snd_soc_dapm_widget) { \
 	.id = snd_soc_dapm_aif_in, .name = wname, .sname = stname, \
@@ -299,7 +294,7 @@ struct snd_soc_dapm_context;
 	.reg = SND_SOC_NOPM, .event = snd_soc_dapm_clock_event, \
 	.event_flags = SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD }
 
-/* generic widgets */
+/* 通用 widget：供电、regulator、pinctrl、clock 等。 */
 #define SND_SOC_DAPM_REG(wid, wname, wreg, wshift, wmask, won_val, woff_val) \
 (struct snd_soc_dapm_widget) { \
 	.id = wid, .name = wname, .kcontrol_news = NULL, .num_kcontrols = 0, \
@@ -326,7 +321,7 @@ struct snd_soc_dapm_context;
 
 
 
-/* dapm kcontrol types */
+/* DAPM 相关的 kcontrol 宏。 */
 #define SOC_DAPM_DOUBLE(xname, reg, lshift, rshift, max, invert) \
 	SOC_DOUBLE_EXT(xname, reg, lshift, rshift, max, invert, \
 		       snd_soc_dapm_get_volsw, snd_soc_dapm_put_volsw)
@@ -373,7 +368,7 @@ struct snd_soc_dapm_context;
 	.put = snd_soc_dapm_put_pin_switch, \
 	.private_value = (unsigned long)xname }
 
-/* dapm stream operations */
+/* DAPM 在流启动/停止/挂起/恢复时使用的状态标记。 */
 #define SND_SOC_DAPM_STREAM_NOP			0x0
 #define SND_SOC_DAPM_STREAM_START		0x1
 #define SND_SOC_DAPM_STREAM_STOP		0x2
@@ -382,7 +377,7 @@ struct snd_soc_dapm_context;
 #define SND_SOC_DAPM_STREAM_PAUSE_PUSH		0x10
 #define SND_SOC_DAPM_STREAM_PAUSE_RELEASE	0x20
 
-/* dapm event types */
+/* DAPM 事件触发时机。 */
 #define SND_SOC_DAPM_PRE_PMU		0x1	/* before widget power up */
 #define SND_SOC_DAPM_POST_PMU		0x2	/* after  widget power up */
 #define SND_SOC_DAPM_PRE_PMD		0x4	/* before widget power down */
@@ -394,23 +389,16 @@ struct snd_soc_dapm_context;
 #define SND_SOC_DAPM_PRE_POST_PMD	(SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMD)
 #define SND_SOC_DAPM_PRE_POST_PMU	(SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU)
 
-/* convenience event type detection */
+/* 便捷判断事件是上电还是下电。 */
 #define SND_SOC_DAPM_EVENT_ON(e)	(e & (SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU))
 #define SND_SOC_DAPM_EVENT_OFF(e)	(e & (SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMD))
 
-/* regulator widget flags */
+/* regulator widget 的附加标志。 */
 #define SND_SOC_DAPM_REGULATOR_BYPASS	0x1	/* bypass when disabled */
 
 /*
- * Bias levels
- *
- * @ON:      Bias is fully on for audio playback and capture operations.
- * @PREPARE: Prepare for audio operations. Called before DAPM switching for
- *           stream start and stop operations.
- * @STANDBY: Low power standby state when no playback/capture operations are
- *           in progress. NOTE: The transition time between STANDBY and ON
- *           should be as fast as possible and no longer than 10ms.
- * @OFF:     Power Off. No restrictions on transition times.
+ * Bias level 表示 codec 当前的偏置/电源状态。
+ * 这是 DAPM 的核心状态机之一，控制 codec 从关闭到完全工作的切换。
  */
 enum snd_soc_bias_level {
 	SND_SOC_BIAS_OFF = 0,
@@ -419,7 +407,11 @@ enum snd_soc_bias_level {
 	SND_SOC_BIAS_ON = 3,
 };
 
-/* dapm widget types */
+/*
+ * DAPM widget 类型。
+ * 每一种类型对应音频路径中的一个节点，例如输入、输出、ADC、DAC、
+ * mixer、mux、supply、clock、AIF 等。
+ */
 enum snd_soc_dapm_type {
 	snd_soc_dapm_input = 0,		/* input pin */
 	snd_soc_dapm_output,		/* output pin */
@@ -466,31 +458,32 @@ enum snd_soc_dapm_type {
 };
 
 /*
- * DAPM audio route definition.
- *
- * Defines an audio route originating at source via control and finishing
- * at sink.
+ * DAPM route。
+ * 定义 source -> sink 的音频连线，可选 control 用于描述受哪个控件控制。
  */
 struct snd_soc_dapm_route {
+	/* 路由的 sink/source/control 名称都来自 topology 或 machine driver。 */
 	const char *sink;
 	const char *control;
 	const char *source;
 
-	/* Note: currently only supported for links where source is a supply */
+	/* 仅在供电类路径上支持的动态连通判定回调。 */
 	int (*connected)(struct snd_soc_dapm_widget *source,
 			 struct snd_soc_dapm_widget *sink);
 
+	/* route 对象的拓扑动态标记。 */
 	struct snd_soc_dobj dobj;
 };
 
-/* dapm audio path between two widgets */
+/* 两个 widget 之间的实际运行时路径。 */
 struct snd_soc_dapm_path {
+	/* 路径名，通常对应 control 或 route 名。 */
 	const char *name;
 
 	/*
-	 * source (input) and sink (output) widgets
-	 * The union is for convience, since it is a lot nicer to type
-	 * p->source, rather than p->node[SND_SOC_DAPM_DIR_IN]
+	 * source（输入）和 sink（输出）widget。
+	 * 这里用 union 只是为了更方便书写，直接访问 p->source
+	 * 比 p->node[SND_SOC_DAPM_DIR_IN] 更直观。
 	 */
 	union {
 		struct {
@@ -501,70 +494,77 @@ struct snd_soc_dapm_path {
 	};
 
 	/* status */
-	u32 connect:1;		/* source and sink widgets are connected */
-	u32 walking:1;		/* path is in the process of being walked */
-	u32 is_supply:1;	/* At least one of the connected widgets is a supply */
+	u32 connect:1;		/* source 和 sink 当前是否连通 */
+	u32 walking:1;		/* 正在被 DAPM 遍历，避免重复处理 */
+	u32 is_supply:1;	/* 至少一端是 supply widget */
 
 	int (*connected)(struct snd_soc_dapm_widget *source,
 			 struct snd_soc_dapm_widget *sink);
 
+	/* 分别挂到 source/sink 的边表中。 */
 	struct list_head list_node[2];
+	/* 与该 path 关联的 kcontrol 链表。 */
 	struct list_head list_kcontrol;
+	/* card->paths 全局链表节点。 */
 	struct list_head list;
 };
 
 /* dapm widget */
 struct snd_soc_dapm_widget {
+	/* widget 类型和名字。 */
 	enum snd_soc_dapm_type id;
 	const char *name;			/* widget name */
 	const char *sname;			/* stream name */
 	struct list_head list;
 	struct snd_soc_dapm_context *dapm;
 
+	/* widget 私有数据和外部资源句柄。 */
 	void *priv;				/* widget specific data */
 	struct regulator *regulator;		/* attached regulator */
 	struct pinctrl *pinctrl;		/* attached pinctrl */
 
 	/* dapm control */
+	/* 寄存器和位段定义。 */
 	int reg;				/* negative reg = no direct dapm */
 	unsigned char shift;			/* bits to shift */
 	unsigned int mask;			/* non-shifted mask */
 	unsigned int on_val;			/* on state value */
 	unsigned int off_val;			/* off state value */
-	unsigned char power:1;			/* block power status */
-	unsigned char active:1;			/* active stream on DAC, ADC's */
-	unsigned char connected:1;		/* connected codec pin */
-	unsigned char new:1;			/* cnew complete */
-	unsigned char force:1;			/* force state */
-	unsigned char ignore_suspend:1;		/* kept enabled over suspend */
-	unsigned char new_power:1;		/* power from this run */
-	unsigned char power_checked:1;		/* power checked this run */
-	unsigned char is_supply:1;		/* Widget is a supply type widget */
-	unsigned char is_ep:2;			/* Widget is a endpoint type widget */
-	unsigned char no_wname_in_kcontrol_name:1; /* No widget name prefix in kcontrol name */
+	unsigned char power:1;			/* 当前是否上电 */
+	unsigned char active:1;			/* 当前是否有活跃流 */
+	unsigned char connected:1;		/* 连接点是否有效 */
+	unsigned char new:1;			/* widget 是否已完整构建 */
+	unsigned char force:1;			/* 强制保持状态 */
+	unsigned char ignore_suspend:1;		/* suspend 时保持启用 */
+	unsigned char new_power:1;		/* 本轮计算出的电源状态 */
+	unsigned char power_checked:1;		/* 本轮是否已检查过 power */
+	unsigned char is_supply:1;		/* 是否为供电节点 */
+	unsigned char is_ep:2;			/* 是否为端点节点 */
+	unsigned char no_wname_in_kcontrol_name:1; /* kcontrol 名称里不加 widget 前缀 */
 	int subseq;				/* sort within widget type */
 
 	int (*power_check)(struct snd_soc_dapm_widget *w);
 
 	/* external events */
-	unsigned short event_flags;		/* flags to specify event types */
+	unsigned short event_flags;		/* 触发哪些 power 事件 */
 	int (*event)(struct snd_soc_dapm_widget*, struct snd_kcontrol *, int);
 
-	/* kcontrols that relate to this widget */
+	/* 与该 widget 关联的 kcontrol。 */
 	int num_kcontrols;
 	const struct snd_kcontrol_new *kcontrol_news;
 	struct snd_kcontrol **kcontrols;
 	struct snd_soc_dobj dobj;
 
-	/* widget input and output edges */
+	/* 输入和输出边。 */
 	struct list_head edges[2];
 
-	/* used during DAPM updates */
+	/* DAPM 更新过程中的工作队列。 */
 	struct list_head work_list;
 	struct list_head power_list;
 	struct list_head dirty;
 	int endpoints[2];
 
+	/* 额外时钟和通道号。 */
 	struct clk *clk;
 
 	int channel;
@@ -583,7 +583,9 @@ struct snd_soc_dapm_update {
 
 /* A list of widgets associated with an object, typically a snd_kcontrol */
 struct snd_soc_dapm_widget_list {
+	/* widget 列表长度。 */
 	int num_widgets;
+	/* 变长数组，保存被连接到同一对象上的所有 widget。 */
 	struct snd_soc_dapm_widget *widgets[] __counted_by(num_widgets);
 };
 
@@ -663,18 +665,18 @@ void snd_soc_dapm_stream_event(struct snd_soc_pcm_runtime *rtd, int stream, int 
 void snd_soc_dapm_stream_stop(struct snd_soc_pcm_runtime *rtd, int stream);
 void snd_soc_dapm_shutdown(struct snd_soc_card *card);
 
-/* external DAPM widget events */
+/* 外部 DAPM widget 事件。 */
 int snd_soc_dapm_mixer_update_power(struct snd_soc_dapm_context *dapm,
 		struct snd_kcontrol *kcontrol, int connect, struct snd_soc_dapm_update *update);
 int snd_soc_dapm_mux_update_power(struct snd_soc_dapm_context *dapm,
 		struct snd_kcontrol *kcontrol, int mux, struct soc_enum *e,
 		struct snd_soc_dapm_update *update);
 
-/* dapm sys fs - used by the core */
+/* DAPM sysfs 接口，由 core 使用。 */
 extern struct attribute *snd_soc_dapm_dev_attrs[];
 void snd_soc_dapm_debugfs_init(struct snd_soc_dapm_context *dapm, struct dentry *parent);
 
-/* dapm audio pin control and status */
+/* DAPM 音频 pin 的控制与状态。 */
 int snd_soc_dapm_enable_pin(struct snd_soc_dapm_context *dapm, const char *pin);
 int snd_soc_dapm_enable_pin_unlocked(struct snd_soc_dapm_context *dapm, const char *pin);
 int snd_soc_dapm_disable_pin(struct snd_soc_dapm_context *dapm, const char *pin);
@@ -687,7 +689,7 @@ int snd_soc_dapm_force_enable_pin_unlocked(struct snd_soc_dapm_context *dapm, co
 int snd_soc_dapm_ignore_suspend(struct snd_soc_dapm_context *dapm, const char *pin);
 void snd_soc_dapm_mark_endpoints_dirty(struct snd_soc_card *card);
 
-/* dapm path query */
+/* DAPM 路径查询接口。 */
 int snd_soc_dapm_dai_get_connected_widgets(struct snd_soc_dai *dai, int stream,
 	struct snd_soc_dapm_widget_list **list,
 	bool (*custom_stop_condition)(struct snd_soc_dapm_widget *, enum snd_soc_dapm_direction));
@@ -708,45 +710,39 @@ void snd_soc_dapm_init_bias_level(struct snd_soc_dapm_context *dapm, enum snd_so
 	     (i)++)
 
 /**
- * snd_soc_dapm_widget_for_each_path - Iterates over all paths in the
- *   specified direction of a widget
- * @w: The widget
- * @dir: Whether to iterate over the paths where the specified widget is the
- *       incoming or outgoing widgets
- * @p: The path iterator variable
+ * snd_soc_dapm_widget_for_each_path - 遍历 widget 指定方向上的所有路径
+ * @w: widget
+ * @dir: 遍历方向，决定该 widget 是路径的输入端还是输出端
+ * @p: 路径迭代变量
  */
 #define snd_soc_dapm_widget_for_each_path(w, dir, p) \
 	list_for_each_entry(p, &w->edges[dir], list_node[dir])
 
 /**
- * snd_soc_dapm_widget_for_each_path_safe - Iterates over all paths in the
- *   specified direction of a widget
- * @w: The widget
- * @dir: Whether to iterate over the paths where the specified widget is the
- *       incoming or outgoing widgets
- * @p: The path iterator variable
- * @next_p: Temporary storage for the next path
+ * snd_soc_dapm_widget_for_each_path_safe - 遍历 widget 指定方向上的所有路径
+ * @w: widget
+ * @dir: 遍历方向，决定该 widget 是路径的输入端还是输出端
+ * @p: 路径迭代变量
+ * @next_p: 下一条路径的临时保存变量
  *
- *  This function works like snd_soc_dapm_widget_for_each_path, expect that
- *  it is safe to remove the current path from the list while iterating
+ * 这个版本与 snd_soc_dapm_widget_for_each_path 类似，但允许在遍历时
+ * 安全删除当前路径。
  */
 #define snd_soc_dapm_widget_for_each_path_safe(w, dir, p, next_p) \
 	list_for_each_entry_safe(p, next_p, &w->edges[dir], list_node[dir])
 
 /**
- * snd_soc_dapm_widget_for_each_sink_path - Iterates over all paths leaving a
- *  widget
- * @w: The widget
- * @p: The path iterator variable
+ * snd_soc_dapm_widget_for_each_sink_path - 遍历从 widget 发出的所有路径
+ * @w: widget
+ * @p: 路径迭代变量
  */
 #define snd_soc_dapm_widget_for_each_sink_path(w, p) \
 	snd_soc_dapm_widget_for_each_path(w, SND_SOC_DAPM_DIR_IN, p)
 
 /**
- * snd_soc_dapm_widget_for_each_source_path - Iterates over all paths leading to
- *  a widget
- * @w: The widget
- * @p: The path iterator variable
+ * snd_soc_dapm_widget_for_each_source_path - 遍历指向 widget 的所有路径
+ * @w: widget
+ * @p: 路径迭代变量
  */
 #define snd_soc_dapm_widget_for_each_source_path(w, p) \
 	snd_soc_dapm_widget_for_each_path(w, SND_SOC_DAPM_DIR_OUT, p)

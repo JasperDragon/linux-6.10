@@ -8,6 +8,7 @@
 #include <sound/soc.h>
 #include <sound/soc-link.h>
 
+/* soc-link.c 负责把一个 rtd 的生命周期桥接到 DAI / PCM / compress。 */
 #define soc_link_ret(rtd, ret) _soc_link_ret(rtd, __func__, ret)
 static inline int _soc_link_ret(struct snd_soc_pcm_runtime *rtd,
 				const char *func, int ret)
@@ -26,6 +27,7 @@ static inline int _soc_link_ret(struct snd_soc_pcm_runtime *rtd,
 
 int snd_soc_link_init(struct snd_soc_pcm_runtime *rtd)
 {
+	/* link 级初始化：让 machine driver 先做板级自定义设置。 */
 	int ret = 0;
 
 	if (rtd->dai_link->init)
@@ -36,6 +38,7 @@ int snd_soc_link_init(struct snd_soc_pcm_runtime *rtd)
 
 void snd_soc_link_exit(struct snd_soc_pcm_runtime *rtd)
 {
+	/* link 级收尾：对应 init() 的反向清理。 */
 	if (rtd->dai_link->exit)
 		rtd->dai_link->exit(rtd);
 }
@@ -43,6 +46,7 @@ void snd_soc_link_exit(struct snd_soc_pcm_runtime *rtd)
 int snd_soc_link_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 				    struct snd_pcm_hw_params *params)
 {
+	/* 允许 machine driver 在 BE 场景下改写 hw_params。 */
 	int ret = 0;
 
 	if (rtd->dai_link->be_hw_params_fixup)
@@ -56,6 +60,7 @@ int snd_soc_link_startup(struct snd_pcm_substream *substream)
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	int ret = 0;
 
+	/* 启动流前，先给 machine driver 一个 startup 钩子。 */
 	if (rtd->dai_link->ops &&
 	    rtd->dai_link->ops->startup)
 		ret = rtd->dai_link->ops->startup(substream);
@@ -72,6 +77,7 @@ void snd_soc_link_shutdown(struct snd_pcm_substream *substream,
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 
+	/* rollback 场景下，只处理已经成功 startup 的流。 */
 	if (rollback && !soc_link_mark_match(rtd, substream, startup))
 		return;
 
@@ -88,6 +94,7 @@ int snd_soc_link_prepare(struct snd_pcm_substream *substream)
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	int ret = 0;
 
+	/* prepare 阶段由 machine driver 做最终准备动作。 */
 	if (rtd->dai_link->ops &&
 	    rtd->dai_link->ops->prepare)
 		ret = rtd->dai_link->ops->prepare(substream);
@@ -101,6 +108,7 @@ int snd_soc_link_hw_params(struct snd_pcm_substream *substream,
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	int ret = 0;
 
+	/* 将用户态选择的格式参数交给 machine driver。 */
 	if (rtd->dai_link->ops &&
 	    rtd->dai_link->ops->hw_params)
 		ret = rtd->dai_link->ops->hw_params(substream, params);
@@ -116,6 +124,7 @@ void snd_soc_link_hw_free(struct snd_pcm_substream *substream, int rollback)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 
+	/* rollback 场景下，只清理已经成功 hw_params 的流。 */
 	if (rollback && !soc_link_mark_match(rtd, substream, hw_params))
 		return;
 
@@ -132,6 +141,7 @@ static int soc_link_trigger(struct snd_pcm_substream *substream, int cmd)
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	int ret = 0;
 
+	/* trigger 只做一层薄封装，把命令传给 machine driver。 */
 	if (rtd->dai_link->ops &&
 	    rtd->dai_link->ops->trigger)
 		ret = rtd->dai_link->ops->trigger(substream, cmd);
@@ -145,6 +155,7 @@ int snd_soc_link_trigger(struct snd_pcm_substream *substream, int cmd,
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	int ret = 0;
 
+	/* 启停/暂停/恢复的 trigger 要维护启动状态，避免 rollback 误操作。 */
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
@@ -172,6 +183,7 @@ int snd_soc_link_compr_startup(struct snd_compr_stream *cstream)
 	struct snd_soc_pcm_runtime *rtd = cstream->private_data;
 	int ret = 0;
 
+	/* compressed 流的 startup 也走 machine driver 钩子。 */
 	if (rtd->dai_link->compr_ops &&
 	    rtd->dai_link->compr_ops->startup)
 		ret = rtd->dai_link->compr_ops->startup(cstream);
@@ -188,6 +200,7 @@ void snd_soc_link_compr_shutdown(struct snd_compr_stream *cstream,
 {
 	struct snd_soc_pcm_runtime *rtd = cstream->private_data;
 
+	/* rollback 时只清理已经成功 startup 的 compressed 流。 */
 	if (rollback && !soc_link_mark_match(rtd, cstream, compr_startup))
 		return;
 
@@ -204,6 +217,7 @@ int snd_soc_link_compr_set_params(struct snd_compr_stream *cstream)
 	struct snd_soc_pcm_runtime *rtd = cstream->private_data;
 	int ret = 0;
 
+	/* compressed 流参数交给 machine driver 做板级适配。 */
 	if (rtd->dai_link->compr_ops &&
 	    rtd->dai_link->compr_ops->set_params)
 		ret = rtd->dai_link->compr_ops->set_params(cstream);

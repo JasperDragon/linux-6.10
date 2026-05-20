@@ -37,7 +37,15 @@ struct platform_device;
 #include <linux/regmap.h>
 
 /*
- * Convenience kcontrol builders
+ * 这些宏用于快速构造 ASoC 的 kcontrol 描述。
+ *
+ * ASoC 里的很多 mixer / enum / bytes 控件并不是直接手写一套
+ * get/put/info 函数，而是把寄存器地址、bit 偏移、取值范围、
+ * 是否反向、是否自动 disable 等信息编码进 private_value，
+ * 再交给通用回调解释。
+ *
+ * 这样做的结果是：驱动侧只需要声明“这是什么控制”，而不用为
+ * 每个寄存器重复实现一套样板操作。
  */
 #define SOC_DOUBLE_S_VALUE(xreg, shift_left, shift_right, xmin, xmax, xsign_bit, \
 			   xinvert, xautodisable) \
@@ -414,6 +422,10 @@ struct platform_device;
 #define SOC_ENUM_SINGLE_VIRT_DECL(name, xtexts) \
 	const struct soc_enum name = SOC_ENUM_SINGLE_VIRT(ARRAY_SIZE(xtexts), xtexts)
 
+/*
+ * 这些 helper 宏把 CPU / CODEC / PLATFORM 端点组织成标准数组，
+ * 再由 snd_soc_dai_link 统一描述一条链路。
+ */
 struct snd_soc_card;
 struct snd_soc_pcm_runtime;
 struct snd_soc_dai;
@@ -428,6 +440,7 @@ struct snd_soc_jack_pin;
 #include <sound/soc-dpcm.h>
 #include <sound/soc-topology.h>
 
+/* card / component / PCM 的注册入口。 */
 int snd_soc_register_card(struct snd_soc_card *card);
 void snd_soc_unregister_card(struct snd_soc_card *card);
 int devm_snd_soc_register_card(struct device *dev, struct snd_soc_card *card);
@@ -446,6 +459,7 @@ static inline int snd_soc_resume(struct device *dev)
 	return 0;
 }
 #endif
+/* component 设备的创建、注册、查找和释放。 */
 int snd_soc_poweroff(struct device *dev);
 int snd_soc_component_initialize(struct snd_soc_component *component,
 				 const struct snd_soc_component_driver *driver,
@@ -468,6 +482,7 @@ struct snd_soc_component *snd_soc_lookup_component(struct device *dev,
 						   const char *driver_name);
 struct snd_soc_component *snd_soc_lookup_component_by_name(const char *component_name);
 
+/* 为 runtime 创建标准 PCM / compress 设备。 */
 int soc_new_pcm(struct snd_soc_pcm_runtime *rtd);
 #ifdef CONFIG_SND_SOC_COMPRESS
 int snd_soc_new_compress(struct snd_soc_pcm_runtime *rtd);
@@ -496,13 +511,15 @@ static inline void snd_soc_runtime_deactivate(struct snd_soc_pcm_runtime *rtd,
 	snd_soc_runtime_action(rtd, stream, -1);
 }
 
+/* 根据 link / DAI 能力推导 runtime 的 PCM 硬件参数。 */
 int snd_soc_runtime_calc_hw(struct snd_soc_pcm_runtime *rtd,
 			    struct snd_pcm_hardware *hw, int stream);
 
+/* 把 runtime 级别的 dai_fmt 配置下发到底层 DAI。 */
 int snd_soc_runtime_set_dai_fmt(struct snd_soc_pcm_runtime *rtd,
 	unsigned int dai_fmt);
 
-/* Utility functions to get clock rates from various things */
+/* 根据 pcm 参数推导 frame size / bclk 等基础时钟信息。 */
 int snd_soc_calc_frame_size(int sample_size, int channels, int tdm_slots);
 int snd_soc_params_to_frame_size(const struct snd_pcm_hw_params *params);
 int snd_soc_calc_bclk(int fs, int sample_size, int channels, int tdm_slots);
@@ -545,7 +562,10 @@ static inline int snd_soc_set_ac97_ops(struct snd_ac97_bus_ops *ops)
 #endif
 
 /*
- *Controls
+ * ALSA 控件相关接口。
+ *
+ * 这里包括创建通用 kcontrol、把控件挂到 card/component/dai 上，
+ * 以及各种 mixer / enum / bytes / bool / TLV helper。
  */
 struct snd_kcontrol *snd_soc_cnew(const struct snd_kcontrol_new *_template,
 				  void *data, const char *long_name,
@@ -600,6 +620,11 @@ int snd_soc_get_strobe(struct snd_kcontrol *kcontrol,
 int snd_soc_put_strobe(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_value *ucontrol);
 
+/*
+ * 触发顺序枚举。
+ *
+ * 用于控制 start / stop 时 link、component 和 DAI 的调用顺序。
+ */
 enum snd_soc_trigger_order {
 						/* start			stop		     */
 	SND_SOC_TRIGGER_ORDER_DEFAULT	= 0,	/* Link->Component->DAI		DAI->Component->Link */
@@ -608,20 +633,33 @@ enum snd_soc_trigger_order {
 	SND_SOC_TRIGGER_ORDER_MAX,
 };
 
-/* SoC PCM stream information */
+/*
+ * 一个 PCM 流能力描述。
+ *
+ * 这是 DAI/codec 对外宣告自己支持哪些播放/录音能力的地方：
+ * - 可用格式
+ * - 可用采样率
+ * - 支持的最小/最大通道数
+ * - 有效位宽
+ */
 struct snd_soc_pcm_stream {
-	const char *stream_name;
-	u64 formats;			/* SNDRV_PCM_FMTBIT_* */
-	u32 subformats;			/* for S32_LE format, SNDRV_PCM_SUBFMTBIT_* */
-	unsigned int rates;		/* SNDRV_PCM_RATE_* */
-	unsigned int rate_min;		/* min rate */
-	unsigned int rate_max;		/* max rate */
-	unsigned int channels_min;	/* min channels */
-	unsigned int channels_max;	/* max channels */
-	unsigned int sig_bits;		/* number of bits of content */
+	const char *stream_name;	/* 流名称，通常对应用户态看到的播放/采集名字 */
+	u64 formats;			/* SNDRV_PCM_FMTBIT_* 的位图 */
+	u32 subformats;			/* 额外子格式位图，例如 S32_LE 的子格式 */
+	unsigned int rates;		/* SNDRV_PCM_RATE_* 位图 */
+	unsigned int rate_min;		/* 最小支持采样率 */
+	unsigned int rate_max;		/* 最大支持采样率 */
+	unsigned int channels_min;	/* 最小声道数 */
+	unsigned int channels_max;	/* 最大声道数 */
+	unsigned int sig_bits;		/* 有效数据位数 */
 };
 
-/* SoC audio ops */
+/*
+ * Machine driver 的 PCM 操作回调。
+ *
+ * 这些回调比 DAI ops 更偏“板级行为”，通常用于把一条音频链路的
+ * 启动/停止/HW 参数配置按机器需求串起来。
+ */
 struct snd_soc_ops {
 	int (*startup)(struct snd_pcm_substream *);
 	void (*shutdown)(struct snd_pcm_substream *);
@@ -641,6 +679,17 @@ struct snd_soc_component*
 snd_soc_rtdcom_lookup(struct snd_soc_pcm_runtime *rtd,
 		       const char *driver_name);
 
+/*
+ * 一个 DAI link 里的单个端点描述。
+ *
+ * 这个结构体本身不是硬件对象，而是“如何定位一个端点”的描述：
+ * - name: 用设备名匹配
+ * - of_node: 用 DT 节点匹配
+ * - dai_name: 用 DAI 名字匹配
+ * - dai_args: 用 OF phandle 参数匹配
+ *
+ * 同一个 link 中可以有多个 CPU / CODEC / platform 端点。
+ */
 struct snd_soc_dai_link_component {
 	const char *name;
 	struct device_node *of_node;
@@ -648,18 +697,20 @@ struct snd_soc_dai_link_component {
 	const struct of_phandle_args *dai_args;
 
 	/*
-	 * Extra format = SND_SOC_DAIFMT_Bx_Fx
+	 * 额外格式位。
 	 *
-	 * [Note] it is Bx_Fx base, not CBx_CFx
-	 *
-	 * It will be used with dai_link->dai_fmt
-	 * see
-	 *	snd_soc_runtime_set_dai_fmt()
+	 * 这部分表示 Bx_Fx 级别的补充约束，会和 dai_link->dai_fmt
+	 * 一起参与最终格式配置。常用于在链接层面附加更细的时序要求。
 	 */
 	unsigned int ext_fmt;
 };
 
 /*
+ * ch_maps 用来描述多 CPU / 多 CODEC link 中的通道对应关系。
+ *
+ * 当一个 link 不是简单的一对一，而是多端点复用或扇出时，
+ * core 不能仅靠端点顺序猜声道映射，因此需要显式给出 ch_map。
+ *
  * [dai_link->ch_maps Image sample]
  *
  *-------------------------
@@ -695,118 +746,130 @@ struct snd_soc_dai_link_component {
  * ch-map[2].cpu = 1	ch-map[2].codec = 2
  *
  */
+/* 一个通道映射条目：把某个 CPU 通道对应到某个 CODEC 通道。 */
 struct snd_soc_dai_link_ch_map {
 	unsigned int cpu;
 	unsigned int codec;
 	unsigned int ch_mask;
 };
 
+/*
+ * DAI link 是 ASoC 最核心的板级连接描述。
+ *
+ * 它描述一条音频路径上的两端或多端连接：
+ * - CPU DAI：SoC 侧 I2S/PCM 控制器
+ * - CODEC DAI：codec 侧音频接口
+ * - platform：DMA / PCM 平台
+ *
+ * 同时它还携带这条连接的行为：
+ * - 格式、主从、时钟
+ * - DPCM 前后端属性
+ * - probe/init/exit/hw_params_fixup
+ * - start/stop 顺序与 symmetry 约束
+ */
 struct snd_soc_dai_link {
-	/* config - must be set by machine driver */
-	const char *name;			/* Codec name */
-	const char *stream_name;		/* Stream name */
+	/* 由 machine driver 配置的静态属性。 */
+	const char *name;			/* 逻辑链接名，便于调试和识别 */
+	const char *stream_name;		/* 用户态可见的 stream 名称 */
 
 	/*
-	 * You MAY specify the link's CPU-side device, either by device name,
-	 * or by DT/OF node, but not both. If this information is omitted,
-	 * the CPU-side DAI is matched using .cpu_dai_name only, which hence
-	 * must be globally unique. These fields are currently typically used
-	 * only for codec to codec links, or systems using device tree.
-	 */
-	/*
-	 * You MAY specify the DAI name of the CPU DAI. If this information is
-	 * omitted, the CPU-side DAI is matched using .cpu_name/.cpu_of_node
-	 * only, which only works well when that device exposes a single DAI.
+	 * CPU 端点列表。
+	 *
+	 * 这里可以通过设备名、DT 节点或 DAI 名字来匹配 CPU DAI。
+	 * 对于多 CPU link 或 codec-to-codec 场景，可能会有多个 CPU 端点。
 	 */
 	struct snd_soc_dai_link_component *cpus;
 	unsigned int num_cpus;
 
 	/*
-	 * You MUST specify the link's codec, either by device name, or by
-	 * DT/OF node, but not both.
+	 * CODEC 端点列表。
+	 *
+	 * 对传统声卡来说这里至少要有一个 codec。
+	 * 对 codec-to-codec、DPCM、虚拟链路等场景也可能出现多个 codec。
 	 */
-	/* You MUST specify the DAI name within the codec */
 	struct snd_soc_dai_link_component *codecs;
 	unsigned int num_codecs;
 
-	/* num_ch_maps = max(num_cpu, num_codecs) */
+	/* CPU 与 CODEC 的通道映射表。 */
 	struct snd_soc_dai_link_ch_map *ch_maps;
 
 	/*
-	 * You MAY specify the link's platform/PCM/DMA driver, either by
-	 * device name, or by DT/OF node, but not both. Some forms of link
-	 * do not need a platform. In such case, platforms are not mandatory.
+	 * platform 端点列表。
+	 *
+	 * 很多简单卡只有一个 platform，通常就是 PCM/DMA 平台。
+	 * 某些纯 codec-to-codec 或特殊链路不需要 platform。
 	 */
 	struct snd_soc_dai_link_component *platforms;
 	unsigned int num_platforms;
 
-	int id;	/* optional ID for machine driver link identification */
+	/* machine driver 自定义的链路 ID，便于区分多个 link。 */
+	int id;
 
-	/*
-	 * for Codec2Codec
-	 */
+	/* codec-to-codec 链路的参数模板。 */
 	const struct snd_soc_pcm_stream *c2c_params;
 	unsigned int num_c2c_params;
 
-	unsigned int dai_fmt;           /* format to set on init */
+	/* 初始化时要设置给 DAI 的总线格式。 */
+	unsigned int dai_fmt;
 
-	enum snd_soc_dpcm_trigger trigger[2]; /* trigger type for DPCM */
+	/* DPCM 下前端和后端的触发顺序策略。 */
+	enum snd_soc_dpcm_trigger trigger[2];
 
-	/* codec/machine specific init - e.g. add machine controls */
+	/* link 建立后的板级初始化，常用于加控件或注册 jack。 */
 	int (*init)(struct snd_soc_pcm_runtime *rtd);
 
-	/* codec/machine specific exit - dual of init() */
+	/* init() 的反向清理函数。 */
 	void (*exit)(struct snd_soc_pcm_runtime *rtd);
 
-	/* optional hw_params re-writing for BE and FE sync */
+	/* 允许机器驱动在 hw_params 阶段改写参数，常用于 FE/BE 同步。 */
 	int (*be_hw_params_fixup)(struct snd_soc_pcm_runtime *rtd,
 			struct snd_pcm_hw_params *params);
 
-	/* machine stream operations */
+	/* 板级 stream 操作，最终会被 soc-link.c 代理调用。 */
 	const struct snd_soc_ops *ops;
 	const struct snd_soc_compr_ops *compr_ops;
 
 	/*
-	 * soc_pcm_trigger() start/stop sequence.
-	 * see also
-	 *	snd_soc_component_driver
-	 *	soc_pcm_trigger()
+	 * PCM trigger 的上下电顺序。
+	 *
+	 * 有些板子需要先动 codec 再动 platform，有些则相反。
+	 * 这两个字段允许 machine driver 控制 start/stop 的调用顺序。
 	 */
 	enum snd_soc_trigger_order trigger_start;
 	enum snd_soc_trigger_order trigger_stop;
 
-	/* Mark this pcm with non atomic ops */
+	/* 该 link 的 PCM 操作是否允许睡眠/非原子调用。 */
 	unsigned int nonatomic:1;
 
-	/* For unidirectional dai links */
+	/* 单向链路：仅播放或仅录音。 */
 	unsigned int playback_only:1;
 	unsigned int capture_only:1;
 
-	/* Keep DAI active over suspend */
+	/* suspend 时保持 DAI 活动，不强制关断。 */
 	unsigned int ignore_suspend:1;
 
-	/* Symmetry requirements */
+	/* 格式/通道/采样位宽对称约束。 */
 	unsigned int symmetric_rate:1;
 	unsigned int symmetric_channels:1;
 	unsigned int symmetric_sample_bits:1;
 
-	/* Do not create a PCM for this DAI link (Backend link) */
+	/* BE 链路不创建独立 PCM 设备。 */
 	unsigned int no_pcm:1;
 
-	/* This DAI link can route to other DAI links at runtime (Frontend)*/
+	/* 该 link 允许运行时路由到其他 link，常见于 FE。 */
 	unsigned int dynamic:1;
 
-	/* DPCM used FE & BE merged format */
+	/* DPCM 下 FE/BE 的格式是否合并处理。 */
 	unsigned int dpcm_merged_format:1;
-	/* DPCM used FE & BE merged channel */
+	/* DPCM 下 FE/BE 的通道是否合并处理。 */
 	unsigned int dpcm_merged_chan:1;
-	/* DPCM used FE & BE merged rate */
+	/* DPCM 下 FE/BE 的采样率是否合并处理。 */
 	unsigned int dpcm_merged_rate:1;
 
-	/* pmdown_time is ignored at stop */
+	/* stop 时忽略 pmdown_time。 */
 	unsigned int ignore_pmdown_time:1;
 
-	/* Do not create a PCM for this DAI link (Backend link) */
+	/* 彻底忽略这个 link，不创建 PCM 设备。 */
 	unsigned int ignore:1;
 
 #ifdef CONFIG_SND_SOC_TOPOLOGY
@@ -834,6 +897,12 @@ snd_soc_link_to_platform(struct snd_soc_dai_link *link, int n) {
 	return &(link)->platforms[n];
 }
 
+/*
+ * 这些 for_each_* 宏把 link 的端点数组当作统一迭代对象。
+ *
+ * 它们隐藏了“单端点”和“多端点”之间的差异，让调用方只关心
+ * 当前遍历到哪一个 CPU / CODEC / PLATFORM / ch_map。
+ */
 #define for_each_link_codecs(link, i, codec)				\
 	for ((i) = 0;							\
 	     ((i) < link->num_codecs) &&				\
@@ -859,6 +928,11 @@ snd_soc_link_to_platform(struct snd_soc_dai_link *link, int n) {
 	     (i)++)
 
 /*
+ * DAILINK_* 宏负责把“端点数组 + 运行时代码”拼成一个完整 link。
+ *
+ * 这些宏的目标是减少 board driver 中的重复定义，让 CPU / CODEC /
+ * PLATFORM 的数量、名字和排列关系都能统一通过一个入口表达出来。
+ *
  * Sample 1 : Single CPU/Codec/Platform
  *
  * SND_SOC_DAILINK_DEFS(test,
@@ -945,6 +1019,13 @@ extern struct snd_soc_dai_link_component null_dailink_component[0];
 extern struct snd_soc_dai_link_component snd_soc_dummy_dlc;
 int snd_soc_dlc_is_dummy(struct snd_soc_dai_link_component *dlc);
 
+/*
+ * 每个 codec 的额外板级配置。
+ *
+ * 常见用途是给同一颗 codec 的不同实例加不同的 name_prefix，
+ * 从而让 mixer/widget/path 名字在用户态里能区分开。
+ */
+/* codec 级别的额外板级配置。 */
 struct snd_soc_codec_conf {
 	/*
 	 * specify device either by device name, or by
@@ -959,6 +1040,13 @@ struct snd_soc_codec_conf {
 	const char *name_prefix;
 };
 
+/*
+ * 辅助设备。
+ *
+ * 这类设备通常不是通过 DAI link 直接连到 card 上，而是作为附属
+ * component 参与 DAPM、控制和电源管理，例如外置功放或 codec-less IC。
+ */
+/* 板级辅助设备。 */
 struct snd_soc_aux_dev {
 	/*
 	 * specify multi-codec either by device name, or by
@@ -970,14 +1058,27 @@ struct snd_soc_aux_dev {
 	int (*init)(struct snd_soc_component *component);
 };
 
-/* SoC card */
+/*
+ * snd_soc_card 描述一整块声卡/音频板。
+ *
+ * 这是 machine driver 的核心对象，代表“这一整套板级音频系统”。
+ * 它管理：
+ * - 多个 DAI link
+ * - card 级 controls/widgets/routes
+ * - DAPM 上下电
+ * - jack、aux dev、codec prefix
+ * - card 级 probe/remove/PM 回调
+ */
+/* 整块声卡/音频板的总描述。 */
 struct snd_soc_card {
+	/* card 的短名称、长名称、驱动名以及组成字符串。 */
 	const char *name;
 	const char *long_name;
 	const char *driver_name;
 	const char *components;
 #ifdef CONFIG_DMI
-	char dmi_longname[80];
+		/* DMI 识别后生成的长名称缓存。 */
+		char dmi_longname[80];
 #endif /* CONFIG_DMI */
 
 #ifdef CONFIG_PCI
@@ -985,36 +1086,40 @@ struct snd_soc_card {
 	 * PCI does not define 0 as invalid, so pci_subsystem_set indicates
 	 * whether a value has been written to these fields.
 	 */
-	unsigned short pci_subsystem_vendor;
-	unsigned short pci_subsystem_device;
-	bool pci_subsystem_set;
+		/* PCI 子系统 ID，用于区分同一驱动的不同板卡。 */
+		unsigned short pci_subsystem_vendor;
+		unsigned short pci_subsystem_device;
+		bool pci_subsystem_set;
 #endif /* CONFIG_PCI */
 
+	/* topology 场景下的短名缓存。 */
 	char topology_shortname[32];
 
+	/* 对应的 device、底层 ALSA card、模块 owner。 */
 	struct device *dev;
 	struct snd_card *snd_card;
 	struct module *owner;
 
+	/* card 总锁和 DAPM 专用锁。 */
 	struct mutex mutex;
 	struct mutex dapm_mutex;
 
-	/* Mutex for PCM operations */
+	/* PCM 相关操作的专用锁。 */
 	struct mutex pcm_mutex;
 
+	/* card 生命周期回调。 */
 	int (*probe)(struct snd_soc_card *card);
 	int (*late_probe)(struct snd_soc_card *card);
 	void (*fixup_controls)(struct snd_soc_card *card);
 	int (*remove)(struct snd_soc_card *card);
 
-	/* the pre and post PM functions are used to do any PM work before and
-	 * after the codec and DAI's do any PM work. */
+	/* suspend/resume 的前后阶段钩子。 */
 	int (*suspend_pre)(struct snd_soc_card *card);
 	int (*suspend_post)(struct snd_soc_card *card);
 	int (*resume_pre)(struct snd_soc_card *card);
 	int (*resume_post)(struct snd_soc_card *card);
 
-	/* callbacks */
+	/* DAPM bias 级别切换的前后回调。 */
 	int (*set_bias_level)(struct snd_soc_card *,
 			      struct snd_soc_dapm_context *dapm,
 			      enum snd_soc_bias_level level);
@@ -1022,36 +1127,38 @@ struct snd_soc_card {
 				   struct snd_soc_dapm_context *dapm,
 				   enum snd_soc_bias_level level);
 
+	/* 动态增加/删除 DAI link 的回调。 */
 	int (*add_dai_link)(struct snd_soc_card *,
 			    struct snd_soc_dai_link *link);
 	void (*remove_dai_link)(struct snd_soc_card *,
 			    struct snd_soc_dai_link *link);
 
-	/* CPU <--> Codec DAI links  */
-	struct snd_soc_dai_link *dai_link;  /* predefined links only */
-	int num_links;  /* predefined links only */
+	/* 静态预定义的 CPU <-> CODEC DAI link 列表。 */
+	struct snd_soc_dai_link *dai_link;
+	int num_links;
 
+	/* 绑定成功后的 runtime 列表。 */
 	struct list_head rtd_list;
 	int num_rtd;
 
-	/* optional codec specific configuration */
+	/* codec 级别的额外配置。 */
 	struct snd_soc_codec_conf *codec_conf;
 	int num_configs;
 
 	/*
-	 * optional auxiliary devices such as amplifiers or codecs with DAI
-	 * link unused
+	 * 可选辅助设备，例如外置功放或不占用 DAI link 的 codec 组件。
 	 */
 	struct snd_soc_aux_dev *aux_dev;
 	int num_aux_devs;
 	struct list_head aux_comp_list;
 
+	/* card 级别的控制项。 */
 	const struct snd_kcontrol_new *controls;
 	int num_controls;
 
 	/*
-	 * Card-specific routes and widgets.
-	 * Note: of_dapm_xxx for Device Tree; Otherwise for driver build-in.
+	 * card 专属的 DAPM widgets/routes。
+	 * of_dapm_* 用于 Device Tree 场景；普通驱动则用内置数组。
 	 */
 	const struct snd_soc_dapm_widget *dapm_widgets;
 	int num_dapm_widgets;
@@ -1062,16 +1169,17 @@ struct snd_soc_card {
 	const struct snd_soc_dapm_route *of_dapm_routes;
 	int num_of_dapm_routes;
 
-	/* lists of probed devices belonging to this card */
+	/* 已绑定到该 card 的 component 设备列表。 */
 	struct list_head component_dev_list;
 	struct list_head list;
 
+	/* card 内部 DAPM 节点、路径和待处理列表。 */
 	struct list_head widgets;
 	struct list_head paths;
 	struct list_head dapm_list;
 	struct list_head dapm_dirty;
 
-	/* Generic DAPM context for the card */
+	/* card 级 DAPM 上下文和统计信息。 */
 	struct snd_soc_dapm_context *dapm;
 	struct snd_soc_dapm_stats dapm_stats;
 
@@ -1081,16 +1189,19 @@ struct snd_soc_card {
 #ifdef CONFIG_PM_SLEEP
 	struct work_struct deferred_resume_work;
 #endif
+	/* 用于控制开机/停流时的 pop/click 延迟。 */
 	u32 pop_time;
 
-	/* bit field */
+	/* card 生命周期标志位。 */
 	unsigned int instantiated:1;
 	unsigned int topology_shortname_created:1;
 	unsigned int fully_routed:1;
 	unsigned int probed:1;
 	unsigned int component_chaining:1;
+	/* devres 绑定用的设备。 */
 	struct device *devres_dev;
 
+	/* 任意驱动私有数据。 */
 	void *drvdata;
 };
 #define for_each_card_prelinks(card, i, link)				\
@@ -1135,55 +1246,68 @@ static inline struct snd_soc_dapm_context *snd_soc_card_to_dapm(struct snd_soc_c
 	return card->dapm;
 }
 
-/* SoC machine DAI configuration, glues a codec and cpu DAI together */
+/*
+ * runtime 级对象。
+ *
+ * 一个 dai_link 真正绑定成功后，会生成一个 pcm_runtime。
+ * 它是一次 PCM 打开后的运行时载体，存放：
+ * - 当前 rtd 对应的 card/link
+ * - 绑定到该 link 的 dai/component 列表
+ * - PCM/compress 设备对象
+ * - DPCM runtime 状态
+ * - delayed work / debugfs / pmdown_time / 标记位
+ */
+/* 某条 DAI link 在运行时对应的 PCM 状态。 */
 struct snd_soc_pcm_runtime {
+	/* rtd 所属设备、card 和 dai_link。 */
 	struct device *dev;
 	struct snd_soc_card *card;
 	struct snd_soc_dai_link *dai_link;
 	struct snd_pcm_ops ops;
 
-	unsigned int c2c_params_select; /* currently selected c2c_param for dai link */
+	/* codec-to-codec 场景下当前选择的参数索引。 */
+	unsigned int c2c_params_select;
 
-	/* Dynamic PCM BE runtime data */
+	/* DPCM 后端运行时数据。 */
 	struct snd_soc_dpcm_runtime dpcm[SNDRV_PCM_STREAM_LAST + 1];
 	struct snd_soc_dapm_widget *c2c_widget[SNDRV_PCM_STREAM_LAST + 1];
 
+	/* 关闭后的延迟下电时间。 */
 	long pmdown_time;
 
-	/* runtime devices */
+	/* 运行时关联的 PCM / compressed 设备。 */
 	struct snd_pcm *pcm;
 	struct snd_compr *compr;
 
 	/*
-	 * dais = cpu_dai + codec_dai
-	 * see
-	 *	soc_new_pcm_runtime()
-	 *	snd_soc_rtd_to_cpu()
-	 *	snd_soc_rtd_to_codec()
+	 * 绑定到这个 runtime 的所有 DAI。
+	 * 排列顺序通常是 cpu_dais 在前，codec_dais 在后。
 	 */
 	struct snd_soc_dai **dais;
 
+	/* 关闭后的延迟 work，用于 pmdown_time。 */
 	struct delayed_work delayed_work;
 	void (*close_delayed_work_func)(struct snd_soc_pcm_runtime *rtd);
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_dpcm_root;
 #endif
 
-	unsigned int id; /* 0-based and monotonic increasing */
-	struct list_head list; /* rtd list of the soc card */
+	/* runtime 序号和挂入 card->rtd_list 的节点。 */
+	unsigned int id;
+	struct list_head list;
 
-	/* function mark */
+	/* 用于 rollback / 防重入 的调用标记。 */
 	struct snd_pcm_substream *mark_startup;
 	struct snd_pcm_substream *mark_hw_params;
 	struct snd_pcm_substream *mark_trigger;
 	struct snd_compr_stream  *mark_compr_startup;
 
-	/* bit field */
+	/* runtime 状态位。 */
 	unsigned int pop_wait:1;
 	unsigned int fe_compr:1; /* for Dynamic PCM */
 	unsigned int initialized:1;
 
-	/* CPU/Codec/Platform */
+	/* 当前 runtime 绑定到的 component 数组。 */
 	int num_components;
 	struct snd_soc_component *components[] __counted_by(num_components);
 };
@@ -1223,11 +1347,16 @@ snd_soc_substream_to_rtd(const struct snd_pcm_substream *substream)
 
 void snd_soc_close_delayed_work(struct snd_soc_pcm_runtime *rtd);
 
-/* mixer control */
+/*
+ * mixer / enum / bytes 控件的私有描述结构。
+ *
+ * 这些结构体通常不会被用户态直接看到，而是藏在 kcontrol 的
+ * private_value 里，供通用的 get/put/info 回调解释。
+ */
 struct soc_mixer_control {
-	/* Minimum and maximum specified as written to the hardware */
+	/* 硬件写入值的最小/最大范围。 */
 	int min, max;
-	/* Limited maximum value specified as presented through the control */
+	/* 用户态可见的最大值上限。 */
 	int platform_max;
 	int reg, rreg;
 	unsigned int shift, rshift;
@@ -1240,12 +1369,14 @@ struct soc_mixer_control {
 #endif
 };
 
+/* bytes 型控件：通常用于批量寄存器或厂商私有 blob。 */
 struct soc_bytes {
 	int base;
 	int num_regs;
 	u32 mask;
 };
 
+/* 扩展 bytes 控件：允许自定义 get/put 处理。 */
 struct soc_bytes_ext {
 	int max;
 #ifdef CONFIG_SND_SOC_TOPOLOGY
@@ -1258,13 +1389,18 @@ struct soc_bytes_ext {
 			unsigned int size);
 };
 
-/* multi register control */
+/* 多寄存器范围型控件。 */
 struct soc_mreg_control {
 	long min, max;
 	unsigned int regbase, regcount, nbits, invert;
 };
 
-/* enumerated kcontrol */
+/*
+ * 枚举型控件。
+ *
+ * 这类控件把寄存器中的某个值映射成一组文字选项，例如：
+ * "I2S" / "Left Justified" / "DSP A" 等。
+ */
 struct soc_enum {
 	int reg;
 	unsigned char shift_l;
@@ -1296,6 +1432,7 @@ static inline unsigned int snd_soc_enum_val_to_item(const struct soc_enum *e,
 {
 	unsigned int i;
 
+	/* 把寄存器值翻译成枚举项索引。 */
 	if (!e->values)
 		return val;
 
@@ -1309,6 +1446,7 @@ static inline unsigned int snd_soc_enum_val_to_item(const struct soc_enum *e,
 static inline unsigned int snd_soc_enum_item_to_val(const struct soc_enum *e,
 	unsigned int item)
 {
+	/* 把枚举项索引翻译回真正要写进寄存器的值。 */
 	if (!e->values)
 		return item;
 
@@ -1388,6 +1526,7 @@ void snd_soc_dlc_use_cpu_as_platform(struct snd_soc_dai_link_component *platform
 struct of_phandle_args *snd_soc_copy_dai_args(struct device *dev,
 					      const struct of_phandle_args *args);
 struct snd_soc_dai *snd_soc_get_dai_via_args(const struct of_phandle_args *dai_args);
+/* card / component / DAI 的注册、查找、解绑逻辑入口。 */
 struct snd_soc_dai *snd_soc_register_dai(struct snd_soc_component *component,
 					 struct snd_soc_dai_driver *dai_drv,
 					 bool legacy_dai_naming);
@@ -1411,6 +1550,7 @@ int snd_soc_fixup_dai_links_platform_name(struct snd_soc_card *card,
 	const char *name;
 	int i;
 
+	/* 某些板子共享同一个 platform 名字，core 这里会给每个 link 补副本。 */
 	if (!platform_name) /* nothing to do */
 		return 0;
 
@@ -1442,6 +1582,9 @@ extern const struct dev_pm_ops snd_soc_pm_ops;
 
 /*
  *	DAPM helper functions
+ *
+ * 这里的重点是锁封装和上下文统一，让 card 级与 runtime 级的
+ * DAPM 操作都走同一套锁语义。
  */
 enum snd_soc_dapm_subclass {
 	SND_SOC_DAPM_CLASS_ROOT		= 0,
@@ -1450,11 +1593,13 @@ enum snd_soc_dapm_subclass {
 
 static inline void _snd_soc_dapm_mutex_lock_root_c(struct snd_soc_card *card)
 {
+	/* root 级操作优先级更高，用独立 subclass 标记。 */
 	mutex_lock_nested(&card->dapm_mutex, SND_SOC_DAPM_CLASS_ROOT);
 }
 
 static inline void _snd_soc_dapm_mutex_lock_c(struct snd_soc_card *card)
 {
+	/* runtime 级 DAPM 操作默认归到同一个锁域。 */
 	mutex_lock_nested(&card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
 }
 
@@ -1503,9 +1648,13 @@ static inline void _snd_soc_dapm_mutex_assert_held_d(struct snd_soc_dapm_context
 
 /*
  *	PCM helper functions
+ *
+ * 这部分围绕 DPCM/PCM 的 card 级锁展开，并通过 _Generic 把
+ * card 和 runtime 两类入口统一起来。
  */
 static inline void _snd_soc_dpcm_mutex_lock_c(struct snd_soc_card *card)
 {
+	/* DPCM 共享 card->pcm_mutex，保证 FE/BE 协商不会乱序。 */
 	mutex_lock(&card->pcm_mutex);
 }
 

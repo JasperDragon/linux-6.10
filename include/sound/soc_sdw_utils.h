@@ -12,12 +12,13 @@
 #include <sound/soc.h>
 #include <sound/soc-acpi.h>
 
+/* SoundWire 相关辅助结构的固定上限。 */
 #define SOC_SDW_MAX_DAI_NUM             8
 #define SOC_SDW_MAX_AUX_NUM		2
 #define SOC_SDW_MAX_NO_PROPS		2
 #define SOC_SDW_JACK_JDSRC(quirk)	((quirk) & GENMASK(3, 0))
 
-/* If a CODEC has an optional speaker output, this quirk will enable it */
+/* codec 有可选 speaker 输出时，用这个 quirk 打开。 */
 #define SOC_SDW_CODEC_SPKR			BIT(15)
 /*
  * If the CODEC has additional devices attached directly to it.
@@ -44,13 +45,16 @@
 
 struct asoc_sdw_codec_info;
 
+/* 单个 SoundWire DAI 的板级描述。 */
 struct asoc_sdw_dai_info {
-	const bool direction[2]; /* playback & capture support */
+	/* playback / capture 支持情况。 */
+	const bool direction[2];
 	const char *codec_name;
 	const char *dai_name;
 	const char *component_name;
 	const int dai_type;
-	const int dailink[2]; /* dailink id for each direction */
+	/* 每个方向对应的 dailink id。 */
+	const int dailink[2];
 	const struct snd_kcontrol_new *controls;
 	const int num_controls;
 	const struct snd_soc_dapm_widget *widgets;
@@ -61,7 +65,8 @@ struct asoc_sdw_dai_info {
 		     bool playback);
 	int (*exit)(struct snd_soc_card *card, struct snd_soc_dai_link *dai_link);
 	int (*rtd_init)(struct snd_soc_pcm_runtime *rtd, struct snd_soc_dai *dai);
-	bool rtd_init_done; /* Indicate that the rtd_init callback is done */
+	/* 标记 rtd_init 是否已经执行。 */
+	bool rtd_init_done;
 	unsigned long quirk;
 	bool quirk_exclude;
 };
@@ -70,6 +75,7 @@ struct asoc_sdw_aux_info {
 	const char *codec_name;
 };
 
+/* 某个 codec 家族在 SoundWire/ASoC 里的统一描述。 */
 struct asoc_sdw_codec_info {
 	const int vendor_id;
 	const int part_id;
@@ -83,7 +89,7 @@ struct asoc_sdw_codec_info {
 	const int dai_num;
 	struct asoc_sdw_aux_info auxs[SOC_SDW_MAX_AUX_NUM];
 	const int aux_num;
-	/* Force AMP-style name_prefix handling (append AMP index) even if MIC/Jack DAIs exist */
+	/* 即使存在 MIC/Jack DAI，也强制使用 AMP 风格的名字前缀。 */
 	const bool is_amp;
 
 	int (*codec_card_late_probe)(struct snd_soc_card *card);
@@ -95,10 +101,12 @@ struct asoc_sdw_codec_info {
 			    struct snd_soc_codec_conf **codec_conf);
 };
 
+/* machine driver 的私有运行时状态。 */
 struct asoc_sdw_mc_private {
 	struct snd_soc_card card;
 	struct snd_soc_jack sdw_headset;
-	struct device *headset_codec_dev; /* only one headset per card */
+	/* 每张 card 只允许一个 headset codec。 */
+	struct device *headset_codec_dev;
 	struct device *amp_dev1, *amp_dev2;
 	bool append_dai_type;
 	bool ignore_internal_dmic;
@@ -107,6 +115,7 @@ struct asoc_sdw_mc_private {
 	int codec_info_list_count;
 };
 
+/* 解析后的 SoundWire endpoint。 */
 struct asoc_sdw_endpoint {
 	struct list_head list;
 
@@ -119,6 +128,7 @@ struct asoc_sdw_endpoint {
 	const struct asoc_sdw_dai_info *dai_info;
 };
 
+/* 一组 SoundWire endpoint 汇总成的 dailink。 */
 struct asoc_sdw_dailink {
 	bool initialised;
 
@@ -131,6 +141,7 @@ struct asoc_sdw_dailink {
 extern struct asoc_sdw_codec_info codec_info_list[];
 int asoc_sdw_get_codec_info_list_count(void);
 
+/* SoundWire 流生命周期钩子。 */
 int asoc_sdw_startup(struct snd_pcm_substream *substream);
 int asoc_sdw_prepare(struct snd_pcm_substream *substream);
 int asoc_sdw_prepare(struct snd_pcm_substream *substream);
@@ -140,11 +151,13 @@ int asoc_sdw_hw_params(struct snd_pcm_substream *substream,
 int asoc_sdw_hw_free(struct snd_pcm_substream *substream);
 void asoc_sdw_shutdown(struct snd_pcm_substream *substream);
 
+/* 按 ACPI / endpoint 信息生成 codec 名字。 */
 const char *asoc_sdw_get_codec_name(struct device *dev,
 				    const struct asoc_sdw_dai_info *dai_info,
 				    const struct snd_soc_acpi_link_adr *adr_link,
 				    int adr_index);
 
+/* codec 信息查找入口。 */
 struct asoc_sdw_codec_info *asoc_sdw_find_codec_info_part(const u64 adr);
 
 struct asoc_sdw_codec_info *asoc_sdw_find_codec_info_acpi(const u8 *acpi_id);
@@ -152,11 +165,14 @@ struct asoc_sdw_codec_info *asoc_sdw_find_codec_info_acpi(const u8 *acpi_id);
 struct asoc_sdw_codec_info *asoc_sdw_find_codec_info_dai(const char *dai_name,
 							 int *dai_index);
 
+/* 在 card 内找到已经被使用的 codec dai_link。 */
 struct snd_soc_dai_link *asoc_sdw_mc_find_codec_dai_used(struct snd_soc_card *card,
 							 const char *dai_name);
 
+/* 退出 machine driver 侧的 dai_link 处理循环。 */
 void asoc_sdw_mc_dailink_exit_loop(struct snd_soc_card *card);
 
+/* late probe hook。 */
 int asoc_sdw_card_late_probe(struct snd_soc_card *card);
 
 void asoc_sdw_init_dai_link(struct device *dev, struct snd_soc_dai_link *dai_links,
@@ -175,6 +191,7 @@ int asoc_sdw_init_simple_dai_link(struct device *dev, struct snd_soc_dai_link *d
 				  int no_pcm, int (*init)(struct snd_soc_pcm_runtime *rtd),
 				  const struct snd_soc_ops *ops);
 
+/* 统计 SoundWire endpoint / device / aux 数量。 */
 int asoc_sdw_count_sdw_endpoints(struct snd_soc_card *card,
 				 int *num_devs, int *num_ends, int *num_aux);
 
@@ -182,15 +199,17 @@ struct asoc_sdw_dailink *asoc_sdw_find_dailink(struct asoc_sdw_dailink *dailinks
 					       const struct snd_soc_acpi_endpoint *new);
 int asoc_sdw_get_dai_type(u32 type);
 
+/* 解析 SoundWire endpoint 并生成 machine driver 需要的数据结构。 */
 int asoc_sdw_parse_sdw_endpoints(struct snd_soc_card *card,
 				 struct snd_soc_aux_dev *soc_aux,
 				 struct asoc_sdw_dailink *soc_dais,
 				 struct asoc_sdw_endpoint *soc_ends,
 				 int *num_devs);
 
+/* rtd 初始化。 */
 int asoc_sdw_rtd_init(struct snd_soc_pcm_runtime *rtd);
 
-/* DMIC support */
+/* DMIC 支持。 */
 int asoc_sdw_dmic_init(struct snd_soc_pcm_runtime *rtd);
 
 /* RT711 support */

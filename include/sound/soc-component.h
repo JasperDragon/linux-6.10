@@ -11,8 +11,9 @@
 #include <sound/soc.h>
 
 /*
- * Component probe and remove ordering levels for components with runtime
- * dependencies.
+ * component 的 probe/remove 顺序控制。
+ * ASoC 里一个 card 往往同时绑定多个 component，例如 codec、platform、
+ * DSP、aux amp 等。这里的 order 用于解决它们之间的运行时依赖。
  */
 #define SND_SOC_COMP_ORDER_FIRST	-2
 #define SND_SOC_COMP_ORDER_EARLY	-1
@@ -20,12 +21,17 @@
 #define SND_SOC_COMP_ORDER_LATE		 1
 #define SND_SOC_COMP_ORDER_LAST		 2
 
+/* 遍历所有 probe/remove 顺序级别。 */
 #define for_each_comp_order(order)		\
 	for (order  = SND_SOC_COMP_ORDER_FIRST;	\
 	     order <= SND_SOC_COMP_ORDER_LAST;	\
 	     order++)
 
-/* component interface */
+/*
+ * 压缩流接口。
+ * 当 component 需要提供 compressed offload 支持时，会通过这组回调和
+ * 用户态的 compress 接口对接。
+ */
 struct snd_compress_ops {
 	int (*open)(struct snd_soc_component *component,
 		    struct snd_compr_stream *stream);
@@ -64,10 +70,19 @@ struct snd_compress_ops {
 			      struct snd_compr_codec_caps *codec);
 };
 
+/*
+ * component driver 是 ASoC 中“硬件功能块”的抽象。
+ * 它描述一个独立硬件单元的：
+ * - 控件和 DAPM 图
+ * - 寄存器读写
+ * - PCM/compress 生命周期
+ * - 时钟、PLL、jack、DT 映射等能力
+ */
 struct snd_soc_component_driver {
+	/* component 的逻辑名字，主要用于调试和匹配。 */
 	const char *name;
 
-	/* Default control and setup, added after probe() is run */
+	/* probe 后自动挂上的默认控件和 DAPM 资源。 */
 	const struct snd_kcontrol_new *controls;
 	unsigned int num_controls;
 	const struct snd_soc_dapm_widget *dapm_widgets;
@@ -75,23 +90,25 @@ struct snd_soc_component_driver {
 	const struct snd_soc_dapm_route *dapm_routes;
 	unsigned int num_dapm_routes;
 
+	/* component 生命周期回调。 */
 	int (*probe)(struct snd_soc_component *component);
 	void (*remove)(struct snd_soc_component *component);
 	int (*suspend)(struct snd_soc_component *component);
 	int (*resume)(struct snd_soc_component *component);
 
+	/* 寄存器访问入口，通常由 regmap 驱动层转发。 */
 	unsigned int (*read)(struct snd_soc_component *component,
 			     unsigned int reg);
 	int (*write)(struct snd_soc_component *component,
 		     unsigned int reg, unsigned int val);
 
-	/* pcm creation and destruction */
+	/* PCM 生命周期钩子。 */
 	int (*pcm_new)(struct snd_soc_component *component,
 		       struct snd_soc_pcm_runtime *rtd);
 	void (*pcm_free)(struct snd_soc_component *component,
 			 struct snd_pcm *pcm);
 
-	/* component wide operations */
+	/* component 级统一控制面：时钟、PLL、jack、DT 映射。 */
 	int (*set_sysclk)(struct snd_soc_component *component,
 			  int clk_id, int source, unsigned int freq, int dir);
 	int (*set_pll)(struct snd_soc_component *component, int pll_id,
@@ -100,7 +117,7 @@ struct snd_soc_component_driver {
 			struct snd_soc_jack *jack,  void *data);
 	int (*get_jack_type)(struct snd_soc_component *component);
 
-	/* DT */
+	/* Device Tree / firmware endpoint 到 DAI 的翻译入口。 */
 	int (*of_xlate_dai_name)(struct snd_soc_component *component,
 				 const struct of_phandle_args *args,
 				 const char **dai_name);
@@ -154,44 +171,39 @@ struct snd_soc_component_driver {
 
 	const struct snd_compress_ops *compress_ops;
 
-	/* probe ordering - for components with runtime dependencies */
+	/* probe/remove 顺序，用于存在依赖关系的多个 component。 */
 	int probe_order;
 	int remove_order;
 
 	/*
-	 * soc_pcm_trigger() start/stop sequence.
-	 * see also
-	 *	snd_soc_dai_link
-	 *	soc_pcm_trigger()
+	 * soc_pcm_trigger() 的启动/停止顺序控制。
+	 * 相关联的优先级和链路规则也会受 snd_soc_dai_link
+	 * 以及 soc_pcm_trigger() 的实现影响。
 	 */
 	enum snd_soc_trigger_order trigger_start;
 	enum snd_soc_trigger_order trigger_stop;
 
 	/*
-	 * signal if the module handling the component should not be removed
-	 * if a pcm is open. Setting this would prevent the module
-	 * refcount being incremented in probe() but allow it be incremented
-	 * when a pcm is opened and decremented when it is closed.
+	 * 打开 PCM 时才拿 module 引用，probe 阶段不持有。
+	 * 适合希望 module 在空闲时可卸载的驱动。
 	 */
 	unsigned int module_get_upon_open:1;
 
-	/* bits */
+	/* 运行时策略位。 */
 	unsigned int idle_bias_on:1;
 	unsigned int suspend_bias_off:1;
 	unsigned int use_pmdown_time:1; /* care pmdown_time at stop */
 	/*
-	 * Indicates that the component does not care about the endianness of
-	 * PCM audio data and the core will ensure that both LE and BE variants
-	 * of each used format are present. Typically this is because the
-	 * component sits behind a bus that abstracts away the endian of the
-	 * original data, ie. one for which the transmission endian is defined
-	 * (I2S/SLIMbus/SoundWire), or the concept of endian doesn't exist (PDM,
-	 * analogue).
+	 * 表示该 component 不关心 PCM 音频数据的字节序。
+	 * core 会确保每个被使用的格式同时具备 LE 和 BE 版本。
+	 * 这通常是因为 component 后面挂着一个会屏蔽原始字节序的总线，
+	 * 例如传输字节序已经定义好的 I2S/SLIMbus/SoundWire；或者像 PDM、
+	 * 模拟链路这样根本不存在字节序的场景。
 	 */
 	unsigned int endianness:1;
 	unsigned int legacy_dai_naming:1;
 
-	/* this component uses topology and ignore machine driver FEs */
+	/* topology 场景下可能忽略 machine driver 的前端 link。 */
 	const char *ignore_machine;
 	const char *topology_name_prefix;
 	int (*be_hw_params_fixup)(struct snd_soc_pcm_runtime *rtd,
@@ -204,44 +216,57 @@ struct snd_soc_component_driver {
 #endif
 };
 
+/*
+ * 运行时 component 对象。
+ * driver 被注册后，内核会为它创建对应的 component；card 绑定时通过
+ * 它来完成控制、DAI、PCM 和 DAPM 的实际操作。
+ */
 struct snd_soc_component {
+	/* component 的显示名和前缀。 */
 	const char *name;
 	const char *name_prefix;
+	/* 关联的设备、card 和活跃状态。 */
 	struct device *dev;
 	struct snd_soc_card *card;
 
 	unsigned int active;
 
+	/* runtime PM 状态。 */
 	unsigned int suspended:1; /* is in suspend PM state */
 
+	/* 组件挂入全局列表和 card 列表时使用的节点。 */
 	struct list_head list;
 	struct list_head card_aux_list; /* for auxiliary bound components */
 	struct list_head card_list;
 
+	/* 对应的驱动描述。 */
 	const struct snd_soc_component_driver *driver;
 
+	/* 该 component 下注册的 DAI 列表。 */
 	struct list_head dai_list;
 	int num_dai;
 
+	/* 寄存器缓存。 */
 	struct regmap *regmap;
 
+	/* component 级 IO 串行化。 */
 	struct mutex io_mutex;
 
-	/* attached dynamic objects */
+	/* 由 topology / runtime 绑定上的动态对象。 */
 	struct list_head dobj_list;
 
-	/*
-	 * DO NOT use any of the fields below in drivers, they are temporary and
-	 * are going to be removed again soon. If you use them in driver code
-	 * the driver will be marked as BROKEN when these fields are removed.
-	 */
+		/*
+		 * 驱动代码不要使用下面这些字段，它们只是过渡性的，
+		 * 很快会再次被移除。若在驱动里依赖这些字段，等字段移除后
+		 * 该驱动会被标记为 BROKEN。
+		 */
 
 	struct snd_soc_dapm_context *dapm;
 
 	/* machine specific init */
 	int (*init)(struct snd_soc_component *component);
 
-	/* function mark */
+	/* 函数级回滚标记，避免重复释放。 */
 	void *mark_module;
 	struct snd_pcm_substream *mark_open;
 	struct snd_pcm_substream *mark_hw_params;
@@ -259,9 +284,10 @@ struct snd_soc_component {
 	list_for_each_entry_safe(dai, _dai, &(component)->dai_list, list)
 
 /**
- * snd_soc_component_to_dapm() - Returns the DAPM context associated with a
- *  component
- * @component: The component for which to get the DAPM context
+ * snd_soc_component_to_dapm() - 取得 component 关联的 DAPM 上下文
+ * @component: 需要获取 DAPM 上下文的 component
+ *
+ * 返回：该 component 绑定的 DAPM context。
  */
 static inline struct snd_soc_dapm_context *snd_soc_component_to_dapm(
 	struct snd_soc_component *component)
@@ -270,10 +296,10 @@ static inline struct snd_soc_dapm_context *snd_soc_component_to_dapm(
 }
 
 /**
- * snd_soc_component_cache_sync() - Sync the register cache with the hardware
- * @component: COMPONENT to sync
+ * snd_soc_component_cache_sync() - 将寄存器缓存同步到硬件
+ * @component: 需要同步的 component
  *
- * Note: This function will call regcache_sync()
+ * 注意：该函数会调用 regcache_sync()。
  */
 static inline int snd_soc_component_cache_sync(
 	struct snd_soc_component *component)
@@ -286,7 +312,7 @@ void snd_soc_component_set_aux(struct snd_soc_component *component,
 int snd_soc_component_init(struct snd_soc_component *component);
 int snd_soc_component_is_dummy(struct snd_soc_component *component);
 
-/* component IO */
+/* component 读写 I/O 接口。 */
 unsigned int snd_soc_component_read(struct snd_soc_component *component,
 				      unsigned int reg);
 int snd_soc_component_write(struct snd_soc_component *component,
@@ -308,7 +334,7 @@ int snd_soc_component_write_field(struct snd_soc_component *component,
 				  unsigned int reg, unsigned int mask,
 				  unsigned int val);
 
-/* component wide operations */
+/* component 级统一控制接口。 */
 int snd_soc_component_set_sysclk(struct snd_soc_component *component,
 				 int clk_id, int source,
 				 unsigned int freq, int dir);
@@ -363,13 +389,13 @@ snd_soc_component_active(struct snd_soc_component *component)
 	return component->active;
 }
 
-/* component controls */
+/* component 控制项查询与通知。 */
 struct snd_kcontrol *snd_soc_component_get_kcontrol(struct snd_soc_component *component,
 						    const char * const ctl);
 int snd_soc_component_notify_control(struct snd_soc_component *component,
 				     const char * const ctl);
 
-/* component driver ops */
+/* component driver 的运行时回调入口。 */
 int snd_soc_component_open(struct snd_soc_component *component,
 			   struct snd_pcm_substream *substream);
 int snd_soc_component_close(struct snd_soc_component *component,

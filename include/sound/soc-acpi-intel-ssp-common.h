@@ -6,14 +6,14 @@
 #ifndef __LINUX_SND_SOC_ACPI_INTEL_SSP_COMMON_H
 #define __LINUX_SND_SOC_ACPI_INTEL_SSP_COMMON_H
 
-/* Cirrus Logic */
+/* ACPI HID 归类：Cirrus Logic。 */
 #define CS35L41_ACPI_HID	"CSC3541"
 #define CS42L42_ACPI_HID	"10134242"
 
-/* Dialog */
+/* Dialog。 */
 #define DA7219_ACPI_HID		"DLGS7219"
 
-/* Everest */
+/* Everest。 */
 #define ES8316_ACPI_HID		"ESSX8316"
 #define ES8326_ACPI_HID		"ESSX8326"
 #define ES8336_ACPI_HID		"ESSX8336"
@@ -23,11 +23,11 @@
 #define MAX_98373_ACPI_HID	"MX98373"
 #define MAX_98390_ACPI_HID	"MX98390"
 
-/* Nuvoton */
+/* Nuvoton。 */
 #define NAU8318_ACPI_HID	"NVTN2012"
 #define NAU8825_ACPI_HID	"10508825"
 
-/* Realtek */
+/* Realtek。 */
 #define RT1011_ACPI_HID		"10EC1011"
 #define RT1015_ACPI_HID		"10EC1015"
 #define RT1015P_ACPI_HID	"RTL1015"
@@ -37,9 +37,10 @@
 #define RT5682_ACPI_HID		"10EC5682"
 #define RT5682S_ACPI_HID	"RTL5682"
 
-/* Texas Instruments */
+/* Texas Instruments。 */
 #define TAS2563_ACPI_HID	"TXNW2563"
 
+/* Intel 平台 ACPI codec / amp 类型枚举。 */
 enum snd_soc_acpi_intel_codec {
 	CODEC_NONE,
 
@@ -69,14 +70,17 @@ enum snd_soc_acpi_intel_codec {
 	CODEC_TAS2563,
 };
 
+/* 通过 ACPI / device tree 侧信息识别 codec / amp 类型。 */
 enum snd_soc_acpi_intel_codec
 snd_soc_acpi_intel_detect_codec_type(struct device *dev);
 enum snd_soc_acpi_intel_codec
 snd_soc_acpi_intel_detect_amp_type(struct device *dev);
 
+/* 把枚举类型映射成 codec 名称。 */
 const char *
 snd_soc_acpi_intel_get_codec_name(enum snd_soc_acpi_intel_codec codec_type);
 
+/* topology 文件名后缀映射。 */
 const char *
 snd_soc_acpi_intel_get_codec_tplg_suffix(enum snd_soc_acpi_intel_codec codec_type);
 const char *

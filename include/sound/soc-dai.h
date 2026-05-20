@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0
  *
- * linux/sound/soc-dai.h -- ALSA SoC Layer
+ * linux/sound/soc-dai.h -- ALSA SoC 层
  *
  * Copyright:	2005-2008 Wolfson Microelectronics. PLC.
  *
- * Digital Audio Interface (DAI) API.
+ * 数字音频接口（DAI）API。
  */
 
 #ifndef __LINUX_SND_SOC_DAI_H
@@ -19,10 +19,9 @@ struct snd_soc_dapm_widget;
 struct snd_compr_stream;
 
 /*
- * DAI hardware audio formats.
- *
- * Describes the physical PCM data formating and clocking. Add new formats
- * to the end.
+ * DAI 物理格式定义。
+ * 这里描述的是总线层面的音频传输规则：I2S、Left/Right Justified、
+ * DSP A/B、AC97、PDM 等。它决定了 BCLK/LRCLK 的关系和数据采样边沿。
  */
 #define SND_SOC_DAIFMT_I2S		SND_SOC_DAI_FORMAT_I2S
 #define SND_SOC_DAIFMT_RIGHT_J		SND_SOC_DAI_FORMAT_RIGHT_J
@@ -36,11 +35,13 @@ struct snd_compr_stream;
 #define SND_SOC_DAIFMT_MSB		SND_SOC_DAIFMT_LEFT_J
 #define SND_SOC_DAIFMT_LSB		SND_SOC_DAIFMT_RIGHT_J
 
-/* Describes the possible PCM format */
 /*
- * use SND_SOC_DAI_FORMAT_xx as eash shift.
- * see
- *	snd_soc_runtime_get_dai_fmt()
+ * 以 bitmask 形式描述“这个 DAI 能支持哪些格式”。
+ * 这是 ASoC core 做格式自动选择时会参考的能力集。
+ */
+/*
+ * 这里按 SND_SOC_DAI_FORMAT_xx 作为位移值来组织能力掩码。
+ * 具体的格式协商过程见 snd_soc_runtime_get_dai_fmt()。
  */
 #define SND_SOC_POSSIBLE_DAIFMT_FORMAT_SHIFT	0
 #define SND_SOC_POSSIBLE_DAIFMT_FORMAT_MASK	(0xFFFF << SND_SOC_POSSIBLE_DAIFMT_FORMAT_SHIFT)
@@ -53,11 +54,9 @@ struct snd_compr_stream;
 #define SND_SOC_POSSIBLE_DAIFMT_PDM		(1 << SND_SOC_DAI_FORMAT_PDM)
 
 /*
- * DAI TDM slot idle modes
- *
- * Describes a CODEC/CPU's behaviour when not actively receiving or
- * transmitting on a given TDM slot. NONE is undefined behaviour.
- * Add new modes to the end.
+ * TDM slot 空闲策略。
+ * 当某个 slot 没有真正承载音频时，硬件希望把该 slot 保持为 0、
+ * 高阻、下拉、上拉还是驱动高电平。
  */
 #define SND_SOC_DAI_TDM_IDLE_NONE	0
 #define SND_SOC_DAI_TDM_IDLE_OFF	1
@@ -68,19 +67,18 @@ struct snd_compr_stream;
 #define SND_SOC_DAI_TDM_IDLE_DRIVE_HIGH	6
 
 /*
- * DAI Clock gating.
- *
- * DAI bit clocks can be gated (disabled) when the DAI is not
- * sending or receiving PCM data in a frame. This can be used to save power.
+ * 时钟门控策略。
+ * gated 表示在没有数据时关闭 bit clock，以降低功耗；
+ * cont 表示时钟持续输出。
  */
 #define SND_SOC_DAIFMT_CONT		(1 << 4) /* continuous clock */
 #define SND_SOC_DAIFMT_GATED		(0 << 4) /* clock is gated */
 
-/* Describes the possible PCM format */
+/* 以 bitmask 形式描述“时钟门控能力集”。 */
 /*
- * define GATED -> CONT. GATED will be selected if both are selected.
- * see
- *	snd_soc_runtime_get_dai_fmt()
+ * 定义能力选择时遵循 GATED -> CONT 的优先级；如果两者都可选，
+ * 最终会优先选择 GATED。
+ * 详细选择逻辑见 snd_soc_runtime_get_dai_fmt()。
  */
 #define SND_SOC_POSSIBLE_DAIFMT_CLOCK_SHIFT	16
 #define SND_SOC_POSSIBLE_DAIFMT_CLOCK_MASK	(0xFFFF	<< SND_SOC_POSSIBLE_DAIFMT_CLOCK_SHIFT)
@@ -88,32 +86,16 @@ struct snd_compr_stream;
 #define SND_SOC_POSSIBLE_DAIFMT_CONT		(0x2ULL	<< SND_SOC_POSSIBLE_DAIFMT_CLOCK_SHIFT)
 
 /*
- * DAI hardware signal polarity.
- *
- * Specifies whether the DAI can also support inverted clocks for the specified
- * format.
- *
- * BCLK:
- * - "normal" polarity means signal is available at rising edge of BCLK
- * - "inverted" polarity means signal is available at falling edge of BCLK
- *
- * FSYNC "normal" polarity depends on the frame format:
- * - I2S: frame consists of left then right channel data. Left channel starts
- *      with falling FSYNC edge, right channel starts with rising FSYNC edge.
- * - Left/Right Justified: frame consists of left then right channel data.
- *      Left channel starts with rising FSYNC edge, right channel starts with
- *      falling FSYNC edge.
- * - DSP A/B: Frame starts with rising FSYNC edge.
- * - AC97: Frame starts with rising FSYNC edge.
- *
- * "Negative" FSYNC polarity is the one opposite of "normal" polarity.
+ * 时钟极性定义。
+ * 这里定义 BCLK 和 LRCLK/FSYNC 的极性组合，决定数据在哪个边沿被
+ * 采样或输出。
  */
 #define SND_SOC_DAIFMT_NB_NF		(0 << 8) /* normal bit clock + frame */
 #define SND_SOC_DAIFMT_NB_IF		(2 << 8) /* normal BCLK + inv FRM */
 #define SND_SOC_DAIFMT_IB_NF		(3 << 8) /* invert BCLK + nor FRM */
 #define SND_SOC_DAIFMT_IB_IF		(4 << 8) /* invert BCLK + FRM */
 
-/* Describes the possible PCM format */
+/* 以 bitmask 形式描述“极性组合能力集”。 */
 #define SND_SOC_POSSIBLE_DAIFMT_INV_SHIFT	32
 #define SND_SOC_POSSIBLE_DAIFMT_INV_MASK	(0xFFFFULL << SND_SOC_POSSIBLE_DAIFMT_INV_SHIFT)
 #define SND_SOC_POSSIBLE_DAIFMT_NB_NF		(0x1ULL    << SND_SOC_POSSIBLE_DAIFMT_INV_SHIFT)
@@ -122,24 +104,22 @@ struct snd_compr_stream;
 #define SND_SOC_POSSIBLE_DAIFMT_IB_IF		(0x8ULL    << SND_SOC_POSSIBLE_DAIFMT_INV_SHIFT)
 
 /*
- * DAI hardware clock providers/consumers
- *
- * This is wrt the codec, the inverse is true for the interface
- * i.e. if the codec is clk and FRM provider then the interface is
- * clk and frame consumer.
+ * 时钟主从关系。
+ * 这里的定义是“针对 codec 的视角”：
+ * codec 负责输出时钟还是接收时钟，frame sync 也同理。
  */
 #define SND_SOC_DAIFMT_CBP_CFP		(1 << 12) /* codec clk provider & frame provider */
 #define SND_SOC_DAIFMT_CBC_CFP		(2 << 12) /* codec clk consumer & frame provider */
 #define SND_SOC_DAIFMT_CBP_CFC		(3 << 12) /* codec clk provider & frame consumer */
 #define SND_SOC_DAIFMT_CBC_CFC		(4 << 12) /* codec clk consumer & frame consumer */
 
-/* when passed to set_fmt directly indicate if the device is provider or consumer */
+/* 直接传给 set_fmt() 时，用于标识当前设备是主设备还是从设备。 */
 #define SND_SOC_DAIFMT_BP_FP		SND_SOC_DAIFMT_CBP_CFP
 #define SND_SOC_DAIFMT_BC_FP		SND_SOC_DAIFMT_CBC_CFP
 #define SND_SOC_DAIFMT_BP_FC		SND_SOC_DAIFMT_CBP_CFC
 #define SND_SOC_DAIFMT_BC_FC		SND_SOC_DAIFMT_CBC_CFC
 
-/* Describes the possible PCM format */
+/* 以 bitmask 形式描述“主从关系能力集”。 */
 #define SND_SOC_POSSIBLE_DAIFMT_CLOCK_PROVIDER_SHIFT	48
 #define SND_SOC_POSSIBLE_DAIFMT_CLOCK_PROVIDER_MASK	(0xFFFFULL << SND_SOC_POSSIBLE_DAIFMT_CLOCK_PROVIDER_SHIFT)
 #define SND_SOC_POSSIBLE_DAIFMT_CBP_CFP			(0x1ULL    << SND_SOC_POSSIBLE_DAIFMT_CLOCK_PROVIDER_SHIFT)
@@ -154,9 +134,7 @@ struct snd_compr_stream;
 
 #define SND_SOC_DAIFMT_MASTER_MASK	SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK
 
-/*
- * Master Clock Directions
- */
+/* 主时钟方向：输入或输出。 */
 #define SND_SOC_CLOCK_IN		0
 #define SND_SOC_CLOCK_OUT		1
 
@@ -176,7 +154,7 @@ struct snd_soc_dai_driver;
 struct snd_soc_dai;
 struct snd_ac97_bus_ops;
 
-/* Digital Audio Interface clocking API.*/
+/* DAI 时钟相关 API。 */
 int snd_soc_dai_set_sysclk(struct snd_soc_dai *dai, int clk_id,
 	unsigned int freq, int dir);
 
@@ -188,7 +166,7 @@ int snd_soc_dai_set_pll(struct snd_soc_dai *dai,
 
 int snd_soc_dai_set_bclk_ratio(struct snd_soc_dai *dai, unsigned int ratio);
 
-/* Digital Audio interface formatting */
+/* DAI 传输格式相关 API。 */
 int snd_soc_dai_get_fmt_max_priority(const struct snd_soc_pcm_runtime *rtd);
 u64 snd_soc_dai_get_fmt(const struct snd_soc_dai *dai, int priority);
 int snd_soc_dai_set_fmt(struct snd_soc_dai *dai, unsigned int fmt);
@@ -209,7 +187,7 @@ int snd_soc_dai_set_tristate(struct snd_soc_dai *dai, int tristate);
 int snd_soc_dai_prepare(struct snd_soc_dai *dai,
 			struct snd_pcm_substream *substream);
 
-/* Digital Audio Interface mute */
+/* DAI 数字静音相关 API。 */
 int snd_soc_dai_digital_mute(struct snd_soc_dai *dai, int mute,
 			     int direction);
 int snd_soc_dai_mute_is_ctrled_at_trigger(struct snd_soc_dai *dai);
@@ -285,8 +263,13 @@ int snd_soc_dai_compr_get_metadata(struct snd_soc_dai *dai,
 
 const char *snd_soc_dai_name_get(const struct snd_soc_dai *dai);
 
+/*
+ * DAI driver 的操作集。
+ * DAI 负责“总线和流”的关系，通常会由 codec driver 或 CPU DAI driver
+ * 提供。它包含时钟、格式、TDM、PCM 生命周期以及压缩流相关回调。
+ */
 struct snd_soc_dai_ops {
-	/* DAI driver callbacks */
+	/* DAI 驱动生命周期回调 */
 	int (*probe)(struct snd_soc_dai *dai);
 	int (*remove)(struct snd_soc_dai *dai);
 	/* compress dai */
@@ -296,8 +279,8 @@ struct snd_soc_dai_ops {
 		       struct snd_soc_dai *dai);
 
 	/*
-	 * DAI clocking configuration, all optional.
-	 * Called by soc_card drivers, normally in their hw_params.
+	 * DAI 时钟配置。
+	 * 通常在 hw_params() 阶段由 card driver 设置。
 	 */
 	int (*set_sysclk)(struct snd_soc_dai *dai,
 		int clk_id, unsigned int freq, int dir);
@@ -307,8 +290,8 @@ struct snd_soc_dai_ops {
 	int (*set_bclk_ratio)(struct snd_soc_dai *dai, unsigned int ratio);
 
 	/*
-	 * DAI format configuration
-	 * Called by soc_card drivers, normally in their hw_params.
+	 * DAI 传输格式配置。
+	 * 包括 I2S/DSP、主从关系、TDM slot、通道映射等。
 	 */
 	int (*set_fmt)(struct snd_soc_dai *dai, unsigned int fmt);
 	int (*xlate_tdm_slot_mask)(unsigned int slots,
@@ -332,14 +315,14 @@ struct snd_soc_dai_ops {
 	void *(*get_stream)(struct snd_soc_dai *dai, int direction);
 
 	/*
-	 * DAI digital mute - optional.
-	 * Called by soc-core to minimise any pops.
+	 * 数字静音。
+	 * soc-core 在启动/停止流时会尽量调用它，用于减少爆音。
 	 */
 	int (*mute_stream)(struct snd_soc_dai *dai, int mute, int stream);
 
 	/*
-	 * ALSA PCM audio operations - all optional.
-	 * Called by soc-core during audio PCM operations.
+	 * ALSA PCM 回调。
+	 * 这些函数在 open/hw_params/prepare/trigger 等生命周期中被调用。
 	 */
 	int (*startup)(struct snd_pcm_substream *,
 		struct snd_soc_dai *);
@@ -352,33 +335,26 @@ struct snd_soc_dai_ops {
 	int (*prepare)(struct snd_pcm_substream *,
 		struct snd_soc_dai *);
 	/*
-	 * NOTE: Commands passed to the trigger function are not necessarily
-	 * compatible with the current state of the dai. For example this
-	 * sequence of commands is possible: START STOP STOP.
-	 * So do not unconditionally use refcounting functions in the trigger
-	 * function, e.g. clk_enable/disable.
+	 * 注意：传给 trigger 的命令不一定和 DAI 的当前状态完全一致。
+	 * 例如可能出现 START STOP STOP 这样的序列。
+	 * 因此不要在 trigger 里无条件使用引用计数式的开关操作，
+	 * 比如 clk_enable()/clk_disable()。
 	 */
 	int (*trigger)(struct snd_pcm_substream *, int,
 		struct snd_soc_dai *);
 
-	/*
-	 * For hardware based FIFO caused delay reporting.
-	 * Optional.
-	 */
+	/* FIFO/硬件管线引入的延迟上报。 */
 	snd_pcm_sframes_t (*delay)(struct snd_pcm_substream *,
 		struct snd_soc_dai *);
 
 	/*
-	 * Format list for auto selection.
-	 * Format will be increased if priority format was
-	 * not selected.
-	 * see
-	 *	snd_soc_dai_get_fmt()
+	 * 自动选择格式列表。
+	 * core 会按优先级逐步尝试这些格式，直到找到双方都支持的组合。
 	 */
 	const u64 *auto_selectable_formats;
 	int num_auto_selectable_formats;
 
-	/* probe ordering - for components with runtime dependencies */
+	/* probe/remove 顺序，与 component driver 的 order 语义一致。 */
 	int probe_order;
 	int remove_order;
 
@@ -388,9 +364,7 @@ struct snd_soc_dai_ops {
 };
 
 struct snd_soc_cdai_ops {
-	/*
-	 * for compress ops
-	 */
+	/* compressed 流操作集。 */
 	int (*startup)(struct snd_compr_stream *,
 			struct snd_soc_dai *);
 	int (*shutdown)(struct snd_compr_stream *,
@@ -413,81 +387,83 @@ struct snd_soc_cdai_ops {
 };
 
 /*
- * Digital Audio Interface Driver.
- *
- * Describes the Digital Audio Interface in terms of its ALSA, DAI and AC97
- * operations and capabilities. Codec and platform drivers will register this
- * structure for every DAI they have.
- *
- * This structure covers the clocking, formating and ALSA operations for each
- * interface.
+ * DAI driver 静态描述。
+ * 这不是运行时对象，而是“某个硬件 DAI 支持什么能力”的模板。
+ * codec/platform driver 通常为每个 DAI 提供一个这样的描述。
  */
 struct snd_soc_dai_driver {
-	/* DAI description */
+	/* DAI 描述信息。 */
 	const char *name;
 	unsigned int id;
 	unsigned int base;
 	struct snd_soc_dobj dobj;
 	const struct of_phandle_args *dai_args;
 
-	/* ops */
+	/* DAI 和 compressed 流回调。 */
 	const struct snd_soc_dai_ops *ops;
 	const struct snd_soc_cdai_ops *cops;
 
-	/* DAI capabilities */
+	/* 播放/录音能力描述，供 runtime 推导硬件约束。 */
 	struct snd_soc_pcm_stream capture;
 	struct snd_soc_pcm_stream playback;
+	/* driver 是否要求各 runtime 参数对称。 */
 	unsigned int symmetric_rate:1;
 	unsigned int symmetric_channels:1;
 	unsigned int symmetric_sample_bits:1;
 };
 
-/* for Playback/Capture */
+/* 每个 stream 对应的运行时状态。 */
 struct snd_soc_dai_stream {
+	/* 绑定到该方向的 DAPM widget。 */
 	struct snd_soc_dapm_widget *widget;
 
-	unsigned int active;	/* usage count */
-	unsigned int tdm_mask;	/* CODEC TDM slot masks and params (for fixup) */
+	/* 活跃计数。 */
+	unsigned int active;
+	/* TDM slot mask，供参数修正和 debug 使用。 */
+	unsigned int tdm_mask;
 
-	void *dma_data;		/* DAI DMA data */
+	/* 平台/codec 私有 DMA 数据。 */
+	void *dma_data;
 };
 
 /*
- * Digital Audio Interface runtime data.
- *
- * Holds runtime data for a DAI.
+ * DAI 运行时对象。
+ * 这是注册后的 DAI 实例，不是静态 driver 描述。它负责保存当前 DAI
+ * 所属的 component、运行时 widget、活动计数和调试标记。
  */
 struct snd_soc_dai {
+	/* 实例名字和编号。 */
 	const char *name;
 	int id;
 	struct device *dev;
 
-	/* driver ops */
+	/* 关联的静态 driver 描述。 */
 	struct snd_soc_dai_driver *driver;
 
-	/* DAI runtime info */
+	/* 每个 stream 的运行时状态。 */
 	struct snd_soc_dai_stream stream[SNDRV_PCM_STREAM_LAST + 1];
 
-	/* Symmetry data - only valid if symmetry is being enforced */
+	/* 对称性缓存，仅在需要强制对称时有效。 */
 	unsigned int symmetric_rate;
 	unsigned int symmetric_channels;
 	unsigned int symmetric_sample_bits;
 
-	/* parent platform/codec */
+	/* 所属 component。 */
 	struct snd_soc_component *component;
 
+	/* 挂入 component->dai_list 的链表节点。 */
 	struct list_head list;
 
-	/* function mark */
+	/* 函数级回滚标记。 */
 	struct snd_pcm_substream *mark_startup;
 	struct snd_pcm_substream *mark_hw_params;
 	struct snd_pcm_substream *mark_trigger;
 	struct snd_compr_stream  *mark_compr_startup;
 
-	/* bit field */
+	/* 是否已经 probe。 */
 	unsigned int probed:1;
 
-	/* DAI private data */
+	/* DAI 私有数据。 */
 	void *priv;
 };
 
@@ -567,20 +543,23 @@ static inline void *snd_soc_dai_get_drvdata(struct snd_soc_dai *dai)
 }
 
 /**
- * snd_soc_dai_set_stream() - Configures a DAI for stream operation
+ * snd_soc_dai_set_stream() - 为 DAI 配置流对象
  * @dai: DAI
- * @stream: STREAM (opaque structure depending on DAI type)
- * @direction: Stream direction(Playback/Capture)
- * Some subsystems, such as SoundWire, don't have a notion of direction and we reuse
- * the ASoC stream direction to configure sink/source ports.
- * Playback maps to source ports and Capture for sink ports.
+ * @stream: 流对象（opaque 结构，具体内容依 DAI 类型而定）
+ * @direction: 流方向（播放/录音）
  *
- * This should be invoked with NULL to clear the stream set previously.
- * Returns 0 on success, a negative error code otherwise.
+ * 某些子系统，比如 SoundWire，并没有“方向”这个概念，这里就复用
+ * ASoC 的流方向来配置 sink/source 端口。播放映射到 source 端口，
+ * 录音映射到 sink 端口。
+ *
+ * 如果传入 NULL，则会清除之前设置的流对象。
+ *
+ * 返回：成功时返回 0，失败时返回负错误码。
  */
 static inline int snd_soc_dai_set_stream(struct snd_soc_dai *dai,
 					 void *stream, int direction)
 {
+	/* 某些总线类型用一个 opaque stream 对象描述 sink/source 端口。 */
 	if (dai->driver->ops->set_stream)
 		return dai->driver->ops->set_stream(dai, stream, direction);
 	else
@@ -588,19 +567,19 @@ static inline int snd_soc_dai_set_stream(struct snd_soc_dai *dai,
 }
 
 /**
- * snd_soc_dai_get_stream() - Retrieves stream from DAI
+ * snd_soc_dai_get_stream() - 从 DAI 取回此前配置的流对象
  * @dai: DAI
- * @direction: Stream direction(Playback/Capture)
+ * @direction: 流方向（播放/录音）
  *
- * This routine only retrieves that was previously configured
- * with snd_soc_dai_get_stream()
+ * 这个函数只会返回此前通过 snd_soc_dai_set_stream() 配置过的对象。
  *
- * Returns pointer to stream or an ERR_PTR value, e.g.
- * ERR_PTR(-ENOTSUPP) if callback is not supported;
+ * 返回：流对象指针，或者 ERR_PTR 值，例如回调不支持时返回
+ * ERR_PTR(-ENOTSUPP)。
  */
 static inline void *snd_soc_dai_get_stream(struct snd_soc_dai *dai,
 					   int direction)
 {
+	/* 读回之前配置的 stream 对象。 */
 	if (dai->driver->ops->get_stream)
 		return dai->driver->ops->get_stream(dai, direction);
 	else

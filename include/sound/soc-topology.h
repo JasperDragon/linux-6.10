@@ -31,9 +31,13 @@ struct snd_soc_dai_driver;
 struct snd_soc_dai;
 struct snd_soc_dapm_route;
 
-/* dynamic object type */
+/*
+ * topology 动态对象类型。
+ * 固件加载后，mixer、enum、widget、DAI link、PCM 等对象都会被包装成
+ * 可动态装卸的对象。
+ */
 enum snd_soc_dobj_type {
-	SND_SOC_DOBJ_NONE		= 0,	/* object is not dynamic */
+	SND_SOC_DOBJ_NONE		= 0,	/* 非动态对象 */
 	SND_SOC_DOBJ_MIXER,
 	SND_SOC_DOBJ_BYTES,
 	SND_SOC_DOBJ_ENUM,
@@ -45,19 +49,22 @@ enum snd_soc_dobj_type {
 	SND_SOC_DOBJ_BACKEND_LINK,
 };
 
-/* dynamic control object */
+/* 动态 control 对象：绑定 kcontrol 以及动态文本/值。 */
 struct snd_soc_dobj_control {
 	struct snd_kcontrol *kcontrol;
 	char **dtexts;
 	unsigned long *dvalues;
 };
 
-/* dynamic widget object */
+/* 动态 widget 对象：保存 kcontrol 类型等附加信息。 */
 struct snd_soc_dobj_widget {
 	unsigned int *kcontrol_type;	/* kcontrol type: mixer, enum, bytes */
 };
 
-/* generic dynamic object - all dynamic objects belong to this struct */
+/*
+ * 通用动态对象。
+ * 所有 topology 动态对象都挂在这个统一结构下，便于 core 统一管理。
+ */
 struct snd_soc_dobj {
 	enum snd_soc_dobj_type type;
 	unsigned int index;	/* objects can belong in different groups */
@@ -71,7 +78,9 @@ struct snd_soc_dobj {
 };
 
 /*
- * Kcontrol operations - used to map handlers onto firmware based controls.
+ * topology 中的 kcontrol 操作映射。
+ * 当 firmware / 拓扑文件定义了控件，但真正的 get/put/info 逻辑仍由
+ * 驱动提供时，就通过这组 ops 做绑定。
  */
 struct snd_soc_tplg_kcontrol_ops {
 	u32 id;
@@ -83,7 +92,7 @@ struct snd_soc_tplg_kcontrol_ops {
 		struct snd_ctl_elem_info *uinfo);
 };
 
-/* Bytes ext operations, for TLV byte controls */
+/* bytes ext 操作，主要用于 TLV / 字节型控制。 */
 struct snd_soc_tplg_bytes_ext_ops {
 	u32 id;
 	int (*get)(struct snd_kcontrol *kcontrol, unsigned int __user *bytes,
@@ -92,9 +101,7 @@ struct snd_soc_tplg_bytes_ext_ops {
 			const unsigned int __user *bytes, unsigned int size);
 };
 
-/*
- * DAPM widget event handlers - used to map handlers onto widgets.
- */
+/* widget 事件处理映射。 */
 struct snd_soc_tplg_widget_events {
 	u16 type;
 	int (*event_handler)(struct snd_soc_dapm_widget *w,
@@ -102,8 +109,8 @@ struct snd_soc_tplg_widget_events {
 };
 
 /*
- * Public API - Used by component drivers to load and unload dynamic objects
- * and their resources.
+ * topology 公共加载接口。
+ * component driver 通过这些 ops 让 core 加载 / 卸载来自 firmware 的动态对象。
  */
 struct snd_soc_tplg_ops {
 
@@ -168,7 +175,7 @@ struct snd_soc_tplg_ops {
 
 #ifdef CONFIG_SND_SOC_TOPOLOGY
 
-/* gets a pointer to data from the firmware block header */
+/* 从 firmware block header 后面取出数据区指针。 */
 static inline const void *snd_soc_tplg_get_data(struct snd_soc_tplg_hdr *hdr)
 {
 	const void *ptr = hdr;
@@ -176,12 +183,12 @@ static inline const void *snd_soc_tplg_get_data(struct snd_soc_tplg_hdr *hdr)
 	return ptr + sizeof(*hdr);
 }
 
-/* Dynamic Object loading and removal for component drivers */
+/* component driver 的动态对象加载 / 移除。 */
 int snd_soc_tplg_component_load(struct snd_soc_component *comp,
 	const struct snd_soc_tplg_ops *ops, const struct firmware *fw);
 int snd_soc_tplg_component_remove(struct snd_soc_component *comp);
 
-/* Binds event handlers to dynamic widgets */
+/* 给动态 widget 绑定事件处理函数。 */
 int snd_soc_tplg_widget_bind_event(struct snd_soc_dapm_widget *w,
 	const struct snd_soc_tplg_widget_events *events, int num_events,
 	u16 event_type);

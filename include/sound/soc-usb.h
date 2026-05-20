@@ -14,14 +14,14 @@ enum snd_soc_usb_kctl {
 };
 
 /**
- * struct snd_soc_usb_device - SoC USB representation of a USB sound device
- * @card_idx: sound card index associated with USB device
- * @chip_idx: USB sound chip array index
- * @cpcm_idx: capture PCM index array associated with USB device
- * @ppcm_idx: playback PCM index array associated with USB device
- * @num_capture: number of capture streams
- * @num_playback: number of playback streams
- * @list: list head for SoC USB devices
+ * struct snd_soc_usb_device - USB 声卡在 SoC USB 框架中的实例描述
+ * @card_idx: 关联的 sound card 索引
+ * @chip_idx: USB 声芯片在阵列里的索引
+ * @cpcm_idx: capture PCM 索引数组
+ * @ppcm_idx: playback PCM 索引数组
+ * @num_capture: capture 流数量
+ * @num_playback: playback 流数量
+ * @list: 挂到全局 USB SoC 列表里的节点
  **/
 struct snd_soc_usb_device {
 	int card_idx;
@@ -37,17 +37,12 @@ struct snd_soc_usb_device {
 };
 
 /**
- * struct snd_soc_usb - representation of a SoC USB backend entity
- * @list: list head for SND SOC struct list
- * @component: reference to ASoC component
- * @connection_status_cb: callback to notify connection events
- * @update_offload_route_info: callback to fetch mapped ASoC card and pcm
- *			       device pair.  This is unrelated to the concept
- *			       of DAPM route.  The "route" argument carries
- *			       an array used for a kcontrol output for either
- *			       the card or pcm index.  "path" determines the
- *			       which entry to look for. (ie mapped card or pcm)
- * @priv_data: driver data
+ * struct snd_soc_usb - USB offload / route 管理上下文
+ * @list: 全局链表节点
+ * @component: 关联的 ASoC component
+ * @connection_status_cb: 连接状态变化回调
+ * @update_offload_route_info: 更新 offload route 信息的回调
+ * @priv_data: 驱动私有数据
  **/
 struct snd_soc_usb {
 	struct list_head list;
@@ -63,20 +58,26 @@ struct snd_soc_usb {
 };
 
 #if IS_ENABLED(CONFIG_SND_SOC_USB)
+/* 根据 card_idx 和 hw_params 判断一个 USB 设备是否支持当前格式。 */
 int snd_soc_usb_find_supported_format(int card_idx,
 				      struct snd_pcm_hw_params *params,
 				      int direction);
 
+/* USB 设备连接/断开通知。 */
 int snd_soc_usb_connect(struct device *usbdev, struct snd_soc_usb_device *sdev);
 int snd_soc_usb_disconnect(struct device *usbdev, struct snd_soc_usb_device *sdev);
+/* 取回挂在 USB 设备上的私有数据。 */
 void *snd_soc_usb_find_priv_data(struct device *usbdev);
 
+/* 给 USB offload 相关场景创建 jack。 */
 int snd_soc_usb_setup_offload_jack(struct snd_soc_component *component,
 				   struct snd_soc_jack *jack);
+/* 更新 offload route 的 card/pcm 映射。 */
 int snd_soc_usb_update_offload_route(struct device *dev, int card, int pcm,
 				     int direction, enum snd_soc_usb_kctl path,
 				     long *route);
 
+/* 申请 / 释放 / 注册 / 注销一个 USB SoC 端口。 */
 struct snd_soc_usb *snd_soc_usb_allocate_port(struct snd_soc_component *component,
 					      void *data);
 void snd_soc_usb_free_port(struct snd_soc_usb *usb);

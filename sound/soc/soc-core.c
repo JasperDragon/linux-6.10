@@ -42,32 +42,42 @@
 #include <sound/soc-link.h>
 #include <sound/initval.h>
 
+/*
+ * soc-core.c 是 ASoC 的核心调度层：
+ * 负责 card/component/dai 的注册绑定、runtime 构建、PCM 流控制、
+ * DAPM 路径推进、debugfs/sysfs 以及模块生命周期管理。
+ */
 #define CREATE_TRACE_POINTS
 #include <trace/events/asoc.h>
 
+/* 保护全局 component/card 绑定关系的总锁。 */
 static DEFINE_MUTEX(client_mutex);
+/* 已注册的 component 全局链表。 */
 static LIST_HEAD(component_list);
+/* 解绑过程中临时挂起的 card 链表。 */
 static LIST_HEAD(unbind_card_list);
 
 #define for_each_component(component)			\
 	list_for_each_entry(component, &component_list, list)
 
 /*
- * This is used if driver don't need to have CPU/Codec/Platform
- * dai_link. see soc.h
+ * 当驱动不需要显式定义 CPU/Codec/Platform dai_link 时使用。
+ * 具体约定见 soc.h。
  */
+/* 某些 DAI link 不需要显式 platform/cpu/codec 端点时使用的空数组。 */
 struct snd_soc_dai_link_component null_dailink_component[0];
 EXPORT_SYMBOL_GPL(null_dailink_component);
 
 /*
- * This is a timeout to do a DAPM powerdown after a stream is closed().
- * It can be used to eliminate pops between different playback streams, e.g.
- * between two audio tracks.
+ * 这是一个在流关闭后执行 DAPM 下电的超时时间。
+ * 它可用于减少不同播放流之间的 pop 声，例如两段音轨之间切换时。
  */
+/* 关闭流后延迟下电的默认时间，单位毫秒，用于减少重开时的 pop 声。 */
 static int pmdown_time = 5000;
 module_param(pmdown_time, int, 0);
 MODULE_PARM_DESC(pmdown_time, "DAPM stream powerdown time (msecs)");
 
+/* 将当前 runtime 的 pmdown_time 暴露到 sysfs。 */
 static ssize_t pmdown_time_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
@@ -76,6 +86,7 @@ static ssize_t pmdown_time_show(struct device *dev,
 	return sysfs_emit(buf, "%ld\n", rtd->pmdown_time);
 }
 
+/* 允许用户态通过 sysfs 调整当前 runtime 的下电延迟。 */
 static ssize_t pmdown_time_store(struct device *dev,
 				 struct device_attribute *attr,
 				 const char *buf, size_t count)
@@ -92,11 +103,16 @@ static ssize_t pmdown_time_store(struct device *dev,
 
 static DEVICE_ATTR_RW(pmdown_time);
 
+/* card/runtime 设备上的 ASoC 专用属性集。 */
 static struct attribute *soc_dev_attrs[] = {
 	&dev_attr_pmdown_time.attr,
 	NULL
 };
 
+/*
+ * 控制某些属性是否对当前 runtime 可见。
+ * 例如只有有 codec 的 runtime 才显示某些控制项。
+ */
 static umode_t soc_dev_attr_is_visible(struct kobject *kobj,
 				       struct attribute *attr, int idx)
 {
@@ -111,16 +127,19 @@ static umode_t soc_dev_attr_is_visible(struct kobject *kobj,
 	return rtd->dai_link->num_codecs ? attr->mode : 0; /* enabled only with codec */
 }
 
+/* DAPM 相关的 sysfs attribute 组。 */
 static const struct attribute_group soc_dapm_dev_group = {
 	.attrs = snd_soc_dapm_dev_attrs,
 	.is_visible = soc_dev_attr_is_visible,
 };
 
+/* 非 DAPM 的 card/runtime 属性组。 */
 static const struct attribute_group soc_dev_group = {
 	.attrs = soc_dev_attrs,
 	.is_visible = soc_dev_attr_is_visible,
 };
 
+/* 供 device core 注册的属性组列表。 */
 static const struct attribute_group *soc_dev_attr_groups[] = {
 	&soc_dapm_dev_group,
 	&soc_dev_group,
@@ -236,6 +255,7 @@ static inline void snd_soc_debugfs_exit(void) { }
 static int snd_soc_is_match_dai_args(const struct of_phandle_args *args1,
 				     const struct of_phandle_args *args2)
 {
+	/* DAI args 匹配要求 node 和参数数组都完全一致。 */
 	if (!args1 || !args2)
 		return 0;
 
@@ -267,6 +287,7 @@ static inline int snd_soc_dlc_dai_is_empty(struct snd_soc_dai_link_component *dl
 static int snd_soc_is_matching_dai(const struct snd_soc_dai_link_component *dlc,
 				   struct snd_soc_dai *dai)
 {
+	/* 端点匹配优先看 phandle 参数，其次看名字。 */
 	if (!dlc)
 		return 0;
 
@@ -276,7 +297,7 @@ static int snd_soc_is_matching_dai(const struct snd_soc_dai_link_component *dlc,
 	if (!dlc->dai_name)
 		return 1;
 
-	/* see snd_soc_dai_name_get() */
+	/* 参见 snd_soc_dai_name_get()。 */
 
 	if (dai->driver->name &&
 	    strcmp(dlc->dai_name, dai->driver->name) == 0)
@@ -294,7 +315,8 @@ static int snd_soc_is_matching_dai(const struct snd_soc_dai_link_component *dlc,
 
 const char *snd_soc_dai_name_get(const struct snd_soc_dai *dai)
 {
-	/* see snd_soc_is_matching_dai() */
+	/* 取一个最适合对外显示的名字，优先级为 driver->name / dai->name / component->name。 */
+	/* 参见 snd_soc_is_matching_dai()。 */
 	if (dai->driver->name)
 		return dai->driver->name;
 
@@ -311,16 +333,17 @@ EXPORT_SYMBOL_GPL(snd_soc_dai_name_get);
 static int snd_soc_rtd_add_component(struct snd_soc_pcm_runtime *rtd,
 				     struct snd_soc_component *component)
 {
+	/* runtime 里不能重复挂同一个 component。 */
 	struct snd_soc_component *comp;
 	int i;
 
 	for_each_rtd_components(rtd, i, comp) {
-		/* already connected */
+		/* 已经连接过了。 */
 		if (comp == component)
 			return 0;
 	}
 
-	/* see for_each_rtd_components */
+	/* 供 for_each_rtd_components() 遍历使用。 */
 	rtd->num_components++; // increment flex array count at first
 	rtd->components[rtd->num_components - 1] = component;
 
@@ -330,6 +353,7 @@ static int snd_soc_rtd_add_component(struct snd_soc_pcm_runtime *rtd,
 struct snd_soc_component *snd_soc_rtdcom_lookup(struct snd_soc_pcm_runtime *rtd,
 						const char *driver_name)
 {
+	/* 在 runtime 中按 component driver name 取回已绑定 component。 */
 	struct snd_soc_component *component;
 	int i;
 
@@ -337,12 +361,12 @@ struct snd_soc_component *snd_soc_rtdcom_lookup(struct snd_soc_pcm_runtime *rtd,
 		return NULL;
 
 	/*
-	 * NOTE
+	 * 注意：
 	 *
-	 * snd_soc_rtdcom_lookup() will find component from rtd by using
-	 * specified driver name.
-	 * But, if many components which have same driver name are connected
-	 * to 1 rtd, this function will return 1st found component.
+	 * snd_soc_rtdcom_lookup() 会按指定的 driver name 从 rtd 中查找
+	 * component。
+	 * 但如果多个 component 使用了相同的 driver name 并连接到同一个
+	 * rtd，这个函数只会返回第一个找到的 component。
 	 */
 	for_each_rtd_components(rtd, i, component) {
 		const char *component_name = component->driver->name;
@@ -362,6 +386,7 @@ EXPORT_SYMBOL_GPL(snd_soc_rtdcom_lookup);
 struct snd_soc_component
 *snd_soc_lookup_component_nolocked(struct device *dev, const char *driver_name)
 {
+	/* 不加 client_mutex 的 component 查找，仅供内部持锁路径使用。 */
 	struct snd_soc_component *component;
 
 	for_each_component(component) {
@@ -388,6 +413,7 @@ EXPORT_SYMBOL_GPL(snd_soc_lookup_component_nolocked);
 struct snd_soc_component *snd_soc_lookup_component(struct device *dev,
 						   const char *driver_name)
 {
+	/* 对外暴露的 component 查找入口。 */
 	guard(mutex)(&client_mutex);
 
 	return snd_soc_lookup_component_nolocked(dev, driver_name);
@@ -396,6 +422,7 @@ EXPORT_SYMBOL_GPL(snd_soc_lookup_component);
 
 struct snd_soc_component *snd_soc_lookup_component_by_name(const char *component_name)
 {
+	/* 按名称模糊查找 component，主要用于调试和 topology 路径。 */
 	struct snd_soc_component *component;
 
 	guard(mutex)(&client_mutex);
@@ -411,6 +438,7 @@ struct snd_soc_pcm_runtime
 *snd_soc_get_pcm_runtime(struct snd_soc_card *card,
 			 struct snd_soc_dai_link *dai_link)
 {
+	/* 按 dai_link 指针精确定位 runtime。 */
 	struct snd_soc_pcm_runtime *rtd;
 
 	for_each_card_rtds(card, rtd) {
@@ -423,15 +451,15 @@ struct snd_soc_pcm_runtime
 EXPORT_SYMBOL_GPL(snd_soc_get_pcm_runtime);
 
 /*
- * Power down the audio subsystem pmdown_time msecs after close is called.
- * This is to ensure there are no pops or clicks in between any music tracks
- * due to DAPM power cycling.
+ * 在流 close 之后延迟 pmdown_time 毫秒再关闭音频子系统。
+ * 这样可以避免由于 DAPM 反复上/下电而在音乐轨道切换时产生 pop/click。
  */
 void snd_soc_close_delayed_work(struct snd_soc_pcm_runtime *rtd)
 {
 	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
 	int playback = SNDRV_PCM_STREAM_PLAYBACK;
 
+	/* 延迟关流发生时要持有 DPCM 锁，避免和 trigger 竞态。 */
 	snd_soc_dpcm_mutex_lock(rtd);
 
 	dev_dbg(rtd->dev,
@@ -441,7 +469,7 @@ void snd_soc_close_delayed_work(struct snd_soc_pcm_runtime *rtd)
 		"active" : "inactive",
 		str_yes_no(rtd->pop_wait));
 
-	/* are we waiting on this codec DAI stream */
+	/* 这个 codec DAI stream 还在等待吗？ */
 	if (rtd->pop_wait == 1) {
 		rtd->pop_wait = 0;
 		snd_soc_dapm_stream_event(rtd, playback,
@@ -454,7 +482,7 @@ EXPORT_SYMBOL_GPL(snd_soc_close_delayed_work);
 
 static void soc_release_rtd_dev(struct device *dev)
 {
-	/* "dev" means "rtd->dev" */
+	/* 这里的 "dev" 指的是 "rtd->dev"。 */
 	kfree(dev);
 }
 
@@ -463,28 +491,17 @@ static void soc_free_pcm_runtime(struct snd_soc_pcm_runtime *rtd)
 	if (!rtd)
 		return;
 
+	/* rtd 释放前要先退出链表、停止 delayed work，再释放嵌套资源。 */
 	list_del(&rtd->list);
 
 	flush_delayed_work(&rtd->delayed_work);
 	snd_soc_pcm_component_free(rtd);
 
 	/*
-	 * we don't need to call kfree() for rtd->dev
-	 * see
-	 *	soc_release_rtd_dev()
-	 *
-	 * We don't need rtd->dev NULL check, because
-	 * it is alloced *before* rtd.
-	 * see
-	 *	soc_new_pcm_runtime()
-	 *
-	 * We don't need to mind freeing for rtd,
-	 * because it was created from dev (= rtd->dev)
-	 * see
-	 *	soc_new_pcm_runtime()
-	 *
-	 *		rtd = devm_kzalloc(dev, ...);
-	 *		rtd->dev = dev
+	 * 不需要对 rtd->dev 单独调用 kfree()。
+	 * 也不需要检查 rtd->dev 是否为 NULL，因为它是在 rtd 之前分配的。
+	 * 同样也不用单独处理 rtd 的释放，因为它本身就是从 dev
+	 * （也就是 rtd->dev）创建出来的。
 	 */
 	device_unregister(rtd->dev);
 }
@@ -506,9 +523,7 @@ static struct snd_soc_pcm_runtime *soc_new_pcm_runtime(
 	int ret;
 	int stream;
 
-	/*
-	 * for rtd->dev
-	 */
+	/* 为 runtime 单独创建一个 device 节点。 */
 	dev = kzalloc_obj(struct device);
 	if (!dev)
 		return NULL;
@@ -524,9 +539,7 @@ static struct snd_soc_pcm_runtime *soc_new_pcm_runtime(
 		return NULL;
 	}
 
-	/*
-	 * for rtd
-	 */
+	/* 运行时对象本体跟随这个 device 分配。 */
 	rtd = devm_kzalloc(dev,
 			   struct_size(rtd, components,
 				       dai_link->num_cpus +
@@ -552,9 +565,7 @@ static struct snd_soc_pcm_runtime *soc_new_pcm_runtime(
 		goto free_rtd;
 	}
 
-	/*
-	 * for rtd->dais
-	 */
+	/* 为 runtime 预留 CPU/Codec DAI 指针数组。 */
 	rtd->dais = devm_kcalloc(dev, dai_link->num_cpus + dai_link->num_codecs,
 					sizeof(struct snd_soc_dai *),
 					GFP_KERNEL);
@@ -574,7 +585,7 @@ static struct snd_soc_pcm_runtime *soc_new_pcm_runtime(
 	rtd->id		= card->num_rtd++;
 	rtd->pmdown_time = pmdown_time;			/* default power off timeout */
 
-	/* see for_each_card_rtds */
+	/* 供 for_each_card_rtds() 遍历使用。 */
 	list_add_tail(&rtd->list, &card->rtd_list);
 
 	ret = device_add_groups(dev, soc_dev_attr_groups);
@@ -594,9 +605,8 @@ static void snd_soc_fill_dummy_dai(struct snd_soc_card *card)
 	int i;
 
 	/*
-	 * COMP_DUMMY() creates size 0 array on dai_link.
-	 * Fill it as dummy DAI in case of CPU/Codec here.
-	 * Do nothing for Platform.
+	 * COMP_DUMMY() 会生成 0 长度端点数组，这里把 CPU/CODEC 补成 dummy。
+	 * Platform 端点不在这个 helper 里处理。
 	 */
 	for_each_card_prelinks(card, i, dai_link) {
 		if (dai_link->num_cpus == 0 && dai_link->cpus) {
@@ -612,6 +622,7 @@ static void snd_soc_fill_dummy_dai(struct snd_soc_card *card)
 
 static void snd_soc_flush_all_delayed_work(struct snd_soc_card *card)
 {
+	/* 卡片级 flush：把所有 runtime 的延迟 work 一次性跑完。 */
 	struct snd_soc_pcm_runtime *rtd;
 
 	for_each_card_rtds(card, rtd)
@@ -621,6 +632,7 @@ static void snd_soc_flush_all_delayed_work(struct snd_soc_card *card)
 #ifdef CONFIG_PM_SLEEP
 static void soc_playback_digital_mute(struct snd_soc_card *card, int mute)
 {
+	/* 仅对真正活跃的 playback DAI 执行 mute/unmute。 */
 	struct snd_soc_pcm_runtime *rtd;
 	struct snd_soc_dai *dai;
 	int playback = SNDRV_PCM_STREAM_PLAYBACK;
@@ -640,6 +652,7 @@ static void soc_playback_digital_mute(struct snd_soc_card *card, int mute)
 
 static void soc_dapm_suspend_resume(struct snd_soc_card *card, int event)
 {
+	/* suspend/resume 时让每条 runtime 的 DAPM 图同步接收事件。 */
 	struct snd_soc_pcm_runtime *rtd;
 	int stream;
 
@@ -653,7 +666,7 @@ static void soc_dapm_suspend_resume(struct snd_soc_card *card, int event)
 	}
 }
 
-/* powers down audio subsystem for suspend */
+/* suspend 时关闭音频子系统。 */
 int snd_soc_suspend(struct device *dev)
 {
 	struct snd_soc_card *card = dev_get_drvdata(dev);
@@ -661,23 +674,23 @@ int snd_soc_suspend(struct device *dev)
 	struct snd_soc_pcm_runtime *rtd;
 	int i;
 
-	/* If the card is not initialized yet there is nothing to do */
+	/* card 还没完成 instantiate 就没有可挂起的运行时对象。 */
 	if (!snd_soc_card_is_instantiated(card))
 		return 0;
 
 	/*
-	 * Due to the resume being scheduled into a workqueue we could
-	 * suspend before that's finished - wait for it to complete.
+	 * 由于 resume 是通过 workqueue 调度的，我们可能会在它完成前就进入
+	 * suspend，因此这里要等它先跑完。
 	 */
 	snd_power_wait(card->snd_card);
 
-	/* we're going to block userspace touching us until resume completes */
+	/* 在 resume 完成之前，先阻止用户态继续访问。 */
 	snd_power_change_state(card->snd_card, SNDRV_CTL_POWER_D3hot);
 
-	/* mute any active DACs */
+	/* 先静音所有活动中的 DAC。 */
 	soc_playback_digital_mute(card, 1);
 
-	/* suspend all pcms */
+	/* suspend 所有 PCM。 */
 	for_each_card_rtds(card, rtd) {
 		if (rtd->dai_link->ignore_suspend)
 			continue;
@@ -687,16 +700,16 @@ int snd_soc_suspend(struct device *dev)
 
 	snd_soc_card_suspend_pre(card);
 
-	/* close any waiting streams */
+	/* 关闭所有还在等待的流。 */
 	snd_soc_flush_all_delayed_work(card);
 
 	soc_dapm_suspend_resume(card, SND_SOC_DAPM_STREAM_SUSPEND);
 
-	/* Recheck all endpoints too, their state is affected by suspend */
+	/* 重新检查所有 endpoint，因为 suspend 会影响它们的状态。 */
 	snd_soc_dapm_mark_endpoints_dirty(card);
 	snd_soc_dapm_sync(snd_soc_card_to_dapm(card));
 
-	/* suspend all COMPONENTs */
+	/* suspend 所有 COMPONENT。 */
 	for_each_card_rtds(card, rtd) {
 
 		if (rtd->dai_link->ignore_suspend)
@@ -706,22 +719,21 @@ int snd_soc_suspend(struct device *dev)
 			struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
 
 			/*
-			 * ignore if component was already suspended
+			 * 如果 component 之前已经 suspend，就直接忽略。
 			 */
 			if (snd_soc_component_is_suspended(component))
 				continue;
 
 			/*
-			 * If there are paths active then the COMPONENT will be
-			 * held with bias _ON and should not be suspended.
+			 * 如果还有路径处于活动状态，COMPONENT 就会保持在
+			 * bias _ON，这时不应该被 suspend。
 			 */
 			switch (snd_soc_dapm_get_bias_level(dapm)) {
 			case SND_SOC_BIAS_STANDBY:
 				/*
-				 * If the COMPONENT is capable of idle
-				 * bias off then being in STANDBY
-				 * means it's doing something,
-				 * otherwise fall through.
+				 * 如果 COMPONENT 支持 idle bias off，
+				 * 那么处于 STANDBY 说明它仍在工作；
+				 * 否则就继续向下处理。
 				 */
 				if (!snd_soc_dapm_get_idle_bias(dapm)) {
 					dev_dbg(component->dev,
@@ -734,7 +746,7 @@ int snd_soc_suspend(struct device *dev)
 				snd_soc_component_suspend(component);
 				if (component->regmap)
 					regcache_mark_dirty(component->regmap);
-				/* deactivate pins to sleep state */
+				/* 将 pin 切换到睡眠态。 */
 				pinctrl_pm_select_sleep_state(component->dev);
 				break;
 			default:
@@ -752,8 +764,8 @@ int snd_soc_suspend(struct device *dev)
 EXPORT_SYMBOL_GPL(snd_soc_suspend);
 
 /*
- * deferred resume work, so resume can complete before we finished
- * setting our codec back up, which can be very slow on I2C
+ * resume 通过 workqueue 延迟执行，因此它可能在 codec 重新配置完成前就
+ * 已经返回。I2C 上这一步可能很慢，所以需要特别处理。
  */
 static void soc_resume_deferred(struct work_struct *work)
 {
@@ -763,13 +775,13 @@ static void soc_resume_deferred(struct work_struct *work)
 	struct snd_soc_component *component;
 
 	/*
-	 * our power state is still SNDRV_CTL_POWER_D3hot from suspend time,
-	 * so userspace apps are blocked from touching us
+	 * 这里的 power state 仍是 D3hot，用户态还不能碰硬件。
+	 * 先把 component 恢复，再把 DAPM 和用户态状态切回来。
 	 */
 
 	dev_dbg(card->dev, "ASoC: starting resume work\n");
 
-	/* Bring us up into D2 so that DAPM starts enabling things */
+	/* 先把电源状态提升到 D2，让 DAPM 开始启用各个节点。 */
 	snd_power_change_state(card->snd_card, SNDRV_CTL_POWER_D2);
 
 	snd_soc_card_resume_pre(card);
@@ -781,32 +793,32 @@ static void soc_resume_deferred(struct work_struct *work)
 
 	soc_dapm_suspend_resume(card, SND_SOC_DAPM_STREAM_RESUME);
 
-	/* unmute any active DACs */
+	/* 取消所有活动 DAC 的静音。 */
 	soc_playback_digital_mute(card, 0);
 
 	snd_soc_card_resume_post(card);
 
 	dev_dbg(card->dev, "ASoC: resume work completed\n");
 
-	/* Recheck all endpoints too, their state is affected by suspend */
+	/* 同样重新检查所有 endpoint，因为 suspend 会影响它们的状态。 */
 	snd_soc_dapm_mark_endpoints_dirty(card);
 	snd_soc_dapm_sync(snd_soc_card_to_dapm(card));
 
-	/* userspace can access us now we are back as we were before */
+	/* 现在状态已经恢复，用户态可以重新访问了。 */
 	snd_power_change_state(card->snd_card, SNDRV_CTL_POWER_D0);
 }
 
-/* powers up audio subsystem after a suspend */
+/* suspend 后重新开启音频子系统。 */
 int snd_soc_resume(struct device *dev)
 {
 	struct snd_soc_card *card = dev_get_drvdata(dev);
 	struct snd_soc_component *component;
 
-	/* If the card is not initialized yet there is nothing to do */
+	/* card 还没完成 instantiate 就没有可恢复的运行时对象。 */
 	if (!snd_soc_card_is_instantiated(card))
 		return 0;
 
-	/* activate pins from sleep state */
+	/* 将 pin 从睡眠态激活回来。 */
 	for_each_card_components(card, component)
 		if (snd_soc_component_active(component))
 			pinctrl_pm_select_default_state(component->dev);
@@ -821,7 +833,7 @@ EXPORT_SYMBOL_GPL(snd_soc_resume);
 
 static void soc_resume_init(struct snd_soc_card *card)
 {
-	/* deferred resume work */
+	/* resume 通过 workqueue 延迟执行，避免同步恢复过慢。 */
 	INIT_WORK(&card->deferred_resume_work, soc_resume_deferred);
 }
 #else
@@ -833,6 +845,7 @@ static inline void soc_resume_init(struct snd_soc_card *card) { }
 static struct device_node
 *soc_component_to_node(struct snd_soc_component *component)
 {
+	/* 先取 component 自己的 of_node，取不到再回退到父设备。 */
 	struct device_node *of_node;
 
 	of_node = component->dev->of_node;
@@ -845,6 +858,7 @@ static struct device_node
 struct of_phandle_args *snd_soc_copy_dai_args(struct device *dev,
 					      const struct of_phandle_args *args)
 {
+	/* 复制一份 phandle args 供 runtime 保存。 */
 	struct of_phandle_args *ret = devm_kzalloc(dev, sizeof(*ret), GFP_KERNEL);
 
 	if (!ret)
@@ -860,6 +874,7 @@ static int snd_soc_is_matching_component(
 	const struct snd_soc_dai_link_component *dlc,
 	struct snd_soc_component *component)
 {
+	/* component 匹配时，dai_args 优先，随后才比对 of_node/name。 */
 	struct device_node *component_of_node;
 
 	if (!dlc)
@@ -887,17 +902,17 @@ static int snd_soc_is_matching_component(
 static struct snd_soc_component *soc_find_component(
 	const struct snd_soc_dai_link_component *dlc)
 {
+	/* 全局 component 列表中找第一个匹配项。 */
 	struct snd_soc_component *component;
 
 	lockdep_assert_held(&client_mutex);
 
 	/*
-	 * NOTE
+	 * 注意：
 	 *
-	 * It returns *1st* found component, but some driver
-	 * has few components by same of_node/name
-	 * ex)
-	 *	CPU component and generic DMAEngine component
+	 * 它只会返回找到的第一个 component，但某些 driver 会让多个
+	 * component 共享同一个 of_node/name，例如 CPU component 和通用
+	 * DMAEngine component。
 	 */
 	for_each_component(component)
 		if (snd_soc_is_matching_component(dlc, component))
@@ -907,25 +922,26 @@ static struct snd_soc_component *soc_find_component(
 }
 
 /**
- * snd_soc_find_dai - Find a registered DAI
+ * snd_soc_find_dai - 查找已注册的 DAI
  *
- * @dlc: name of the DAI or the DAI driver and optional component info to match
+ * @dlc: 需要匹配的 DAI 信息，可能包含 DAI 名称、DAI driver 名称
+ *       以及可选的 component 信息
  *
- * This function will search all registered components and their DAIs to
- * find the DAI of the same name. The component's of_node and name
- * should also match if being specified.
+ * 该函数会遍历所有已注册的 component 及其下属 DAI，查找名称匹配的
+ * 目标 DAI。如果指定了 component 的 of_node 或 name，也必须同时匹配。
  *
- * Return: pointer of DAI, or NULL if not found.
+ * 返回：找到时返回 DAI 指针，未找到则返回 NULL。
  */
 struct snd_soc_dai *snd_soc_find_dai(
 	const struct snd_soc_dai_link_component *dlc)
 {
+	/* 先找匹配的 component，再在它下面找 DAI。 */
 	struct snd_soc_component *component;
 	struct snd_soc_dai *dai;
 
 	lockdep_assert_held(&client_mutex);
 
-	/* Find CPU DAI from registered DAIs */
+	/* 从已注册的 DAI 中查找 CPU DAI。 */
 	for_each_component(component)
 		if (snd_soc_is_matching_component(dlc, component))
 			for_each_component_dais(component, dai)
@@ -951,11 +967,20 @@ static int soc_dai_link_sanity_check(struct snd_soc_card *card,
 	int i;
 	struct snd_soc_dai_link_component *dlc;
 
-	/* Codec check */
+	/*
+	 * 在真正创建 runtime 之前，先把这条 dai_link 的三类端点都校验一遍：
+	 * - CODEC 必须能定位到明确的 component + DAI
+	 * - PLATFORM 可以为空，但一旦写了就必须能找到对应 component
+	 * - CPU 允许只写 DAI 名，但如果写了 component 也必须可解析
+	 *
+	 * 这里的目标不是检查“硬件对不对”，而是尽早把板级描述里的
+	 * 语义错误、歧义描述、以及 probe 顺序尚未满足的情况分离出来。
+	 */
+	/* 检查 Codec。 */
 	for_each_link_codecs(link, i, dlc) {
 		/*
-		 * Codec must be specified by 1 of name or OF node,
-		 * not both or neither.
+		 * Codec 必须通过 name 或 OF node 二选一指定，不能同时指定，
+		 * 也不能完全不指定。
 		 */
 		if (snd_soc_dlc_component_is_invalid(dlc))
 			goto component_invalid;
@@ -963,24 +988,23 @@ static int soc_dai_link_sanity_check(struct snd_soc_card *card,
 		if (snd_soc_dlc_component_is_empty(dlc))
 			goto component_empty;
 
-		/* Codec DAI name must be specified */
+		/* 必须指定 Codec DAI 名称。 */
 		if (snd_soc_dlc_dai_is_empty(dlc))
 			goto dai_empty;
 
 		/*
-		 * Defer card registration if codec component is not added to
-		 * component list.
+		 * 如果 codec component 还没加入 component 列表，就延后
+		 * card 注册。
 		 */
 		if (!soc_find_component(dlc))
 			goto component_not_found;
 	}
 
-	/* Platform check */
+	/* 检查 Platform。 */
 	for_each_link_platforms(link, i, dlc) {
 		/*
-		 * Platform may be specified by either name or OF node, but it
-		 * can be left unspecified, then no components will be inserted
-		 * in the rtdcom list
+		 * Platform 可以通过 name 或 OF node 指定，也可以留空；
+		 * 如果留空，就不会把任何 component 插入 rtdcom 列表。
 		 */
 		if (snd_soc_dlc_component_is_invalid(dlc))
 			goto component_invalid;
@@ -989,19 +1013,18 @@ static int soc_dai_link_sanity_check(struct snd_soc_card *card,
 			goto component_empty;
 
 		/*
-		 * Defer card registration if platform component is not added to
-		 * component list.
+		 * 如果 platform component 还没加入 component 列表，就延后
+		 * card 注册。
 		 */
 		if (!soc_find_component(dlc))
 			goto component_not_found;
 	}
 
-	/* CPU check */
+	/* 检查 CPU。 */
 	for_each_link_cpus(link, i, dlc) {
 		/*
-		 * CPU device may be specified by either name or OF node, but
-		 * can be left unspecified, and will be matched based on DAI
-		 * name alone..
+		 * CPU device 可以通过 name 或 OF node 指定，也可以留空，
+		 * 最终只按 DAI name 进行匹配。
 		 */
 		if (snd_soc_dlc_component_is_invalid(dlc))
 			goto component_invalid;
@@ -1083,10 +1106,9 @@ static int snd_soc_compensate_channel_connection_map(struct snd_soc_card *card,
 	int i;
 
 	/*
-	 * dai_link->ch_maps indicates how CPU/Codec are connected.
-	 * It will be a map seen from a larger number of DAI.
-	 * see
-	 *	soc.h :: [dai_link->ch_maps Image sample]
+	 * dai_link->ch_maps 用来描述 CPU/Codec 的通道连接方式。
+	 * 它表示的是从较大编号 DAI 视角看到的映射。
+	 * 见 soc.h 里的 dai_link->ch_maps 示例。
 	 */
 
 	/* it should have ch_maps if connection was N:M */
@@ -1137,11 +1159,11 @@ sanity_check:
 }
 
 /**
- * snd_soc_remove_pcm_runtime - Remove a pcm_runtime from card
- * @card: The ASoC card to which the pcm_runtime has
- * @rtd: The pcm_runtime to remove
+ * snd_soc_remove_pcm_runtime - 从 card 中移除 pcm_runtime
+ * @card: 持有该 pcm_runtime 的 ASoC card
+ * @rtd: 需要移除的 pcm_runtime
  *
- * This function removes a pcm_runtime from the ASoC card.
+ * 该函数会把 pcm_runtime 从 ASoC card 的运行时列表中摘除。
  */
 void snd_soc_remove_pcm_runtime(struct snd_soc_card *card,
 				struct snd_soc_pcm_runtime *rtd)
@@ -1149,10 +1171,11 @@ void snd_soc_remove_pcm_runtime(struct snd_soc_card *card,
 	if (!rtd)
 		return;
 
+	/* card 上的 runtime 先通知 machine driver，再释放 runtime 对象。 */
 	lockdep_assert_held(&client_mutex);
 
 	/*
-	 * Notify the machine driver for extra destruction
+	 * 通知 machine driver 做额外的销毁处理。
 	 */
 	snd_soc_card_remove_dai_link(card, rtd->dai_link);
 
@@ -1161,19 +1184,19 @@ void snd_soc_remove_pcm_runtime(struct snd_soc_card *card,
 EXPORT_SYMBOL_GPL(snd_soc_remove_pcm_runtime);
 
 /**
- * snd_soc_add_pcm_runtime - Add a pcm_runtime dynamically via dai_link
- * @card: The ASoC card to which the pcm_runtime is added
- * @dai_link: The DAI link to find pcm_runtime
+ * snd_soc_add_pcm_runtime - 通过 dai_link 动态添加 pcm_runtime
+ * @card: 需要添加 pcm_runtime 的 ASoC card
+ * @dai_link: 用于创建 pcm_runtime 的 DAI link
  *
- * This function adds a pcm_runtime ASoC card by using dai_link.
+ * 该函数根据 dai_link 动态把一条链路实例化为 pcm_runtime。
  *
- * Note: Topology can use this API to add pcm_runtime when probing the
- * topology component. And machine drivers can still define static
- * DAI links in dai_link array.
+ * 注意：topology 可以在 probing topology component 时调用该 API 添加
+ * pcm_runtime；machine driver 仍然可以在 dai_link 数组里定义静态链路。
  */
 static int snd_soc_add_pcm_runtime(struct snd_soc_card *card,
 				   struct snd_soc_dai_link *dai_link)
 {
+	/* 动态把一条 dai_link 变成真正的 pcm_runtime。 */
 	struct snd_soc_pcm_runtime *rtd;
 	struct snd_soc_dai_link_component *codec, *platform, *cpu;
 	struct snd_soc_component *component;
@@ -1182,7 +1205,7 @@ static int snd_soc_add_pcm_runtime(struct snd_soc_card *card,
 	lockdep_assert_held(&client_mutex);
 
 	/*
-	 * Notify the machine driver for extra initialization
+	 * 通知 machine driver 做额外的初始化处理。
 	 */
 	ret = snd_soc_card_add_dai_link(card, dai_link);
 	if (ret < 0)
@@ -1237,14 +1260,13 @@ static int snd_soc_add_pcm_runtime(struct snd_soc_card *card,
 	}
 
 	/*
-	 * Most drivers will register their PCMs using DAI link ordering but
-	 * topology based drivers can use the DAI link id field to set PCM
-	 * device number and then use rtd + a base offset of the BEs.
+	 * 大多数驱动会按 DAI link 顺序注册 PCM；
+	 * 基于 topology 的驱动则可以利用 DAI link 的 id 字段设置 PCM
+	 * 设备号，再用 rtd 加上 BE 的基址偏移来编号。
 	 *
 	 * FIXME
 	 *
-	 * This should be implemented by using "dai_link" feature instead of
-	 * "component" feature.
+	 * 这一点本应通过 "dai_link" 特性实现，而不是依赖 "component" 特性。
 	 */
 	id = rtd->id;
 	for_each_rtd_components(rtd, i, component) {
@@ -1269,6 +1291,7 @@ int snd_soc_add_pcm_runtimes(struct snd_soc_card *card,
 			     struct snd_soc_dai_link *dai_link,
 			     int num_dai_link)
 {
+	/* 批量添加 runtime 时，逐个先修正通道映射再创建。 */
 	for (int i = 0; i < num_dai_link; i++) {
 		int ret;
 
@@ -1287,6 +1310,13 @@ EXPORT_SYMBOL_GPL(snd_soc_add_pcm_runtimes);
 
 static void snd_soc_runtime_get_dai_fmt(struct snd_soc_pcm_runtime *rtd)
 {
+	/*
+	 * 从每个 DAI 的可选格式集合里协商出最终的 runtime dai_fmt。
+	 *
+	 * 这一层做的是“运行时格式求交集”而不是简单地读取 card 里
+	 * 配好的 dai_fmt。原因是多 DAI 链路里，CPU 和 CODEC 可能各自
+	 * 只支持一部分格式，最终只能从双方都支持的交集中选一个。
+	 */
 	struct snd_soc_dai_link *dai_link = rtd->dai_link;
 	struct snd_soc_dai *dai, *not_used;
 	u64 pos, possible_fmt;
@@ -1294,38 +1324,27 @@ static void snd_soc_runtime_get_dai_fmt(struct snd_soc_pcm_runtime *rtd)
 	int i, j, priority, pri, until;
 
 	/*
-	 * Get selectable format from each DAIs.
+	 * 从每个 DAI 的可选格式集合里取出可协商的格式。
 	 *
 	 ****************************
-	 *            NOTE
-	 * Using .auto_selectable_formats is not mandatory,
-	 * we can select format manually from Sound Card.
-	 * When use it, driver should list well tested format only.
+	 * 注意
+	 * 使用 .auto_selectable_formats 不是强制要求；
+	 * 也可以直接在 Sound Card 里手动指定格式。
+	 * 但如果启用它，驱动应当只列出已经充分验证过的格式。
 	 ****************************
 	 *
-	 * ex)
+	 * 例如：
 	 *	auto_selectable_formats (= SND_SOC_POSSIBLE_xxx)
 	 *		 (A)	 (B)	 (C)
 	 *	DAI0_: { 0x000F, 0x00F0, 0x0F00 };
 	 *	DAI1 : { 0xF000, 0x0F00 };
 	 *		 (X)	 (Y)
 	 *
-	 * "until" will be 3 in this case (MAX array size from DAI0 and DAI1)
-	 * Here is dev_dbg() message and comments
+	 * 这里的 until 为 3（取决于 DAI0/DAI1 数组的最大长度）。
+	 * 下面的 dev_dbg() 示例用于说明协商过程。
 	 *
 	 * priority = 1
-	 * DAI0: (pri, fmt) = (1, 000000000000000F) // 1st check (A) DAI1 is not selected
-	 * DAI1: (pri, fmt) = (0, 0000000000000000) //               Necessary Waste
-	 * DAI0: (pri, fmt) = (1, 000000000000000F) // 2nd check (A)
-	 * DAI1: (pri, fmt) = (1, 000000000000F000) //           (X)
-	 * priority = 2
-	 * DAI0: (pri, fmt) = (2, 00000000000000FF) // 3rd check (A) + (B)
-	 * DAI1: (pri, fmt) = (1, 000000000000F000) //           (X)
-	 * DAI0: (pri, fmt) = (2, 00000000000000FF) // 4th check (A) + (B)
-	 * DAI1: (pri, fmt) = (2, 000000000000FF00) //           (X) + (Y)
-	 * priority = 3
-	 * DAI0: (pri, fmt) = (3, 0000000000000FFF) // 5th check (A) + (B) + (C)
-	 * DAI1: (pri, fmt) = (2, 000000000000FF00) //           (X) + (Y)
+	 * ...
 	 * found auto selected format: 0000000000000F00
 	 */
 	until = snd_soc_dai_get_fmt_max_priority(rtd);
@@ -1348,27 +1367,23 @@ static void snd_soc_runtime_get_dai_fmt(struct snd_soc_pcm_runtime *rtd)
 	return;
 found:
 	/*
-	 * convert POSSIBLE_DAIFMT to DAIFMT
+	 * 把 POSSIBLE_DAIFMT 转换成最终的 DAIFMT。
 	 *
-	 * Some basic/default settings on each is defined as 0.
-	 * see
+	 * 某些基础/默认设置的编码值是 0，例如：
 	 *	SND_SOC_DAIFMT_NB_NF
 	 *	SND_SOC_DAIFMT_GATED
 	 *
-	 * SND_SOC_DAIFMT_xxx_MASK can't notice it if Sound Card specify
-	 * these value, and will be overwrite to auto selected value.
+	 * 如果 Sound Card 显式指定了这些值，SND_SOC_DAIFMT_xxx_MASK
+	 * 不容易单独识别出来，最后会被自动选择的值覆盖。
 	 *
-	 * To avoid such issue, loop from 63 to 0 here.
-	 * Small number of SND_SOC_POSSIBLE_xxx will be Hi priority.
-	 * Basic/Default settings of each part and above are defined
-	 * as Hi priority (= small number) of SND_SOC_POSSIBLE_xxx.
+	 * 为了避免这个问题，这里从 63 递减到 0 遍历。
+	 * 数值越小的 SND_SOC_POSSIBLE_xxx 优先级越高，
+	 * 基础/默认设置也会被视为高优先级。
 	 */
 	for (i = 63; i >= 0; i--) {
 		pos = 1ULL << i;
 		switch (possible_fmt & pos) {
-		/*
-		 * for format
-		 */
+		/* 格式部分。 */
 		case SND_SOC_POSSIBLE_DAIFMT_I2S:
 		case SND_SOC_POSSIBLE_DAIFMT_RIGHT_J:
 		case SND_SOC_POSSIBLE_DAIFMT_LEFT_J:
@@ -1378,18 +1393,14 @@ found:
 		case SND_SOC_POSSIBLE_DAIFMT_PDM:
 			dai_fmt = (dai_fmt & ~SND_SOC_DAIFMT_FORMAT_MASK) | i;
 			break;
-		/*
-		 * for clock
-		 */
+		/* 时钟门控部分。 */
 		case SND_SOC_POSSIBLE_DAIFMT_CONT:
 			dai_fmt = (dai_fmt & ~SND_SOC_DAIFMT_CLOCK_MASK) | SND_SOC_DAIFMT_CONT;
 			break;
 		case SND_SOC_POSSIBLE_DAIFMT_GATED:
 			dai_fmt = (dai_fmt & ~SND_SOC_DAIFMT_CLOCK_MASK) | SND_SOC_DAIFMT_GATED;
 			break;
-		/*
-		 * for clock invert
-		 */
+		/* 时钟极性部分。 */
 		case SND_SOC_POSSIBLE_DAIFMT_NB_NF:
 			dai_fmt = (dai_fmt & ~SND_SOC_DAIFMT_INV_MASK) | SND_SOC_DAIFMT_NB_NF;
 			break;
@@ -1402,9 +1413,7 @@ found:
 		case SND_SOC_POSSIBLE_DAIFMT_IB_IF:
 			dai_fmt = (dai_fmt & ~SND_SOC_DAIFMT_INV_MASK) | SND_SOC_DAIFMT_IB_IF;
 			break;
-		/*
-		 * for clock provider / consumer
-		 */
+		/* 主从时钟关系部分。 */
 		case SND_SOC_POSSIBLE_DAIFMT_CBP_CFP:
 			dai_fmt = (dai_fmt & ~SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) | SND_SOC_DAIFMT_CBP_CFP;
 			break;
@@ -1421,14 +1430,13 @@ found:
 	}
 
 	/*
-	 * Some driver might have very complex limitation.
-	 * In such case, user want to auto-select non-limitation part,
-	 * and want to manually specify complex part.
+	 * 有些驱动会有非常复杂的限制条件。
+	 * 这时用户通常希望自动选择不受限制的部分，同时手动指定复杂部分。
 	 *
-	 * Or for example, if both CPU and Codec can be clock provider,
-	 * but because of its quality, user want to specify it manually.
+	 * 例如 CPU 和 Codec 都能作为时钟提供者时，用户可能希望因为器件
+	 * 质量或板级约束而手动指定其中一方。
 	 *
-	 * Use manually specified settings if sound card did.
+	 * 如果 Sound Card 已经手动指定了某些设置，这里就保留手动配置。
 	 */
 	if (!(dai_link->dai_fmt & SND_SOC_DAIFMT_FORMAT_MASK))
 		mask |= SND_SOC_DAIFMT_FORMAT_MASK;
@@ -1443,17 +1451,16 @@ found:
 }
 
 /**
- * snd_soc_runtime_set_dai_fmt() - Change DAI link format for a ASoC runtime
- * @rtd: The runtime for which the DAI link format should be changed
- * @dai_fmt: The new DAI link format
+ * snd_soc_runtime_set_dai_fmt() - 修改 ASoC runtime 的 DAI link 格式
+ * @rtd: 需要修改格式的 runtime
+ * @dai_fmt: 新的 DAI link 格式
  *
- * This function updates the DAI link format for all DAIs connected to the DAI
- * link for the specified runtime.
+ * 该函数会更新指定 runtime 所连接的所有 DAI 的 link 格式。
  *
- * Note: For setups with a static format set the dai_fmt field in the
- * corresponding snd_dai_link struct instead of using this function.
+ * 注意：如果系统使用静态格式，应当直接在对应 snd_dai_link 结构体中
+ * 设置 dai_fmt 字段，而不是调用这个函数。
  *
- * Returns 0 on success, otherwise a negative error code.
+ * 返回：成功时返回 0，否则返回负错误码。
  */
 int snd_soc_runtime_set_dai_fmt(struct snd_soc_pcm_runtime *rtd,
 				unsigned int dai_fmt)
@@ -1588,6 +1595,11 @@ static void soc_remove_component(struct snd_soc_component *component,
 	if (!component->card)
 		return;
 
+	/*
+	 * component 已经成功绑到 card 上时，卸载顺序要和 probe 对称：
+	 * 先让 component 自身做收尾，再从 card 的挂接链表里摘掉，最后
+	 * 释放它对应的 DAPM 上下文和 debugfs 资源。
+	 */
 	if (probed)
 		snd_soc_component_remove(component);
 
@@ -1609,6 +1621,10 @@ static int soc_probe_component(struct snd_soc_card *card,
 	if (snd_soc_component_is_dummy(component))
 		return 0;
 
+	/*
+	 * 同一个 component 只能绑定到一张 card 上。
+	 * 如果它已经被另一张卡占用，说明板级拓扑或者 probe 顺序有问题。
+	 */
 	if (component->card) {
 		if (component->card != card) {
 			dev_err(component->dev,
@@ -1626,6 +1642,10 @@ static int soc_probe_component(struct snd_soc_card *card,
 	component->card = card;
 	soc_set_name_prefix(card, component);
 
+	/*
+	 * 先初始化 debugfs / dapm 基础对象，再创建 widget、route 和
+	 * 各类 control。这样后续创建失败时，收尾路径才能统一回收。
+	 */
 	soc_init_component_debugfs(component);
 
 	snd_soc_dapm_init(dapm, card, component);
@@ -1680,7 +1700,7 @@ static int soc_probe_component(struct snd_soc_card *card,
 	if (ret < 0)
 		goto err_probe;
 
-	/* see for_each_card_components */
+	/* 供 for_each_card_components() 遍历使用。 */
 	list_add(&component->card_list, &card->component_dev_list);
 
 err_probe:
@@ -1695,6 +1715,10 @@ static void soc_remove_link_dais(struct snd_soc_card *card)
 	struct snd_soc_pcm_runtime *rtd;
 	int order;
 
+	/*
+	 * 反向卸载 DAI 时，必须按 remove_order 分轮次执行。
+	 * 这样可以保证依赖较深的 DAI 先停，再拆较上层的桥接对象。
+	 */
 	for_each_comp_order(order) {
 		for_each_card_rtds(card, rtd) {
 			/* remove all rtd connected DAIs in good order */
@@ -1708,6 +1732,11 @@ static int soc_probe_link_dais(struct snd_soc_card *card)
 	struct snd_soc_pcm_runtime *rtd;
 	int order, ret;
 
+	/*
+	 * DAI probe 也必须按 probe_order 分轮次做。
+	 * 某些 DAI 需要先初始化底层时钟、regmap 或 component 状态，
+	 * 再向上暴露 runtime 能力。
+	 */
 	for_each_comp_order(order) {
 		for_each_card_rtds(card, rtd) {
 			/* probe all rtd connected DAIs in good order */
@@ -1726,6 +1755,10 @@ static void soc_remove_link_components(struct snd_soc_card *card)
 	struct snd_soc_pcm_runtime *rtd;
 	int i, order;
 
+	/*
+	 * 和 probe 相反，component 的 remove 也按 remove_order 逆序拆。
+	 * 这样可以避免上层 runtime 还在引用下层资源时就把底层卸掉。
+	 */
 	for_each_comp_order(order) {
 		for_each_card_rtds(card, rtd) {
 			for_each_rtd_components(rtd, i, component) {
@@ -1744,6 +1777,11 @@ static int soc_probe_link_components(struct snd_soc_card *card)
 	struct snd_soc_pcm_runtime *rtd;
 	int i, ret, order;
 
+	/*
+	 * 先逐轮探测所有 link 直接引用到的 component。
+	 * 这一步的意义是把“卡上会用到哪些 component”先绑好，
+	 * 后面的 DAI probe / DAPM graph 创建才有稳定的宿主。
+	 */
 	for_each_comp_order(order) {
 		for_each_card_rtds(card, rtd) {
 			for_each_rtd_components(rtd, i, component) {
@@ -1765,7 +1803,7 @@ static void soc_unbind_aux_dev(struct snd_soc_card *card)
 	struct snd_soc_component *component, *_component;
 
 	for_each_card_auxs_safe(card, component, _component) {
-		/* for snd_soc_component_init() */
+		/* 供 snd_soc_component_init() 使用。 */
 		snd_soc_component_set_aux(component, NULL);
 		list_del(&component->card_aux_list);
 	}
@@ -1777,6 +1815,10 @@ static int soc_bind_aux_dev(struct snd_soc_card *card)
 	struct snd_soc_aux_dev *aux;
 	int i;
 
+	/*
+	 * AUX device 是 card 级别的附加 component，它不一定出现在
+	 * 主 dai_link 里，但仍然要纳入 card 的生命周期管理。
+	 */
 	for_each_card_pre_auxs(card, i, aux) {
 		/* codecs, usually analog devices */
 		component = soc_find_component(&aux->dlc);
@@ -1785,7 +1827,7 @@ static int soc_bind_aux_dev(struct snd_soc_card *card)
 
 		/* for snd_soc_component_init() */
 		snd_soc_component_set_aux(component, aux);
-		/* see for_each_card_auxs */
+		/* 供 for_each_card_auxs() 遍历使用。 */
 		list_add(&component->card_aux_list, &card->aux_comp_list);
 	}
 	return 0;
@@ -1826,9 +1868,9 @@ static void soc_remove_aux_devices(struct snd_soc_card *card)
 
 #ifdef CONFIG_DMI
 /*
- * If a DMI filed contain strings in this blacklist (e.g.
- * "Type2 - Board Manufacturer" or "Type1 - TBD by OEM"), it will be taken
- * as invalid and dropped when setting the card long name from DMI info.
+ * 如果某个 DMI 字段包含这里列出的黑名单字符串（例如
+ * "Type2 - Board Manufacturer" 或 "Type1 - TBD by OEM"），
+ * 那么在根据 DMI 信息设置 card 长名时会把它判定为无效并丢弃。
  */
 static const char * const dmi_blacklist[] = {
 	"To be filled by OEM",
@@ -1841,9 +1883,8 @@ static const char * const dmi_blacklist[] = {
 };
 
 /*
- * Trim special characters, and replace '-' with '_' since '-' is used to
- * separate different DMI fields in the card long name. Only number and
- * alphabet characters and a few separator characters are kept.
+ * 去掉特殊字符，并把 '-' 替换成 '_'，因为 '-' 会用于分隔 card 长名中
+ * 不同的 DMI 字段。这里只保留数字、字母以及少量分隔字符。
  */
 static void cleanup_dmi_name(char *name)
 {
@@ -1861,8 +1902,7 @@ static void cleanup_dmi_name(char *name)
 }
 
 /*
- * Check if a DMI field is valid, i.e. not containing any string
- * in the black list and not the empty string.
+ * 检查某个 DMI 字段是否有效，也就是既不为空，也不包含黑名单字符串。
  */
 static int is_dmi_valid(const char *field)
 {
@@ -1881,7 +1921,7 @@ static int is_dmi_valid(const char *field)
 }
 
 /*
- * Append a string to card->dmi_longname with character cleanups.
+ * 把字符串追加到 card->dmi_longname，并在过程中清理字符。
  */
 static void append_dmi_string(struct snd_soc_card *card, const char *str)
 {
@@ -1898,46 +1938,43 @@ static void append_dmi_string(struct snd_soc_card *card, const char *str)
 }
 
 /**
- * snd_soc_set_dmi_name() - Register DMI names to card
- * @card: The card to register DMI names
+ * snd_soc_set_dmi_name() - 为 card 注册 DMI 命名
+ * @card: 需要注册 DMI 名称的 card
  *
- * An Intel machine driver may be used by many different devices but are
- * difficult for userspace to differentiate, since machine drivers usually
- * use their own name as the card short name and leave the card long name
- * blank. To differentiate such devices and fix bugs due to lack of
- * device-specific configurations, this function allows DMI info to be used
- * as the sound card long name, in the format of
+ * 某些 Intel machine driver 可能会被多个不同设备复用，但用户空间很难
+ * 区分这些设备，因为 machine driver 往往把自己的名字作为 card 短名，
+ * 而把 card 长名留空。为了区分这类设备，并修复因缺少设备专属配置而
+ * 引发的问题，该函数允许把 DMI 信息作为 sound card 的长名，格式为
  * "vendor-product-version-board"
- * (Character '-' is used to separate different DMI fields here).
- * This will help the user space to load the device-specific Use Case Manager
- * (UCM) configurations for the card.
+ * （这里用字符 '-' 分隔不同的 DMI 字段）。
  *
- * Possible card long names may be:
+ * 这有助于用户空间为该 card 加载设备专属的 Use Case Manager (UCM)
+ * 配置。
+ *
+ * 可能的 card 长名示例：
  * DellInc.-XPS139343-01-0310JH
  * ASUSTeKCOMPUTERINC.-T100TA-1.0-T100TA
  * Circuitco-MinnowboardMaxD0PLATFORM-D0-MinnowBoardMAX
  *
- * This function also supports flavoring the card longname to provide
- * the extra differentiation, like "vendor-product-version-board-flavor".
+ * 该函数还支持为 card long name 增加 flavor，用于提供额外的区分，
+ * 例如 "vendor-product-version-board-flavor"。
  *
- * We only keep number and alphabet characters and a few separator characters
- * in the card long name since UCM in the user space uses the card long names
- * as card configuration directory names and AudoConf cannot support special
- * characters like SPACE.
+ * 由于用户空间里的 UCM 会把 card 长名当成配置目录名，因此这里只保留
+ * 数字、字母以及少量分隔字符；像空格这类特殊字符不被允许。
  *
- * Returns 0 on success, otherwise a negative error code.
+ * 返回：成功时返回 0，否则返回负错误码。
  */
 static int snd_soc_set_dmi_name(struct snd_soc_card *card)
 {
 	const char *vendor, *product, *board;
 
 	if (card->long_name)
-		return 0; /* long name already set by driver or from DMI */
+		return 0; /* 长名称已经由驱动或 DMI 设置过了。 */
 
 	if (!dmi_available)
 		return 0;
 
-	/* make up dmi long name as: vendor-product-version-board */
+	/* 按 vendor-product-version-board 的格式拼出 DMI 长名。 */
 	vendor = dmi_get_system_info(DMI_BOARD_VENDOR);
 	if (!vendor || !is_dmi_valid(vendor)) {
 		dev_warn(card->dev, "ASoC: no DMI vendor name!\n");
@@ -1954,8 +1991,8 @@ static int snd_soc_set_dmi_name(struct snd_soc_card *card)
 		append_dmi_string(card, product);
 
 		/*
-		 * some vendors like Lenovo may only put a self-explanatory
-		 * name in the product version field
+		 * 某些厂商，例如 Lenovo，可能只会在 product version 字段里
+		 * 放一个自解释的名字。
 		 */
 		if (product_version && is_dmi_valid(product_version))
 			append_dmi_string(card, product_version);
@@ -1966,12 +2003,12 @@ static int snd_soc_set_dmi_name(struct snd_soc_card *card)
 		if (!product || strcasecmp(board, product))
 			append_dmi_string(card, board);
 	} else if (!product) {
-		/* fall back to using legacy name */
+		/* 回退到使用 legacy 名称。 */
 		dev_warn(card->dev, "ASoC: no DMI board/product name!\n");
 		return 0;
 	}
 
-	/* set the card long name */
+	/* 设置 card 的长名称。 */
 	card->long_name = card->dmi_longname;
 
 	return 0;
@@ -1992,11 +2029,11 @@ static void soc_check_tplg_fes(struct snd_soc_card *card)
 
 	for_each_component(component) {
 
-		/* does this component override BEs ? */
+		/* 这个 component 是否会覆盖 BE？ */
 		if (!component->driver->ignore_machine)
 			continue;
 
-		/* for this machine ? */
+		/* 是针对这块 machine 吗？ */
 		if (!strcmp(component->driver->ignore_machine,
 			    card->dev->driver->name))
 			goto match;
@@ -2007,7 +2044,7 @@ match:
 		/* machine matches, so override the rtd data */
 		for_each_card_prelinks(card, i, dai_link) {
 
-			/* ignore this FE */
+			/* 忽略这个 FE。 */
 			if (dai_link->dynamic) {
 				dai_link->ignore = true;
 				continue;
@@ -2016,7 +2053,7 @@ match:
 			dev_dbg(card->dev, "info: override BE DAI link %s\n",
 				card->dai_link[i].name);
 
-			/* override platform component */
+			/* 覆盖 platform component。 */
 			if (!dai_link->platforms) {
 				dev_err(card->dev, "init platform error");
 				continue;
@@ -2027,29 +2064,29 @@ match:
 			else
 				dai_link->platforms->name = component->name;
 
-			/* convert non BE into BE */
+			/* 把非 BE 链路转换成 BE。 */
 			dai_link->no_pcm = 1;
 
 			/*
-			 * override any BE fixups
-			 * see
+			 * 覆盖所有 BE fixup。
+			 * 参见
 			 *	snd_soc_link_be_hw_params_fixup()
 			 */
 			dai_link->be_hw_params_fixup =
 				component->driver->be_hw_params_fixup;
 
 			/*
-			 * most BE links don't set stream name, so set it to
-			 * dai link name if it's NULL to help bind widgets.
+			 * 大多数 BE link 不会设置 stream name，所以如果它为空，
+			 * 就把它设成 dai link name，方便绑定 widget。
 			 */
 			if (!dai_link->stream_name)
 				dai_link->stream_name = dai_link->name;
 		}
 
-		/* Inform userspace we are using alternate topology */
+		/* 通知用户态当前使用的是替代 topology。 */
 		if (component->driver->topology_name_prefix) {
 
-			/* topology shortname created? */
+			/* topology shortname 是否已经创建过？ */
 			if (!card->topology_shortname_created) {
 				comp_drv = component->driver;
 
@@ -2059,7 +2096,7 @@ match:
 				card->topology_shortname_created = true;
 			}
 
-			/* use topology shortname */
+			/* 使用 topology shortname。 */
 			card->name = card->topology_shortname;
 		}
 	}
@@ -2079,15 +2116,14 @@ static void __soc_setup_card_name(struct snd_soc_card *card,
 	if (name != card->snd_card->driver)
 		return;
 
-	/*
-	 * Name normalization (driver field)
-	 *
-	 * The driver name is somewhat special, as it's used as a key for
-	 * searches in the user-space.
-	 *
-	 * ex)
-	 *	"abcd??efg" -> "abcd__efg"
-	 */
+		/*
+		 * 名称规范化（driver 字段）。
+		 *
+		 * driver 名称比较特殊，因为它会作为用户空间搜索的 key。
+		 *
+		 * 例如：
+		 *	"abcd??efg" -> "abcd__efg"
+		 */
 	for (i = 0; i < len; i++) {
 		switch (name[i]) {
 		case '_':
@@ -2101,11 +2137,11 @@ static void __soc_setup_card_name(struct snd_soc_card *card,
 		}
 	}
 
-	/*
-	 * The driver field should contain a valid string from the user view.
-	 * The wrapping usually does not work so well here. Set a smaller string
-	 * in the specific ASoC driver.
-	 */
+		/*
+		 * driver 字段应该保持为用户可识别的合法字符串。
+		 * 这里通常不太适合做自动换行，所以具体 ASoC driver 应当
+		 * 直接提供更短的字符串。
+		 */
 	if (strlen(src) > len - 1)
 		dev_err(card->dev, "ASoC: driver name too long '%s' -> '%s'\n", src, name);
 }
@@ -2114,33 +2150,38 @@ static void soc_cleanup_card_resources(struct snd_soc_card *card)
 {
 	struct snd_soc_pcm_runtime *rtd, *n;
 
+	/*
+	 * card 销毁时的资源回收要按“先断外部可见入口，再拆内部依赖”的
+	 * 顺序执行。这里集中处理 runtime、component、DAI、AUX、DAPM 和
+	 * snd_card 本体，避免残留引用导致的 use-after-free。
+	 */
 	if (card->snd_card)
 		snd_card_disconnect_sync(card->snd_card);
 
 	snd_soc_dapm_shutdown(card);
 
-	/* release machine specific resources */
+	/* 释放 machine 私有资源。 */
 	for_each_card_rtds(card, rtd)
 		if (rtd->initialized)
 			snd_soc_link_exit(rtd);
-	/* flush delayed work before removing DAIs and DAPM widgets */
+	/* 在移除 DAI 和 DAPM widget 之前，先把延迟工作全部刷完。 */
 	snd_soc_flush_all_delayed_work(card);
 
-	/* remove and free each DAI */
+	/* 逐个移除并释放 DAI。 */
 	soc_remove_link_dais(card);
 	soc_remove_link_components(card);
 
 	for_each_card_rtds_safe(card, rtd, n)
 		snd_soc_remove_pcm_runtime(card, rtd);
 
-	/* remove auxiliary devices */
+	/* 移除辅助设备。 */
 	soc_remove_aux_devices(card);
 	soc_unbind_aux_dev(card);
 
 	snd_soc_dapm_free(snd_soc_card_to_dapm(card));
 	soc_cleanup_card_debugfs(card);
 
-	/* remove the card */
+	/* 移除 card。 */
 	snd_soc_card_remove(card);
 
 	if (card->snd_card) {
@@ -2151,6 +2192,7 @@ static void soc_cleanup_card_resources(struct snd_soc_card *card)
 
 static void snd_soc_unbind_card(struct snd_soc_card *card)
 {
+	/* instantiated 只是入口状态，真正清理在 soc_cleanup_card_resources()。 */
 	if (snd_soc_card_is_instantiated(card)) {
 		card->instantiated = false;
 		soc_cleanup_card_resources(card);
@@ -2164,26 +2206,31 @@ static int snd_soc_bind_card(struct snd_soc_card *card)
 	struct snd_soc_dapm_context *dapm = snd_soc_card_to_dapm(card);
 	int ret;
 
+	/* bind 是 card 进入可工作状态的总入口。 */
 	snd_soc_card_mutex_lock_root(card);
 	snd_soc_fill_dummy_dai(card);
 
+	/*
+	 * card 级 DAPM 先建起来，后面 runtime/component 的 widget、route 和
+	 * 控制都要挂在这个上下文之下。
+	 */
 	snd_soc_dapm_init(dapm, card, NULL);
 
-	/* check whether any platform is ignore machine FE and using topology */
+	/* 检查是否有平台忽略 machine FE 并改用 topology。 */
 	soc_check_tplg_fes(card);
 
-	/* bind aux_devs too */
+	/* 同时绑定 aux_dev。 */
 	ret = soc_bind_aux_dev(card);
 	if (ret < 0)
 		goto probe_end;
 
-	/* add predefined DAI links to the list */
+	/* 把预定义的 DAI link 加入链表。 */
 	card->num_rtd = 0;
 	ret = snd_soc_add_pcm_runtimes(card, card->dai_link, card->num_links);
 	if (ret < 0)
 		goto probe_end;
 
-	/* card bind complete so register a sound card */
+	/* card 绑定完成后，才真正创建 sound card。 */
 	ret = snd_card_new(card->dev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
 			card->owner, 0, &card->snd_card);
 	if (ret < 0) {
@@ -2207,12 +2254,12 @@ static int snd_soc_bind_card(struct snd_soc_card *card)
 	if (ret < 0)
 		goto probe_end;
 
-	/* initialise the sound card only once */
+	/* sound card 只初始化一次。 */
 	ret = snd_soc_card_probe(card);
 	if (ret < 0)
 		goto probe_end;
 
-	/* probe all components used by DAI links on this card */
+	/* 探测该 card 上所有被 DAI link 使用的 component。 */
 	ret = soc_probe_link_components(card);
 	if (ret < 0) {
 		if (ret != -EPROBE_DEFER) {
@@ -2222,7 +2269,7 @@ static int snd_soc_bind_card(struct snd_soc_card *card)
 		goto probe_end;
 	}
 
-	/* probe auxiliary components */
+	/* 探测辅助 component。 */
 	ret = soc_probe_aux_devices(card);
 	if (ret < 0) {
 		dev_err(card->dev,
@@ -2230,7 +2277,7 @@ static int snd_soc_bind_card(struct snd_soc_card *card)
 		goto probe_end;
 	}
 
-	/* probe all DAI links on this card */
+	/* 探测该 card 上所有 DAI link。 */
 	ret = soc_probe_link_dais(card);
 	if (ret < 0) {
 		dev_err(card->dev,
@@ -2244,6 +2291,7 @@ static int snd_soc_bind_card(struct snd_soc_card *card)
 			goto probe_end;
 	}
 
+	/* runtime 就位后，把 DAI widget 真正串成 DAPM 图。 */
 	snd_soc_dapm_link_dai_widgets(card);
 	snd_soc_dapm_connect_dai_link_widgets(card);
 
@@ -2262,7 +2310,7 @@ static int snd_soc_bind_card(struct snd_soc_card *card)
 	if (ret < 0)
 		goto probe_end;
 
-	/* try to set some sane longname if DMI is available */
+	/* 如果 DMI 可用，就尽量生成一个合理的 longname。 */
 	snd_soc_set_dmi_name(card);
 
 	soc_setup_card_name(card, card->snd_card->shortname,
@@ -2273,10 +2321,9 @@ static int snd_soc_bind_card(struct snd_soc_card *card)
 			    card->driver_name, card->name);
 
 	if (card->components) {
-		/* the current implementation of snd_component_add() accepts */
-		/* multiple components in the string separated by space, */
-		/* but the string collision (identical string) check might */
-		/* not work correctly */
+		/* 目前 snd_component_add() 允许在字符串里用空格分隔多个 component，
+		 * 但这种情况下相同字符串的冲突检查可能不够可靠。
+		 */
 		ret = snd_component_add(card->snd_card, card->components);
 		if (ret < 0) {
 			dev_err(card->dev, "ASoC: %s snd_component_add() failed: %d\n",
@@ -2303,7 +2350,7 @@ static int snd_soc_bind_card(struct snd_soc_card *card)
 	snd_soc_dapm_mark_endpoints_dirty(card);
 	snd_soc_dapm_sync(dapm);
 
-	/* deactivate pins to sleep state */
+	/* 将 pin 切换到睡眠态。 */
 	for_each_card_components(card, component)
 		if (!snd_soc_component_active(component))
 			pinctrl_pm_select_sleep_state(component->dev);
@@ -2326,6 +2373,7 @@ static int devm_snd_soc_bind_card(struct device *dev, struct snd_soc_card *card)
 	struct snd_soc_card **ptr;
 	int ret;
 
+	/* devres 版绑定，便于设备释放时自动解绑 card。 */
 	ptr = devres_alloc(devm_card_bind_release, sizeof(*ptr), GFP_KERNEL);
 	if (!ptr)
 		return -ENOMEM;
@@ -2345,13 +2393,16 @@ static int snd_soc_rebind_card(struct snd_soc_card *card)
 {
 	int ret;
 
+	/* rebind 用于 topology / devres 触发后的重新挂载。 */
 	if (card->devres_dev) {
+		/* 先撤掉旧的 devres 绑定，再重新走一次绑定流程。 */
 		devres_destroy(card->devres_dev, devm_card_bind_release, NULL, NULL);
 		ret = devm_snd_soc_bind_card(card->devres_dev, card);
 	} else {
 		ret = snd_soc_bind_card(card);
 	}
 
+	/* 不是 EPROBE_DEFER 的话，说明这张卡不再需要留在等待队列里。 */
 	if (ret != -EPROBE_DEFER)
 		list_del_init(&card->list);
 
@@ -2363,9 +2414,10 @@ static int soc_probe(struct platform_device *pdev)
 {
 	struct snd_soc_card *card = platform_get_drvdata(pdev);
 
+	/* 旧式 soc-audio platform driver 入口。 */
 	/*
-	 * no card, so machine driver should be registering card
-	 * we should not be here in that case so ret error
+	 * 没有 card，说明 machine driver 还没有完成注册；
+	 * 这种情况下理论上不应该走到这里，直接返回错误。
 	 */
 	if (!card)
 		return -EINVAL;
@@ -2374,7 +2426,7 @@ static int soc_probe(struct platform_device *pdev)
 		 "ASoC: machine %s should use snd_soc_register_card()\n",
 		 card->name);
 
-	/* Bodge while we unpick instantiation */
+	/* 在理顺实例化流程之前，暂时手动补上 card->dev。 */
 	card->dev = &pdev->dev;
 
 	return devm_snd_soc_register_card(&pdev->dev, card);
@@ -2385,18 +2437,23 @@ int snd_soc_poweroff(struct device *dev)
 	struct snd_soc_card *card = dev_get_drvdata(dev);
 	struct snd_soc_component *component;
 
+	/*
+	 * poweroff 不是普通 suspend：
+	 * 系统已进入关闭阶段，不需要为“稍后恢复”保留电源状态，
+	 * 所以这里会把延迟关断、DAPM 和 pinctrl 都直接收尾。
+	 */
 	if (!snd_soc_card_is_instantiated(card))
 		return 0;
 
 	/*
-	 * Flush out pmdown_time work - we actually do want to run it
-	 * now, we're shutting down so no imminent restart.
+	 * 刷新 pmdown_time 的延迟工作 - 这里确实希望立即执行，
+	 * 因为系统正在关机，不存在马上重启的需求。
 	 */
 	snd_soc_flush_all_delayed_work(card);
 
 	snd_soc_dapm_shutdown(card);
 
-	/* deactivate pins to sleep state */
+	/* 将 pin 切换到睡眠态。 */
 	for_each_card_components(card, component)
 		pinctrl_pm_select_sleep_state(component->dev);
 
@@ -2414,7 +2471,7 @@ const struct dev_pm_ops snd_soc_pm_ops = {
 };
 EXPORT_SYMBOL_GPL(snd_soc_pm_ops);
 
-/* ASoC platform driver */
+/* ASoC 平台驱动。 */
 static struct platform_driver soc_driver = {
 	.driver		= {
 		.name		= "soc-audio",
@@ -2424,15 +2481,15 @@ static struct platform_driver soc_driver = {
 };
 
 /**
- * snd_soc_cnew - create new control
- * @_template: control template
- * @data: control private data
- * @long_name: control long name
- * @prefix: control name prefix
+ * snd_soc_cnew - 由模板创建新的控制项
+ * @_template: 控制模板
+ * @data: 控制私有数据
+ * @long_name: 控制项长名称
+ * @prefix: 控制名称前缀
  *
- * Create a new mixer control from a template control.
+ * 通过模板控制项创建一个新的 mixer control。
  *
- * Returns 0 for success, else error.
+ * 返回：成功时返回控制项指针，失败时返回 NULL。
  */
 struct snd_kcontrol *snd_soc_cnew(const struct snd_kcontrol_new *_template,
 				  void *data, const char *long_name,
@@ -2442,6 +2499,7 @@ struct snd_kcontrol *snd_soc_cnew(const struct snd_kcontrol_new *_template,
 	struct snd_kcontrol *kcontrol;
 	char *name = NULL;
 
+	/* 复制一份模板，必要时拼接 prefix 后再交给 ALSA core 创建。 */
 	memcpy(&template, _template, sizeof(template));
 	template.index = 0;
 
@@ -2472,6 +2530,7 @@ static int snd_soc_add_controls(struct snd_card *card, struct device *dev,
 {
 	int i;
 
+	/* 逐个把控制模板实例化并注册进 card。 */
 	for (i = 0; i < num_controls; i++) {
 		const struct snd_kcontrol_new *control = &controls[i];
 		int err = snd_ctl_add(card, snd_soc_cnew(control, data,
@@ -2487,13 +2546,13 @@ static int snd_soc_add_controls(struct snd_card *card, struct device *dev,
 }
 
 /**
- * snd_soc_add_component_controls - Add an array of controls to a component.
+ * snd_soc_add_component_controls - 向 component 添加一组控制项
  *
- * @component: Component to add controls to
- * @controls: Array of controls to add
- * @num_controls: Number of elements in the array
+ * @component: 需要添加控制项的 component
+ * @controls: 要添加的控制项数组
+ * @num_controls: 数组元素个数
  *
- * Return: 0 for success, else error.
+ * 返回：成功时返回 0，否则返回错误码。
  */
 int snd_soc_add_component_controls(struct snd_soc_component *component,
 	const struct snd_kcontrol_new *controls, unsigned int num_controls)
@@ -2506,14 +2565,14 @@ int snd_soc_add_component_controls(struct snd_soc_component *component,
 EXPORT_SYMBOL_GPL(snd_soc_add_component_controls);
 
 /**
- * snd_soc_add_card_controls - add an array of controls to a SoC card.
- * Convenience function to add a list of controls.
+ * snd_soc_add_card_controls - 向 SoC card 添加一组控制项
+ * 这是一个添加控制项列表的便捷函数。
  *
- * @soc_card: SoC card to add controls to
- * @controls: array of controls to add
- * @num_controls: number of elements in the array
+ * @soc_card: 需要添加控制项的 SoC card
+ * @controls: 要添加的控制项数组
+ * @num_controls: 数组元素个数
  *
- * Return 0 for success, else error.
+ * 返回：成功时返回 0，否则返回错误码。
  */
 int snd_soc_add_card_controls(struct snd_soc_card *soc_card,
 	const struct snd_kcontrol_new *controls, int num_controls)
@@ -2526,14 +2585,14 @@ int snd_soc_add_card_controls(struct snd_soc_card *soc_card,
 EXPORT_SYMBOL_GPL(snd_soc_add_card_controls);
 
 /**
- * snd_soc_add_dai_controls - add an array of controls to a DAI.
- * Convenience function to add a list of controls.
+ * snd_soc_add_dai_controls - 向 DAI 添加一组控制项
+ * 这是一个添加控制项列表的便捷函数。
  *
- * @dai: DAI to add controls to
- * @controls: array of controls to add
- * @num_controls: number of elements in the array
+ * @dai: 需要添加控制项的 DAI
+ * @controls: 要添加的控制项数组
+ * @num_controls: 数组元素个数
  *
- * Return 0 for success, else error.
+ * 返回：成功时返回 0，否则返回错误码。
  */
 int snd_soc_add_dai_controls(struct snd_soc_dai *dai,
 	const struct snd_kcontrol_new *controls, int num_controls)
@@ -2546,15 +2605,17 @@ int snd_soc_add_dai_controls(struct snd_soc_dai *dai,
 EXPORT_SYMBOL_GPL(snd_soc_add_dai_controls);
 
 /**
- * snd_soc_register_card - Register a card with the ASoC core
+ * snd_soc_register_card - 向 ASoC core 注册 card
  *
- * @card: Card to register
+ * @card: 需要注册的 card
  *
+ * 注册 card 之前会先完成其基础初始化。
  */
 int snd_soc_register_card(struct snd_soc_card *card)
 {
 	int ret;
 
+	/* register_card 负责初始化 card/DAPM/锁，并启动 bind 流程。 */
 	if (!card->name || !card->dev)
 		return -EINVAL;
 
@@ -2580,6 +2641,7 @@ int snd_soc_register_card(struct snd_soc_card *card)
 
 	guard(mutex)(&client_mutex);
 
+	/* devres 模式下可能因为依赖未就绪而先挂到等待重绑链表里。 */
 	if (card->devres_dev) {
 		ret = devm_snd_soc_bind_card(card->devres_dev, card);
 		if (ret == -EPROBE_DEFER) {
@@ -2595,13 +2657,13 @@ int snd_soc_register_card(struct snd_soc_card *card)
 EXPORT_SYMBOL_GPL(snd_soc_register_card);
 
 /**
- * snd_soc_unregister_card - Unregister a card with the ASoC core
+ * snd_soc_unregister_card - 从 ASoC core 注销 card
  *
- * @card: Card to unregister
- *
+ * @card: 需要注销的 card
  */
 void snd_soc_unregister_card(struct snd_soc_card *card)
 {
+	/* unregister 先解绑再从全局链表删掉。 */
 	guard(mutex)(&client_mutex);
 
 	snd_soc_unbind_card(card);
@@ -2612,11 +2674,12 @@ void snd_soc_unregister_card(struct snd_soc_card *card)
 EXPORT_SYMBOL_GPL(snd_soc_unregister_card);
 
 /*
- * Simplify DAI link configuration by removing ".-1" from device names
- * and sanitizing names.
+ * 规范化单设备名字，并去掉 ".-1" 之类的 legacy 后缀。
+ * 这样生成的名字更适合用于 dai_link 匹配。
  */
 static char *fmt_single_name(struct device *dev, int *id)
 {
+	/* 把单设备名字规范化，顺便生成一个稳定 id。 */
 	const char *devname = dev_name(dev);
 	char *found, *name;
 	unsigned int id1, id2;
@@ -2629,26 +2692,26 @@ static char *fmt_single_name(struct device *dev, int *id)
 	if (!name)
 		return NULL;
 
-	/* are we a "%s.%d" name (platform and SPI components) */
+	/* 检查是否是 "%s.%d" 这类名字（platform / SPI 组件）。 */
 	found = strstr(name, dev->driver->name);
 	if (found) {
-		/* get ID */
+		/* 解析 ID。 */
 		if (sscanf(&found[strlen(dev->driver->name)], ".%d", &__id) == 1) {
 
-			/* discard ID from name if ID == -1 */
+			/* 如果 ID == -1，就把名字里的后缀去掉。 */
 			if (__id == -1)
 				found[strlen(dev->driver->name)] = '\0';
 		}
 
-	/* I2C component devices are named "bus-addr" */
+	/* I2C component 设备通常命名为 "bus-addr"。 */
 	} else if (sscanf(name, "%x-%x", &id1, &id2) == 2) {
 
-		/* create unique ID number from I2C addr and bus */
+		/* 根据 I2C 地址和 bus 号生成唯一 ID。 */
 		__id = ((id1 & 0xffff) << 16) + id2;
 
 		devm_kfree(dev, name);
 
-		/* sanitize component name for DAI link creation */
+		/* 对 component 名称做一次清理，方便后续创建 DAI link。 */
 		name = devm_kasprintf(dev, GFP_KERNEL, "%s.%s", dev->driver->name, devname);
 	} else {
 		__id = 0;
@@ -2661,12 +2724,13 @@ static char *fmt_single_name(struct device *dev, int *id)
 }
 
 /*
- * Simplify DAI link naming for single devices with multiple DAIs by removing
- * any ".-1" and using the DAI name (instead of device name).
+ * 对于一个设备上挂多个 DAI 的情况，直接用 DAI 自己的名字，
+ * 避免继续沿用设备名造成歧义。
  */
 static inline char *fmt_multiple_name(struct device *dev,
 		struct snd_soc_dai_driver *dai_drv)
 {
+	/* 多 DAI 场景直接沿用 DAI driver 自身名字。 */
 	if (dai_drv->name == NULL) {
 		dev_err(dev,
 			"ASoC: error - multiple DAI %s registered with no name\n",
@@ -2679,6 +2743,7 @@ static inline char *fmt_multiple_name(struct device *dev,
 
 void snd_soc_unregister_dai(struct snd_soc_dai *dai)
 {
+	/* DAI 解绑只负责从 component->dai_list 移除。 */
 	lockdep_assert_held(&client_mutex);
 
 	dev_dbg(dai->dev, "ASoC: Unregistered DAI '%s'\n", dai->name);
@@ -2687,16 +2752,16 @@ void snd_soc_unregister_dai(struct snd_soc_dai *dai)
 EXPORT_SYMBOL_GPL(snd_soc_unregister_dai);
 
 /**
- * snd_soc_register_dai - Register a DAI dynamically & create its widgets
+ * snd_soc_register_dai - 动态注册 DAI 并创建其 widget
  *
- * @component: The component the DAIs are registered for
- * @dai_drv: DAI driver to use for the DAI
- * @legacy_dai_naming: if %true, use legacy single-name format;
- * 	if %false, use multiple-name format;
+ * @component: DAI 所属的 component
+ * @dai_drv: DAI 使用的 driver 描述
+ * @legacy_dai_naming: 为 %true 时使用旧式单名字格式；
+ * 	为 %false 时使用多名字格式；
  *
- * Topology can use this API to register DAIs when probing a component.
- * These DAIs's widgets will be freed in the card cleanup and the DAIs
- * will be freed in the component cleanup.
+ * topology 可以在 probing component 时调用该 API 注册 DAI。
+ * 这些 DAI 的 widget 会在 card 清理阶段释放，而 DAI 本体会在
+ * component 清理阶段释放。
  */
 struct snd_soc_dai *snd_soc_register_dai(struct snd_soc_component *component,
 					 struct snd_soc_dai_driver *dai_drv,
@@ -2705,6 +2770,7 @@ struct snd_soc_dai *snd_soc_register_dai(struct snd_soc_component *component,
 	struct device *dev = component->dev;
 	struct snd_soc_dai *dai;
 
+	/* 以 component 为宿主创建一个运行时 DAI。 */
 	lockdep_assert_held(&client_mutex);
 
 	dai = devm_kzalloc(dev, sizeof(*dai), GFP_KERNEL);
@@ -2712,12 +2778,9 @@ struct snd_soc_dai *snd_soc_register_dai(struct snd_soc_component *component,
 		return NULL;
 
 	/*
-	 * Back in the old days when we still had component-less DAIs,
-	 * instead of having a static name, component-less DAIs would
-	 * inherit the name of the parent device so it is possible to
-	 * register multiple instances of the DAI. We still need to keep
-	 * the same naming style even though those DAIs are not
-	 * component-less anymore.
+	 * 在早期还存在 component-less DAI 的年代，这类 DAI 没有静态名字，
+	 * 而是继承父设备的名字，因此可以注册多个同名实例。即使现在这些
+	 * DAI 已经不再是 component-less 了，仍要保留同样的命名风格。
 	 */
 	if (legacy_dai_naming &&
 	    (dai_drv->id == 0 || dai_drv->name == NULL)) {
@@ -2736,7 +2799,7 @@ struct snd_soc_dai *snd_soc_register_dai(struct snd_soc_component *component,
 	dai->dev = dev;
 	dai->driver = dai_drv;
 
-	/* see for_each_component_dais */
+	/* 供 for_each_component_dais() 遍历使用。 */
 	list_add_tail(&dai->list, &component->dai_list);
 	component->num_dai++;
 
@@ -2746,12 +2809,13 @@ struct snd_soc_dai *snd_soc_register_dai(struct snd_soc_component *component,
 EXPORT_SYMBOL_GPL(snd_soc_register_dai);
 
 /**
- * snd_soc_unregister_dais - Unregister DAIs from the ASoC core
+ * snd_soc_unregister_dais - 从 ASoC core 注销该 component 下的所有 DAI
  *
- * @component: The component for which the DAIs should be unregistered
+ * @component: 需要注销 DAI 的 component
  */
 static void snd_soc_unregister_dais(struct snd_soc_component *component)
 {
+	/* 逐个回收 component 下的所有 DAI。 */
 	struct snd_soc_dai *dai, *_dai;
 
 	for_each_component_dais_safe(component, dai, _dai)
@@ -2759,16 +2823,17 @@ static void snd_soc_unregister_dais(struct snd_soc_component *component)
 }
 
 /**
- * snd_soc_register_dais - Register a DAI with the ASoC core
+ * snd_soc_register_dais - 向 ASoC core 批量注册 DAI
  *
- * @component: The component the DAIs are registered for
- * @dai_drv: DAI driver to use for the DAIs
- * @count: Number of DAIs
+ * @component: 这些 DAI 所属的 component
+ * @dai_drv: DAI driver 数组
+ * @count: DAI 数量
  */
 static int snd_soc_register_dais(struct snd_soc_component *component,
 				 struct snd_soc_dai_driver *dai_drv,
 				 size_t count)
 {
+	/* 批量注册 DAI，任一步失败则回滚全部。 */
 	struct snd_soc_dai *dai;
 	unsigned int i;
 	int ret;
@@ -2811,13 +2876,14 @@ static u64 endianness_format_map[] = {
 };
 
 /*
- * Fix up the DAI formats for endianness: codecs don't actually see
- * the endianness of the data but we're using the CPU format
- * definitions which do need to include endianness so we ensure that
- * codec DAIs always have both big and little endian variants set.
+ * 针对字节序修正 DAI 格式：
+ * codec 实际上并不感知数据字节序，但这里使用的是 CPU 侧格式定义，
+ * 这些定义需要区分字节序。因此要保证 codec DAI 同时具备大端和小端
+ * 版本。
  */
 static void convert_endianness_formats(struct snd_soc_pcm_stream *stream)
 {
+	/* 让 codec DAI 同时声明 LE/BE 版本格式，避免对端匹配失败。 */
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(endianness_format_map); i++)
@@ -2827,6 +2893,7 @@ static void convert_endianness_formats(struct snd_soc_pcm_stream *stream)
 
 static void snd_soc_del_component_unlocked(struct snd_soc_component *component)
 {
+	/* 解绑 component 时先清 DAI，再处理 card 关联。 */
 	struct snd_soc_card *card = component->card;
 	bool instantiated;
 
@@ -2846,6 +2913,7 @@ int snd_soc_component_initialize(struct snd_soc_component *component,
 				 const struct snd_soc_component_driver *driver,
 				 struct device *dev)
 {
+	/* 初始化 component 的运行时对象和默认链表。 */
 	component->dapm = snd_soc_dapm_alloc(dev);
 	if (!component->dapm)
 		return -ENOMEM;
@@ -2886,6 +2954,13 @@ int snd_soc_add_component(struct snd_soc_component *component,
 	int i;
 	guard(mutex)(&client_mutex);
 
+	/*
+	 * component 注册的顺序很固定：
+	 * 1) 先把 DAI driver 变成运行时 DAI
+	 * 2) 再把 component 加入全局表
+	 * 3) 然后唤醒之前因为依赖未就绪而挂起的 card
+	 */
+	/* 先注册 DAI，再把 component 插入全局列表，最后尝试重绑等待中的 card。 */
 	if (component->driver->endianness) {
 		for (i = 0; i < num_dai; i++) {
 			convert_endianness_formats(&dai_drv[i].playback);
@@ -2901,14 +2976,19 @@ int snd_soc_add_component(struct snd_soc_component *component,
 	}
 
 	if (!component->driver->write && !component->driver->read) {
+		/*
+		 * 如果驱动没自己实现寄存器访问，优先尝试从设备上挂接的
+		 * regmap 取一个默认实现。
+		 */
 		if (!component->regmap)
 			component->regmap = dev_get_regmap(component->dev,
 							   NULL);
 	}
 
-	/* see for_each_component */
+	/* 供 for_each_component() 遍历使用。 */
 	list_add(&component->list, &component_list);
 
+	/* 如果有卡在等待这个 component，就在这里重新走一次绑定流程。 */
 	list_for_each_entry_safe(card, c, &unbind_card_list, list)
 		snd_soc_rebind_card(card);
 
@@ -2928,6 +3008,7 @@ int snd_soc_register_component(struct device *dev,
 	struct snd_soc_component *component;
 	int ret;
 
+	/* devm 版 component 注册。 */
 	component = devm_kzalloc(dev, sizeof(*component), GFP_KERNEL);
 	if (!component)
 		return -ENOMEM;
@@ -2941,17 +3022,17 @@ int snd_soc_register_component(struct device *dev,
 EXPORT_SYMBOL_GPL(snd_soc_register_component);
 
 /**
- * snd_soc_unregister_component_by_driver - Unregister component using a given driver
- * from the ASoC core
+ * snd_soc_unregister_component_by_driver - 按给定 driver 从 ASoC core 注销 component
  *
- * @dev: The device to unregister
- * @component_driver: The component driver to unregister
+ * @dev: 需要注销的设备
+ * @component_driver: 需要注销的 component driver
  */
 void snd_soc_unregister_component_by_driver(struct device *dev,
 					    const struct snd_soc_component_driver *component_driver)
 {
 	const char *driver_name = NULL;
 
+	/* 按 driver 名称逐个回收该设备下的 component。 */
 	if (component_driver)
 		driver_name = component_driver->name;
 
@@ -2963,15 +3044,17 @@ void snd_soc_unregister_component_by_driver(struct device *dev,
 		if (!component)
 			break;
 
+		/* 解除 component 时会同时把 DAI、card 关联和全局链表都拆掉。 */
 		snd_soc_del_component_unlocked(component);
 	}
 }
 EXPORT_SYMBOL_GPL(snd_soc_unregister_component_by_driver);
 
-/* Retrieve a card's name from device tree */
+/* 从 device tree 中读取 card 名称。 */
 int snd_soc_of_parse_card_name(struct snd_soc_card *card,
 			       const char *propname)
 {
+	/* 从 DT 里取 card 名。 */
 	struct device_node *np;
 	int ret;
 
@@ -2984,9 +3067,8 @@ int snd_soc_of_parse_card_name(struct snd_soc_card *card,
 
 	ret = of_property_read_string_index(np, propname, 0, &card->name);
 	/*
-	 * EINVAL means the property does not exist. This is fine providing
-	 * card->name was previously set, which is checked later in
-	 * snd_soc_register_card.
+	 * EINVAL 表示该属性不存在。只要 card->name 之前已经被设置过，
+	 * 这就是允许的；后面在 snd_soc_register_card 里会再检查。
 	 */
 	if (ret < 0 && ret != -EINVAL) {
 		dev_err(card->dev,
@@ -3203,7 +3285,7 @@ void snd_soc_of_parse_node_prefix(struct device_node *np,
 
 	ret = of_property_read_string(np, propname, &str);
 	if (ret < 0) {
-		/* no prefix is not error */
+	/* 没有 prefix 不是错误。 */
 		return;
 	}
 
@@ -3320,11 +3402,10 @@ EXPORT_SYMBOL_GPL(snd_soc_daifmt_clock_provider_flipped);
 unsigned int snd_soc_daifmt_clock_provider_from_bitmap(unsigned int bit_frame)
 {
 	/*
-	 * bit_frame is return value from
-	 *	snd_soc_daifmt_parse_clock_provider_raw()
+	 * bit_frame 是 snd_soc_daifmt_parse_clock_provider_raw() 的返回值。
 	 */
 
-	/* Codec base */
+	/* 以 Codec 侧的约定为基准。 */
 	switch (bit_frame) {
 	case 0x11:
 		return SND_SOC_DAIFMT_CBP_CFP;
@@ -3367,9 +3448,8 @@ unsigned int snd_soc_daifmt_parse_format(struct device_node *np,
 		prefix = "";
 
 	/*
-	 * check "dai-format = xxx"
-	 * or    "[prefix]format = xxx"
-	 * SND_SOC_DAIFMT_FORMAT_MASK area
+	 * 检查 "dai-format = xxx" 或 "[prefix]format = xxx"。
+	 * 这里对应 SND_SOC_DAIFMT_FORMAT_MASK 区域。
 	 */
 	ret = of_property_read_string(np, "dai-format", &str);
 	if (ret < 0) {
@@ -3388,8 +3468,8 @@ unsigned int snd_soc_daifmt_parse_format(struct device_node *np,
 	}
 
 	/*
-	 * check "[prefix]continuous-clock"
-	 * SND_SOC_DAIFMT_CLOCK_MASK area
+	 * 检查 "[prefix]continuous-clock"。
+	 * 这里对应 SND_SOC_DAIFMT_CLOCK_MASK 区域。
 	 */
 	snprintf(prop, sizeof(prop), "%scontinuous-clock", prefix);
 	if (of_property_read_bool(np, prop))
@@ -3398,9 +3478,8 @@ unsigned int snd_soc_daifmt_parse_format(struct device_node *np,
 		format |= SND_SOC_DAIFMT_GATED;
 
 	/*
-	 * check "[prefix]bitclock-inversion"
-	 * check "[prefix]frame-inversion"
-	 * SND_SOC_DAIFMT_INV_MASK area
+	 * 检查 "[prefix]bitclock-inversion" 和 "[prefix]frame-inversion"。
+	 * 这里对应 SND_SOC_DAIFMT_INV_MASK 区域。
 	 */
 	snprintf(prop, sizeof(prop), "%sbitclock-inversion", prefix);
 	bit = of_property_read_bool(np, prop);
@@ -3419,7 +3498,7 @@ unsigned int snd_soc_daifmt_parse_format(struct device_node *np,
 		format |= SND_SOC_DAIFMT_NB_IF;
 		break;
 	default:
-		/* SND_SOC_DAIFMT_NB_NF is default */
+		/* SND_SOC_DAIFMT_NB_NF 是默认值。 */
 		break;
 	}
 
@@ -3442,8 +3521,7 @@ unsigned int snd_soc_daifmt_parse_clock_provider_raw(struct device_node *np,
 		prefix = "";
 
 	/*
-	 * check "[prefix]bitclock-master"
-	 * check "[prefix]frame-master"
+	 * 检查 "[prefix]bitclock-master" 和 "[prefix]frame-master"。
 	 */
 	snprintf(prop, sizeof(prop), "%sbitclock-master", prefix);
 	bit = of_property_present(np, prop);
@@ -3456,9 +3534,7 @@ unsigned int snd_soc_daifmt_parse_clock_provider_raw(struct device_node *np,
 		*framemaster = of_parse_phandle(np, prop, 0);
 
 	/*
-	 * return bitmap.
-	 * It will be parameter of
-	 *	snd_soc_daifmt_clock_provider_from_bitmap()
+	 * 返回位图，供 snd_soc_daifmt_clock_provider_from_bitmap() 使用。
 	 */
 	return (bit << 4) + frame;
 }
@@ -3507,10 +3583,10 @@ int snd_soc_get_dai_id(struct device_node *ep)
 
 
 	/*
-	 * For example HDMI case, HDMI has video/sound port,
-	 * but ALSA SoC needs sound port number only.
-	 * Thus counting HDMI DT port/endpoint doesn't work.
-	 * Then, it should have .of_xlate_dai_id
+	 * 这里只拿 endpoint 所属的 port_parent 去找 DAI id。
+	 * 像 HDMI 这类设备会同时挂视频和音频端口，ALSA 只关心音频那一侧，
+	 * 所以不能简单按 graph 里 endpoint 的顺序去数，必须让驱动提供
+	 * 自己的 .of_xlate_dai_id 逻辑。
 	 */
 	ret = -ENOTSUPP;
 
@@ -3533,6 +3609,13 @@ int snd_soc_get_dlc(const struct of_phandle_args *args, struct snd_soc_dai_link_
 	int ret = -EPROBE_DEFER;
 	guard(mutex)(&client_mutex);
 
+	/*
+	 * 从 DT phandle + cells 里解析出一个可用于 dai_link 的端点描述。
+	 * 解析顺序是：
+	 * 1) 找到对应 component
+	 * 2) 让 component 的 of_xlate 回调优先把 args 映射成 DAI name
+	 * 3) 如果没有回调，再退回到按 DAI id 位置查找
+	 */
 	for_each_component(pos) {
 		struct device_node *component_of_node = soc_component_to_node(pos);
 
@@ -3552,7 +3635,7 @@ int snd_soc_get_dlc(const struct of_phandle_args *args, struct snd_soc_dai_link_
 				id = args->args[0];
 				break;
 			default:
-				/* not supported */
+				/* 不支持。 */
 				break;
 			}
 
@@ -3563,7 +3646,7 @@ int snd_soc_get_dlc(const struct of_phandle_args *args, struct snd_soc_dai_link_
 
 			ret = 0;
 
-			/* find target DAI */
+			/* 查找目标 DAI。 */
 			for_each_component_dais(pos, dai) {
 				if (id == 0)
 					break;
@@ -3573,10 +3656,9 @@ int snd_soc_get_dlc(const struct of_phandle_args *args, struct snd_soc_dai_link_
 			dlc->dai_name	= snd_soc_dai_name_get(dai);
 		} else if (ret) {
 			/*
-			 * if another error than ENOTSUPP is returned go on and
-			 * check if another component is provided with the same
-			 * node. This may happen if a device provides several
-			 * components
+			 * 如果返回的不是 ENOTSUPP，就继续检查同一个 node 上是否
+			 * 还提供了别的 component。一个设备提供多个 component 时，
+			 * 这里就可能出现这种情况。
 			 */
 			continue;
 		}
@@ -3599,6 +3681,10 @@ int snd_soc_of_get_dlc(struct device_node *of_node,
 	struct of_phandle_args __args;
 	int ret;
 
+	/*
+	 * 这是最底层的 DT helper：先把 sound-dai phandle 解析出来，
+	 * 再交给 snd_soc_get_dlc() 转成 ALSA/ASoC 可直接使用的端点描述。
+	 */
 	if (!args)
 		args = &__args;
 
@@ -3617,6 +3703,7 @@ int snd_soc_get_dai_name(const struct of_phandle_args *args,
 	struct snd_soc_dai_link_component dlc;
 	int ret = snd_soc_get_dlc(args, &dlc);
 
+	/* 只关心名字时，就先走完整解析，再把结果里的 dai_name 取出来。 */
 	if (ret == 0)
 		*dai_name = dlc.dai_name;
 
@@ -3630,6 +3717,7 @@ int snd_soc_of_get_dai_name(struct device_node *of_node,
 	struct snd_soc_dai_link_component dlc;
 	int ret = snd_soc_of_get_dlc(of_node, NULL, &dlc, index);
 
+	/* 直接复用 snd_soc_of_get_dlc() 的解析结果，只取 dai 名字。 */
 	if (ret == 0)
 		*dai_name = dlc.dai_name;
 
@@ -3643,6 +3731,7 @@ struct snd_soc_dai *snd_soc_get_dai_via_args(const struct of_phandle_args *dai_a
 	struct snd_soc_component *component;
 	guard(mutex)(&client_mutex);
 
+	/* 按 dai_args 精确匹配已注册的 DAI，适合 topology 或高级板级映射。 */
 	for_each_component(component) {
 		for_each_component_dais(component, dai)
 			if (snd_soc_is_match_dai_args(dai->driver->dai_args, dai_args))
@@ -3654,6 +3743,7 @@ EXPORT_SYMBOL_GPL(snd_soc_get_dai_via_args);
 
 static void __snd_soc_of_put_component(struct snd_soc_dai_link_component *component)
 {
+	/* 解析时拿到的 of_node 引用必须配对 put，避免长时间持有节点。 */
 	if (component->of_node) {
 		of_node_put(component->of_node);
 		component->of_node = NULL;
@@ -3668,7 +3758,7 @@ static int __snd_soc_of_get_dai_link_component_alloc(
 	struct snd_soc_dai_link_component *component;
 	int num;
 
-	/* Count the number of CPUs/CODECs */
+	/* 统计 CPU/CODEC 的数量。 */
 	num = of_count_phandle_with_args(of_node, "sound-dai", "#sound-dai-cells");
 	if (num <= 0) {
 		if (num == -ENOENT)
@@ -3688,34 +3778,34 @@ static int __snd_soc_of_get_dai_link_component_alloc(
 }
 
 /*
- * snd_soc_of_put_dai_link_codecs - Dereference device nodes in the codecs array
+ * snd_soc_of_put_dai_link_codecs - 释放 codecs 数组里的 device node 引用
  * @dai_link: DAI link
  *
- * Dereference device nodes acquired by snd_soc_of_get_dai_link_codecs().
+ * 释放由 snd_soc_of_get_dai_link_codecs() 获取的 device node 引用。
  */
 void snd_soc_of_put_dai_link_codecs(struct snd_soc_dai_link *dai_link)
 {
 	struct snd_soc_dai_link_component *component;
 	int index;
 
+	/* 释放 codecs 数组里每个 component 持有的 of_node 引用。 */
 	for_each_link_codecs(dai_link, index, component)
 		__snd_soc_of_put_component(component);
 }
 EXPORT_SYMBOL_GPL(snd_soc_of_put_dai_link_codecs);
 
 /*
- * snd_soc_of_get_dai_link_codecs - Parse a list of CODECs in the devicetree
- * @dev: Card device
- * @of_node: Device node
+ * snd_soc_of_get_dai_link_codecs - 解析 devicetree 中的 CODEC 列表
+ * @dev: card 设备
+ * @of_node: device node
  * @dai_link: DAI link
  *
- * Builds an array of CODEC DAI components from the DAI link property
- * 'sound-dai'.
- * The array is set in the DAI link and the number of DAIs is set accordingly.
- * The device nodes in the array (of_node) must be dereferenced by calling
- * snd_soc_of_put_dai_link_codecs() on @dai_link.
+ * 从 DAI link 的 sound-dai 属性中构造 CODEC DAI component 数组。
+ * 解析结果会写入 @dai_link，同时更新 DAI 数量。
+ * 数组里持有的 device node 引用需要在之后调用
+ * snd_soc_of_put_dai_link_codecs() 释放。
  *
- * Returns 0 for success
+ * 返回 0 表示成功。
  */
 int snd_soc_of_get_dai_link_codecs(struct device *dev,
 				   struct device_node *of_node,
@@ -3729,7 +3819,7 @@ int snd_soc_of_get_dai_link_codecs(struct device *dev,
 	if (ret < 0)
 		return ret;
 
-	/* Parse the list */
+	/* 把 codec 列表逐个解析成可直接参与 match 的 dai_link_component。 */
 	for_each_link_codecs(dai_link, index, component) {
 		ret = snd_soc_of_get_dlc(of_node, NULL, component, index);
 		if (ret)
@@ -3745,31 +3835,31 @@ err:
 EXPORT_SYMBOL_GPL(snd_soc_of_get_dai_link_codecs);
 
 /*
- * snd_soc_of_put_dai_link_cpus - Dereference device nodes in the codecs array
+ * snd_soc_of_put_dai_link_cpus - 释放 CPU 数组里的 device node 引用
  * @dai_link: DAI link
  *
- * Dereference device nodes acquired by snd_soc_of_get_dai_link_cpus().
+ * 释放由 snd_soc_of_get_dai_link_cpus() 获取的 device node 引用。
  */
 void snd_soc_of_put_dai_link_cpus(struct snd_soc_dai_link *dai_link)
 {
 	struct snd_soc_dai_link_component *component;
 	int index;
 
+	/* 释放 CPUs 数组里每个 component 持有的 of_node 引用。 */
 	for_each_link_cpus(dai_link, index, component)
 		__snd_soc_of_put_component(component);
 }
 EXPORT_SYMBOL_GPL(snd_soc_of_put_dai_link_cpus);
 
 /*
- * snd_soc_of_get_dai_link_cpus - Parse a list of CPU DAIs in the devicetree
- * @dev: Card device
- * @of_node: Device node
+ * snd_soc_of_get_dai_link_cpus - 解析 devicetree 中的 CPU DAI 列表
+ * @dev: card 设备
+ * @of_node: device node
  * @dai_link: DAI link
  *
- * Is analogous to snd_soc_of_get_dai_link_codecs but parses a list of CPU DAIs
- * instead.
+ * 逻辑与 snd_soc_of_get_dai_link_codecs() 类似，只是解析目标换成 CPU DAI。
  *
- * Returns 0 for success
+ * 返回 0 表示成功。
  */
 int snd_soc_of_get_dai_link_cpus(struct device *dev,
 				 struct device_node *of_node,
@@ -3778,13 +3868,13 @@ int snd_soc_of_get_dai_link_cpus(struct device *dev,
 	struct snd_soc_dai_link_component *component;
 	int index, ret;
 
-	/* Count the number of CPUs */
+	/* 先统计 CPU 数量，再为 CPU 数组分配存储。 */
 	ret = __snd_soc_of_get_dai_link_component_alloc(dev, of_node,
 					 &dai_link->cpus, &dai_link->num_cpus);
 	if (ret < 0)
 		return ret;
 
-	/* Parse the list */
+	/* CPU 列表解析逻辑与 codec 相同，只是目标数组换成 cpus。 */
 	for_each_link_cpus(dai_link, index, component) {
 		ret = snd_soc_of_get_dlc(of_node, NULL, component, index);
 		if (ret)
@@ -3830,7 +3920,7 @@ static void __exit snd_soc_exit(void)
 }
 module_exit(snd_soc_exit);
 
-/* Module information */
+/* 模块信息。 */
 MODULE_AUTHOR("Liam Girdwood, lrg@slimlogic.co.uk");
 MODULE_DESCRIPTION("ALSA SoC Core");
 MODULE_LICENSE("GPL");

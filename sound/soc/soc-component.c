@@ -13,6 +13,7 @@
 #include <sound/soc.h>
 #include <linux/bitops.h>
 
+/* component 级辅助逻辑：时钟、PLL、jack、control、PCM/compress 代理调用。 */
 #define soc_component_ret(dai, ret) _soc_component_ret(dai, __func__, ret)
 static inline int _soc_component_ret(struct snd_soc_component *component, const char *func, int ret)
 {
@@ -32,6 +33,7 @@ static inline int _soc_component_ret_reg_rw(struct snd_soc_component *component,
 static inline int soc_component_field_shift(struct snd_soc_component *component,
 					    unsigned int mask)
 {
+	/* 计算寄存器字段最低位的偏移，供 update_bits/read_field 使用。 */
 	if (!mask) {
 		dev_err(component->dev,	"ASoC: error field mask is zero for %s\n",
 			component->name);
@@ -42,8 +44,7 @@ static inline int soc_component_field_shift(struct snd_soc_component *component,
 }
 
 /*
- * We might want to check substream by using list.
- * In such case, we can update these macros.
+ * 以后如果需要改成通过链表检查 substream，这里这组标记宏可以一起调整。
  */
 #define soc_component_mark_push(component, substream, tgt)	((component)->mark_##tgt = substream)
 #define soc_component_mark_pop(component, tgt)	((component)->mark_##tgt = NULL)
@@ -52,6 +53,7 @@ static inline int soc_component_field_shift(struct snd_soc_component *component,
 void snd_soc_component_set_aux(struct snd_soc_component *component,
 			       struct snd_soc_aux_dev *aux)
 {
+	/* aux 设备把自己的 init 回调挂到 component 上。 */
 	component->init = (aux) ? aux->init : NULL;
 }
 
@@ -59,6 +61,7 @@ int snd_soc_component_init(struct snd_soc_component *component)
 {
 	int ret = 0;
 
+	/* component 初始化时，如果有板级/辅助 init 先执行它。 */
 	if (component->init)
 		ret = component->init(component);
 
@@ -66,14 +69,14 @@ int snd_soc_component_init(struct snd_soc_component *component)
 }
 
 /**
- * snd_soc_component_set_sysclk - configure COMPONENT system or master clock.
- * @component: COMPONENT
- * @clk_id: DAI specific clock ID
- * @source: Source for the clock
- * @freq: new clock frequency in Hz
- * @dir: new clock direction - input/output.
+ * snd_soc_component_set_sysclk - 配置 component 的系统/主时钟
+ * @component: component
+ * @clk_id: DAI 相关的时钟 ID
+ * @source: 时钟来源
+ * @freq: 新的时钟频率，单位 Hz
+ * @dir: 时钟方向，输入或输出
  *
- * Configures the CODEC master (MCLK) or system (SYSCLK) clocking.
+ * 用于配置 CODEC 的主时钟（MCLK）或系统时钟（SYSCLK）。
  */
 int snd_soc_component_set_sysclk(struct snd_soc_component *component,
 				 int clk_id, int source, unsigned int freq,
@@ -81,6 +84,7 @@ int snd_soc_component_set_sysclk(struct snd_soc_component *component,
 {
 	int ret = -ENOTSUPP;
 
+	/* 统一入口：优先调用 driver 提供的 set_sysclk。 */
 	if (component->driver->set_sysclk)
 		ret = component->driver->set_sysclk(component, clk_id, source,
 						     freq, dir);
@@ -89,15 +93,15 @@ int snd_soc_component_set_sysclk(struct snd_soc_component *component,
 }
 EXPORT_SYMBOL_GPL(snd_soc_component_set_sysclk);
 
-/*
- * snd_soc_component_set_pll - configure component PLL.
- * @component: COMPONENT
- * @pll_id: DAI specific PLL ID
- * @source: DAI specific source for the PLL
- * @freq_in: PLL input clock frequency in Hz
- * @freq_out: requested PLL output clock frequency in Hz
+/**
+ * snd_soc_component_set_pll - 配置 component 的 PLL
+ * @component: component
+ * @pll_id: DAI 相关的 PLL ID
+ * @source: PLL 的输入来源
+ * @freq_in: PLL 输入时钟频率，单位 Hz
+ * @freq_out: 请求的 PLL 输出时钟频率，单位 Hz
  *
- * Configures and enables PLL to generate output clock based on input clock.
+ * 根据输入时钟配置并使能 PLL 以生成输出时钟。
  */
 int snd_soc_component_set_pll(struct snd_soc_component *component, int pll_id,
 			      int source, unsigned int freq_in,
@@ -105,6 +109,7 @@ int snd_soc_component_set_pll(struct snd_soc_component *component, int pll_id,
 {
 	int ret = -EINVAL;
 
+	/* 统一入口：优先调用 driver 提供的 set_pll。 */
 	if (component->driver->set_pll)
 		ret = component->driver->set_pll(component, pll_id, source,
 						  freq_in, freq_out);
@@ -116,6 +121,7 @@ EXPORT_SYMBOL_GPL(snd_soc_component_set_pll);
 void snd_soc_component_seq_notifier(struct snd_soc_component *component,
 				    enum snd_soc_dapm_type type, int subseq)
 {
+	/* DAPM/Sequencer 事件通知直接转给驱动。 */
 	if (component->driver->seq_notifier)
 		component->driver->seq_notifier(component, type, subseq);
 }
@@ -125,6 +131,7 @@ int snd_soc_component_stream_event(struct snd_soc_component *component,
 {
 	int ret = 0;
 
+	/* 流事件（start/stop/resume/suspend）由 component driver 处理。 */
 	if (component->driver->stream_event)
 		ret = component->driver->stream_event(component, event);
 
@@ -136,6 +143,7 @@ int snd_soc_component_set_bias_level(struct snd_soc_component *component,
 {
 	int ret = 0;
 
+	/* component 级 bias 变化回调。 */
 	if (component->driver->set_bias_level)
 		ret = component->driver->set_bias_level(component, level);
 
@@ -145,7 +153,7 @@ int snd_soc_component_set_bias_level(struct snd_soc_component *component,
 static void soc_get_kcontrol_name(struct snd_soc_component *component,
 				  char *buf, int size, const char * const ctl)
 {
-	/* When updating, change also snd_soc_dapm_widget_name_cmp() */
+	/* 控件名前缀和 DAPM widget 名比较逻辑需要保持一致。 */
 	if (component->name_prefix)
 		snprintf(buf, size, "%s %s", component->name_prefix, ctl);
 	else
@@ -168,6 +176,7 @@ int snd_soc_component_notify_control(struct snd_soc_component *component,
 {
 	struct snd_kcontrol *kctl;
 
+	/* 找到控件后，向 ALSA core 发送 value change 通知。 */
 	kctl = snd_soc_component_get_kcontrol(component, ctl);
 	if (!kctl)
 		return soc_component_ret(component, -EINVAL);
@@ -180,18 +189,19 @@ int snd_soc_component_notify_control(struct snd_soc_component *component,
 EXPORT_SYMBOL_GPL(snd_soc_component_notify_control);
 
 /**
- * snd_soc_component_set_jack - configure component jack.
- * @component: COMPONENTs
- * @jack: structure to use for the jack
- * @data: can be used if codec driver need extra data for configuring jack
+ * snd_soc_component_set_jack - 配置 component 的 jack 检测
+ * @component: component
+ * @jack: jack 结构体
+ * @data: codec driver 可能需要的额外配置数据
  *
- * Configures and enables jack detection function.
+ * 配置并启用 jack 检测功能。
  */
 int snd_soc_component_set_jack(struct snd_soc_component *component,
 			       struct snd_soc_jack *jack, void *data)
 {
 	int ret = -ENOTSUPP;
 
+	/* jack 检测能力由 component driver 决定是否实现。 */
 	if (component->driver->set_jack)
 		ret = component->driver->set_jack(component, jack, data);
 
@@ -200,18 +210,18 @@ int snd_soc_component_set_jack(struct snd_soc_component *component,
 EXPORT_SYMBOL_GPL(snd_soc_component_set_jack);
 
 /**
- * snd_soc_component_get_jack_type
- * @component: COMPONENTs
+ * snd_soc_component_get_jack_type - 获取 component 的 jack 类型
+ * @component: component
  *
- * Returns the jack type of the component
- * This can either be the supported type or one read from
- * devicetree with the property: jack-type.
+ * 返回 component 支持的 jack 类型。
+ * 该类型可以来自驱动支持值，也可以来自 DT 的 jack-type 属性。
  */
 int snd_soc_component_get_jack_type(
 	struct snd_soc_component *component)
 {
 	int ret = -ENOTSUPP;
 
+	/* 获取该 component 支持的 jack 类型。 */
 	if (component->driver->get_jack_type)
 		ret = component->driver->get_jack_type(component);
 
@@ -238,6 +248,7 @@ int snd_soc_component_module_get(struct snd_soc_component *component,
 void snd_soc_component_module_put(struct snd_soc_component *component,
 				  void *mark, int upon_open, int rollback)
 {
+	/* rollback 场景只回收本次确实拿过的 module 引用。 */
 	if (rollback && !soc_component_mark_match(component, mark, module))
 		return;
 
@@ -253,6 +264,7 @@ int snd_soc_component_open(struct snd_soc_component *component,
 {
 	int ret = 0;
 
+	/* component 级 open 负责为当前 substream 准备底层资源。 */
 	if (component->driver->open)
 		ret = component->driver->open(component, substream);
 
@@ -269,6 +281,7 @@ int snd_soc_component_close(struct snd_soc_component *component,
 {
 	int ret = 0;
 
+	/* close 与 open 成对出现，rollback 时避免重复回收。 */
 	if (rollback && !soc_component_mark_match(component, substream, open))
 		return 0;
 
@@ -283,6 +296,7 @@ int snd_soc_component_close(struct snd_soc_component *component,
 
 void snd_soc_component_suspend(struct snd_soc_component *component)
 {
+	/* suspend/resume 是 component 的电源管理边界。 */
 	if (component->driver->suspend)
 		component->driver->suspend(component);
 	component->suspended = 1;
@@ -290,6 +304,7 @@ void snd_soc_component_suspend(struct snd_soc_component *component)
 
 void snd_soc_component_resume(struct snd_soc_component *component)
 {
+	/* 恢复时先让驱动恢复硬件状态，再清除 suspended 标记。 */
 	if (component->driver->resume)
 		component->driver->resume(component);
 	component->suspended = 0;
@@ -304,6 +319,7 @@ int snd_soc_component_probe(struct snd_soc_component *component)
 {
 	int ret = 0;
 
+	/* probe 是 component 进入可用状态之前的最后一次驱动钩子。 */
 	if (component->driver->probe)
 		ret = component->driver->probe(component);
 
@@ -312,6 +328,7 @@ int snd_soc_component_probe(struct snd_soc_component *component)
 
 void snd_soc_component_remove(struct snd_soc_component *component)
 {
+	/* remove 只做驱动自定义清理，不改状态机逻辑。 */
 	if (component->driver->remove)
 		component->driver->remove(component);
 }
@@ -321,6 +338,7 @@ int snd_soc_component_of_xlate_dai_id(struct snd_soc_component *component,
 {
 	int ret = -ENOTSUPP;
 
+	/* OF endpoint 到 DAI ID 的翻译由驱动自己决定。 */
 	if (component->driver->of_xlate_dai_id)
 		ret = component->driver->of_xlate_dai_id(component, ep);
 
@@ -331,13 +349,14 @@ int snd_soc_component_of_xlate_dai_name(struct snd_soc_component *component,
 					const struct of_phandle_args *args,
 					const char **dai_name)
 {
+	/* 优先尝试让驱动从 phandle 参数里解析出 DAI 名字。 */
 	if (component->driver->of_xlate_dai_name)
 		return component->driver->of_xlate_dai_name(component,
 							    args, dai_name);
 	/*
-	 * Don't use soc_component_ret here because we may not want to report
-	 * the error just yet. If a device has more than one component, the
-	 * first may not match and we don't want spam the log with this.
+	 * 这里不要直接用 soc_component_ret，因为此时未必需要立刻上报错误。
+	 * 如果一个设备上挂了多个 component，前一个可能不匹配，
+	 * 我们不希望因为这种情况反复刷日志。
 	 */
 	return -ENOTSUPP;
 }
@@ -362,15 +381,13 @@ EXPORT_SYMBOL_GPL(snd_soc_component_regmap_val_bytes);
 #ifdef CONFIG_REGMAP
 
 /**
- * snd_soc_component_init_regmap() - Initialize regmap instance for the
- *                                   component
- * @component: The component for which to initialize the regmap instance
- * @regmap: The regmap instance that should be used by the component
+ * snd_soc_component_init_regmap() - 初始化 component 的 regmap 实例
+ * @component: 要初始化 regmap 的 component
+ * @regmap: component 应使用的 regmap 实例
  *
- * This function allows deferred assignment of the regmap instance that is
- * associated with the component. Only use this if the regmap instance is not
- * yet ready when the component is registered. The function must also be called
- * before the first IO attempt of the component.
+ * 允许在 component 注册时延迟绑定 regmap。
+ * 只有当 regmap 还没准备好、但后面会补上时才使用这个接口。
+ * 并且必须在 component 第一次 IO 之前调用。
  */
 void snd_soc_component_init_regmap(struct snd_soc_component *component,
 				   struct regmap *regmap)
@@ -380,15 +397,11 @@ void snd_soc_component_init_regmap(struct snd_soc_component *component,
 EXPORT_SYMBOL_GPL(snd_soc_component_init_regmap);
 
 /**
- * snd_soc_component_exit_regmap() - De-initialize regmap instance for the
- *                                   component
- * @component: The component for which to de-initialize the regmap instance
+ * snd_soc_component_exit_regmap() - 反初始化 component 的 regmap
+ * @component: 要反初始化 regmap 的 component
  *
- * Calls regmap_exit() on the regmap instance associated to the component and
- * removes the regmap instance from the component.
- *
- * This function should only be used if snd_soc_component_init_regmap() was used
- * to initialize the regmap instance.
+ * 对 component 关联的 regmap 调用 regmap_exit()，并清空 component 上的引用。
+ * 仅当之前使用过 snd_soc_component_init_regmap() 时才应调用。
  */
 void snd_soc_component_exit_regmap(struct snd_soc_component *component)
 {
@@ -404,6 +417,7 @@ int snd_soc_component_compr_open(struct snd_soc_component *component,
 {
 	int ret = 0;
 
+	/* compressed offload 也遵循和 PCM 类似的 open/mark 模式。 */
 	if (component->driver->compress_ops &&
 	    component->driver->compress_ops->open)
 		ret = component->driver->compress_ops->open(component, cstream);
@@ -420,6 +434,7 @@ void snd_soc_component_compr_free(struct snd_soc_component *component,
 				  struct snd_compr_stream *cstream,
 				  int rollback)
 {
+	/* rollback 下只清理当前这次真正打开过的 compress stream。 */
 	if (rollback && !soc_component_mark_match(component, cstream, compr_open))
 		return;
 
@@ -438,6 +453,7 @@ int snd_soc_component_compr_trigger(struct snd_compr_stream *cstream, int cmd)
 	struct snd_soc_component *component;
 	int i, ret;
 
+	/* 一个 runtime 里可能挂多个 component，这里逐个下发 trigger。 */
 	for_each_rtd_components(rtd, i, component) {
 		if (component->driver->compress_ops &&
 		    component->driver->compress_ops->trigger) {
@@ -459,6 +475,7 @@ int snd_soc_component_compr_set_params(struct snd_compr_stream *cstream,
 	struct snd_soc_component *component;
 	int i, ret;
 
+	/* set_params 把压缩流协商结果同步到所有参与 component。 */
 	for_each_rtd_components(rtd, i, component) {
 		if (component->driver->compress_ops &&
 		    component->driver->compress_ops->set_params) {
@@ -480,6 +497,7 @@ int snd_soc_component_compr_get_params(struct snd_compr_stream *cstream,
 	struct snd_soc_component *component;
 	int i, ret;
 
+	/* 读取参数时，只要有一个 component 能给出结果就直接返回。 */
 	for_each_rtd_components(rtd, i, component) {
 		if (component->driver->compress_ops &&
 		    component->driver->compress_ops->get_params) {
@@ -500,6 +518,7 @@ int snd_soc_component_compr_get_caps(struct snd_compr_stream *cstream,
 	struct snd_soc_component *component;
 	int i, ret = 0;
 
+	/* 压缩能力通常由后端组件决定，所以这里也要先拿 card 级锁。 */
 	snd_soc_dpcm_mutex_lock(rtd);
 
 	for_each_rtd_components(rtd, i, component) {
@@ -669,11 +688,11 @@ static unsigned int soc_component_read_no_lock(
 }
 
 /**
- * snd_soc_component_read() - Read register value
- * @component: Component to read from
- * @reg: Register to read
+ * snd_soc_component_read() - 读取寄存器值
+ * @component: 要读取的 component
+ * @reg: 要读取的寄存器
  *
- * Return: read value
+ * 返回：寄存器当前值。
  */
 unsigned int snd_soc_component_read(struct snd_soc_component *component,
 				    unsigned int reg)
@@ -703,12 +722,12 @@ static int soc_component_write_no_lock(
 }
 
 /**
- * snd_soc_component_write() - Write register value
- * @component: Component to write to
- * @reg: Register to write
- * @val: Value to write to the register
+ * snd_soc_component_write() - 写入寄存器值
+ * @component: 要写入的 component
+ * @reg: 要写入的寄存器
+ * @val: 要写入寄存器的值
  *
- * Return: 0 on success, a negative error code otherwise.
+ * 返回：成功时返回 0，失败时返回负错误码。
  */
 int snd_soc_component_write(struct snd_soc_component *component,
 			    unsigned int reg, unsigned int val)
@@ -745,15 +764,14 @@ static int snd_soc_component_update_bits_legacy(
 }
 
 /**
- * snd_soc_component_update_bits() - Perform read/modify/write cycle
- * @component: Component to update
- * @reg: Register to update
- * @mask: Mask that specifies which bits to update
- * @val: New value for the bits specified by mask
+ * snd_soc_component_update_bits() - 执行读-改-写更新
+ * @component: 要更新的 component
+ * @reg: 要更新的寄存器
+ * @mask: 指定需要更新的位掩码
+ * @val: mask 指定位的新值
  *
- * Return: 1 if the operation was successful and the value of the register
- * changed, 0 if the operation was successful, but the value did not change.
- * Returns a negative error code otherwise.
+ * 当寄存器值发生变化时返回 1，操作成功但值未变化时返回 0，
+ * 其他情况返回负错误码。
  */
 int snd_soc_component_update_bits(struct snd_soc_component *component,
 				  unsigned int reg, unsigned int mask, unsigned int val)
@@ -775,21 +793,18 @@ int snd_soc_component_update_bits(struct snd_soc_component *component,
 EXPORT_SYMBOL_GPL(snd_soc_component_update_bits);
 
 /**
- * snd_soc_component_update_bits_async() - Perform asynchronous
- *  read/modify/write cycle
- * @component: Component to update
- * @reg: Register to update
- * @mask: Mask that specifies which bits to update
- * @val: New value for the bits specified by mask
+ * snd_soc_component_update_bits_async() - 异步执行读-改-写更新
+ * @component: 要更新的 component
+ * @reg: 要更新的寄存器
+ * @mask: 指定需要更新的位掩码
+ * @val: mask 指定位的新值
  *
- * This function is similar to snd_soc_component_update_bits(), but the update
- * operation is scheduled asynchronously. This means it may not be completed
- * when the function returns. To make sure that all scheduled updates have been
- * completed snd_soc_component_async_complete() must be called.
+ * 该函数与 snd_soc_component_update_bits() 类似，但更新会异步排队，
+ * 因此函数返回时更新可能尚未完成。若需要确保所有异步更新都已提交，
+ * 必须调用 snd_soc_component_async_complete()。
  *
- * Return: 1 if the operation was successful and the value of the register
- * changed, 0 if the operation was successful, but the value did not change.
- * Returns a negative error code otherwise.
+ * 返回：寄存器值变化时返回 1，操作成功但值未变化时返回 0，
+ * 其他情况返回负错误码。
  */
 int snd_soc_component_update_bits_async(struct snd_soc_component *component,
 					unsigned int reg, unsigned int mask, unsigned int val)
@@ -811,12 +826,12 @@ int snd_soc_component_update_bits_async(struct snd_soc_component *component,
 EXPORT_SYMBOL_GPL(snd_soc_component_update_bits_async);
 
 /**
- * snd_soc_component_read_field() - Read register field value
- * @component: Component to read from
- * @reg: Register to read
- * @mask: mask of the register field
+ * snd_soc_component_read_field() - 读取寄存器字段值
+ * @component: 要读取的 component
+ * @reg: 要读取的寄存器
+ * @mask: 字段对应的掩码
  *
- * Return: read value of register field.
+ * 返回：字段解码后的值。
  */
 unsigned int snd_soc_component_read_field(struct snd_soc_component *component,
 					  unsigned int reg, unsigned int mask)
@@ -832,13 +847,13 @@ unsigned int snd_soc_component_read_field(struct snd_soc_component *component,
 EXPORT_SYMBOL_GPL(snd_soc_component_read_field);
 
 /**
- * snd_soc_component_write_field() - write to register field
- * @component: Component to write to
- * @reg: Register to write
- * @mask: mask of the register field to update
- * @val: value of the field to write
+ * snd_soc_component_write_field() - 写入寄存器字段
+ * @component: 要写入的 component
+ * @reg: 要写入的寄存器
+ * @mask: 需要更新的字段掩码
+ * @val: 要写入字段的值
  *
- * Return: 1 for change, otherwise 0.
+ * 返回：字段内容发生变化时返回 1，否则返回 0。
  */
 int snd_soc_component_write_field(struct snd_soc_component *component,
 				  unsigned int reg, unsigned int mask,
@@ -852,11 +867,11 @@ int snd_soc_component_write_field(struct snd_soc_component *component,
 EXPORT_SYMBOL_GPL(snd_soc_component_write_field);
 
 /**
- * snd_soc_component_async_complete() - Ensure asynchronous I/O has completed
- * @component: Component for which to wait
+ * snd_soc_component_async_complete() - 等待异步 I/O 完成
+ * @component: 需要等待的 component
  *
- * This function blocks until all asynchronous I/O which has previously been
- * scheduled using snd_soc_component_update_bits_async() has completed.
+ * 该函数会阻塞，直到此前通过 snd_soc_component_update_bits_async()
+ * 提交的异步操作全部完成。
  */
 void snd_soc_component_async_complete(struct snd_soc_component *component)
 {
@@ -866,16 +881,15 @@ void snd_soc_component_async_complete(struct snd_soc_component *component)
 EXPORT_SYMBOL_GPL(snd_soc_component_async_complete);
 
 /**
- * snd_soc_component_test_bits - Test register for change
- * @component: component
- * @reg: Register to test
- * @mask: Mask that specifies which bits to test
- * @value: Value to test against
+ * snd_soc_component_test_bits() - 测试写入后寄存器是否会变化
+ * @component: 要测试的 component
+ * @reg: 要测试的寄存器
+ * @mask: 需要比较的位掩码
+ * @value: 用于比较的新值
  *
- * Tests a register with a new value and checks if the new value is
- * different from the old value.
+ * 将寄存器与新值进行合成后判断是否会产生变化。
  *
- * Return: 1 for change, otherwise 0.
+ * 返回：发生变化时返回 1，否则返回 0。
  */
 int snd_soc_component_test_bits(struct snd_soc_component *component,
 				unsigned int reg, unsigned int mask, unsigned int value)
@@ -926,10 +940,9 @@ void snd_soc_pcm_component_delay(struct snd_pcm_substream *substream,
 	int i;
 
 	/*
-	 * We're looking for the delay through the full audio path so it needs to
-	 * be the maximum of the Components doing transmit and the maximum of the
-	 * Components doing receive (ie, all CPUs and all CODECs) rather than
-	 * just the maximum of all Components.
+	 * 这里要统计的是整条音频路径上的总延迟，因此应当取所有发送端
+	 * component 的最大值，再取所有接收端 component 的最大值，
+	 * 而不是简单地对所有 component 取一个全局最大值。
 	 */
 	for_each_rtd_components(rtd, i, component) {
 		if (!component->driver->delay)

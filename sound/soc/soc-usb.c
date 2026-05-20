@@ -55,17 +55,15 @@ static struct snd_soc_usb *snd_soc_find_usb_ctx(struct device *dev)
 	return ctx ? ctx : NULL;
 }
 
-/* SOC USB sound kcontrols */
+/* SoC USB 声卡控制相关逻辑。 */
 /**
- * snd_soc_usb_setup_offload_jack() - Create USB offloading jack
- * @component: USB DPCM backend DAI component
- * @jack: jack structure to create
+ * snd_soc_usb_setup_offload_jack() - 创建 USB offload jack
+ * @component: USB DPCM 后端 DAI component
+ * @jack: 要创建的 jack 结构体
  *
- * Creates a jack device for notifying userspace of the availability
- * of an offload capable device.
+ * 创建一个 jack 设备，用于通知用户空间当前设备是否支持 offload。
  *
- * Returns 0 on success, negative on error.
- *
+ * 返回 0 表示成功，负值表示错误。
  */
 int snd_soc_usb_setup_offload_jack(struct snd_soc_component *component,
 				   struct snd_soc_jack *jack)
@@ -91,19 +89,17 @@ int snd_soc_usb_setup_offload_jack(struct snd_soc_component *component,
 EXPORT_SYMBOL_GPL(snd_soc_usb_setup_offload_jack);
 
 /**
- * snd_soc_usb_update_offload_route - Find active USB offload path
- * @dev: USB device to get offload status
- * @card: USB card index
- * @pcm: USB PCM device index
- * @direction: playback or capture direction
- * @path: pcm or card index
- * @route: pointer to route output array
+ * snd_soc_usb_update_offload_route - 查询当前 USB offload 路径
+ * @dev: 用于查询 offload 状态的 USB 设备
+ * @card: USB card 索引
+ * @pcm: USB PCM 设备索引
+ * @direction: 播放或录音方向
+ * @path: 查询 card 还是 pcm 索引
+ * @route: 路由输出数组指针
  *
- * Fetch the current status for the USB SND card and PCM device indexes
- * specified.  The "route" argument should be an array of integers being
- * used for a kcontrol output.  The first element should have the selected
- * card index, and the second element should have the selected pcm device
- * index.
+ * 读取指定 USB 声卡和 PCM 设备索引的当前状态。
+ * route 参数应该是一个用于 kcontrol 输出的整数数组；
+ * 第一个元素保存选择的 card 索引，第二个元素保存选择的 PCM 索引。
  */
 int snd_soc_usb_update_offload_route(struct device *dev, int card, int pcm,
 				     int direction, enum snd_soc_usb_kctl path,
@@ -128,11 +124,10 @@ exit:
 EXPORT_SYMBOL_GPL(snd_soc_usb_update_offload_route);
 
 /**
- * snd_soc_usb_find_priv_data() - Retrieve private data stored
- * @usbdev: device reference
+ * snd_soc_usb_find_priv_data() - 取回保存的私有数据
+ * @usbdev: 设备引用
  *
- * Fetch the private data stored in the USB SND SoC structure.
- *
+ * 取回 USB SoC 结构体中保存的私有数据。
  */
 void *snd_soc_usb_find_priv_data(struct device *usbdev)
 {
@@ -147,16 +142,14 @@ void *snd_soc_usb_find_priv_data(struct device *usbdev)
 EXPORT_SYMBOL_GPL(snd_soc_usb_find_priv_data);
 
 /**
- * snd_soc_usb_find_supported_format() - Check if audio format is supported
- * @card_idx: USB sound chip array index
- * @params: PCM parameters
- * @direction: capture or playback
+ * snd_soc_usb_find_supported_format() - 检查音频格式是否受支持
+ * @card_idx: USB 声芯片数组索引
+ * @params: PCM 参数
+ * @direction: 播放或录音方向
  *
- * Ensure that a requested audio profile from the ASoC side is able to be
- * supported by the USB device.
+ * 确认 ASoC 侧请求的音频配置能够被 USB 设备支持。
  *
- * Return 0 on success, negative on error.
- *
+ * 返回 0 表示成功，负值表示错误。
  */
 int snd_soc_usb_find_supported_format(int card_idx,
 				      struct snd_pcm_hw_params *params,
@@ -173,16 +166,13 @@ int snd_soc_usb_find_supported_format(int card_idx,
 EXPORT_SYMBOL_GPL(snd_soc_usb_find_supported_format);
 
 /**
- * snd_soc_usb_allocate_port() - allocate a SoC USB port for offloading support
- * @component: USB DPCM backend DAI component
- * @data: private data
+ * snd_soc_usb_allocate_port() - 为 offload 支持分配 SoC USB 端口
+ * @component: USB DPCM 后端 DAI component
+ * @data: 私有数据
  *
- * Allocate and initialize a SoC USB port.  The SoC USB port is used to communicate
- * different USB audio devices attached, in order to start audio offloading handled
- * by an ASoC entity.  USB device plug in/out events are signaled with a
- * notification, but don't directly impact the memory allocated for the SoC USB
- * port.
- *
+ * 分配并初始化一个 SoC USB 端口。
+ * 该端口用于和不同的 USB 音频设备通信，以便由 ASoC 实体接管 offload。
+ * USB 设备的插入/拔出会通过通知上报，但不会直接影响这个端口的内存分配。
  */
 struct snd_soc_usb *snd_soc_usb_allocate_port(struct snd_soc_component *component,
 					      void *data)
@@ -201,12 +191,10 @@ struct snd_soc_usb *snd_soc_usb_allocate_port(struct snd_soc_component *componen
 EXPORT_SYMBOL_GPL(snd_soc_usb_allocate_port);
 
 /**
- * snd_soc_usb_free_port() - free a SoC USB port used for offloading support
- * @usb: allocated SoC USB port
+ * snd_soc_usb_free_port() - 释放用于 offload 支持的 SoC USB 端口
+ * @usb: 已分配的 SoC USB 端口
  *
- * Free and remove the SoC USB port from the available list of ports.  This will
- * ensure that the communication between USB SND and ASoC is halted.
- *
+ * 从可用端口列表中移除并释放该端口，确保 USB SND 和 ASoC 的通信停止。
  */
 void snd_soc_usb_free_port(struct snd_soc_usb *usb)
 {
@@ -216,12 +204,11 @@ void snd_soc_usb_free_port(struct snd_soc_usb *usb)
 EXPORT_SYMBOL_GPL(snd_soc_usb_free_port);
 
 /**
- * snd_soc_usb_add_port() - Add a USB backend port
- * @usb: soc usb port to add
+ * snd_soc_usb_add_port() - 添加一个 USB 后端端口
+ * @usb: 要添加的 SoC USB 端口
  *
- * Register a USB backend DAI link to the USB SoC framework.  Memory is allocated
- * as part of the USB backend DAI link.
- *
+ * 将一个 USB 后端 DAI link 注册到 USB SoC 框架。
+ * 端口相关内存由后端 DAI link 负责管理。
  */
 void snd_soc_usb_add_port(struct snd_soc_usb *usb)
 {
@@ -234,12 +221,11 @@ void snd_soc_usb_add_port(struct snd_soc_usb *usb)
 EXPORT_SYMBOL_GPL(snd_soc_usb_add_port);
 
 /**
- * snd_soc_usb_remove_port() - Remove a USB backend port
- * @usb: soc usb port to remove
+ * snd_soc_usb_remove_port() - 移除一个 USB 后端端口
+ * @usb: 要移除的 SoC USB 端口
  *
- * Remove a USB backend DAI link from USB SoC.  Memory is freed when USB backend
- * DAI is removed, or when snd_soc_usb_free_port() is called.
- *
+ * 从 USB SoC 框架中移除 USB 后端 DAI link。
+ * 相关内存在后端 DAI 删除或调用 snd_soc_usb_free_port() 时释放。
  */
 void snd_soc_usb_remove_port(struct snd_soc_usb *usb)
 {
@@ -257,14 +243,12 @@ void snd_soc_usb_remove_port(struct snd_soc_usb *usb)
 EXPORT_SYMBOL_GPL(snd_soc_usb_remove_port);
 
 /**
- * snd_soc_usb_connect() - Notification of USB device connection
- * @usbdev: USB bus device
- * @sdev: USB SND device to add
+ * snd_soc_usb_connect() - USB 设备连接通知
+ * @usbdev: USB 总线设备
+ * @sdev: 要添加的 USB SND 设备
  *
- * Notify of a new USB SND device connection.  The sdev->card_idx can be used to
- * handle how the DPCM backend selects, which device to enable USB offloading
- * on.
- *
+ * 通知一个新的 USB SND 设备已连接。
+ * sdev->card_idx 可用于控制 DPCM 后端选择哪个设备来启用 USB offload。
  */
 int snd_soc_usb_connect(struct device *usbdev, struct snd_soc_usb_device *sdev)
 {
@@ -289,12 +273,11 @@ exit:
 EXPORT_SYMBOL_GPL(snd_soc_usb_connect);
 
 /**
- * snd_soc_usb_disconnect() - Notification of USB device disconnection
- * @usbdev: USB bus device
- * @sdev: USB SND device to remove
+ * snd_soc_usb_disconnect() - USB 设备断开通知
+ * @usbdev: USB 总线设备
+ * @sdev: 要移除的 USB SND 设备
  *
- * Notify of a new USB SND device disconnection to the USB backend.
- *
+ * 通知 USB 后端有新的 USB SND 设备断开。
  */
 int snd_soc_usb_disconnect(struct device *usbdev, struct snd_soc_usb_device *sdev)
 {

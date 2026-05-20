@@ -8,13 +8,17 @@
 #ifndef __SOC_JACK_H
 #define __SOC_JACK_H
 
+/*
+ * jack 相关的公共定义。
+ * 这一层把插拔检测结果映射到 pin、zone 和 GPIO 事件，供 card / codec
+ * driver 统一消费。
+ */
+
 /**
- * struct snd_soc_jack_pin - Describes a pin to update based on jack detection
+ * struct snd_soc_jack_pin - 根据 jack 检测结果需要联动更新的 pin
  *
- * @pin:    name of the pin to update
- * @mask:   bits to check for in reported jack status
- * @invert: if non-zero then pin is enabled when status is not reported
- * @list:   internal list entry
+ * 这个结构体描述“jack 检测结果会影响哪些 pin”。
+ * 常见场景是耳机插入后打开某个输出 pin，或插入麦克风后切换输入路径。
  */
 struct snd_soc_jack_pin {
 	struct list_head list;
@@ -24,14 +28,11 @@ struct snd_soc_jack_pin {
 };
 
 /**
- * struct snd_soc_jack_zone - Describes voltage zones of jack detection
+ * struct snd_soc_jack_zone - jack 电压分区
  *
- * @min_mv: start voltage in mv
- * @max_mv: end voltage in mv
- * @jack_type: type of jack that is expected for this voltage
- * @debounce_time: debounce_time for jack, codec driver should wait for this
- *		duration before reading the adc for voltages
- * @list:   internal list entry
+ * 这个结构体用于“电压分区识别”。
+ * 很多 codec 会通过 micbias 电压或 ADC 采样值区分耳机、麦克风、
+ * 按键耳机等不同器件。
  */
 struct snd_soc_jack_zone {
 	unsigned int min_mv;
@@ -42,20 +43,10 @@ struct snd_soc_jack_zone {
 };
 
 /**
- * struct snd_soc_jack_gpio - Describes a gpio pin for jack detection
+ * struct snd_soc_jack_gpio - 用于 jack 检测的 GPIO 描述
  *
- * @idx:          gpio descriptor index within the function of the GPIO
- *                consumer device
- * @gpiod_dev:    GPIO consumer device
- * @name:         gpio name. Also as connection ID for the GPIO consumer
- *                device function name lookup
- * @report:       value to report when jack detected
- * @invert:       report presence in low state
- * @debounce_time: debounce time in ms
- * @wake:	  enable as wake source
- * @jack_status_check: callback function which overrides the detection
- *		       to provide more complex checks (eg, reading an
- *		       ADC).
+ * 这个结构体把 GPIO 级插拔检测接到 jack 框架里。
+ * 适合没有专用 jack detect 引脚、但板级 GPIO 能提供插拔状态的场景。
  */
 struct snd_soc_jack_gpio {
 	unsigned int idx;
@@ -78,16 +69,19 @@ struct snd_soc_jack_gpio {
 };
 
 struct snd_soc_jack {
+	/* 保护 jack 状态、pin 列表和通知链的互斥锁。 */
 	struct mutex mutex;
 	struct snd_jack *jack;
 	struct snd_soc_card *card;
+	/* 与 jack 绑定的 pin 列表和电压区间列表。 */
 	struct list_head pins;
 	int status;
+	/* jack 状态变更的 blocking notifier。 */
 	struct blocking_notifier_head notifier;
 	struct list_head jack_zones;
 };
 
-/* Jack reporting */
+/* jack 的状态上报、pin 绑定、通知注册、GPIO 绑定等 API。 */
 void snd_soc_jack_report(struct snd_soc_jack *jack, int status, int mask);
 int snd_soc_jack_add_pins(struct snd_soc_jack *jack, int count,
 			  struct snd_soc_jack_pin *pins);

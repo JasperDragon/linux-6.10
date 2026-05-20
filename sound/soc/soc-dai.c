@@ -10,6 +10,7 @@
 #include <sound/soc-dai.h>
 #include <sound/soc-link.h>
 
+/* DAI 级辅助逻辑：格式、时钟、TDM、PCM/compress 生命周期桥接。 */
 #define soc_dai_ret(dai, ret) _soc_dai_ret(dai, __func__, ret)
 static inline int _soc_dai_ret(const struct snd_soc_dai *dai,
 			       const char *func, int ret)
@@ -40,6 +41,7 @@ int snd_soc_dai_set_sysclk(struct snd_soc_dai *dai, int clk_id,
 {
 	int ret;
 
+	/* 先尝试走 DAI 私有 ops，失败后再退回到 component 级实现。 */
 	if (dai->driver->ops &&
 	    dai->driver->ops->set_sysclk)
 		ret = dai->driver->ops->set_sysclk(dai, clk_id, freq, dir);
@@ -66,6 +68,7 @@ int snd_soc_dai_set_clkdiv(struct snd_soc_dai *dai,
 {
 	int ret = -EINVAL;
 
+	/* 时钟分频通常是 codec / DAI 实现里最常见的板内调谐手段。 */
 	if (dai->driver->ops &&
 	    dai->driver->ops->set_clkdiv)
 		ret = dai->driver->ops->set_clkdiv(dai, div_id, div);
@@ -89,6 +92,7 @@ int snd_soc_dai_set_pll(struct snd_soc_dai *dai, int pll_id, int source,
 {
 	int ret;
 
+	/* PLL 往往是从外部 MCLK 派生音频工作时钟的核心入口。 */
 	if (dai->driver->ops &&
 	    dai->driver->ops->set_pll)
 		ret = dai->driver->ops->set_pll(dai, pll_id, source,
@@ -112,6 +116,7 @@ int snd_soc_dai_set_bclk_ratio(struct snd_soc_dai *dai, unsigned int ratio)
 {
 	int ret = -ENOTSUPP;
 
+	/* BCLK 比例经常由硬件格式自动推导，但某些芯片需要显式配置。 */
 	if (dai->driver->ops &&
 	    dai->driver->ops->set_bclk_ratio)
 		ret = dai->driver->ops->set_bclk_ratio(dai, ratio);
@@ -159,6 +164,10 @@ u64 snd_soc_dai_get_fmt(const struct snd_soc_dai *dai, int priority)
 	int i, max = 0, until = priority;
 
 	/*
+	 * 这里不是“列出所有理论可行格式”，而是列出驱动认为
+	 * 质量足够高、可自动选择的格式集合。
+	 */
+	/*
 	 * Collect auto_selectable_formats until priority
 	 *
 	 * ex)
@@ -195,6 +204,7 @@ int snd_soc_dai_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 {
 	int ret = -ENOTSUPP;
 
+	/* 把最终选定的总线时序/主从关系下发给具体硬件。 */
 	if (dai->driver->ops && dai->driver->ops->set_fmt)
 		ret = dai->driver->ops->set_fmt(dai, fmt);
 
@@ -214,6 +224,7 @@ static int snd_soc_xlate_tdm_slot_mask(unsigned int slots,
 				       unsigned int *tx_mask,
 				       unsigned int *rx_mask)
 {
+	/* 没显式指定 mask 时，默认把所有 slot 都看作有效。 */
 	if (*tx_mask || *rx_mask)
 		return 0;
 
@@ -260,6 +271,7 @@ int snd_soc_dai_set_tdm_slot(struct snd_soc_dai *dai,
 		&rx_mask,
 	};
 
+	/* 先把输入的 slot 信息标准化，再把它缓存进 DAI 的 stream 状态。 */
 	if (slots) {
 		if (dai->driver->ops &&
 		    dai->driver->ops->xlate_tdm_slot_mask)
@@ -309,6 +321,7 @@ int snd_soc_dai_set_tdm_idle(struct snd_soc_dai *dai,
 {
 	int ret = -EOPNOTSUPP;
 
+	/* RX 方向不能被配置成主动驱动输出电平。 */
 	/* You can't write to the RX line */
 	if (rx_mode == SND_SOC_DAI_TDM_IDLE_ZERO)
 		return soc_dai_ret(dai, -EINVAL);
@@ -340,6 +353,7 @@ int snd_soc_dai_set_channel_map(struct snd_soc_dai *dai,
 {
 	int ret = -ENOTSUPP;
 
+	/* 把“第几个声道对应第几个 slot”这个映射交给硬件实现。 */
 	if (dai->driver->ops &&
 	    dai->driver->ops->set_channel_map)
 		ret = dai->driver->ops->set_channel_map(dai, tx_num, tx_slot,
@@ -364,6 +378,7 @@ int snd_soc_dai_get_channel_map(const struct snd_soc_dai *dai,
 {
 	int ret = -ENOTSUPP;
 
+	/* 读回当前 channel map，供调试或 runtime 协商使用。 */
 	if (dai->driver->ops &&
 	    dai->driver->ops->get_channel_map)
 		ret = dai->driver->ops->get_channel_map(dai, tx_num, tx_slot,
@@ -383,6 +398,7 @@ int snd_soc_dai_set_tristate(struct snd_soc_dai *dai, int tristate)
 {
 	int ret = -EINVAL;
 
+	/* tristate 用来让总线释放共享的时钟/数据线。 */
 	if (dai->driver->ops &&
 	    dai->driver->ops->set_tristate)
 		ret = dai->driver->ops->set_tristate(dai, tristate);
@@ -396,6 +412,7 @@ int snd_soc_dai_prepare(struct snd_soc_dai *dai,
 {
 	int ret = 0;
 
+	/* prepare 只对当前 stream 真正有效的 DAI 执行。 */
 	if (!snd_soc_dai_stream_valid(dai, substream->stream))
 		return 0;
 
@@ -432,6 +449,7 @@ int snd_soc_dai_digital_mute(struct snd_soc_dai *dai, int mute,
 	 * ignore if direction was CAPTURE
 	 * and it had .no_capture_mute flag
 	 */
+	/* 某些 codec 只允许播放路径静音，不允许 capture 路径做 mute。 */
 	if (dai->driver->ops &&
 	    dai->driver->ops->mute_stream &&
 	    (direction == SNDRV_PCM_STREAM_PLAYBACK ||
@@ -448,6 +466,7 @@ int snd_soc_dai_hw_params(struct snd_soc_dai *dai,
 {
 	int ret = 0;
 
+	/* hw_params 是把用户态请求翻译成 DAI 可执行配置的关键一步。 */
 	if (dai->driver->ops &&
 	    dai->driver->ops->hw_params)
 		ret = dai->driver->ops->hw_params(substream, params, dai);
@@ -463,6 +482,7 @@ void snd_soc_dai_hw_free(struct snd_soc_dai *dai,
 			 struct snd_pcm_substream *substream,
 			 int rollback)
 {
+	/* rollback 场景下，只有真正做过 hw_params 的 DAI 才需要回滚。 */
 	if (rollback && !soc_dai_mark_match(dai, substream, hw_params))
 		return;
 
@@ -479,6 +499,7 @@ int snd_soc_dai_startup(struct snd_soc_dai *dai,
 {
 	int ret = 0;
 
+	/* startup 阶段通常用于打开时钟、电源和缓存资源。 */
 	if (!snd_soc_dai_stream_valid(dai, substream->stream))
 		return 0;
 
@@ -497,6 +518,7 @@ void snd_soc_dai_shutdown(struct snd_soc_dai *dai,
 			  struct snd_pcm_substream *substream,
 			  int rollback)
 {
+	/* shutdown 负责对 startup 做成对清理。 */
 	if (!snd_soc_dai_stream_valid(dai, substream->stream))
 		return;
 
@@ -515,6 +537,7 @@ int snd_soc_dai_compress_new(struct snd_soc_dai *dai,
 			     struct snd_soc_pcm_runtime *rtd)
 {
 	int ret = -ENOTSUPP;
+	/* 压缩流设备的初始化入口，通常只在支持 offload 的场景出现。 */
 	if (dai->driver->ops &&
 	    dai->driver->ops->compress_new)
 		ret = dai->driver->ops->compress_new(rtd);
@@ -530,6 +553,7 @@ bool snd_soc_dai_stream_valid(const struct snd_soc_dai *dai, int dir)
 {
 	const struct snd_soc_pcm_stream *stream = snd_soc_dai_get_pcm_stream(dai, dir);
 
+	/* 没声明 channels_min 的流，视为这个方向不支持。 */
 	/* If the codec specifies any channels at all, it supports the stream */
 	return stream->channels_min;
 }
@@ -537,6 +561,7 @@ bool snd_soc_dai_stream_valid(const struct snd_soc_dai *dai, int dir)
 void snd_soc_dai_action(struct snd_soc_dai *dai,
 			int stream, int action)
 {
+	/* 这个计数用于标记 DAI/component 当前是否处于活跃状态。 */
 	/* see snd_soc_dai_stream_active() */
 	dai->stream[stream].active	+= action;
 
@@ -549,6 +574,7 @@ int snd_soc_dai_active(const struct snd_soc_dai *dai)
 {
 	int stream, active;
 
+	/* 把播放和录音两个方向的活跃计数加总。 */
 	active = 0;
 	for_each_pcm_streams(stream)
 		active += dai->stream[stream].active;
@@ -562,6 +588,7 @@ int snd_soc_pcm_dai_probe(struct snd_soc_pcm_runtime *rtd, int order)
 	struct snd_soc_dai *dai;
 	int i;
 
+	/* 按 probe_order 逐个唤醒 runtime 里绑定的 DAI。 */
 	for_each_rtd_dais(rtd, i, dai) {
 		if (dai->probed)
 			continue;
@@ -588,6 +615,7 @@ int snd_soc_pcm_dai_remove(struct snd_soc_pcm_runtime *rtd, int order)
 	struct snd_soc_dai *dai;
 	int i, r, ret = 0;
 
+	/* remove 阶段与 probe 相反，按 order 做成对清理。 */
 	for_each_rtd_dais(rtd, i, dai) {
 		if (!dai->probed)
 			continue;
@@ -613,6 +641,7 @@ int snd_soc_pcm_dai_new(struct snd_soc_pcm_runtime *rtd)
 	struct snd_soc_dai *dai;
 	int i;
 
+	/* pcm_new 用于在 runtime 创建时让每个 DAI 做最后的设备初始化。 */
 	for_each_rtd_dais(rtd, i, dai) {
 		if (dai->driver->ops &&
 		    dai->driver->ops->pcm_new) {
@@ -631,6 +660,7 @@ int snd_soc_pcm_dai_prepare(struct snd_pcm_substream *substream)
 	struct snd_soc_dai *dai;
 	int i, ret;
 
+	/* 对一个 runtime 里所有 DAI 依次下发 prepare。 */
 	for_each_rtd_dais(rtd, i, dai) {
 		ret = snd_soc_dai_prepare(dai, substream);
 		if (ret < 0)
@@ -645,6 +675,7 @@ static int soc_dai_trigger(struct snd_soc_dai *dai,
 {
 	int ret = 0;
 
+	/* 单个 DAI 的 trigger 包装，便于统一错误报告和流有效性判断。 */
 	if (!snd_soc_dai_stream_valid(dai, substream->stream))
 		return 0;
 
@@ -662,6 +693,7 @@ int snd_soc_pcm_dai_trigger(struct snd_pcm_substream *substream,
 	struct snd_soc_dai *dai;
 	int i, r, ret = 0;
 
+	/* 按 start/stop/pause 语义，统一处理 runtime 里所有 DAI 的 trigger。 */
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
@@ -712,6 +744,7 @@ void snd_soc_pcm_dai_delay(struct snd_pcm_substream *substream,
 	 * of all DAIs.
 	 */
 
+	/* 这里分 CPU / CODEC 两边分别取最大延迟，避免把两个方向混在一起。 */
 	/* for CPU */
 	for_each_rtd_cpu_dais(rtd, i, dai)
 		if (dai->driver->ops &&
@@ -730,6 +763,7 @@ int snd_soc_dai_compr_startup(struct snd_soc_dai *dai,
 {
 	int ret = 0;
 
+	/* offload 压缩流的启动阶段，通常先分配硬件资源再开始流控。 */
 	if (dai->driver->cops &&
 	    dai->driver->cops->startup)
 		ret = dai->driver->cops->startup(cstream, dai);
@@ -746,6 +780,7 @@ void snd_soc_dai_compr_shutdown(struct snd_soc_dai *dai,
 				struct snd_compr_stream *cstream,
 				int rollback)
 {
+	/* compress 流的 shutdown 与 startup 对应，负责释放 offload 资源。 */
 	if (rollback && !soc_dai_mark_match(dai, cstream, compr_startup))
 		return;
 

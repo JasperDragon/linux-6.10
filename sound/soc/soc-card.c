@@ -11,6 +11,12 @@
 #include <sound/soc.h>
 #include <sound/jack.h>
 
+/*
+ * card 级辅助逻辑：jack 创建、probe/remove/suspend/resume 封装等。
+ *
+ * 这一层不直接做复杂音频处理，而是把 machine driver 的 card
+ * 生命周期、jack 资源和错误码包装成统一的 helper。
+ */
 #define soc_card_ret(dai, ret) _soc_card_ret(dai, __func__, ret)
 static inline int _soc_card_ret(struct snd_soc_card *card,
 				const char *func, int ret)
@@ -22,6 +28,7 @@ static inline int _soc_card_ret(struct snd_soc_card *card,
 struct snd_kcontrol *snd_soc_card_get_kcontrol(struct snd_soc_card *soc_card,
 					       const char *name)
 {
+	/* card 级控件查找通常只需要按 mixer 名字去 ALSA core 里找。 */
 	if (unlikely(!name))
 		return NULL;
 
@@ -32,6 +39,7 @@ EXPORT_SYMBOL_GPL(snd_soc_card_get_kcontrol);
 static int jack_new(struct snd_soc_card *card, const char *id, int type,
 		    struct snd_soc_jack *jack, bool initial_kctl)
 {
+	/* jack 对象既要有 ALSA jack 实体，也要有 ASoC 封装的 pins/zones。 */
 	mutex_init(&jack->mutex);
 	jack->card = card;
 	INIT_LIST_HEAD(&jack->pins);
@@ -59,6 +67,7 @@ static int jack_new(struct snd_soc_card *card, const char *id, int type,
 int snd_soc_card_jack_new(struct snd_soc_card *card, const char *id, int type,
 			  struct snd_soc_jack *jack)
 {
+	/* 不带 pins 的 jack，通常用于板级代码后续再补 pin 绑定。 */
 	return soc_card_ret(card, jack_new(card, id, type, jack, true));
 }
 EXPORT_SYMBOL_GPL(snd_soc_card_jack_new);
@@ -86,6 +95,7 @@ int snd_soc_card_jack_new_pins(struct snd_soc_card *card, const char *id,
 {
 	int ret;
 
+	/* 先创建 jack，再把一组 pin 一次性挂上去。 */
 	ret = jack_new(card, id, type, jack, false);
 	if (ret)
 		goto end;
@@ -101,6 +111,7 @@ int snd_soc_card_suspend_pre(struct snd_soc_card *card)
 {
 	int ret = 0;
 
+	/* card 级 suspend_pre 是 machine driver 关机前的最早一批钩子。 */
 	if (card->suspend_pre)
 		ret = card->suspend_pre(card);
 
@@ -111,6 +122,7 @@ int snd_soc_card_suspend_post(struct snd_soc_card *card)
 {
 	int ret = 0;
 
+	/* suspend_post 通常用于在子系统关闭后再做收尾。 */
 	if (card->suspend_post)
 		ret = card->suspend_post(card);
 
@@ -121,6 +133,7 @@ int snd_soc_card_resume_pre(struct snd_soc_card *card)
 {
 	int ret = 0;
 
+	/* resume_pre 是恢复序列里更靠前的板级回调。 */
 	if (card->resume_pre)
 		ret = card->resume_pre(card);
 
@@ -131,6 +144,7 @@ int snd_soc_card_resume_post(struct snd_soc_card *card)
 {
 	int ret = 0;
 
+	/* resume_post 在硬件恢复后执行，用于补齐板级状态。 */
 	if (card->resume_post)
 		ret = card->resume_post(card);
 
@@ -146,13 +160,8 @@ int snd_soc_card_probe(struct snd_soc_card *card)
 			return soc_card_ret(card, ret);
 
 		/*
-		 * It has "card->probe" and "card->late_probe" callbacks.
-		 * So, set "probed" flag here, because it needs to care
-		 * about "late_probe".
-		 *
-		 * see
-		 *	snd_soc_bind_card()
-		 *	snd_soc_card_late_probe()
+		 * probe 成功后先把标志置位，给 late_probe 保留统一的
+		 * 生命周期判断点。
 		 */
 		card->probed = 1;
 	}
@@ -170,14 +179,7 @@ int snd_soc_card_late_probe(struct snd_soc_card *card)
 	}
 
 	/*
-	 * It has "card->probe" and "card->late_probe" callbacks,
-	 * and "late_probe" callback is called after "probe".
-	 * This means, we can set "card->probed" flag afer "late_probe"
-	 * for all cases.
-	 *
-	 * see
-	 *	snd_soc_bind_card()
-	 *	snd_soc_card_probe()
+	 * late_probe 跑完之后，card 才算完整可用；这里统一补置 probed。
 	 */
 	card->probed = 1;
 
@@ -186,6 +188,7 @@ int snd_soc_card_late_probe(struct snd_soc_card *card)
 
 void snd_soc_card_fixup_controls(struct snd_soc_card *card)
 {
+	/* machine driver 可以在这里给 card 级控件做最后修正。 */
 	if (card->fixup_controls)
 		card->fixup_controls(card);
 }
@@ -194,6 +197,7 @@ int snd_soc_card_remove(struct snd_soc_card *card)
 {
 	int ret = 0;
 
+	/* 只有已经 probe 过的 card 才需要真正执行 remove。 */
 	if (card->probed &&
 	    card->remove)
 		ret = card->remove(card);
@@ -209,6 +213,7 @@ int snd_soc_card_set_bias_level(struct snd_soc_card *card,
 {
 	int ret = 0;
 
+	/* card 级 bias 回调用于协调整张声卡的电源级别变化。 */
 	if (card->set_bias_level)
 		ret = card->set_bias_level(card, dapm, level);
 
@@ -221,6 +226,7 @@ int snd_soc_card_set_bias_level_post(struct snd_soc_card *card,
 {
 	int ret = 0;
 
+	/* post 回调用于在 DAPM 核心完成切换后做收尾。 */
 	if (card->set_bias_level_post)
 		ret = card->set_bias_level_post(card, dapm, level);
 
@@ -232,6 +238,7 @@ int snd_soc_card_add_dai_link(struct snd_soc_card *card,
 {
 	int ret = 0;
 
+	/* 动态 card 可以在运行时新增一条 DAI link。 */
 	if (card->add_dai_link)
 		ret = card->add_dai_link(card, dai_link);
 
@@ -242,6 +249,7 @@ EXPORT_SYMBOL_GPL(snd_soc_card_add_dai_link);
 void snd_soc_card_remove_dai_link(struct snd_soc_card *card,
 				  struct snd_soc_dai_link *dai_link)
 {
+	/* remove_dai_link 与 add_dai_link 成对，负责清理动态 link。 */
 	if (card->remove_dai_link)
 		card->remove_dai_link(card, dai_link);
 }

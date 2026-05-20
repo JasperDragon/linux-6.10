@@ -13,29 +13,35 @@
 #include <sound/soc.h>
 
 struct snd_soc_acpi_package_context {
-	char *name;           /* package name */
-	int length;           /* number of elements */
+	/* 解析到的 package 名称。 */
+	char *name;
+	/* package 里包含的元素个数。 */
+	int length;
+	/* 解析后的数据缓冲区。 */
 	struct acpi_buffer *format;
+	/* ACPI 状态缓冲区。 */
 	struct acpi_buffer *state;
+	/* 解析结果是否有效。 */
 	bool data_valid;
 };
 
-/* codec name is used in DAIs is i2c-<HID>:00 with HID being 8 chars */
+/* codec name 的命名长度上限：i2c-<HID>:00 这类格式需要预留空间。 */
 #define SND_ACPI_I2C_ID_LEN (4 + ACPI_ID_LEN + 3 + 1)
 
 #if IS_ENABLED(CONFIG_ACPI)
-/* acpi match */
+/* ACPI 机器表匹配入口。 */
 struct snd_soc_acpi_mach *
 snd_soc_acpi_find_machine(struct snd_soc_acpi_mach *machines);
 
+/* 从 HID 中解析出一份 ACPI package。 */
 bool snd_soc_acpi_find_package_from_hid(const u8 hid[ACPI_ID_LEN],
 				    struct snd_soc_acpi_package_context *ctx);
 
-/* check all codecs */
+/* 扫描当前 ACPI 设备并返回匹配的 codec 机器描述。 */
 struct snd_soc_acpi_mach *snd_soc_acpi_codec_list(void *arg);
 
 #else
-/* acpi match */
+/* 非 ACPI 配置下的空实现。 */
 static inline struct snd_soc_acpi_mach *
 snd_soc_acpi_find_machine(struct snd_soc_acpi_mach *machines)
 {
@@ -49,31 +55,17 @@ snd_soc_acpi_find_package_from_hid(const u8 hid[ACPI_ID_LEN],
 	return false;
 }
 
-/* check all codecs */
+/* 非 ACPI 配置下的空实现。 */
 static inline struct snd_soc_acpi_mach *snd_soc_acpi_codec_list(void *arg)
 {
 	return NULL;
 }
 #endif
 
-/**
- * snd_soc_acpi_mach_params: interface for machine driver configuration
- *
- * @acpi_ipc_irq_index: used for BYT-CR detection
- * @platform: string used for HDAudio codec support
- * @codec_mask: used for HDAudio support
- * @dmic_num: number of SoC- or chipset-attached PDM digital microphones
- * @link_mask: SoundWire links enabled on the board
- * @links: array of SoundWire link _ADR descriptors, null terminated
- * @i2s_link_mask: I2S/TDM links enabled on the board
- * @num_dai_drivers: number of elements in @dai_drivers
- * @dai_drivers: pointer to dai_drivers, used e.g. in nocodec mode
- * @subsystem_vendor: optional PCI SSID vendor value
- * @subsystem_device: optional PCI SSID device value
- * @subsystem_rev: optional PCI SSID revision value
- * @subsystem_id_set: true if a value has been written to
- *		      subsystem_vendor and subsystem_device.
- * @bt_link_mask: BT offload link enabled on the board
+/*
+ * ACPI machine driver 的运行参数。
+ * 这里保存的是平台探测后，给 machine driver / topology 使用的
+ * 板级描述信息。
  */
 struct snd_soc_acpi_mach_params {
 	u32 acpi_ipc_irq_index;
@@ -92,13 +84,7 @@ struct snd_soc_acpi_mach_params {
 	u32 bt_link_mask;
 };
 
-/**
- * snd_soc_acpi_endpoint - endpoint descriptor
- * @num: endpoint number (mandatory, unique per device)
- * @aggregated: 0 (independent) or 1 (logically grouped)
- * @group_position: zero-based order (only when @aggregated is 1)
- * @group_id: platform-unique group identifier (only when @aggregrated is 1)
- */
+/* ACPI 枚举出的 endpoint 描述。 */
 struct snd_soc_acpi_endpoint {
 	u8 num;
 	u8 aggregated;
@@ -106,13 +92,7 @@ struct snd_soc_acpi_endpoint {
 	u8 group_id;
 };
 
-/**
- * snd_soc_acpi_adr_device - descriptor for _ADR-enumerated device
- * @adr: 64 bit ACPI _ADR value
- * @num_endpoints: number of endpoints for this device
- * @endpoints: array of endpoints
- * @name_prefix: string used for codec controls
- */
+/* 通过 _ADR 枚举出来的设备描述。 */
 struct snd_soc_acpi_adr_device {
 	u64 adr;
 	u8 num_endpoints;
@@ -120,91 +100,35 @@ struct snd_soc_acpi_adr_device {
 	const char *name_prefix;
 };
 
-/**
- * snd_soc_acpi_link_adr - ACPI-based list of _ADR enumerated devices
- * @mask: one bit set indicates the link this list applies to
- * @num_adr: ARRAY_SIZE of devices
- * @adr_d: array of devices
- *
- * The number of devices per link can be more than 1, e.g. in SoundWire
- * multi-drop configurations.
+/*
+ * 一个 link 上的 _ADR 设备列表。
+ * 典型场景包括 SoundWire multi-drop，同一条 link 上挂多个设备。
  */
-
 struct snd_soc_acpi_link_adr {
 	u32 mask;
 	u32 num_adr;
 	const struct snd_soc_acpi_adr_device *adr_d;
 };
 
-/*
- * when set the topology uses the -ssp<N> suffix, where N is determined based on
- * BIOS or DMI information
- */
+/* topology 使用 -ssp<N> 后缀，N 由 BIOS / DMI 决定。 */
 #define SND_SOC_ACPI_TPLG_INTEL_SSP_NUMBER BIT(0)
 
-/*
- * when more than one SSP is reported in the link mask, use the most significant.
- * This choice was found to be valid on platforms with ES8336 codecs.
- */
+/* 当多个 SSP 都可用时，优先使用最高位那一路。 */
 #define SND_SOC_ACPI_TPLG_INTEL_SSP_MSB BIT(1)
 
-/*
- * when set the topology uses the -dmic<N>ch suffix, where N is determined based on
- * BIOS or DMI information
- */
+/* topology 使用 -dmic<N>ch 后缀。 */
 #define SND_SOC_ACPI_TPLG_INTEL_DMIC_NUMBER BIT(2)
 
-/*
- * when set the speaker amplifier name suffix (i.e. "-max98360a") will be
- * appended to topology file name
- */
+/* topology 文件名附加 speaker amplifier 后缀。 */
 #define SND_SOC_ACPI_TPLG_INTEL_AMP_NAME BIT(3)
 
-/*
- * when set the headphone codec name suffix (i.e. "-rt5682") will be appended to
- * topology file name
- */
+/* topology 文件名附加 headphone codec 后缀。 */
 #define SND_SOC_ACPI_TPLG_INTEL_CODEC_NAME BIT(4)
 
-/**
- * snd_soc_acpi_mach: ACPI-based machine descriptor. Most of the fields are
- * related to the hardware, except for the firmware and topology file names.
- * A platform supported by legacy and Sound Open Firmware (SOF) would expose
- * all firmware/topology related fields.
- *
- * @id: ACPI ID (usually the codec's) used to find a matching machine driver.
- * @uid: ACPI Unique ID, can be used to disambiguate matches.
- * @comp_ids: list of compatible audio codecs using the same machine driver,
- * firmware and topology
- * @link_mask: describes required board layout, e.g. for SoundWire.
- * @links: array of link _ADR descriptors, null terminated.
- * @drv_name: machine driver name
- * @fw_filename: firmware file name. Used when SOF is not enabled.
- * @tplg_filename: topology file name. Used when SOF is not enabled.
- * @board: board name
- * @machine_quirk: pointer to quirk, usually based on DMI information when
- * ACPI ID alone is not sufficient, wrong or misleading
- * @quirk_data: data used to uniquely identify a machine, usually a list of
- * audio codecs whose presence if checked with ACPI
- * @machine_check: pointer to quirk function. The functionality is similar to
- * the use of @machine_quirk, except that the return value is a boolean: the intent
- * is to skip a machine if the additional hardware/firmware verification invalidates
- * the initial selection in the snd_soc_acpi_mach table.
- * @pdata: intended for platform data or machine specific-ops. This structure
- *  is not constant since this field may be updated at run-time
- * @sof_tplg_filename: Sound Open Firmware topology file name, if enabled
- * @tplg_quirk_mask: quirks to select different topology files dynamically
- * @get_function_tplg_files: This is an optional callback, if specified then instead of
- *	the single sof_tplg_filename the callback will return the list of function topology
- *	files to be loaded.
- *	Return value: The number of the files or negative ERRNO. 0 means that the single topology
- *		      file should be used, no function topology split can be used on the machine.
- *	@card: the pointer of the card
- *	@mach: the pointer of the machine driver
- *	@prefix: the prefix of the topology file name. Typically, it is the path.
- *	@tplg_files: the pointer of the array of the topology file names.
- *	@best_effort: ignore non supported links and try to build the card in best effort
- *		      with supported links
+/*
+ * ACPI 平台的 machine 描述。
+ * 这里把硬件匹配信息、固件/拓扑文件名、quirk、以及运行时参数都
+ * 集中放到一份表里，供 machine driver 和 SOF 路径共用。
  */
 /* Descriptor for SST ASoC machine driver */
 struct snd_soc_acpi_mach {
@@ -232,15 +156,7 @@ struct snd_soc_acpi_mach {
 
 #define SND_SOC_ACPI_MAX_CODECS 3
 
-/**
- * struct snd_soc_acpi_codecs: Structure to hold secondary codec information
- * apart from the matched one, this data will be passed to the quirk function
- * to match with the ACPI detected devices
- *
- * @num_codecs: number of secondary codecs used in the platform
- * @codecs: holds the codec IDs
- *
- */
+/* 额外 codec 列表，用于 quirk / machine 匹配。 */
 struct snd_soc_acpi_codecs {
 	int num_codecs;
 	u8 codecs[SND_SOC_ACPI_MAX_CODECS][ACPI_ID_LEN];
@@ -248,10 +164,12 @@ struct snd_soc_acpi_codecs {
 
 static inline bool snd_soc_acpi_sof_parent(struct device *dev)
 {
+	/* 判断父设备是否属于 SOF ACPI 驱动树。 */
 	return dev->parent && dev->parent->driver && dev->parent->driver->name &&
 		!strncmp(dev->parent->driver->name, "sof-audio-acpi", strlen("sof-audio-acpi"));
 }
 
+/* SoundWire link 上是否找到 ACPI 描述的 slave 设备。 */
 bool snd_soc_acpi_sdw_link_slaves_found(struct device *dev,
 					const struct snd_soc_acpi_link_adr *link,
 					struct sdw_peripherals *peripherals);

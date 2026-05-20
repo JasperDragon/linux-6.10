@@ -38,21 +38,29 @@
 #include <sound/soc.h>
 #include <sound/initval.h>
 
+/*
+ * soc-dapm.c 负责 DAPM 的运行时状态机：
+ * 路径遍历、widget 上下电、事件回调、bias 级别推进以及调试接口都在这里。
+ */
 #include <trace/events/asoc.h>
 
 /* DAPM context */
 struct snd_soc_dapm_context {
+	/* 当前 bias 状态：OFF / STANDBY / PREPARE / ON。 */
 	enum snd_soc_bias_level bias_level;
 
+	/* 是否在空闲时保持偏置，不直接掉到 OFF。 */
 	bool idle_bias;				/* Use BIAS_OFF instead of STANDBY when false */
 
+	/* 这个 DAPM context 挂在哪个 component / card 下面。 */
 	struct snd_soc_component *component;	/* parent component */
 	struct snd_soc_card *card;		/* parent card */
 
-	/* used during DAPM updates */
+	/* DAPM 更新过程中，用来保存目标 bias 和临时遍历状态。 */
 	enum snd_soc_bias_level target_bias_level;
 	struct list_head list;
 
+	/* 路径搜索缓存，减少重复遍历。 */
 	struct snd_soc_dapm_widget *wcache_sink;
 	struct snd_soc_dapm_widget *wcache_source;
 
@@ -70,8 +78,9 @@ struct snd_soc_dapm_context {
 	for ((dir) = SND_SOC_DAPM_DIR_IN; (dir) <= SND_SOC_DAPM_DIR_OUT; \
 		(dir)++)
 
-/* dapm power sequences - make this per codec in the future */
+/* DAPM 上下电顺序列表，未来可以按 codec 维度拆分。 */
 static int dapm_up_seq[] = {
+	/* 上电顺序：越靠前越早开。 */
 	[snd_soc_dapm_pre] = 1,
 	[snd_soc_dapm_regulator_supply] = 2,
 	[snd_soc_dapm_pinctrl] = 2,
@@ -114,6 +123,7 @@ static int dapm_up_seq[] = {
 };
 
 static int dapm_down_seq[] = {
+	/* 下电顺序：越靠前越晚关，整体与上电大体相反。 */
 	[snd_soc_dapm_pre] = 1,
 	[snd_soc_dapm_kcontrol] = 2,
 	[snd_soc_dapm_adc] = 3,
@@ -157,12 +167,14 @@ static int dapm_down_seq[] = {
 
 static void dapm_assert_locked(struct snd_soc_dapm_context *dapm)
 {
+	/* card 已经 instantiated 后，DAPM 操作必须持有专用锁。 */
 	if (snd_soc_card_is_instantiated(dapm->card))
 		snd_soc_dapm_mutex_assert_held(dapm);
 }
 
 static void dapm_pop_wait(u32 pop_time)
 {
+	/* pop/click 抑制通过延迟一小段时间给硬件缓冲。 */
 	if (pop_time)
 		schedule_timeout_uninterruptible(msecs_to_jiffies(pop_time));
 }
@@ -173,6 +185,7 @@ static void dapm_pop_dbg(struct device *dev, u32 pop_time, const char *fmt, ...)
 	va_list args;
 	char *buf;
 
+	/* 只有启用 pop 延迟时才值得拼接调试信息。 */
 	if (!pop_time)
 		return;
 
@@ -190,6 +203,7 @@ static void dapm_pop_dbg(struct device *dev, u32 pop_time, const char *fmt, ...)
 
 struct snd_soc_dapm_context *snd_soc_dapm_alloc(struct device *dev)
 {
+	/* DAPM context 统一用 devres 分配，跟随 device 生命周期释放。 */
 	return devm_kzalloc(dev, sizeof(struct snd_soc_dapm_context), GFP_KERNEL);
 }
 
@@ -216,6 +230,7 @@ EXPORT_SYMBOL_GPL(snd_soc_dapm_to_component);
 
 static bool dapm_dirty_widget(struct snd_soc_dapm_widget *w)
 {
+	/* dirty 列表非空表示该 widget 需要重新计算连接关系或状态。 */
 	return !list_empty(&w->dirty);
 }
 
@@ -223,6 +238,7 @@ static void dapm_mark_dirty(struct snd_soc_dapm_widget *w, const char *reason)
 {
 	struct device *dev = snd_soc_dapm_to_dev(w->dapm);
 
+	/* dirty widget 会在后续 DAPM 遍历里被重新收敛。 */
 	dapm_assert_locked(w->dapm);
 
 	if (!dapm_dirty_widget(w)) {
@@ -233,11 +249,10 @@ static void dapm_mark_dirty(struct snd_soc_dapm_widget *w, const char *reason)
 }
 
 /*
- * Common implementation for dapm_widget_invalidate_input_paths() and
- * dapm_widget_invalidate_output_paths(). The function is inlined since the
- * combined size of the two specialized functions is only marginally larger then
- * the size of the generic function and at the same time the fast path of the
- * specialized functions is significantly smaller than the generic function.
+ * dapm_widget_invalidate_input_paths() 和
+ * dapm_widget_invalidate_output_paths() 的公共实现。
+ * 之所以做成内联，是因为两个特化函数合起来的体积只比通用版本略大，
+ * 但特化版本的快路径明显更短，整体更划算。
  */
 static __always_inline void dapm_widget_invalidate_paths(
 	struct snd_soc_dapm_widget *w, enum snd_soc_dapm_direction dir)
@@ -247,6 +262,7 @@ static __always_inline void dapm_widget_invalidate_paths(
 	struct snd_soc_dapm_path *p;
 	LIST_HEAD(list);
 
+	/* 递归失效缓存路径计数，直到所有可达节点都被重标记。 */
 	dapm_assert_locked(w->dapm);
 
 	if (w->endpoints[dir] == -1)
@@ -269,64 +285,58 @@ static __always_inline void dapm_widget_invalidate_paths(
 }
 
 /*
- * dapm_widget_invalidate_input_paths() - Invalidate the cached number of
- *  input paths
- * @w: The widget for which to invalidate the cached number of input paths
+ * dapm_widget_invalidate_input_paths() - 失效缓存的输入路径数量
+ * @w: 需要失效缓存输入路径数量的 widget
  *
- * Resets the cached number of inputs for the specified widget and all widgets
- * that can be reached via outcoming paths from the widget.
+ * 该函数会把指定 widget 以及从它沿输出路径可达的所有 widget 的输入
+ * 缓存重新置空。
  *
- * This function must be called if the number of output paths for a widget might
- * have changed. E.g. if the source state of a widget changes or a path is added
- * or activated with the widget as the sink.
+ * 当某个 widget 的输出路径数量可能变化时必须调用它，例如 widget 的
+ * source 状态变化，或者新增/激活了一条以它为 sink 的路径。
  */
 static void dapm_widget_invalidate_input_paths(struct snd_soc_dapm_widget *w)
 {
+	/* 某个 widget 的输出发生变化时，需要失效它的输入缓存。 */
 	dapm_widget_invalidate_paths(w, SND_SOC_DAPM_DIR_IN);
 }
 
 /*
- * dapm_widget_invalidate_output_paths() - Invalidate the cached number of
- *  output paths
- * @w: The widget for which to invalidate the cached number of output paths
+ * dapm_widget_invalidate_output_paths() - 失效缓存的输出路径数量
+ * @w: 需要失效缓存输出路径数量的 widget
  *
- * Resets the cached number of outputs for the specified widget and all widgets
- * that can be reached via incoming paths from the widget.
+ * 该函数会把指定 widget 以及从它沿输入路径可达的所有 widget 的输出
+ * 缓存重新置空。
  *
- * This function must be called if the number of output paths for a widget might
- * have changed. E.g. if the sink state of a widget changes or a path is added
- * or activated with the widget as the source.
+ * 当某个 widget 的输出路径数量可能变化时必须调用它，例如 widget 的
+ * sink 状态变化，或者新增/激活了一条以它为 source 的路径。
  */
 static void dapm_widget_invalidate_output_paths(struct snd_soc_dapm_widget *w)
 {
+	/* 某个 widget 的输入发生变化时，需要失效它的输出缓存。 */
 	dapm_widget_invalidate_paths(w, SND_SOC_DAPM_DIR_OUT);
 }
 
 /*
- * dapm_path_invalidate() - Invalidates the cached number of inputs and outputs
- *  for the widgets connected to a path
- * @p: The path to invalidate
+ * dapm_path_invalidate() - 失效路径两端 widget 的输入/输出缓存
+ * @p: 需要失效的路径
  *
- * Resets the cached number of inputs for the sink of the path and the cached
- * number of outputs for the source of the path.
+ * 该函数会重置路径 sink 侧的输入缓存，以及路径 source 侧的输出缓存。
  *
- * This function must be called when a path is added, removed or the connected
- * state changes.
+ * 当一条路径被新增、删除，或者 connect 状态变化时，必须调用它。
  */
 static void dapm_path_invalidate(struct snd_soc_dapm_path *p)
 {
 	/*
-	 * Weak paths or supply paths do not influence the number of input or
-	 * output paths of their neighbors.
+	 * 弱路径或供电路径不会影响邻居节点的输入/输出路径数量。
 	 */
+	/* path 变化时，只影响真正与之相连的上下游节点。 */
 	if (p->is_supply)
 		return;
 
 	/*
-	 * The number of connected endpoints is the sum of the number of
-	 * connected endpoints of all neighbors. If a node with 0 connected
-	 * endpoints is either connected or disconnected that sum won't change,
-	 * so there is no need to re-check the path.
+	 * 已连接 endpoint 的数量等于所有邻居节点已连接 endpoint 数量之和。
+	 * 如果某个节点本来就没有已连接 endpoint，那么它连上或断开都不会
+	 * 改变这个总和，因此不需要重新检查这条路径。
 	 */
 	if (p->source->endpoints[SND_SOC_DAPM_DIR_IN] != 0)
 		dapm_widget_invalidate_input_paths(p->sink);
@@ -338,6 +348,7 @@ void snd_soc_dapm_mark_endpoints_dirty(struct snd_soc_card *card)
 {
 	struct snd_soc_dapm_widget *w;
 
+	/* 卡片重新路由后，把所有 endpoint 标记为 dirty 重新计算。 */
 	snd_soc_dapm_mutex_lock_root(card);
 
 	for_each_card_widgets(card, w) {
@@ -353,11 +364,12 @@ void snd_soc_dapm_mark_endpoints_dirty(struct snd_soc_card *card)
 	snd_soc_dapm_mutex_unlock(card);
 }
 
-/* create a new dapm widget */
+/* 创建一个新的 DAPM widget */
 static inline struct snd_soc_dapm_widget *dapm_cnew_widget(
 	const struct snd_soc_dapm_widget *_widget,
 	const char *prefix)
 {
+	/* 创建 widget 副本时也会复制名称，并按 prefix 重新命名。 */
 	struct snd_soc_dapm_widget *w __free(kfree) = kmemdup(_widget,
 							      sizeof(*_widget),
 							      GFP_KERNEL);
@@ -391,15 +403,17 @@ struct dapm_kcontrol_data {
 
 static unsigned int dapm_read(struct snd_soc_dapm_context *dapm, int reg)
 {
+	/* DAPM 需要在当前 component 上读取寄存器状态。 */
 	if (!dapm->component)
 		return -EIO;
 	return  snd_soc_component_read(dapm->component, reg);
 }
 
-/* set up initial codec paths */
+/* 初始化 codec path 状态 */
 static void dapm_set_mixer_path_status(struct snd_soc_dapm_path *p, int i,
 				       int nth_path)
 {
+	/* 根据当前寄存器值判断 mixer path 是否应当默认连通。 */
 	struct soc_mixer_control *mc = (struct soc_mixer_control *)
 		p->sink->kcontrol_news[i].private_value;
 	unsigned int reg = mc->reg;
@@ -412,16 +426,13 @@ static void dapm_set_mixer_path_status(struct snd_soc_dapm_path *p, int i,
 		unsigned int val = dapm_read(p->sink->dapm, reg);
 
 		/*
-		 * The nth_path argument allows this function to know
-		 * which path of a kcontrol it is setting the initial
-		 * status for. Ideally this would support any number
-		 * of paths and channels. But since kcontrols only come
-		 * in mono and stereo variants, we are limited to 2
-		 * channels.
+		 * nth_path 参数用来告诉这个函数：当前是在为 kcontrol 的哪一条
+		 * path 计算初始状态。理想情况下它应该支持任意数量的 path 和
+		 * channel，但实际 kcontrol 只分单声道和立体声两类，因此这里只能
+		 * 处理 2 个 channel。
 		 *
-		 * The following code assumes for stereo controls the
-		 * first path is the left channel, and all remaining
-		 * paths are the right channel.
+		 * 下面的代码假定：对于立体声 control，第一条 path 对应左声道，
+		 * 其余 path 都对应右声道。
 		 */
 		if (snd_soc_volsw_is_stereo(mc) && nth_path > 0) {
 			if (reg != mc->rreg)
@@ -434,21 +445,21 @@ static void dapm_set_mixer_path_status(struct snd_soc_dapm_path *p, int i,
 			val = max - val;
 		p->connect = !!val;
 	} else {
-		/* since a virtual mixer has no backing registers to
-		 * decide which path to connect, it will try to match
-		 * with initial state.  This is to ensure
-		 * that the default mixer choice will be
-		 * correctly powered up during initialization.
+		/*
+		 * 虚拟 mixer 没有底层寄存器可用来判断该连哪条 path，因此这里只能
+		 * 直接沿用初始状态。这样可以保证初始化时默认选中的 mixer 分支会
+		 * 被正确上电。
 		 */
 		p->connect = invert;
 	}
 }
 
-/* connect mux widget to its interconnecting audio paths */
+/* 将 mux widget 连接到它所对应的音频路径 */
 static int dapm_connect_mux(struct snd_soc_dapm_context *dapm,
 			    struct snd_soc_dapm_path *path, const char *control_name,
 			    struct snd_soc_dapm_widget *w)
 {
+	/* mux/demux 通过枚举文本匹配当前选择项。 */
 	const struct snd_kcontrol_new *kcontrol = &w->kcontrol_news[0];
 	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
 	unsigned int item;
@@ -461,15 +472,15 @@ static int dapm_connect_mux(struct snd_soc_dapm_context *dapm,
 		val = (val >> e->shift_l) & e->mask;
 		item = snd_soc_enum_val_to_item(e, val);
 	} else {
-		/* since a virtual mux has no backing registers to
-		 * decide which path to connect, it will try to match
-		 * with the first enumeration.  This is to ensure
-		 * that the default mux choice (the first) will be
-		 * correctly powered up during initialization.
+		/*
+		 * 虚拟 mux 同样没有底层寄存器来决定应该连哪条 path，所以这里
+		 * 直接匹配第一个枚举项。这样初始化时默认 mux 选项（第一个）
+		 * 能正确上电。
 		 */
 		item = 0;
 	}
 
+	/* 根据 control_name 找到枚举项，匹配的项才会被视为连通。 */
 	i = match_string(e->texts, e->items, control_name);
 	if (i < 0)
 		return -ENODEV;
@@ -480,13 +491,14 @@ static int dapm_connect_mux(struct snd_soc_dapm_context *dapm,
 
 }
 
-/* connect mixer widget to its interconnecting audio paths */
+/* 将 mixer widget 连接到它所对应的音频路径 */
 static int dapm_connect_mixer(struct snd_soc_dapm_context *dapm,
 			      struct snd_soc_dapm_path *path, const char *control_name)
 {
+	/* mixer 通过同名 kcontrol 找到路径并判断默认是否连通。 */
 	int i, nth_path = 0;
 
-	/* search for mixer kcontrol */
+	/* 查找对应的 mixer kcontrol。 */
 	for (i = 0; i < path->sink->num_kcontrols; i++) {
 		if (!strcmp(control_name, path->sink->kcontrol_news[i].name)) {
 			path->name = path->sink->kcontrol_news[i].name;
@@ -498,23 +510,24 @@ static int dapm_connect_mixer(struct snd_soc_dapm_context *dapm,
 }
 
 /*
- * dapm_update_widget_flags() - Re-compute widget sink and source flags
- * @w: The widget for which to update the flags
+ * dapm_update_widget_flags() - 重新计算 widget 的 sink/source 标志
+ * @w: 需要更新标志的 widget
  *
- * Some widgets have a dynamic category which depends on which neighbors they
- * are connected to. This function update the category for these widgets.
+ * 某些 widget 的类别是动态的，会随着相邻节点的连接关系变化而变化。
+ * 这个函数就是用来更新这类 widget 的分类。
  *
- * This function must be called whenever a path is added or removed to a widget.
+ * 当 widget 相关路径被新增或删除时，必须调用它。
  */
 static void dapm_update_widget_flags(struct snd_soc_dapm_widget *w)
 {
+	/* widget 的 sink/source 属性会随着相邻路径变化而动态修正。 */
 	enum snd_soc_dapm_direction dir;
 	struct snd_soc_dapm_path *p;
 	unsigned int ep;
 
 	switch (w->id) {
 	case snd_soc_dapm_input:
-		/* On a fully routed card an input is never a source */
+		/* 在 fully_routed 的卡上，input 不会再被视为 source。 */
 		if (w->dapm->card->fully_routed)
 			return;
 		ep = SND_SOC_DAPM_EP_SOURCE;
@@ -529,7 +542,7 @@ static void dapm_update_widget_flags(struct snd_soc_dapm_widget *w)
 		}
 		break;
 	case snd_soc_dapm_output:
-		/* On a fully routed card a output is never a sink */
+		/* 在 fully_routed 的卡上，output 不会再被视为 sink。 */
 		if (w->dapm->card->fully_routed)
 			return;
 		ep = SND_SOC_DAPM_EP_SINK;
@@ -562,6 +575,7 @@ static int dapm_check_dynamic_path(
 	struct snd_soc_dapm_widget *source, struct snd_soc_dapm_widget *sink,
 	const char *control)
 {
+	/* 只允许 mux/switch/mixer 类动态节点参与受控路径。 */
 	struct device *dev = snd_soc_dapm_to_dev(dapm);
 	bool dynamic_source = false;
 	bool dynamic_sink = false;
@@ -611,6 +625,7 @@ static int dapm_add_path(
 	int (*connected)(struct snd_soc_dapm_widget *source,
 			 struct snd_soc_dapm_widget *sink))
 {
+	/* 新路径加入时，需要校验供电边界、动态控制类型和默认连通状态。 */
 	struct device *dev = snd_soc_dapm_to_dev(dapm);
 	enum snd_soc_dapm_direction dir;
 	struct snd_soc_dapm_path *path;
@@ -655,7 +670,7 @@ static int dapm_add_path(
 	if (wsource->is_supply || wsink->is_supply)
 		path->is_supply = 1;
 
-	/* connect static paths */
+/* 连接静态路径 */
 	if (control == NULL) {
 		path->connect = 1;
 	} else {
@@ -690,9 +705,11 @@ static int dapm_add_path(
 
 	list_add(&path->list, &dapm->card->paths);
 
+	/* 双向挂到 source/sink 的边表中，后续遍历依赖这个结构。 */
 	dapm_for_each_direction(dir)
 		list_add(&path->list_node[dir], &path->node[dir]->edges[dir]);
 
+	/* 新增路径会让两端 widget 重新进入 dirty 状态。 */
 	dapm_for_each_direction(dir) {
 		dapm_update_widget_flags(path->node[dir]);
 		dapm_mark_dirty(path->node[dir], "Route added");
@@ -710,6 +727,7 @@ err:
 static int dapm_kcontrol_data_alloc(struct snd_soc_dapm_widget *widget,
 	struct snd_kcontrol *kcontrol, const char *ctrl_name)
 {
+	/* kcontrol 绑定到 DAPM widget 后，会生成一份专用的路径数据。 */
 	struct device *dev = snd_soc_dapm_to_dev(widget->dapm);
 	struct dapm_kcontrol_data *data;
 	struct soc_mixer_control *mc;
@@ -730,6 +748,11 @@ static int dapm_kcontrol_data_alloc(struct snd_soc_dapm_widget *widget,
 		mc = (struct soc_mixer_control *)kcontrol->private_value;
 
 		if (mc->autodisable) {
+			/*
+			 * autodisable 的意思是：当这个 control 被关闭时，
+			 * 不只是关掉寄存器位，还要把对应的 DAPM widget 一并
+			 * 映射成一个“自动关断”节点，方便 DAPM 图计算电源。
+			 */
 			struct snd_soc_dapm_widget template;
 
 			if (snd_soc_volsw_is_stereo(mc))
@@ -774,6 +797,10 @@ static int dapm_kcontrol_data_alloc(struct snd_soc_dapm_widget *widget,
 		e = (struct soc_enum *)kcontrol->private_value;
 
 		if (e->autodisable) {
+			/*
+			 * mux/demux 场景下，autodisable 也会生成一个独立的
+			 * DAPM kcontrol 节点，用来把枚举值和供电状态绑定起来。
+			 */
 			struct snd_soc_dapm_widget template;
 
 			name = kasprintf(GFP_KERNEL, "%s %s", ctrl_name,
@@ -826,6 +853,7 @@ static void dapm_kcontrol_free(struct snd_kcontrol *kctl)
 {
 	struct dapm_kcontrol_data *data = snd_kcontrol_chip(kctl);
 
+	/* 释放 kcontrol 时，要先把它挂着的 path 链表摘掉，再回收辅助 list。 */
 	list_del(&data->paths);
 	kfree(data->wlist);
 	kfree(data);
@@ -846,6 +874,10 @@ static int dapm_kcontrol_add_widget(struct snd_kcontrol *kcontrol,
 	struct snd_soc_dapm_widget_list *new_wlist;
 	unsigned int n;
 
+	/*
+	 * 一个 DAPM kcontrol 可能由多个 widget 共享，所以这里维护的是
+	 * 一个可扩展的 widget 列表，而不是单点指针。
+	 */
 	if (data->wlist)
 		n = data->wlist->num_widgets + 1;
 	else
@@ -870,6 +902,7 @@ static void dapm_kcontrol_add_path(const struct snd_kcontrol *kcontrol,
 {
 	struct dapm_kcontrol_data *data = snd_kcontrol_chip(kcontrol);
 
+	/* 该 kcontrol 直接控制到的所有 DAPM path 统一挂到路径链表里。 */
 	list_add_tail(&path->list_kcontrol, &data->paths);
 }
 
@@ -877,6 +910,10 @@ static bool dapm_kcontrol_is_powered(const struct snd_kcontrol *kcontrol)
 {
 	struct dapm_kcontrol_data *data = snd_kcontrol_chip(kcontrol);
 
+	/*
+	 * 某些 kcontrol 本身会被映射到一个辅助 widget；如果还没有
+	 * 创建出这个 widget，就默认认为它是“可访问”的。
+	 */
 	if (!data->widget)
 		return true;
 
@@ -908,6 +945,7 @@ static bool dapm_kcontrol_set_value(const struct snd_kcontrol *kcontrol,
 {
 	struct dapm_kcontrol_data *data = snd_kcontrol_chip(kcontrol);
 
+	/* 值没变就不需要继续做状态传播，避免重复触发 DAPM 更新。 */
 	if (data->value == value)
 		return false;
 
@@ -935,39 +973,40 @@ static bool dapm_kcontrol_set_value(const struct snd_kcontrol *kcontrol,
 }
 
 /**
- * snd_soc_dapm_kcontrol_to_widget() - Returns the widget associated to a
- *   kcontrol
- * @kcontrol: The kcontrol
+ * snd_soc_dapm_kcontrol_to_widget() - 取得与 kcontrol 关联的 widget
+ * @kcontrol: kcontrol
  */
 struct snd_soc_dapm_widget *snd_soc_dapm_kcontrol_to_widget(struct snd_kcontrol *kcontrol)
 {
+	/* 取出这个 DAPM kcontrol 绑定的代表性 widget。 */
 	return dapm_kcontrol_get_wlist(kcontrol)->widgets[0];
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_kcontrol_to_widget);
 
 /**
- * snd_soc_dapm_kcontrol_to_dapm() - Returns the dapm context associated to a kcontrol
- * @kcontrol: The kcontrol
+ * snd_soc_dapm_kcontrol_to_dapm() - 取得与 kcontrol 关联的 DAPM 上下文
+ * @kcontrol: kcontrol
  *
- * Note: This function must only be used on kcontrols that are known to have
- * been registered for a CODEC. Otherwise the behaviour is undefined.
+ * 注意：该函数只能用于已经确认是为 CODEC 注册的 kcontrol，
+ * 否则行为未定义。
  */
 struct snd_soc_dapm_context *snd_soc_dapm_kcontrol_to_dapm(struct snd_kcontrol *kcontrol)
 {
+	/* 通过 kcontrol 反查它属于哪个 DAPM 上下文。 */
 	return dapm_kcontrol_get_wlist(kcontrol)->widgets[0]->dapm;
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_kcontrol_to_dapm);
 
 /**
- * snd_soc_dapm_kcontrol_to_component() - Returns the component associated to a
- * kcontrol
- * @kcontrol: The kcontrol
+ * snd_soc_dapm_kcontrol_to_component() - 取得与 kcontrol 关联的 component
+ * @kcontrol: kcontrol
  *
- * This function must only be used on DAPM contexts that are known to be part of
- * a COMPONENT (e.g. in a COMPONENT driver). Otherwise the behavior is undefined
+ * 该函数只能用于已经确认属于某个 component 的 DAPM 上下文，
+ * 否则行为未定义。
  */
 struct snd_soc_component *snd_soc_dapm_kcontrol_to_component(struct snd_kcontrol *kcontrol)
 {
+	/* DAPM context 再往上就是 component，本函数提供反向桥接。 */
 	return snd_soc_dapm_to_component(snd_soc_dapm_kcontrol_to_dapm(kcontrol));
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_kcontrol_to_component);
@@ -978,6 +1017,7 @@ static void dapm_reset(struct snd_soc_card *card)
 
 	snd_soc_dapm_mutex_assert_held(card);
 
+	/* 先清空统计和中间态，再从当前 power 值重新初始化遍历缓存。 */
 	memset(&card->dapm_stats, 0, sizeof(card->dapm_stats));
 
 	for_each_card_widgets(card, w) {
@@ -988,6 +1028,7 @@ static void dapm_reset(struct snd_soc_card *card)
 
 static const char *dapm_prefix(struct snd_soc_dapm_context *dapm)
 {
+	/* DAPM widget / kcontrol 的前缀通常来自 component 的 name_prefix。 */
 	if (!dapm->component)
 		return NULL;
 	return dapm->component->name_prefix;
@@ -996,6 +1037,7 @@ static const char *dapm_prefix(struct snd_soc_dapm_context *dapm)
 static int dapm_update_bits(struct snd_soc_dapm_context *dapm,
 	int reg, unsigned int mask, unsigned int value)
 {
+	/* DAPM 层的寄存器写回最终还是代理到 component 的 regmap 接口。 */
 	if (!dapm->component)
 		return -EIO;
 	return snd_soc_component_update_bits(dapm->component, reg,
@@ -1005,6 +1047,7 @@ static int dapm_update_bits(struct snd_soc_dapm_context *dapm,
 static int dapm_test_bits(struct snd_soc_dapm_context *dapm,
 	int reg, unsigned int mask, unsigned int value)
 {
+	/* 仅做寄存器值比较，不触发实际写入。用于判断状态是否会改变。 */
 	if (!dapm->component)
 		return -EIO;
 	return snd_soc_component_test_bits(dapm->component, reg, mask, value);
@@ -1012,6 +1055,7 @@ static int dapm_test_bits(struct snd_soc_dapm_context *dapm,
 
 static void dapm_async_complete(struct snd_soc_dapm_context *dapm)
 {
+	/* 让 component 把延迟的异步访问补完，避免 DAPM 与底层写寄存器打架。 */
 	if (dapm->component)
 		snd_soc_component_async_complete(dapm->component);
 }
@@ -1024,6 +1068,7 @@ dapm_wcache_lookup(struct snd_soc_dapm_widget *w, const char *name)
 		const int depth = 2;
 		int i = 0;
 
+		/* 从当前 widget 附近做一次短距离查找，避免全卡遍历。 */
 		list_for_each_entry_from(w, wlist, list) {
 			if (!strcmp(name, w->name))
 				return w;
@@ -1037,27 +1082,27 @@ dapm_wcache_lookup(struct snd_soc_dapm_widget *w, const char *name)
 }
 
 /**
- * snd_soc_dapm_force_bias_level() - Sets the DAPM bias level
- * @dapm: The DAPM context for which to set the level
- * @level: The level to set
+ * snd_soc_dapm_force_bias_level() - 强制设置 DAPM bias level
+ * @dapm: 需要设置的 DAPM 上下文
+ * @level: 目标 level
  *
- * Forces the DAPM bias level to a specific state. It will call the bias level
- * callback of DAPM context with the specified level. This will even happen if
- * the context is already at the same level. Furthermore it will not go through
- * the normal bias level sequencing, meaning any intermediate states between the
- * current and the target state will not be entered.
+ * 强制把 DAPM bias level 设为指定状态。即使当前已经处于同一状态，
+ * 也会调用 bias level 回调。该过程不会经过正常的 bias level 序列，
+ * 因此不会进入当前状态与目标状态之间的中间状态。
  *
- * Note that the change in bias level is only temporary and the next time
- * snd_soc_dapm_sync() is called the state will be set to the level as
- * determined by the DAPM core. The function is mainly intended to be used to
- * used during probe or resume from suspend to power up the device so
- * initialization can be done, before the DAPM core takes over.
+ * 注意，这种修改只是临时的。下次调用 snd_soc_dapm_sync() 时，状态会
+ * 再次回到 DAPM core 计算出的 level。这个函数通常用于 probe 或
+ * suspend/resume 期间先把设备拉起来，方便完成初始化。
  */
 int snd_soc_dapm_force_bias_level(struct snd_soc_dapm_context *dapm,
 	enum snd_soc_bias_level level)
 {
 	int ret = 0;
 
+	/*
+	 * 强制切到目标 bias level，不走完整的中间态序列。
+	 * 这是 probe / resume 这类场景下用来快速把设备唤醒或对齐状态的。
+	 */
 	if (dapm->component)
 		ret = snd_soc_component_set_bias_level(dapm->component, level);
 
@@ -1069,32 +1114,31 @@ int snd_soc_dapm_force_bias_level(struct snd_soc_dapm_context *dapm,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_force_bias_level);
 
 /**
- * snd_soc_dapm_init_bias_level() - Initialize DAPM bias level
- * @dapm: The DAPM context to initialize
- * @level: The DAPM level to initialize to
+ * snd_soc_dapm_init_bias_level() - 初始化 DAPM bias level
+ * @dapm: 需要初始化的 DAPM 上下文
+ * @level: 目标 DAPM level
  *
- * This function only sets the driver internal state of the DAPM level and will
- * not modify the state of the device. Hence it should not be used during normal
- * operation, but only to synchronize the internal state to the device state.
- * E.g. during driver probe to set the DAPM level to the one corresponding with
- * the power-on reset state of the device.
+ * 该函数只会设置驱动内部记录的 DAPM level，不会修改设备状态。
+ * 因此它不应在正常运行期间使用，只适合把内部状态同步到设备状态。
+ * 例如在 driver probe 时，把 DAPM level 设为与设备上电复位状态一致。
  *
- * To change the DAPM state of the device use snd_soc_dapm_set_bias_level().
+ * 若要真正改变设备的 DAPM 状态，请使用 snd_soc_dapm_set_bias_level()。
  */
 void snd_soc_dapm_init_bias_level(struct snd_soc_dapm_context *dapm, enum snd_soc_bias_level level)
 {
+	/* 只改内核侧记录，不直接碰硬件寄存器。 */
 	dapm->bias_level = level;
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_init_bias_level);
 
 /**
- * snd_soc_dapm_set_bias_level - set the bias level for the system
- * @dapm: DAPM context
- * @level: level to configure
+ * snd_soc_dapm_set_bias_level - 设置系统的 bias level
+ * @dapm: DAPM 上下文
+ * @level: 需要配置的 level
  *
- * Configure the bias (power) levels for the SoC audio device.
+ * 配置 SoC 音频设备的 bias（电源）级别。
  *
- * Returns 0 for success else error.
+ * 返回：成功时返回 0，否则返回错误码。
  */
 static int snd_soc_dapm_set_bias_level(struct snd_soc_dapm_context *dapm,
 				       enum snd_soc_bias_level level)
@@ -1102,6 +1146,7 @@ static int snd_soc_dapm_set_bias_level(struct snd_soc_dapm_context *dapm,
 	struct snd_soc_card *card = dapm->card;
 	int ret = 0;
 
+	/* 卡级回调先做前置动作，DAPM 自身再强制同步，最后执行后置收尾。 */
 	trace_snd_soc_bias_level_start(dapm, level);
 
 	ret = snd_soc_card_set_bias_level(card, dapm, level);
@@ -1126,10 +1171,10 @@ out:
 }
 
 /**
- * snd_soc_dapm_get_bias_level() - Get current DAPM bias level
- * @dapm: The context for which to get the bias level
+ * snd_soc_dapm_get_bias_level() - 获取当前 DAPM bias level
+ * @dapm: 需要获取 bias level 的上下文
  *
- * Returns: The current bias level of the passed DAPM context.
+ * 返回：该 DAPM 上下文当前的 bias level。
  */
 enum snd_soc_bias_level snd_soc_dapm_get_bias_level(struct snd_soc_dapm_context *dapm)
 {
@@ -1145,6 +1190,10 @@ static int dapm_is_shared_kcontrol(struct snd_soc_dapm_context *dapm,
 	struct snd_soc_dapm_widget *w;
 	int i;
 
+	/*
+	 * 共享 kcontrol 的场景：不同 widget 可能引用同一个控制定义。
+	 * 这里先在同一张 card 的同类 widget 里找现成实例，避免重复创建。
+	 */
 	*kcontrol = NULL;
 
 	for_each_card_widgets(dapm->card, w) {
@@ -1163,8 +1212,8 @@ static int dapm_is_shared_kcontrol(struct snd_soc_dapm_context *dapm,
 }
 
 /*
- * Determine if a kcontrol is shared. If it is, look it up. If it isn't,
- * create it. Either way, add the widget into the control's widget list
+ * 判断某个 kcontrol 是否被共享。如果是就复用现有实例；如果不是就创建。
+ * 无论哪种情况，都要把当前 widget 加入该 control 的 widget 列表。
  */
 static int dapm_create_or_share_kcontrol(struct snd_soc_dapm_widget *w,
 	int kci)
@@ -1191,6 +1240,11 @@ static int dapm_create_or_share_kcontrol(struct snd_soc_dapm_widget *w,
 					 &kcontrol);
 
 	if (!kcontrol) {
+		/*
+		 * 这个控制定义如果没有被别的 widget 共享，就按 widget 类型
+		 * 决定名字拼装策略：有些要把 widget 名塞进长名里，有些只
+		 * 需要 control 名即可。
+		 */
 		if (shared) {
 			wname_in_long_name = false;
 			kcname_in_long_name = true;
@@ -1223,10 +1277,8 @@ static int dapm_create_or_share_kcontrol(struct snd_soc_dapm_widget *w,
 
 		if (wname_in_long_name && kcname_in_long_name) {
 			/*
-			 * The control will get a prefix from the control
-			 * creation process but we're also using the same
-			 * prefix for widgets so cut the prefix off the
-			 * front of the widget name.
+			 * control 在创建过程中会自动带上前缀，但 widget 也在使用
+			 * 同一前缀，所以这里要把 widget 名称前面的前缀裁掉。
 			 */
 			long_name = kasprintf(GFP_KERNEL, "%s %s",
 				 w->name + prefix_len,
@@ -1277,18 +1329,18 @@ exit_free:
 	return ret;
 }
 
-/* create new dapm mixer control */
+/* 创建新的 DAPM mixer control。 */
 static int dapm_new_mixer(struct snd_soc_dapm_widget *w)
 {
 	int i, ret;
 	struct snd_soc_dapm_path *path;
 	struct dapm_kcontrol_data *data;
 
-	/* add kcontrol */
+	/* 添加 kcontrol。 */
 	for (i = 0; i < w->num_kcontrols; i++) {
-		/* match name */
+		/* 按名字匹配。 */
 		snd_soc_dapm_widget_for_each_source_path(w, path) {
-			/* mixer/mux paths name must match control name */
+			/* mixer/mux 路径名必须和 control 名称匹配。 */
 			if (path->name != (char *)w->kcontrol_news[i].name)
 				continue;
 
@@ -1312,7 +1364,7 @@ static int dapm_new_mixer(struct snd_soc_dapm_widget *w)
 	return 0;
 }
 
-/* create new dapm mux control */
+/* 创建新的 DAPM mux control。 */
 static int dapm_new_mux(struct snd_soc_dapm_widget *w)
 {
 	struct snd_soc_dapm_context *dapm = w->dapm;
@@ -1360,11 +1412,12 @@ static int dapm_new_mux(struct snd_soc_dapm_widget *w)
 	return 0;
 }
 
-/* create new dapm volume control */
+/* 创建新的 DAPM volume control。 */
 static int dapm_new_pga(struct snd_soc_dapm_widget *w)
 {
 	int i;
 
+	/* PGA 只是为每一路 kcontrol 建立对应控制，没有额外路径匹配逻辑。 */
 	for (i = 0; i < w->num_kcontrols; i++) {
 		int ret = dapm_create_or_share_kcontrol(w, i);
 		if (ret < 0)
@@ -1374,17 +1427,18 @@ static int dapm_new_pga(struct snd_soc_dapm_widget *w)
 	return 0;
 }
 
-/* create new dapm dai link control */
+/* 创建新的 DAPM DAI link control。 */
 static int dapm_new_dai_link(struct snd_soc_dapm_widget *w)
 {
 	int i;
 	struct snd_soc_pcm_runtime *rtd = w->priv;
 
-	/* create control for links with > 1 config */
+	/* 只为拥有多个配置的 link 创建控制。 */
 	if (rtd->dai_link->num_c2c_params <= 1)
 		return 0;
 
-	/* add kcontrol */
+	/* DAI link 类 widget 的控制是直接挂到 runtime 上，而不是共享路径。 */
+	/* 添加 kcontrol。 */
 	for (i = 0; i < w->num_kcontrols; i++) {
 		struct snd_soc_dapm_context *dapm = w->dapm;
 		struct device *dev = snd_soc_dapm_to_dev(dapm);
@@ -1406,15 +1460,16 @@ static int dapm_new_dai_link(struct snd_soc_dapm_widget *w)
 	return 0;
 }
 
-/* We implement power down on suspend by checking the power state of
- * the ALSA card - when we are suspending the ALSA state for the card
- * is set to D3.
+/*
+ * 这里通过检查 ALSA card 的 power state 来实现 suspend 时下电；
+ * 当系统挂起时，card 的 ALSA 状态会被设置为 D3。
  */
 static int dapm_suspend_check(struct snd_soc_dapm_widget *widget)
 {
 	struct device *dev = snd_soc_dapm_to_dev(widget->dapm);
 	int level = snd_power_get_state(widget->dapm->card->snd_card);
 
+	/* 挂起时是否保留这个 widget，取决于卡当前的 power state 和 ignore_suspend。 */
 	switch (level) {
 	case SNDRV_CTL_POWER_D3hot:
 	case SNDRV_CTL_POWER_D3cold:
@@ -1429,6 +1484,7 @@ static int dapm_suspend_check(struct snd_soc_dapm_widget *widget)
 
 static void dapm_widget_list_free(struct snd_soc_dapm_widget_list **list)
 {
+	/* widget list 是一次性分配的聚合容器，直接整体释放即可。 */
 	kfree(*list);
 }
 
@@ -1440,6 +1496,7 @@ static int dapm_widget_list_create(struct snd_soc_dapm_widget_list **list,
 	unsigned int size = 0;
 	unsigned int i = 0;
 
+	/* 把临时链表压缩成连续数组，方便导出给 DAI 连接查询接口。 */
 	list_for_each(it, widgets)
 		size++;
 
@@ -1458,9 +1515,7 @@ static int dapm_widget_list_create(struct snd_soc_dapm_widget_list **list,
 }
 
 /*
- * Recursively reset the cached number of inputs or outputs for the specified
- * widget and all widgets that can be reached via incoming or outcoming paths
- * from the widget.
+ * 递归重置指定 widget 以及所有可达 widget 的输入/输出路径缓存计数。
  */
 static void dapm_invalidate_paths_ep(struct snd_soc_dapm_widget *widget,
 	enum snd_soc_dapm_direction dir)
@@ -1470,6 +1525,7 @@ static void dapm_invalidate_paths_ep(struct snd_soc_dapm_widget *widget,
 
 	widget->endpoints[dir] = -1;
 
+	/* 反向遍历所有路径，把沿途缓存的 endpoint 计数全部打脏。 */
 	snd_soc_dapm_widget_for_each_path(widget, rdir, path) {
 		if (path->is_supply)
 			continue;
@@ -1486,11 +1542,9 @@ static void dapm_invalidate_paths_ep(struct snd_soc_dapm_widget *widget,
 }
 
 /*
- * Common implementation for is_connected_output_ep() and
- * is_connected_input_ep(). The function is inlined since the combined size of
- * the two specialized functions is only marginally larger then the size of the
- * generic function and at the same time the fast path of the specialized
- * functions is significantly smaller than the generic function.
+ * is_connected_output_ep() 和 is_connected_input_ep() 的公共实现。
+ * 之所以内联，是因为两个特化函数的总大小只比通用版本略大，
+ * 但特化版本的快路径会明显更小。
  */
 static __always_inline int dapm_is_connected_ep(struct snd_soc_dapm_widget *widget,
 	struct list_head *list, enum snd_soc_dapm_direction dir,
@@ -1507,9 +1561,10 @@ static __always_inline int dapm_is_connected_ep(struct snd_soc_dapm_widget *widg
 	if (widget->endpoints[dir] >= 0)
 		return widget->endpoints[dir];
 
+	/* 这个递归会把可达的 widget 顺手串进 list，供后续统一同步。 */
 	DAPM_UPDATE_STAT(widget, path_checks);
 
-	/* do we need to add this widget to the list ? */
+	/* 这个 widget 需要加入列表吗？ */
 	if (list)
 		list_add_tail(&widget->work_list, list);
 
@@ -1547,13 +1602,11 @@ static __always_inline int dapm_is_connected_ep(struct snd_soc_dapm_widget *widg
 }
 
 /*
- * Recursively check for a completed path to an active or physically connected
- * output widget. Returns number of complete paths.
+ * 递归检查到一个已激活或物理连接的输出 widget 是否存在完整路径。
+ * 返回完整路径数量。
  *
- * Optionally, can be supplied with a function acting as a stopping condition.
- * This function takes the dapm widget currently being examined and the walk
- * direction as an arguments, it should return true if widgets from that point
- * in the graph onwards should not be added to the widget list.
+ * 也可以提供一个停止条件函数。该函数接收当前检查的 dapm widget
+ * 和遍历方向；如果从该点开始不应再把后续 widget 加入列表，则返回 true。
  */
 static int dapm_is_connected_output_ep(struct snd_soc_dapm_widget *widget,
 	struct list_head *list,
@@ -1565,13 +1618,11 @@ static int dapm_is_connected_output_ep(struct snd_soc_dapm_widget *widget,
 }
 
 /*
- * Recursively check for a completed path to an active or physically connected
- * input widget. Returns number of complete paths.
+ * 递归检查到一个已激活或物理连接的输入 widget 是否存在完整路径。
+ * 返回完整路径数量。
  *
- * Optionally, can be supplied with a function acting as a stopping condition.
- * This function takes the dapm widget currently being examined and the walk
- * direction as an arguments, it should return true if the walk should be
- * stopped and false otherwise.
+ * 也可以提供一个停止条件函数。该函数接收当前检查的 dapm widget
+ * 和遍历方向；如果应该停止遍历，则返回 true，否则返回 false。
  */
 static int dapm_is_connected_input_ep(struct snd_soc_dapm_widget *widget,
 	struct list_head *list,
@@ -1583,23 +1634,20 @@ static int dapm_is_connected_input_ep(struct snd_soc_dapm_widget *widget,
 }
 
 /**
- * snd_soc_dapm_dai_get_connected_widgets - query audio path and it's widgets.
- * @dai: the soc DAI.
- * @stream: stream direction.
- * @list: list of active widgets for this stream.
- * @custom_stop_condition: (optional) a function meant to stop the widget graph
- *                         walk based on custom logic.
+ * snd_soc_dapm_dai_get_connected_widgets - 查询音频路径及其 widget
+ * @dai: SoC DAI
+ * @stream: 流方向
+ * @list: 当前流对应的活跃 widget 列表
+ * @custom_stop_condition: 可选的停止条件回调，用于按自定义逻辑中止遍历
  *
- * Queries DAPM graph as to whether a valid audio stream path exists for
- * the initial stream specified by name. This takes into account
- * current mixer and mux kcontrol settings. Creates list of valid widgets.
+ * 查询 DAPM 图中指定流方向是否存在有效音频路径。
+ * 这个过程会考虑当前 mixer 和 mux kcontrol 的设置，并创建
+ * 有效 widget 的列表。
  *
- * Optionally, can be supplied with a function acting as a stopping condition.
- * This function takes the dapm widget currently being examined and the walk
- * direction as an arguments, it should return true if the walk should be
- * stopped and false otherwise.
+ * 也可以传入一个停止条件函数。该函数接收当前正在检查的 dapm widget
+ * 以及遍历方向，如果应该停止继续向图中遍历，则返回 true。
  *
- * Returns the number of valid paths or negative error.
+ * 返回：有效路径数量，或负错误码。
  */
 int snd_soc_dapm_dai_get_connected_widgets(struct snd_soc_dai *dai, int stream,
 	struct snd_soc_dapm_widget_list **list,
@@ -1644,15 +1692,17 @@ void snd_soc_dapm_dai_free_widgets(struct snd_soc_dapm_widget_list **list)
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_dai_free_widgets);
 
-/*
- * Handler for regulator supply widget.
- */
+/* regulator supply widget 的处理函数。 */
 int snd_soc_dapm_regulator_event(struct snd_soc_dapm_widget *w,
 				 struct snd_kcontrol *kcontrol, int event)
 {
 	struct device *dev = snd_soc_dapm_to_dev(w->dapm);
 	int ret;
 
+	/*
+	 * regulator widget 只负责把供电器件开/关，真正的电源时序仍由
+	 * DAPM 统一调度。这里先补完异步访问，再切 regulator 状态。
+	 */
 	dapm_async_complete(w->dapm);
 
 	if (SND_SOC_DAPM_EVENT_ON(event)) {
@@ -1679,9 +1729,7 @@ int snd_soc_dapm_regulator_event(struct snd_soc_dapm_widget *w,
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_regulator_event);
 
-/*
- * Handler for pinctrl widget.
- */
+/* pinctrl widget 的处理函数。 */
 int snd_soc_dapm_pinctrl_event(struct snd_soc_dapm_widget *w,
 			       struct snd_kcontrol *kcontrol, int event)
 {
@@ -1689,6 +1737,7 @@ int snd_soc_dapm_pinctrl_event(struct snd_soc_dapm_widget *w,
 	struct pinctrl *p = w->pinctrl;
 	struct pinctrl_state *s;
 
+	/* pinctrl widget 的职责是把 DAPM 状态映射到 pinctrl state 切换。 */
 	if (!p || !priv)
 		return -EIO;
 
@@ -1704,15 +1753,14 @@ int snd_soc_dapm_pinctrl_event(struct snd_soc_dapm_widget *w,
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_pinctrl_event);
 
-/*
- * Handler for clock supply widget.
- */
+/* clock supply widget 的处理函数。 */
 int snd_soc_dapm_clock_event(struct snd_soc_dapm_widget *w,
 			     struct snd_kcontrol *kcontrol, int event)
 {
 	if (!w->clk)
 		return -EIO;
 
+	/* clock widget 只是对时钟使能位做包装，依然要先等待异步事务完成。 */
 	dapm_async_complete(w->dapm);
 
 	if (SND_SOC_DAPM_EVENT_ON(event)) {
@@ -1741,7 +1789,7 @@ static int dapm_widget_power_check(struct snd_soc_dapm_widget *w)
 	return w->new_power;
 }
 
-/* Generic check to see if a widget should be powered. */
+/* 通用的 widget 上电判定。 */
 static int dapm_generic_check_power(struct snd_soc_dapm_widget *w)
 {
 	int in, out;
@@ -1753,7 +1801,7 @@ static int dapm_generic_check_power(struct snd_soc_dapm_widget *w)
 	return out != 0 && in != 0;
 }
 
-/* Check to see if a power supply is needed */
+/* 判断是否需要电源供给。 */
 static int dapm_supply_check_power(struct snd_soc_dapm_widget *w)
 {
 	struct snd_soc_dapm_path *path;
@@ -1813,7 +1861,7 @@ static int dapm_seq_compare(struct snd_soc_dapm_widget *a,
 	return 0;
 }
 
-/* Insert a widget in order into a DAPM power sequence. */
+/* 将 widget 按顺序插入 DAPM 上下电序列。 */
 static void dapm_seq_insert(struct snd_soc_dapm_widget *new_widget,
 			    struct list_head *list,
 			    bool power_up)
@@ -1884,7 +1932,7 @@ static void dapm_seq_check_event(struct snd_soc_card *card,
 	}
 }
 
-/* Apply the coalesced changes from a DAPM sequence */
+/* 应用 DAPM 序列里合并后的更改。 */
 static void dapm_seq_run_coalesced(struct snd_soc_card *card,
 				   struct list_head *pending)
 {
@@ -1936,13 +1984,12 @@ static void dapm_seq_run_coalesced(struct snd_soc_card *card,
 	}
 }
 
-/* Apply a DAPM power sequence.
+/*
+ * 应用一段 DAPM 上/下电序列。
  *
- * We walk over a pre-sorted list of widgets to apply power to.  In
- * order to minimise the number of writes to the device required
- * multiple widgets will be updated in a single write where possible.
- * Currently anything that requires more than a single write is not
- * handled.
+ * 这里会遍历已经排好序的 widget 列表并执行上电/下电。
+ * 为了尽量减少对设备的写次数，能合并写入的 widget 会尽量
+ * 合并成一次写操作。当前暂不处理需要多次写入才能完成的情况。
  */
 static void dapm_seq_run(struct snd_soc_card *card,
 	struct list_head *list, int event, bool power_up)
@@ -2095,8 +2142,9 @@ static void dapm_widget_update(struct snd_soc_card *card, struct snd_soc_dapm_up
 	}
 }
 
-/* Async callback run prior to DAPM sequences - brings to _PREPARE if
- * they're changing state.
+/*
+ * 在 DAPM 序列执行前运行的异步回调。
+ * 如果状态发生变化，会先把它们切到 _PREPARE。
  */
 static void dapm_pre_sequence_async(void *data, async_cookie_t cookie)
 {
@@ -2128,8 +2176,9 @@ static void dapm_pre_sequence_async(void *data, async_cookie_t cookie)
 	}
 }
 
-/* Async callback run prior to DAPM sequences - brings to their final
- * state.
+/*
+ * 在 DAPM 序列执行前运行的异步回调。
+ * 用于把对象推进到最终状态。
  */
 static void dapm_post_sequence_async(void *data, async_cookie_t cookie)
 {
@@ -2169,14 +2218,15 @@ static void dapm_post_sequence_async(void *data, async_cookie_t cookie)
 static void dapm_widget_set_peer_power(struct snd_soc_dapm_widget *peer,
 				       bool power, bool connect)
 {
-	/* If a connection is being made or broken then that update
-	 * will have marked the peer dirty, otherwise the widgets are
-	 * not connected and this update has no impact. */
+	/*
+	 * 只有在路径真的建立/断开时，peer 才可能受影响。
+	 * 这里不直接改对端电源状态，只在必要时把它打脏，让后续
+	 * DAPM 统一重新计算。
+	 */
 	if (!connect)
 		return;
 
-	/* If the peer is already in the state we're moving to then we
-	 * won't have an impact on it. */
+	/* 如果对端已经处在目标状态，就没有必要再次标脏。 */
 	if (power != peer->power)
 		dapm_mark_dirty(peer, "peer state change");
 }
@@ -2207,14 +2257,14 @@ static void dapm_power_one_widget(struct snd_soc_dapm_widget *w,
 	trace_snd_soc_dapm_widget_power(w, power);
 
 	/*
-	 * If we changed our power state perhaps our neigbours
-	 * changed also.
+	 * 当前 widget 的 power 变化可能会连带影响前后级路径。
+	 * 这里先把源端的 peer 标脏，再由下一轮 DAPM 递归重新计算。
 	 */
 	snd_soc_dapm_widget_for_each_source_path(w, path)
 		dapm_widget_set_peer_power(path->source, power, path->connect);
 
 	/*
-	 * Supplies can't affect their outputs, only their inputs
+	 * 供电类 widget 只会影响下游输入，不会反向改变输出端。
 	 */
 	if (!w->is_supply)
 		snd_soc_dapm_widget_for_each_sink_path(w, path)
@@ -2249,13 +2299,13 @@ void snd_soc_dapm_set_idle_bias(struct snd_soc_dapm_context *dapm, bool on)
 EXPORT_SYMBOL_GPL(snd_soc_dapm_set_idle_bias);
 
 /*
- * Scan each dapm widget for complete audio path.
- * A complete path is a route that has valid endpoints i.e.:-
+ * 扫描每个 DAPM widget，寻找完整的音频路径。
+ * 所谓完整路径，是指端点有效的路径，例如：
  *
- *  o DAC to output pin.
- *  o Input pin to ADC.
- *  o Input pin to Output pin (bypass, sidetone)
- *  o DAC to ADC (loopback).
+ *  o DAC 到输出 pin
+ *  o 输入 pin 到 ADC
+ *  o 输入 pin 到输出 pin（bypass、sidetone）
+ *  o DAC 到 ADC（loopback）
  */
 static int dapm_power_widgets(struct snd_soc_card *card, int event,
 			      struct snd_soc_dapm_update *update)
@@ -2273,6 +2323,10 @@ static int dapm_power_widgets(struct snd_soc_card *card, int event,
 
 	trace_snd_soc_dapm_start(card, event);
 
+	/*
+	 * 每轮 power walk 先给所有 DAPM context 计算目标 bias。
+	 * 这个目标值是“图上有多少活跃路径”与“idle bias 策略”的共同结果。
+	 */
 	for_each_card_dapms(card, d) {
 		if (snd_soc_dapm_get_idle_bias(d))
 			d->target_bias_level = SND_SOC_BIAS_STANDBY;
@@ -2282,11 +2336,9 @@ static int dapm_power_widgets(struct snd_soc_card *card, int event,
 
 	dapm_reset(card);
 
-	/* Check which widgets we need to power and store them in
-	 * lists indicating if they should be powered up or down.  We
-	 * only check widgets that have been flagged as dirty but note
-	 * that new widgets may be added to the dirty list while we
-	 * iterate.
+	/*
+	 * 先把 dirty widget 分拣成 up/down 两个序列，再按序列做
+	 * 寄存器更新和事件回调。这样可以尽量减少 pop/click。
 	 */
 	list_for_each_entry(w, &card->dapm_dirty, dirty) {
 		dapm_power_one_widget(w, &up_list, &down_list);
@@ -2306,12 +2358,10 @@ static int dapm_power_widgets(struct snd_soc_card *card, int event,
 		if (w->new_power) {
 			d = w->dapm;
 
-			/* Supplies and micbiases only bring the
-			 * context up to STANDBY as unless something
-			 * else is active and passing audio they
-			 * generally don't require full power.  Signal
-			 * generators are virtual pins and have no
-			 * power impact themselves.
+			/*
+			 * 供电、micbias 这类 widget 只需要把上下文抬到
+			 * STANDBY；信号源 / 虚拟源自身不直接决定整条链路
+			 * 要不要进入 ON。
 			 */
 			switch (w->id) {
 			case snd_soc_dapm_siggen:
@@ -2333,8 +2383,9 @@ static int dapm_power_widgets(struct snd_soc_card *card, int event,
 
 	}
 
-	/* Force all contexts in the card to the same bias state if
-	 * they're not ground referenced.
+	/*
+	 * 对于非 ground-referenced 的上下文，把 card 内所有 target bias
+	 * 收敛到同一个最高值，避免同一张卡上不同子图处于不一致状态。
 	 */
 	bias = SND_SOC_BIAS_OFF;
 	for_each_card_dapms(card, d)
@@ -2346,9 +2397,9 @@ static int dapm_power_widgets(struct snd_soc_card *card, int event,
 
 	trace_snd_soc_dapm_walk_done(card);
 
-	/* Run card bias changes at first */
+	/* 先执行 card 自身的 bias 过渡，再并行处理其他 context。 */
 	dapm_pre_sequence_async(dapm, 0);
-	/* Run other bias changes in parallel */
+	/* 其他 context 的 bias 变化可以并行。 */
 	for_each_card_dapms(card, d) {
 		if (d != dapm && d->bias_level != d->target_bias_level)
 			async_schedule_domain(dapm_pre_sequence_async, d,
@@ -2364,22 +2415,22 @@ static int dapm_power_widgets(struct snd_soc_card *card, int event,
 		dapm_seq_check_event(card, w, SND_SOC_DAPM_WILL_PMU);
 	}
 
-	/* Power down widgets first; try to avoid amplifying pops. */
+	/* 先关下游路径，尽量把 pop/click 控制在关断阶段。 */
 	dapm_seq_run(card, &down_list, event, false);
 
 	dapm_widget_update(card, update);
 
-	/* Now power up. */
+	/* 再开上游路径。 */
 	dapm_seq_run(card, &up_list, event, true);
 
-	/* Run all the bias changes in parallel */
+	/* 关断/开启后的 bias 收尾也尽量并行。 */
 	for_each_card_dapms(card, d) {
 		if (d != dapm && d->bias_level != d->target_bias_level)
 			async_schedule_domain(dapm_post_sequence_async, d,
 						&async_domain);
 	}
 	async_synchronize_full_domain(&async_domain);
-	/* Run card bias changes at last */
+	/* card 自己的 bias 收尾放在最后。 */
 	dapm_post_sequence_async(dapm, 0);
 
 	/* do we need to notify any clients that DAPM event is complete */
@@ -2633,13 +2684,14 @@ static void dapm_connect_path(struct snd_soc_dapm_path *path,
 	if (path->connect == connect)
 		return;
 
+	/* 改路径状态时，源端和汇端都要重新参与下一轮图计算。 */
 	path->connect = connect;
 	dapm_mark_dirty(path->source, reason);
 	dapm_mark_dirty(path->sink, reason);
 	dapm_path_invalidate(path);
 }
 
-/* test and update the power status of a mux widget */
+/* 测试并更新 mux widget 的电源状态。 */
 static int dapm_mux_update_power(struct snd_soc_card *card,
 				 struct snd_kcontrol *kcontrol,
 				 struct snd_soc_dapm_update *update,
@@ -2651,10 +2703,10 @@ static int dapm_mux_update_power(struct snd_soc_card *card,
 
 	snd_soc_dapm_mutex_assert_held(card);
 
-	/* find dapm widget path assoc with kcontrol */
+	/* 找出这个 mux control 对应的全部 path，再按枚举值重建连通状态。 */
 	dapm_kcontrol_for_each_path(path, kcontrol) {
 		found = 1;
-		/* we now need to match the string in the enum to the path */
+		/* 现在需要把枚举字符串和路径名匹配起来。 */
 		if (e && !(strcmp(path->name, e->texts[mux])))
 			connect = true;
 		else
@@ -2685,7 +2737,7 @@ int snd_soc_dapm_mux_update_power(struct snd_soc_dapm_context *dapm,
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_mux_update_power);
 
-/* test and update the power status of a mixer or switch widget */
+/* 测试并更新 mixer 或 switch widget 的电源状态。 */
 static int dapm_mixer_update_power(struct snd_soc_card *card,
 				   struct snd_kcontrol *kcontrol,
 				   struct snd_soc_dapm_update *update,
@@ -2696,29 +2748,22 @@ static int dapm_mixer_update_power(struct snd_soc_card *card,
 
 	snd_soc_dapm_mutex_assert_held(card);
 
-	/* find dapm widget path assoc with kcontrol */
+	/* mixer/switch 的 kcontrol 可能对应多条路径，逐条更新连通状态。 */
 	dapm_kcontrol_for_each_path(path, kcontrol) {
 		/*
-		 * Ideally this function should support any number of
-		 * paths and channels. But since kcontrols only come
-		 * in mono and stereo variants, we are limited to 2
-		 * channels.
+		 * 理想情况下，这个函数应该支持任意数量的路径和通道。
+		 * 但由于 kcontrol 只有 mono 和 stereo 两种形式，实际只限定为
+		 * 2 个通道。
 		 *
-		 * The following code assumes for stereo controls the
-		 * first path (when 'found == 0') is the left channel,
-		 * and all remaining paths (when 'found == 1') are the
-		 * right channel.
+		 * 下面的代码假设 stereo control 中，第一条路径
+		 *（found == 0）是左声道，其余路径（found == 1）是右声道。
 		 *
-		 * A stereo control is signified by a valid 'rconnect'
-		 * value, either 0 for unconnected, or >= 0 for connected.
-		 * This is chosen instead of using snd_soc_volsw_is_stereo,
-		 * so that the behavior of snd_soc_dapm_mixer_update_power
-		 * doesn't change even when the kcontrol passed in is
-		 * stereo.
+		 * stereo control 通过有效的 rconnect 值来表示：0 代表未连接，
+		 * 大于等于 0 代表已连接。
+		 * 这里不使用 snd_soc_volsw_is_stereo，是为了即使传入的是 stereo
+		 * kcontrol，也不改变 snd_soc_dapm_mixer_update_power 的行为。
 		 *
-		 * It passes 'connect' as the path connect status for
-		 * the left channel, and 'rconnect' for the right
-		 * channel.
+		 * connect 作为左声道的路径连接状态，rconnect 作为右声道状态。
 		 */
 		if (found && rconnect >= 0)
 			dapm_connect_path(path, rconnect, "mixer update");
@@ -2756,9 +2801,9 @@ static ssize_t dapm_widget_show_component(struct snd_soc_component *component,
 	struct snd_soc_dapm_widget *w;
 	char *state = "not set";
 
-	/* card won't be set for the dummy component, as a spot fix
-	 * we're checking for that case specifically here but in future
-	 * we will ensure that the dummy component looks like others.
+	/*
+	 * dummy component 可能没有正常的 card 关联，sysfs 展示时要先兜底。
+	 * 这里是把 component 下面的“耗电 widget”按当前 power 状态打印出来。
 	 */
 	if (!component->card)
 		return 0;
@@ -2767,7 +2812,7 @@ static ssize_t dapm_widget_show_component(struct snd_soc_component *component,
 		if (w->dapm != dapm)
 			continue;
 
-		/* only display widgets that burn power */
+		/* sysfs 只展示那些真的会影响功耗的 widget。 */
 		switch (w->id) {
 		case snd_soc_dapm_hp:
 		case snd_soc_dapm_mic:
@@ -2813,7 +2858,7 @@ static ssize_t dapm_widget_show_component(struct snd_soc_component *component,
 	return count;
 }
 
-/* show dapm widget status in sys fs */
+/* 在 sysfs 中显示 DAPM widget 状态。 */
 static ssize_t dapm_widget_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
@@ -2821,6 +2866,7 @@ static ssize_t dapm_widget_show(struct device *dev,
 	struct snd_soc_dai *codec_dai;
 	int i, count = 0;
 
+	/* sysfs 入口：遍历 runtime 上的 codec DAI，把每个 component 的状态拼到缓冲区。 */
 	snd_soc_dapm_mutex_lock_root(rtd->card);
 
 	for_each_rtd_codec_dais(rtd, i, codec_dai) {
@@ -2843,6 +2889,7 @@ struct attribute *snd_soc_dapm_dev_attrs[] = {
 
 static void dapm_free_path(struct snd_soc_dapm_path *path)
 {
+	/* 一个 path 同时挂在输入、输出和 kcontrol 三个链上，释放时都要摘掉。 */
 	list_del(&path->list_node[SND_SOC_DAPM_DIR_IN]);
 	list_del(&path->list_node[SND_SOC_DAPM_DIR_OUT]);
 	list_del(&path->list_kcontrol);
@@ -2851,10 +2898,10 @@ static void dapm_free_path(struct snd_soc_dapm_path *path)
 }
 
 /**
- * snd_soc_dapm_free_widget - Free specified widget
- * @w: widget to free
+ * snd_soc_dapm_free_widget - 释放指定 widget
+ * @w: 需要释放的 widget
  *
- * Removes widget from all paths and frees memory occupied by it.
+ * 从所有路径中移除该 widget，并释放其占用的内存。
  */
 void snd_soc_dapm_free_widget(struct snd_soc_dapm_widget *w)
 {
@@ -2867,9 +2914,8 @@ void snd_soc_dapm_free_widget(struct snd_soc_dapm_widget *w)
 	list_del(&w->list);
 	list_del(&w->dirty);
 	/*
-	 * remove source and sink paths associated to this widget.
-	 * While removing the path, remove reference to it from both
-	 * source and sink widgets so that path is removed only once.
+	 * 释放 widget 前，必须把它挂住的所有 path 先拆掉。
+	 * 这里同时从 source/sink 两侧解除引用，保证每条 path 只回收一次。
 	 */
 	dapm_for_each_direction(dir) {
 		snd_soc_dapm_widget_for_each_path_safe(w, dir, p, next_p)
@@ -2885,11 +2931,12 @@ void snd_soc_dapm_free_widget(struct snd_soc_dapm_widget *w)
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_free_widget);
 
-/* free all dapm widgets and resources */
+/* 释放所有 DAPM widget 和资源。 */
 static void dapm_free_widgets(struct snd_soc_dapm_context *dapm)
 {
 	struct snd_soc_dapm_widget *w, *next_w;
 
+	/* 只清理当前 DAPM context 下的 widget，避免误伤其他 context。 */
 	for_each_card_widgets_safe(dapm->card, w, next_w) {
 		if (w->dapm != dapm)
 			continue;
@@ -2918,6 +2965,7 @@ static struct snd_soc_dapm_widget *dapm_find_widget(
 		pin_name = pin;
 	}
 
+	/* 先找本 context，找不到时才按需要去 card 里找同名 fallback。 */
 	for_each_card_widgets(dapm->card, w) {
 		if (!strcmp(w->name, pin_name)) {
 			if (w->dapm == dapm)
@@ -2934,9 +2982,9 @@ static struct snd_soc_dapm_widget *dapm_find_widget(
 }
 
 /*
- * set the DAPM pin status:
- * returns 1 when the value has been updated, 0 when unchanged, or a negative
- * error code; called from kcontrol put callback
+ * 设置 DAPM pin 状态：
+ * 值发生变化时返回 1，未变化时返回 0，出错时返回负错误码；
+ * 由 kcontrol 的 put 回调调用。
  */
 static int __dapm_set_pin(struct snd_soc_dapm_context *dapm,
 			  const char *pin, int status)
@@ -2953,6 +3001,7 @@ static int __dapm_set_pin(struct snd_soc_dapm_context *dapm,
 	}
 
 	if (w->connected != status) {
+		/* pin 状态变化会影响整条路由图，所以先把相关缓存全部打脏。 */
 		dapm_mark_dirty(w, "pin configuration");
 		dapm_widget_invalidate_input_paths(w);
 		dapm_widget_invalidate_output_paths(w);
@@ -2967,33 +3016,35 @@ static int __dapm_set_pin(struct snd_soc_dapm_context *dapm,
 }
 
 /*
- * similar as __dapm_set_pin(), but returns 0 when successful;
- * called from several API functions below
+ * 与 __dapm_set_pin() 类似，但成功时返回 0；
+ * 下方多个 API 函数都会调用它。
  */
 static int dapm_set_pin(struct snd_soc_dapm_context *dapm,
 				const char *pin, int status)
 {
 	int ret = __dapm_set_pin(dapm, pin, status);
 
+	/* 对外 API 只关心成功与否，0/1 的差异在内部 already handled. */
 	return ret < 0 ? ret : 0;
 }
 
 /**
- * snd_soc_dapm_sync_unlocked - scan and power dapm paths
- * @dapm: DAPM context
+ * snd_soc_dapm_sync_unlocked - 扫描并驱动 DAPM 路径上下电
+ * @dapm: DAPM 上下文
  *
- * Walks all dapm audio paths and powers widgets according to their
- * stream or path usage.
+ * 遍历所有 DAPM 音频路径，并根据它们的 stream 或 path 使用情况
+ * 对 widget 上下电。
  *
- * Requires external locking.
+ * 需要外部锁保护。
  *
- * Returns 0 for success.
+ * 成功时返回 0。
  */
 int snd_soc_dapm_sync_unlocked(struct snd_soc_dapm_context *dapm)
 {
 	/*
-	 * Suppress early reports (eg, jacks syncing their state) to avoid
-	 * silly DAPM runs during card startup.
+	 * card 还没正式 instantiated 前，不要提前跑 DAPM。
+	 * 这能避免 jack / pin / debugfs 这些早期状态变化在 probe 阶段
+	 * 触发无意义的图计算。
 	 */
 	if (!snd_soc_card_is_instantiated(dapm->card))
 		return 0;
@@ -3003,13 +3054,13 @@ int snd_soc_dapm_sync_unlocked(struct snd_soc_dapm_context *dapm)
 EXPORT_SYMBOL_GPL(snd_soc_dapm_sync_unlocked);
 
 /**
- * snd_soc_dapm_sync - scan and power dapm paths
- * @dapm: DAPM context
+ * snd_soc_dapm_sync - 扫描并驱动 DAPM 路径上下电
+ * @dapm: DAPM 上下文
  *
- * Walks all dapm audio paths and powers widgets according to their
- * stream or path usage.
+ * 遍历所有 DAPM 音频路径，并根据它们的 stream 或 path 使用情况
+ * 对 widget 上下电。
  *
- * Returns 0 for success.
+ * 成功时返回 0。
  */
 int snd_soc_dapm_sync(struct snd_soc_dapm_context *dapm)
 {
@@ -3063,6 +3114,10 @@ static int dapm_update_dai_unlocked(struct snd_pcm_substream *substream,
 	if (!w)
 		return 0;
 
+	/*
+	 * DAI route update 是“按当前 hw_params 重新裁剪路径”，不是普通 pin
+	 * 设定。这里会根据声道数决定哪些 AIF 节点需要保持连通。
+	 */
 	dev_dbg(dai->dev, "Update DAI routes for %s %s\n", dai->name, snd_pcm_direction_name(dir));
 
 	snd_soc_dapm_widget_for_each_sink_path(w, p) {
@@ -3099,6 +3154,7 @@ int snd_soc_dapm_widget_name_cmp(struct snd_soc_dapm_widget *widget, const char 
 	struct snd_soc_component *component = widget->dapm->component;
 	const char *wname = widget->name;
 
+	/* 比较时忽略 component name_prefix，方便按裸 widget 名做查找。 */
 	if (component && component->name_prefix)
 		wname += strlen(component->name_prefix) + 1; /* plus space */
 
@@ -3137,6 +3193,10 @@ static int snd_soc_dapm_add_route(struct snd_soc_dapm_context *dapm,
 	wsource	= dapm_wcache_lookup(dapm->wcache_source, source);
 	wsink	= dapm_wcache_lookup(dapm->wcache_sink,   sink);
 
+	/*
+	 * 先走短缓存，再全卡扫描。DAPM 的 route 常常成批插入，
+	 * 这种“最近一次命中的 source/sink”缓存能显著减少重复查找。
+	 */
 	if (wsink && wsource)
 		goto skip_search;
 
@@ -3173,7 +3233,7 @@ static int snd_soc_dapm_add_route(struct snd_soc_dapm_context *dapm,
 					w->name);
 		}
 	}
-	/* use widget from another DAPM context if not found from this */
+	/* 如果本 context 中找不到，就复用另一个 DAPM context 的 widget。 */
 	if (!wsink)
 		wsink = wtsink;
 	if (!wsource)
@@ -3186,10 +3246,11 @@ static int snd_soc_dapm_add_route(struct snd_soc_dapm_context *dapm,
 		goto err;
 
 skip_search:
-	/* update cache */
+	/* 更新缓存。 */
 	dapm->wcache_sink	= wsink;
 	dapm->wcache_source	= wsource;
 
+	/* route 解析到 widget 后，真正把边插入图里的是 dapm_add_path(). */
 	ret = dapm_add_path(dapm, wsource, wsink, route->control,
 		route->connected);
 err:
@@ -3247,6 +3308,7 @@ static int snd_soc_dapm_del_route(struct snd_soc_dapm_context *dapm,
 		struct snd_soc_dapm_widget *wsource = path->source;
 		struct snd_soc_dapm_widget *wsink = path->sink;
 
+		/* 删除 route 时，先把两端节点和路径本身都打脏，再做回收。 */
 		dapm_mark_dirty(wsource, "Route removed");
 		dapm_mark_dirty(wsink, "Route removed");
 		if (path->connect)
@@ -3266,23 +3328,23 @@ static int snd_soc_dapm_del_route(struct snd_soc_dapm_context *dapm,
 }
 
 /**
- * snd_soc_dapm_add_routes - Add routes between DAPM widgets
- * @dapm: DAPM context
- * @route: audio routes
- * @num: number of routes
+ * snd_soc_dapm_add_routes - 添加 DAPM widget 之间的路径
+ * @dapm: DAPM 上下文
+ * @route: 音频路径数组
+ * @num: 路径数量
  *
- * Connects 2 dapm widgets together via a named audio path. The sink is
- * the widget receiving the audio signal, whilst the source is the sender
- * of the audio signal.
+ * 通过命名的音频路径把两个 DAPM widget 连接起来。sink 是接收音频信号的
+ * widget，source 是发送音频信号的 widget。
  *
- * Returns 0 for success else error. On error all resources can be freed
- * with a call to snd_soc_card_free().
+ * 返回：成功时返回 0，失败时返回错误码。出错后资源可通过
+ * snd_soc_card_free() 统一释放。
  */
 int snd_soc_dapm_add_routes(struct snd_soc_dapm_context *dapm,
 			    const struct snd_soc_dapm_route *route, int num)
 {
 	int i, ret = 0;
 
+	/* route 通常批量加载，逐条处理但保留第一个错误返回。 */
 	snd_soc_dapm_mutex_lock(dapm);
 	for (i = 0; i < num; i++) {
 		int r = snd_soc_dapm_add_route(dapm, route);
@@ -3297,12 +3359,12 @@ int snd_soc_dapm_add_routes(struct snd_soc_dapm_context *dapm,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_add_routes);
 
 /**
- * snd_soc_dapm_del_routes - Remove routes between DAPM widgets
- * @dapm: DAPM context
- * @route: audio routes
- * @num: number of routes
+ * snd_soc_dapm_del_routes - 删除 DAPM widget 之间的路径
+ * @dapm: DAPM 上下文
+ * @route: 音频路径数组
+ * @num: 路径数量
  *
- * Removes routes from the DAPM context.
+ * 从 DAPM 上下文中移除路径。
  */
 int snd_soc_dapm_del_routes(struct snd_soc_dapm_context *dapm,
 			    const struct snd_soc_dapm_route *route, int num)
@@ -3321,12 +3383,12 @@ int snd_soc_dapm_del_routes(struct snd_soc_dapm_context *dapm,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_del_routes);
 
 /**
- * snd_soc_dapm_new_widgets - add new dapm widgets
- * @card: card to be checked for new dapm widgets
+ * snd_soc_dapm_new_widgets - 添加新的 DAPM widget
+ * @card: 需要检查新增 DAPM widget 的 card
  *
- * Checks the codec for any new dapm widgets and creates them if found.
+ * 检查 card 里是否存在新的 DAPM widget，如果有则创建。
  *
- * Returns 0 for success.
+ * 返回：成功时返回 0。
  */
 int snd_soc_dapm_new_widgets(struct snd_soc_card *card)
 {
@@ -3335,6 +3397,10 @@ int snd_soc_dapm_new_widgets(struct snd_soc_card *card)
 
 	snd_soc_dapm_mutex_lock_root(card);
 
+	/*
+	 * 新 widget 创建完后并不立刻重算整张图，而是先统一建对象、
+	 * 标脏、挂 debugfs，最后只跑一次 DAPM power walk。
+	 */
 	for_each_card_widgets(card, w)
 	{
 		if (w->new)
@@ -3372,7 +3438,7 @@ int snd_soc_dapm_new_widgets(struct snd_soc_card *card)
 			break;
 		}
 
-		/* Read the initial power state from the device */
+		/* 从设备读取初始电源状态。 */
 		if (w->reg >= 0) {
 			val = dapm_read(w->dapm, w->reg);
 			val = val >> w->shift;
@@ -3394,13 +3460,13 @@ int snd_soc_dapm_new_widgets(struct snd_soc_card *card)
 EXPORT_SYMBOL_GPL(snd_soc_dapm_new_widgets);
 
 /**
- * snd_soc_dapm_get_volsw - dapm mixer get callback
+ * snd_soc_dapm_get_volsw - DAPM mixer 的 get 回调
  * @kcontrol: mixer control
- * @ucontrol: control element information
+ * @ucontrol: control 元素信息
  *
- * Callback to get the value of a dapm mixer control.
+ * 读取 DAPM mixer control 的当前值。
  *
- * Returns 0 for success.
+ * 返回：成功时返回 0。
  */
 int snd_soc_dapm_get_volsw(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_value *ucontrol)
@@ -3416,6 +3482,11 @@ int snd_soc_dapm_get_volsw(struct snd_kcontrol *kcontrol,
 	unsigned int invert = mc->invert;
 	unsigned int reg_val, val, rval = 0;
 
+	/*
+	 * 读取 volume/switch 时有两条路径：
+	 * - widget 已供电：直接读硬件寄存器，得到真实状态
+	 * - widget 未供电：读 DAPM 缓存值，避免把关机态器件强行唤醒
+	 */
 	snd_soc_dapm_mutex_lock(dapm);
 	if (dapm_kcontrol_is_powered(kcontrol) && reg != SND_SOC_NOPM) {
 		reg_val = dapm_read(dapm, reg);
@@ -3452,13 +3523,13 @@ int snd_soc_dapm_get_volsw(struct snd_kcontrol *kcontrol,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_get_volsw);
 
 /**
- * snd_soc_dapm_put_volsw - dapm mixer set callback
+ * snd_soc_dapm_put_volsw - DAPM mixer 的 set 回调
  * @kcontrol: mixer control
- * @ucontrol: control element information
+ * @ucontrol: control 元素信息
  *
- * Callback to set the value of a dapm mixer control.
+ * 设置 DAPM mixer control 的值。
  *
- * Returns 0 for success.
+ * 返回：成功时返回 0。
  */
 int snd_soc_dapm_put_volsw(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_value *ucontrol)
@@ -3480,6 +3551,12 @@ int snd_soc_dapm_put_volsw(struct snd_kcontrol *kcontrol,
 	struct snd_soc_dapm_update *pupdate = NULL;
 	int ret = 0;
 
+	/*
+	 * set 回调要同时处理三件事：
+	 * 1) 更新 DAPM 侧缓存值
+	 * 2) 判断硬件寄存器是否真的需要写
+	 * 3) 如果连通性变化了，要重新跑 DAPM power walk
+	 */
 	val = (ucontrol->value.integer.value[0] & mask);
 	connect = !!val;
 
@@ -3541,13 +3618,13 @@ int snd_soc_dapm_put_volsw(struct snd_kcontrol *kcontrol,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_put_volsw);
 
 /**
- * snd_soc_dapm_get_enum_double - dapm enumerated double mixer get callback
+ * snd_soc_dapm_get_enum_double - DAPM 枚举型双通道 mixer 的 get 回调
  * @kcontrol: mixer control
- * @ucontrol: control element information
+ * @ucontrol: control 元素信息
  *
- * Callback to get the value of a dapm enumerated double mixer control.
+ * 读取 DAPM 枚举型双通道 mixer control 的当前值。
  *
- * Returns 0 for success.
+ * 返回：成功时返回 0。
  */
 int snd_soc_dapm_get_enum_double(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_value *ucontrol)
@@ -3556,6 +3633,7 @@ int snd_soc_dapm_get_enum_double(struct snd_kcontrol *kcontrol,
 	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
 	unsigned int reg_val, val;
 
+	/* 枚举控件同样分“读硬件”与“读缓存”两条路。 */
 	snd_soc_dapm_mutex_lock(dapm);
 	if (e->reg != SND_SOC_NOPM && dapm_kcontrol_is_powered(kcontrol)) {
 		reg_val = dapm_read(dapm, e->reg);
@@ -3577,13 +3655,13 @@ int snd_soc_dapm_get_enum_double(struct snd_kcontrol *kcontrol,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_get_enum_double);
 
 /**
- * snd_soc_dapm_put_enum_double - dapm enumerated double mixer set callback
+ * snd_soc_dapm_put_enum_double - DAPM 枚举型双通道 mixer 的 set 回调
  * @kcontrol: mixer control
- * @ucontrol: control element information
+ * @ucontrol: control 元素信息
  *
- * Callback to set the value of a dapm enumerated double mixer control.
+ * 设置 DAPM 枚举型双通道 mixer control 的值。
  *
- * Returns 0 for success.
+ * 返回：成功时返回 0。
  */
 int snd_soc_dapm_put_enum_double(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_value *ucontrol)
@@ -3598,6 +3676,11 @@ int snd_soc_dapm_put_enum_double(struct snd_kcontrol *kcontrol,
 	struct snd_soc_dapm_update *pupdate = NULL;
 	int ret = 0;
 
+	/*
+	 * 枚举类型的 put 先把 item 转成寄存器值，再按结果决定：
+	 * - 只改图上连通性
+	 * - 或者同时更新寄存器和 DAPM 图
+	 */
 	if (item[0] >= e->items)
 		return -EINVAL;
 
@@ -3638,16 +3721,17 @@ int snd_soc_dapm_put_enum_double(struct snd_kcontrol *kcontrol,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_put_enum_double);
 
 /**
- * snd_soc_dapm_info_pin_switch - Info for a pin switch
+ * snd_soc_dapm_info_pin_switch - pin switch 的信息回调
  *
  * @kcontrol: mixer control
- * @uinfo: control element information
+ * @uinfo: control 元素信息
  *
- * Callback to provide information about a pin switch control.
+ * 提供 pin switch control 的类型和取值范围信息。
  */
 int snd_soc_dapm_info_pin_switch(struct snd_kcontrol *kcontrol,
 				 struct snd_ctl_elem_info *uinfo)
 {
+	/* pin switch 在用户态看来就是一个标准 boolean 开关。 */
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
 	uinfo->count = 1;
 	uinfo->value.integer.min = 0;
@@ -3661,6 +3745,7 @@ static int __snd_soc_dapm_get_pin_switch(struct snd_soc_dapm_context *dapm,
 					 const char *pin,
 					 struct snd_ctl_elem_value *ucontrol)
 {
+	/* 这个 helper 统一做锁保护下的 pin 状态读取。 */
 	snd_soc_dapm_mutex_lock(dapm);
 	ucontrol->value.integer.value[0] = snd_soc_dapm_get_pin_status(dapm, pin);
 	snd_soc_dapm_mutex_unlock(dapm);
@@ -3669,13 +3754,12 @@ static int __snd_soc_dapm_get_pin_switch(struct snd_soc_dapm_context *dapm,
 }
 
 /**
- * snd_soc_dapm_get_pin_switch - Get information for a pin switch
+ * snd_soc_dapm_get_pin_switch - 获取 card 级 pin switch 的状态
  *
  * @kcontrol: mixer control
  * @ucontrol: Value
  *
- * Callback to provide information for a pin switch added at the card
- * level.
+ * 读取 card 级 pin switch 的当前状态。
  */
 int snd_soc_dapm_get_pin_switch(struct snd_kcontrol *kcontrol,
 				struct snd_ctl_elem_value *ucontrol)
@@ -3684,18 +3768,18 @@ int snd_soc_dapm_get_pin_switch(struct snd_kcontrol *kcontrol,
 	struct snd_soc_dapm_context *dapm = snd_soc_card_to_dapm(card);
 	const char *pin = (const char *)kcontrol->private_value;
 
+	/* card 级 pin switch：先从 card 找到 top-level DAPM context。 */
 	return __snd_soc_dapm_get_pin_switch(dapm, pin, ucontrol);
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_get_pin_switch);
 
 /**
- * snd_soc_dapm_get_component_pin_switch - Get information for a pin switch
+ * snd_soc_dapm_get_component_pin_switch - 获取 component 级 pin switch 的状态
  *
  * @kcontrol: mixer control
  * @ucontrol: Value
  *
- * Callback to provide information for a pin switch added at the component
- * level.
+ * 读取 component 级 pin switch 的当前状态。
  */
 int snd_soc_dapm_get_component_pin_switch(struct snd_kcontrol *kcontrol,
 					  struct snd_ctl_elem_value *ucontrol)
@@ -3704,6 +3788,7 @@ int snd_soc_dapm_get_component_pin_switch(struct snd_kcontrol *kcontrol,
 	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
 	const char *pin = (const char *)kcontrol->private_value;
 
+	/* component 级 pin switch：直接在 component 自己的 DAPM 上下文里查。 */
 	return __snd_soc_dapm_get_pin_switch(dapm, pin, ucontrol);
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_get_component_pin_switch);
@@ -3714,6 +3799,10 @@ static int __dapm_put_pin_switch(struct snd_soc_dapm_context *dapm,
 {
 	int ret;
 
+	/*
+	 * pin 状态切换后必须立即做一次 sync，让图上所有 endpoint
+	 * 重新计算，不能只停留在 connected 标志位上。
+	 */
 	snd_soc_dapm_mutex_lock(dapm);
 	ret = __dapm_set_pin(dapm, pin, !!ucontrol->value.integer.value[0]);
 	snd_soc_dapm_mutex_unlock(dapm);
@@ -3724,13 +3813,12 @@ static int __dapm_put_pin_switch(struct snd_soc_dapm_context *dapm,
 }
 
 /**
- * snd_soc_dapm_put_pin_switch - Set information for a pin switch
+ * snd_soc_dapm_put_pin_switch - 设置 card 级 pin switch
  *
  * @kcontrol: mixer control
  * @ucontrol: Value
  *
- * Callback to provide information for a pin switch added at the card
- * level.
+ * 写入 card 级 pin switch 的状态。
  */
 int snd_soc_dapm_put_pin_switch(struct snd_kcontrol *kcontrol,
 				struct snd_ctl_elem_value *ucontrol)
@@ -3739,18 +3827,18 @@ int snd_soc_dapm_put_pin_switch(struct snd_kcontrol *kcontrol,
 	struct snd_soc_dapm_context *dapm = snd_soc_card_to_dapm(card);
 	const char *pin = (const char *)kcontrol->private_value;
 
+	/* card 级 pin switch 的写入路径。 */
 	return __dapm_put_pin_switch(dapm, pin, ucontrol);
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_put_pin_switch);
 
 /**
- * snd_soc_dapm_put_component_pin_switch - Set information for a pin switch
+ * snd_soc_dapm_put_component_pin_switch - 设置 component 级 pin switch
  *
  * @kcontrol: mixer control
  * @ucontrol: Value
  *
- * Callback to provide information for a pin switch added at the component
- * level.
+ * 写入 component 级 pin switch 的状态。
  */
 int snd_soc_dapm_put_component_pin_switch(struct snd_kcontrol *kcontrol,
 					  struct snd_ctl_elem_value *ucontrol)
@@ -3759,6 +3847,7 @@ int snd_soc_dapm_put_component_pin_switch(struct snd_kcontrol *kcontrol,
 	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
 	const char *pin = (const char *)kcontrol->private_value;
 
+	/* component 级 pin switch 的写入路径。 */
 	return __dapm_put_pin_switch(dapm, pin, ucontrol);
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_put_component_pin_switch);
@@ -3772,6 +3861,10 @@ snd_soc_dapm_new_control_unlocked(struct snd_soc_dapm_context *dapm,
 	struct snd_soc_dapm_widget *w;
 	int ret = -ENOMEM;
 
+	/*
+	 * 这里把模板 widget 复制成真正的运行时 widget，并按 widget 类型
+	 * 绑定 regulator/pinctrl/clock/endpoint 语义。
+	 */
 	w = dapm_cnew_widget(widget, dapm_prefix(dapm));
 	if (!w)
 		goto cnew_failed;
@@ -3885,7 +3978,7 @@ snd_soc_dapm_new_control_unlocked(struct snd_soc_dapm_context *dapm,
 	w->dapm = dapm;
 	INIT_LIST_HEAD(&w->list);
 	INIT_LIST_HEAD(&w->dirty);
-	/* see for_each_card_widgets */
+	/* 供 for_each_card_widgets() 遍历使用。 */
 	list_add_tail(&w->list, &dapm->card->widgets);
 
 	dapm_for_each_direction(dir) {
@@ -3908,13 +4001,13 @@ cnew_failed:
 }
 
 /**
- * snd_soc_dapm_new_control - create new dapm control
- * @dapm: DAPM context
- * @widget: widget template
+ * snd_soc_dapm_new_control - 创建新的 DAPM control
+ * @dapm: DAPM 上下文
+ * @widget: widget 模板
  *
- * Creates new DAPM control based upon a template.
+ * 根据模板创建一个新的 DAPM control。
  *
- * Returns a widget pointer on success or an error pointer on failure
+ * 返回：成功时返回 widget 指针，失败时返回错误指针。
  */
 struct snd_soc_dapm_widget *
 snd_soc_dapm_new_control(struct snd_soc_dapm_context *dapm,
@@ -3931,14 +4024,14 @@ snd_soc_dapm_new_control(struct snd_soc_dapm_context *dapm,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_new_control);
 
 /**
- * snd_soc_dapm_new_controls - create new dapm controls
- * @dapm: DAPM context
- * @widget: widget array
- * @num: number of widgets
+ * snd_soc_dapm_new_controls - 创建一组新的 DAPM control
+ * @dapm: DAPM 上下文
+ * @widget: widget 数组
+ * @num: widget 数量
  *
- * Creates new DAPM controls based upon the templates.
+ * 根据模板批量创建 DAPM control。
  *
- * Returns 0 for success else error.
+ * 返回：成功时返回 0，否则返回错误码。
  */
 int snd_soc_dapm_new_controls(struct snd_soc_dapm_context *dapm,
 	const struct snd_soc_dapm_widget *widget,
@@ -3974,13 +4067,11 @@ static int dapm_dai_link_event_pre_pmu(struct snd_soc_dapm_widget *w,
 	int ret;
 
 	/*
-	 * NOTE
+	 * 注意：
 	 *
-	 * snd_pcm_hw_params is quite large (608 bytes on arm64) and is
-	 * starting to get a bit excessive for allocation on the stack,
-	 * especially when you're building with some of the KASAN type
-	 * stuff that increases stack usage.
-	 * So, we use kzalloc()/kfree() for params in this function.
+	 * snd_pcm_hw_params 在 arm64 上已经很大（608 字节），如果再叠加
+	 * KASAN 一类会增加栈占用的配置，把它放在栈上分配已经有点过量了。
+	 * 所以这个函数里用 kzalloc()/kfree() 来保存 params。
 	 */
 	struct snd_pcm_hw_params *params __free(kfree) = kzalloc_obj(*params);
 	if (!params)
@@ -4027,7 +4118,7 @@ static int dapm_dai_link_event_pre_pmu(struct snd_soc_dapm_widget *w,
 		return -EINVAL;
 	}
 
-	/* Be a little careful as we don't want to overflow the mask array */
+	/* 这里要稍微小心，避免 mask 数组溢出。 */
 	if (!config->formats) {
 		dev_warn(dev, "ASoC: Invalid format was specified\n");
 
@@ -4163,7 +4254,7 @@ static int dapm_dai_link_event(struct snd_soc_dapm_widget *w,
 	}
 
 out:
-	/* Restore the substream direction */
+	/* 恢复 substream 的方向。 */
 	substream->stream = saved_stream;
 	return ret;
 }
@@ -4185,7 +4276,7 @@ static int dapm_dai_link_put(struct snd_kcontrol *kcontrol,
 	struct snd_soc_dapm_widget *w = snd_kcontrol_chip(kcontrol);
 	struct snd_soc_pcm_runtime *rtd = w->priv;
 
-	/* Can't change the config when widget is already powered */
+	/* widget 已经上电时不能再修改配置。 */
 	if (w->power)
 		return -EBUSY;
 
@@ -4269,7 +4360,7 @@ dapm_alloc_kcontrol(struct snd_soc_card *card,
 		goto outfree_w_param;
 	}
 	kcontrol_dai_link[0].private_value = *private_value;
-	/* duplicate kcontrol_dai_link on heap so that memory persists */
+	/* 在堆上复制一份 kcontrol_dai_link，确保内存能够持续保留。 */
 	kcontrol_news = devm_kmemdup(card->dev, &kcontrol_dai_link[0],
 					sizeof(struct snd_kcontrol_new),
 					GFP_KERNEL);
@@ -4306,7 +4397,10 @@ static struct snd_soc_dapm_widget *dapm_new_dai(struct snd_soc_card *card,
 	if (!link_name)
 		goto name_fail;
 
-	/* allocate memory for control, only in case of multiple configs */
+	/*
+	 * 只有在 codec2codec 存在多个配置时，才需要额外分配一个枚举控制。
+	 * 普通单配置链路只需要一个普通 DAI link widget。
+	 */
 	w_param_text	= NULL;
 	kcontrol_news	= NULL;
 	num_kcontrols	= 0;
@@ -4338,6 +4432,7 @@ static struct snd_soc_dapm_widget *dapm_new_dai(struct snd_soc_card *card,
 
 	dev_dbg(card->dev, "ASoC: adding %s widget\n", link_name);
 
+	/* 这个 widget 是 codec2codec 链路的中间锚点，供 DAPM 事件和控制挂接。 */
 	w = snd_soc_dapm_new_control_unlocked(dapm, &template);
 	if (IS_ERR(w)) {
 		ret = PTR_ERR(w);
@@ -4361,11 +4456,11 @@ name_fail:
 }
 
 /**
- * snd_soc_dapm_new_dai_widgets - Create new DAPM widgets
- * @dapm: DAPM context
- * @dai: parent DAI
+ * snd_soc_dapm_new_dai_widgets - 创建新的 DAPM DAI widget
+ * @dapm: DAPM 上下文
+ * @dai: 父 DAI
  *
- * Returns 0 on success, error code otherwise.
+ * 返回：成功时返回 0，否则返回错误码。
  */
 int snd_soc_dapm_new_dai_widgets(struct snd_soc_dapm_context *dapm,
 				 struct snd_soc_dai *dai)
@@ -4379,6 +4474,10 @@ int snd_soc_dapm_new_dai_widgets(struct snd_soc_dapm_context *dapm,
 	memset(&template, 0, sizeof(template));
 	template.reg = SND_SOC_NOPM;
 
+	/*
+	 * 每个 DAI 的 playback/capture stream 都会变成一个专用 widget，
+	 * 后续的 DAI link 连接、stream event 都依赖这两个锚点。
+	 */
 	if (dai->driver->playback.stream_name) {
 		template.id = snd_soc_dapm_dai_in;
 		template.name = dai->driver->playback.stream_name;
@@ -4421,7 +4520,7 @@ int snd_soc_dapm_link_dai_widgets(struct snd_soc_card *card)
 	struct snd_soc_dapm_widget *src, *sink;
 	struct snd_soc_dai *dai;
 
-	/* For each DAI widget... */
+	/* 对每个 DAI widget 分别处理。 */
 	for_each_card_widgets(card, dai_w) {
 		switch (dai_w->id) {
 		case snd_soc_dapm_dai_in:
@@ -4431,7 +4530,7 @@ int snd_soc_dapm_link_dai_widgets(struct snd_soc_card *card)
 			continue;
 		}
 
-		/* let users know there is no DAI to link */
+		/* 让用户知道这里没有可连接的 DAI。 */
 		if (!dai_w->priv) {
 			dev_dbg(card->dev, "dai widget %s has no DAI\n",
 				dai_w->name);
@@ -4440,7 +4539,7 @@ int snd_soc_dapm_link_dai_widgets(struct snd_soc_card *card)
 
 		dai = dai_w->priv;
 
-		/* ...find all widgets with the same stream and link them */
+		/* 在同一个 DAPM context 内找同 stream 的普通 widget，然后建立静态连边。 */
 		for_each_card_widgets(card, w) {
 			if (w->dapm != dai_w->dapm)
 				continue;
@@ -4464,6 +4563,7 @@ int snd_soc_dapm_link_dai_widgets(struct snd_soc_card *card)
 				sink = dai_w;
 			}
 			dev_dbg(dai->dev, "%s -> %s\n", src->name, sink->name);
+			/* 这里插入的是“DAI widget 到普通 widget”的静态连边。 */
 			dapm_add_path(w->dapm, src, sink, NULL, NULL);
 		}
 	}
@@ -4484,6 +4584,10 @@ static void dapm_connect_dai_routes(struct snd_soc_dapm_context *dapm,
 		src_dai->component->name, src->name,
 		sink_dai->component->name, sink->name);
 
+	/*
+	 * 对于 codec2codec 链路，中间可能要先挂一个专用 DAI widget；
+	 * 普通链路则直接把 src 和 sink 连接起来。
+	 */
 	if (dai) {
 		dapm_add_path(dapm, src, dai, NULL, NULL);
 		src = dai;
@@ -4513,14 +4617,14 @@ static void dapm_connect_dai_pair(struct snd_soc_card *card,
 		stream_cpu	= snd_soc_get_stream_cpu(dai_link, stream);
 		stream_codec	= stream;
 
-		/* connect BE DAI playback if widgets are valid */
+		/* 只有 CPU/Codec 两端对应的 DAI widget 都存在，才能建立这条 route。 */
 		cpu	= snd_soc_dai_get_widget(cpu_dai,	stream_cpu);
 		codec	= snd_soc_dai_get_widget(codec_dai,	stream_codec);
 
 		if (!cpu || !codec)
 			continue;
 
-		/* special handling for [Codec2Codec] */
+		/* codec2codec 场景下，每个 stream 都可能需要单独的中间 widget。 */
 		if (dai_link->c2c_params && !rtd->c2c_widget[stream]) {
 			struct snd_pcm_substream *substream = rtd->pcm->streams[stream].substream;
 			struct snd_soc_dapm_widget *dai = dapm_new_dai(card, substream,
@@ -4532,6 +4636,7 @@ static void dapm_connect_dai_pair(struct snd_soc_card *card,
 			rtd->c2c_widget[stream] = dai;
 		}
 
+		/* 每个流方向都单独建立一条 DAPM route。 */
 		dapm_connect_dai_routes(dapm, src_dai[stream], *src[stream],
 					rtd->c2c_widget[stream],
 					sink_dai[stream], *sink[stream]);
@@ -4547,6 +4652,7 @@ static void dapm_dai_stream_event(struct snd_soc_dai *dai, int stream, int event
 	if (w) {
 		unsigned int ep;
 
+		/* stream start/stop 会改变 widget 的活跃状态，必须标脏后重算。 */
 		dapm_mark_dirty(w, "stream event");
 
 		if (w->id == snd_soc_dapm_dai_in) {
@@ -4611,6 +4717,7 @@ static void dapm_stream_event(struct snd_soc_pcm_runtime *rtd, int stream, int e
 	struct snd_soc_dai *dai;
 	int i;
 
+	/* runtime 级 stream event 先分发给所有 DAI，再统一跑一次 power walk。 */
 	for_each_rtd_dais(rtd, i, dai)
 		dapm_dai_stream_event(dai, stream, event);
 
@@ -4618,21 +4725,21 @@ static void dapm_stream_event(struct snd_soc_pcm_runtime *rtd, int stream, int e
 }
 
 /**
- * snd_soc_dapm_stream_event - send a stream event to the dapm core
- * @rtd: PCM runtime data
- * @stream: stream name
- * @event: stream event
+ * snd_soc_dapm_stream_event - 向 DAPM core 发送流事件
+ * @rtd: PCM runtime 数据
+ * @stream: 流方向
+ * @event: 流事件
  *
- * Sends a stream event to the dapm core. The core then makes any
- * necessary widget power changes.
+ * 向 DAPM core 发送流事件，core 会据此做必要的 widget 上下电切换。
  *
- * Returns 0 for success else error.
+ * 返回：成功时返回 0，否则返回错误码。
  */
 void snd_soc_dapm_stream_event(struct snd_soc_pcm_runtime *rtd, int stream,
 			      int event)
 {
 	struct snd_soc_card *card = rtd->card;
 
+	/* 对外接口先加卡级锁，再进入内部的 DAPM 事件分发。 */
 	snd_soc_dapm_mutex_lock(card);
 	dapm_stream_event(rtd, stream, event);
 	snd_soc_dapm_mutex_unlock(card);
@@ -4662,17 +4769,16 @@ void snd_soc_dapm_stream_stop(struct snd_soc_pcm_runtime *rtd, int stream)
 EXPORT_SYMBOL_GPL(snd_soc_dapm_stream_stop);
 
 /**
- * snd_soc_dapm_enable_pin_unlocked - enable pin.
- * @dapm: DAPM context
- * @pin: pin name
+ * snd_soc_dapm_enable_pin_unlocked - 使能 pin
+ * @dapm: DAPM 上下文
+ * @pin: pin 名称
  *
- * Enables input/output pin and its parents or children widgets iff there is
- * a valid audio route and active audio stream.
+ * 如果存在有效音频路径且有活跃音频流，则使能输入/输出 pin 及其父/子 widget。
  *
- * Requires external locking.
+ * 需要外部锁保护。
  *
- * NOTE: snd_soc_dapm_sync() needs to be called after this for DAPM to
- * do any widget power switching.
+ * 注意：之后需要调用 snd_soc_dapm_sync()，DAPM 才会真正执行
+ * widget 上下电切换。
  */
 int snd_soc_dapm_enable_pin_unlocked(struct snd_soc_dapm_context *dapm,
 				   const char *pin)
@@ -4682,15 +4788,14 @@ int snd_soc_dapm_enable_pin_unlocked(struct snd_soc_dapm_context *dapm,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_enable_pin_unlocked);
 
 /**
- * snd_soc_dapm_enable_pin - enable pin.
- * @dapm: DAPM context
- * @pin: pin name
+ * snd_soc_dapm_enable_pin - 使能 pin
+ * @dapm: DAPM 上下文
+ * @pin: pin 名称
  *
- * Enables input/output pin and its parents or children widgets iff there is
- * a valid audio route and active audio stream.
+ * 如果存在有效音频路径且有活跃音频流，则使能输入/输出 pin 及其父/子 widget。
  *
- * NOTE: snd_soc_dapm_sync() needs to be called after this for DAPM to
- * do any widget power switching.
+ * 注意：之后需要调用 snd_soc_dapm_sync()，DAPM 才会真正执行
+ * widget 上下电切换。
  */
 int snd_soc_dapm_enable_pin(struct snd_soc_dapm_context *dapm, const char *pin)
 {
@@ -4707,18 +4812,17 @@ int snd_soc_dapm_enable_pin(struct snd_soc_dapm_context *dapm, const char *pin)
 EXPORT_SYMBOL_GPL(snd_soc_dapm_enable_pin);
 
 /**
- * snd_soc_dapm_force_enable_pin_unlocked - force a pin to be enabled
- * @dapm: DAPM context
- * @pin: pin name
+ * snd_soc_dapm_force_enable_pin_unlocked - 强制使能 pin
+ * @dapm: DAPM 上下文
+ * @pin: pin 名称
  *
- * Enables input/output pin regardless of any other state.  This is
- * intended for use with microphone bias supplies used in microphone
- * jack detection.
+ * 不考虑其他状态，强制使能输入/输出 pin。通常用于麦克风 bias 供电，
+ * 以及麦克风 jack 检测场景。
  *
- * Requires external locking.
+ * 需要外部锁保护。
  *
- * NOTE: snd_soc_dapm_sync() needs to be called after this for DAPM to
- * do any widget power switching.
+ * 注意：之后需要调用 snd_soc_dapm_sync()，DAPM 才会真正执行
+ * widget 上下电切换。
  */
 int snd_soc_dapm_force_enable_pin_unlocked(struct snd_soc_dapm_context *dapm,
 					 const char *pin)
@@ -4753,16 +4857,15 @@ int snd_soc_dapm_force_enable_pin_unlocked(struct snd_soc_dapm_context *dapm,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_force_enable_pin_unlocked);
 
 /**
- * snd_soc_dapm_force_enable_pin - force a pin to be enabled
- * @dapm: DAPM context
- * @pin: pin name
+ * snd_soc_dapm_force_enable_pin - 强制使能 pin
+ * @dapm: DAPM 上下文
+ * @pin: pin 名称
  *
- * Enables input/output pin regardless of any other state.  This is
- * intended for use with microphone bias supplies used in microphone
- * jack detection.
+ * 不考虑其他状态，强制使能输入/输出 pin。通常用于麦克风 bias 供电，
+ * 以及麦克风 jack 检测场景。
  *
- * NOTE: snd_soc_dapm_sync() needs to be called after this for DAPM to
- * do any widget power switching.
+ * 注意：之后需要调用 snd_soc_dapm_sync()，DAPM 才会真正执行
+ * widget 上下电切换。
  */
 int snd_soc_dapm_force_enable_pin(struct snd_soc_dapm_context *dapm,
 				  const char *pin)
@@ -4780,16 +4883,16 @@ int snd_soc_dapm_force_enable_pin(struct snd_soc_dapm_context *dapm,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_force_enable_pin);
 
 /**
- * snd_soc_dapm_disable_pin_unlocked - disable pin.
- * @dapm: DAPM context
- * @pin: pin name
+ * snd_soc_dapm_disable_pin_unlocked - 禁用 pin
+ * @dapm: DAPM 上下文
+ * @pin: pin 名称
  *
- * Disables input/output pin and its parents or children widgets.
+ * 禁用输入/输出 pin 及其父/子 widget。
  *
- * Requires external locking.
+ * 需要外部锁保护。
  *
- * NOTE: snd_soc_dapm_sync() needs to be called after this for DAPM to
- * do any widget power switching.
+ * 注意：之后需要调用 snd_soc_dapm_sync()，DAPM 才会真正执行
+ * widget 上下电切换。
  */
 int snd_soc_dapm_disable_pin_unlocked(struct snd_soc_dapm_context *dapm,
 				    const char *pin)
@@ -4799,14 +4902,14 @@ int snd_soc_dapm_disable_pin_unlocked(struct snd_soc_dapm_context *dapm,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_disable_pin_unlocked);
 
 /**
- * snd_soc_dapm_disable_pin - disable pin.
- * @dapm: DAPM context
- * @pin: pin name
+ * snd_soc_dapm_disable_pin - 禁用 pin
+ * @dapm: DAPM 上下文
+ * @pin: pin 名称
  *
- * Disables input/output pin and its parents or children widgets.
+ * 禁用输入/输出 pin 及其父/子 widget。
  *
- * NOTE: snd_soc_dapm_sync() needs to be called after this for DAPM to
- * do any widget power switching.
+ * 注意：之后需要调用 snd_soc_dapm_sync()，DAPM 才会真正执行
+ * widget 上下电切换。
  */
 int snd_soc_dapm_disable_pin(struct snd_soc_dapm_context *dapm,
 			     const char *pin)
@@ -4824,19 +4927,20 @@ int snd_soc_dapm_disable_pin(struct snd_soc_dapm_context *dapm,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_disable_pin);
 
 /**
- * snd_soc_dapm_get_pin_status - get audio pin status
- * @dapm: DAPM context
- * @pin: audio signal pin endpoint (or start point)
+ * snd_soc_dapm_get_pin_status - 获取音频 pin 状态
+ * @dapm: DAPM 上下文
+ * @pin: 音频信号 pin 的端点（或起点）
  *
- * Get audio pin status - connected or disconnected.
+ * 获取音频 pin 的连接状态：已连接或未连接。
  *
- * Returns 1 for connected otherwise 0.
+ * 返回：已连接返回 1，否则返回 0。
  */
 int snd_soc_dapm_get_pin_status(struct snd_soc_dapm_context *dapm,
 				const char *pin)
 {
 	struct snd_soc_dapm_widget *w = dapm_find_widget(dapm, pin, true);
 
+	/* 只是查询逻辑状态，不触发重算。 */
 	if (w)
 		return w->connected;
 
@@ -4845,15 +4949,14 @@ int snd_soc_dapm_get_pin_status(struct snd_soc_dapm_context *dapm,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_get_pin_status);
 
 /**
- * snd_soc_dapm_ignore_suspend - ignore suspend status for DAPM endpoint
- * @dapm: DAPM context
- * @pin: audio signal pin endpoint (or start point)
+ * snd_soc_dapm_ignore_suspend - 让 DAPM 端点忽略 suspend
+ * @dapm: DAPM 上下文
+ * @pin: 音频信号 pin 的端点（或起点）
  *
- * Mark the given endpoint or pin as ignoring suspend.  When the
- * system is disabled a path between two endpoints flagged as ignoring
- * suspend will not be disabled.  The path must already be enabled via
- * normal means at suspend time, it will not be turned on if it was not
- * already enabled.
+ * 把给定端点或 pin 标记为忽略 suspend。系统进入 suspend 时，
+ * 连接两个被标记为忽略 suspend 的端点之间的路径不会被关闭。
+ * 但该路径必须在 suspend 前就已经通过正常方式处于启用状态，
+ * 如果本来没启用，不会自动帮你打开。
  */
 int snd_soc_dapm_ignore_suspend(struct snd_soc_dapm_context *dapm,
 				const char *pin)
@@ -4861,6 +4964,10 @@ int snd_soc_dapm_ignore_suspend(struct snd_soc_dapm_context *dapm,
 	struct device *dev = snd_soc_dapm_to_dev(dapm);
 	struct snd_soc_dapm_widget *w = dapm_find_widget(dapm, pin, false);
 
+	/*
+	 * 这个标志只影响 suspend/resume 期间的图裁剪，
+	 * 不会主动把路径打开，也不会替用户补连通性。
+	 */
 	if (!w) {
 		dev_err(dev, "ASoC: unknown pin %s\n", pin);
 		return -EINVAL;
@@ -4873,13 +4980,14 @@ int snd_soc_dapm_ignore_suspend(struct snd_soc_dapm_context *dapm,
 EXPORT_SYMBOL_GPL(snd_soc_dapm_ignore_suspend);
 
 /**
- * snd_soc_dapm_free - free dapm resources
- * @dapm: DAPM context
+ * snd_soc_dapm_free - 释放 DAPM 资源
+ * @dapm: DAPM 上下文
  *
- * Free all dapm widgets and resources.
+ * 释放所有 DAPM widget 和相关资源。
  */
 void snd_soc_dapm_free(struct snd_soc_dapm_context *dapm)
 {
+	/* 先清 debugfs，再拆 widget 和路径，最后摘掉 context 链表。 */
 	dapm_debugfs_cleanup(dapm);
 	dapm_free_widgets(dapm);
 	list_del(&dapm->list);
@@ -4897,7 +5005,7 @@ void snd_soc_dapm_init(struct snd_soc_dapm_context *dapm,
 		dapm->idle_bias		= component->driver->idle_bias_on;
 
 	INIT_LIST_HEAD(&dapm->list);
-	/* see for_each_card_dapms */
+	/* 供 for_each_card_dapms() 遍历使用。 */
 	list_add(&dapm->list, &card->dapm_list);
 }
 
@@ -4920,9 +5028,7 @@ static void dapm_shutdown(struct snd_soc_dapm_context *dapm)
 		}
 	}
 
-	/* If there were no widgets to power down we're already in
-	 * standby.
-	 */
+	/* 如果没有需要下电的 widget，系统其实已经处于 standby。 */
 	if (powerdown) {
 		if (dapm->bias_level == SND_SOC_BIAS_ON)
 			snd_soc_dapm_set_bias_level(dapm,
@@ -4957,7 +5063,7 @@ void snd_soc_dapm_shutdown(struct snd_soc_card *card)
 		snd_soc_dapm_set_bias_level(card_dapm, SND_SOC_BIAS_OFF);
 }
 
-/* Module information */
+/* 模块信息。 */
 MODULE_AUTHOR("Liam Girdwood, lrg@slimlogic.co.uk");
 MODULE_DESCRIPTION("Dynamic Audio Power Management core for ALSA SoC");
 MODULE_LICENSE("GPL");

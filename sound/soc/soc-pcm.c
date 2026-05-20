@@ -26,6 +26,11 @@
 #include <sound/soc-link.h>
 #include <sound/initval.h>
 
+/*
+ * soc-pcm.c 负责 PCM 数据面的核心实现：
+ * open / hw_params / prepare / trigger / pointer / mmap / copy 等
+ * 都会经过这里，再分发给 card、DAI 和 component 的具体回调。
+ */
 #define soc_pcm_ret(rtd, ret) _soc_pcm_ret(rtd, __func__, ret)
 static inline int _soc_pcm_ret(struct snd_soc_pcm_runtime *rtd,
 			       const char *func, int ret)
@@ -48,6 +53,7 @@ static int snd_soc_dpcm_can_fe_update(struct snd_soc_pcm_runtime *fe, int stream
 static int snd_soc_dpcm_can_be_update(struct snd_soc_pcm_runtime *fe,
 			       struct snd_soc_pcm_runtime *be, int stream)
 {
+	/* 只有 FE 主导更新，或者 BE 自己也处于更新协商中，才允许继续。 */
 	if ((fe->dpcm[stream].runtime_update == SND_SOC_DPCM_UPDATE_FE) ||
 	    ((fe->dpcm[stream].runtime_update == SND_SOC_DPCM_UPDATE_BE) &&
 	     be->dpcm[stream].runtime_update))
@@ -66,6 +72,7 @@ static int snd_soc_dpcm_check_state(struct snd_soc_pcm_runtime *fe,
 	int ret = 1;
 	int i;
 
+	/* 同一个 BE 后面挂着的其它 FE 不能已经处在冲突状态。 */
 	for_each_dpcm_fe(be, stream, dpcm) {
 
 		if (dpcm->fe == fe)
@@ -97,6 +104,7 @@ static int snd_soc_dpcm_can_be_free_stop(struct snd_soc_pcm_runtime *fe,
 		SND_SOC_DPCM_STATE_SUSPEND,
 	};
 
+	/* STOP / HW_FREE 只能在其他 FE 没有处于活动态时执行。 */
 	return snd_soc_dpcm_check_state(fe, be, stream, state, ARRAY_SIZE(state));
 }
 
@@ -114,6 +122,7 @@ static int snd_soc_dpcm_can_be_params(struct snd_soc_pcm_runtime *fe,
 		SND_SOC_DPCM_STATE_PREPARE,
 	};
 
+	/* hw_params 要求更严格，避免正在准备/运行的链路被重配。 */
 	return snd_soc_dpcm_check_state(fe, be, stream, state, ARRAY_SIZE(state));
 }
 
@@ -130,6 +139,7 @@ static int snd_soc_dpcm_can_be_prepared(struct snd_soc_pcm_runtime *fe,
 		SND_SOC_DPCM_STATE_PREPARE,
 	};
 
+	/* prepare 阶段也不能和已有活动 FE 冲突。 */
 	return snd_soc_dpcm_check_state(fe, be, stream, state, ARRAY_SIZE(state));
 }
 
@@ -137,15 +147,18 @@ static int snd_soc_dpcm_can_be_prepared(struct snd_soc_pcm_runtime *fe,
 
 static inline const char *soc_cpu_dai_name(struct snd_soc_pcm_runtime *rtd)
 {
+	/* 单 CPU 时显示真实名字，多 CPU 时用统一标签便于 debugfs 输出。 */
 	return (rtd)->dai_link->num_cpus == 1 ? snd_soc_rtd_to_cpu(rtd, 0)->name : "multicpu";
 }
 static inline const char *soc_codec_dai_name(struct snd_soc_pcm_runtime *rtd)
 {
+	/* 单 CODEC 时显示真实名字，多 CODEC 时退化为 multicodec。 */
 	return (rtd)->dai_link->num_codecs == 1 ? snd_soc_rtd_to_codec(rtd, 0)->name : "multicodec";
 }
 
 static const char *dpcm_state_string(enum snd_soc_dpcm_state state)
 {
+	/* debugfs 和 trace 里直接展示的状态字符串。 */
 	switch (state) {
 	case SND_SOC_DPCM_STATE_NEW:
 		return "new";
@@ -180,7 +193,7 @@ static ssize_t dpcm_show_state(struct snd_soc_pcm_runtime *fe,
 	struct snd_soc_dpcm *dpcm;
 	ssize_t offset = 0;
 
-	/* FE state */
+	/* 先打印 FE 自身状态，再列出它绑定的所有 BE。 */
 	offset += scnprintf(buf + offset, size - offset,
 			   "[%s - %s]\n", fe->dai_link->name,
 			   stream ? "Capture" : "Playback");
@@ -238,6 +251,7 @@ static ssize_t dpcm_state_read_file(struct file *file, char __user *user_buf,
 	int stream;
 	char *buf;
 
+	/* debugfs 先生成一份完整文本，再一次性回传给用户态。 */
 	if (fe->dai_link->num_cpus > 1)
 		return snd_soc_ret(fe->dev, -EINVAL,
 			"%s doesn't support Multi CPU yet\n", __func__);
@@ -268,6 +282,7 @@ static const struct file_operations dpcm_state_fops = {
 
 void soc_dpcm_debugfs_add(struct snd_soc_pcm_runtime *rtd)
 {
+	/* 只有动态 FE/BE 连接才暴露 DPCM debugfs。 */
 	if (!rtd->dai_link->dynamic)
 		return;
 
@@ -285,6 +300,7 @@ static void dpcm_create_debugfs_state(struct snd_soc_dpcm *dpcm, int stream)
 {
 	char *name;
 
+	/* 每个 BE stream 都创建独立的状态目录，便于定位问题。 */
 	name = kasprintf(GFP_KERNEL, "%s:%s", dpcm->be->dai_link->name,
 			 snd_pcm_direction_name(stream));
 	if (name) {
@@ -298,6 +314,7 @@ static void dpcm_create_debugfs_state(struct snd_soc_dpcm *dpcm, int stream)
 
 static void dpcm_remove_debugfs_state(struct snd_soc_dpcm *dpcm)
 {
+	/* debugfs 节点按树递归删除。 */
 	debugfs_remove_recursive(dpcm->debugfs_state);
 }
 
@@ -324,6 +341,7 @@ static void dpcm_set_fe_update_state(struct snd_soc_pcm_runtime *fe,
 	struct snd_pcm_substream *substream =
 		snd_soc_dpcm_get_substream(fe, stream);
 
+	/* FE 更新状态需要持有 substream 锁，避免和 trigger 竞态。 */
 	snd_pcm_stream_lock_irq(substream);
 	if (state == SND_SOC_DPCM_UPDATE_NO && fe->dpcm[stream].trigger_pending) {
 		dpcm_fe_dai_do_trigger(substream,
@@ -337,6 +355,7 @@ static void dpcm_set_fe_update_state(struct snd_soc_pcm_runtime *fe,
 static void dpcm_set_be_update_state(struct snd_soc_pcm_runtime *be,
 				     int stream, enum snd_soc_dpcm_update state)
 {
+	/* BE 的更新状态由 FE 侧调度后直接写入。 */
 	be->dpcm[stream].runtime_update = state;
 }
 
@@ -360,6 +379,7 @@ void snd_soc_runtime_action(struct snd_soc_pcm_runtime *rtd,
 	struct snd_soc_dai *dai;
 	int i;
 
+	/* runtime 既要更新 DAI，也要更新没有 DAI 的 component 活跃计数。 */
 	snd_soc_dpcm_mutex_assert_held(rtd);
 
 	for_each_rtd_dais(rtd, i, dai)
@@ -388,6 +408,7 @@ bool snd_soc_runtime_ignore_pmdown_time(struct snd_soc_pcm_runtime *rtd)
 	struct snd_soc_component *component;
 	int i;
 
+	/* 如果任一 component 依赖 pmdown_time，就不能忽略关流延迟。 */
 	if (!rtd->pmdown_time || rtd->dai_link->ignore_pmdown_time)
 		return true;
 
@@ -404,6 +425,7 @@ void dpcm_dapm_stream_event(struct snd_soc_pcm_runtime *fe, int dir, int event)
 {
 	struct snd_soc_dpcm *dpcm;
 
+	/* 先让 BE 进入正确电源状态，再通知 FE。 */
 	snd_soc_dpcm_mutex_assert_held(fe);
 
 	for_each_dpcm_be(fe, dir, dpcm) {
@@ -426,6 +448,7 @@ void dpcm_dapm_stream_event(struct snd_soc_pcm_runtime *fe, int dir, int event)
 void soc_pcm_set_dai_params(struct snd_soc_dai *dai,
 			    struct snd_pcm_hw_params *params)
 {
+	/* 把 hw_params 里的关键对称性参数缓存到 DAI 上。 */
 	if (params) {
 		dai->symmetric_rate	   = params_rate(params);
 		dai->symmetric_channels	   = params_channels(params);
@@ -443,6 +466,7 @@ static int soc_pcm_apply_symmetry(struct snd_pcm_substream *substream,
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	int ret;
 
+	/* 只有目标 DAI 已经活跃，才需要把对称性约束强行下发。 */
 	if (!snd_soc_dai_active(soc_dai))
 		return 0;
 
@@ -476,6 +500,7 @@ static int soc_pcm_params_symmetry(struct snd_pcm_substream *substream,
 	struct snd_soc_dai *cpu_dai;
 	unsigned int symmetry, i;
 
+	/* 对称性检查会拒绝和现有 CPU DAI 不一致的新参数。 */
 	d.name = __func__;
 	soc_pcm_set_dai_params(&d, params);
 
@@ -509,6 +534,7 @@ static void soc_pcm_update_symmetry(struct snd_pcm_substream *substream)
 	struct snd_soc_dai *dai;
 	unsigned int symmetry, i;
 
+	/* 只要任意一侧要求对称，就把 runtime 标记成 joint duplex。 */
 	symmetry = link->symmetric_rate ||
 		link->symmetric_channels ||
 		link->symmetric_sample_bits;
@@ -528,6 +554,7 @@ static void soc_pcm_set_msb(struct snd_pcm_substream *substream, int bits)
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	int ret;
 
+	/* MSB 约束常用于把有效位宽钉死，避免位对齐出错。 */
 	if (!bits)
 		return;
 
@@ -546,6 +573,7 @@ static void soc_pcm_apply_msb(struct snd_pcm_substream *substream)
 	int i;
 	unsigned int bits = 0, cpu_bits = 0;
 
+	/* CPU / CODEC 两边分别取最大有效位宽，确保约束足够保守。 */
 	for_each_rtd_codec_dais(rtd, i, codec_dai) {
 		const struct snd_soc_pcm_stream *pcm_codec = snd_soc_dai_get_pcm_stream(codec_dai, stream);
 
@@ -572,6 +600,7 @@ static void soc_pcm_apply_msb(struct snd_pcm_substream *substream)
 
 static void soc_pcm_hw_init(struct snd_pcm_hardware *hw, bool force)
 {
+	/* 先初始化为尽可能开放的硬件约束，再逐步收窄。 */
 	if (force) {
 		hw->rates = UINT_MAX;
 		hw->rate_min = 0;
@@ -595,6 +624,7 @@ static void soc_pcm_hw_init(struct snd_pcm_hardware *hw, bool force)
 static void soc_pcm_hw_update_rate(struct snd_pcm_hardware *hw,
 				   const struct snd_soc_pcm_stream *p)
 {
+	/* 采样率约束先取交集，再同步更新 min/max。 */
 	hw->rates = snd_pcm_rate_mask_intersect(hw->rates, p->rates);
 
 	/* setup hw->rate_min/max via hw->rates first */
@@ -608,6 +638,7 @@ static void soc_pcm_hw_update_rate(struct snd_pcm_hardware *hw,
 static void soc_pcm_hw_update_chan(struct snd_pcm_hardware *hw,
 				   const struct snd_soc_pcm_stream *p)
 {
+	/* 声道数只保留双方都能接受的范围。 */
 	hw->channels_min = max(hw->channels_min, p->channels_min);
 	hw->channels_max = min(hw->channels_max, p->channels_max);
 }
@@ -615,6 +646,7 @@ static void soc_pcm_hw_update_chan(struct snd_pcm_hardware *hw,
 static void soc_pcm_hw_update_format(struct snd_pcm_hardware *hw,
 				     const struct snd_soc_pcm_stream *p)
 {
+	/* 格式位图和子格式位图都要做交集。 */
 	hw->formats	&= p->formats;
 	hw->subformats	&= p->subformats;
 }
@@ -638,6 +670,7 @@ int snd_soc_runtime_calc_hw(struct snd_soc_pcm_runtime *rtd,
 	unsigned int cpu_chan_min = 0, cpu_chan_max = UINT_MAX;
 	int i;
 
+	/* 先叠加 CPU 侧能力，再叠加 CODEC 侧能力。 */
 	soc_pcm_hw_init(hw, true);
 
 	/* first calculate min/max only for CPUs in the DAI link */
@@ -709,6 +742,7 @@ static void soc_pcm_init_runtime_hw(struct snd_pcm_substream *substream)
 	 * have bailed out on a higher level, since there would be no CPU or
 	 * CODEC to support the transfer direction in that case.
 	 */
+	/* runtime->hw 先由 link / DAI 共同推导，再和已有格式掩码相交。 */
 	snd_soc_runtime_calc_hw(rtd, hw, substream->stream);
 
 	if (formats)
@@ -721,6 +755,7 @@ static int soc_pcm_components_open(struct snd_pcm_substream *substream)
 	struct snd_soc_component *component;
 	int i, ret = 0;
 
+	/* 先拿 module 引用，再调用 component open。 */
 	for_each_rtd_components(rtd, i, component) {
 		ret = snd_soc_component_module_get_when_open(component, substream);
 		if (ret < 0)
@@ -741,6 +776,7 @@ static int soc_pcm_components_close(struct snd_pcm_substream *substream,
 	struct snd_soc_component *component;
 	int i, ret = 0;
 
+	/* close 阶段需要按组件逆向释放打开时申请的资源。 */
 	for_each_rtd_components(rtd, i, component) {
 		int r = snd_soc_component_close(component, substream, rollback);
 		if (r < 0)

@@ -30,13 +30,21 @@
 #include <sound/soc-topology.h>
 #include <sound/tlv.h>
 
+/*
+ * soc-topology.c 负责从 firmware/topology 文件加载动态对象：
+ * mixer、enum、widget、route、DAI link、vendor data 等都通过这里装载。
+ *
+ * 这层代码本质上是“固件对象到内核对象”的转换器：
+ * 它读 topology blob，验证 ABI，再把结果落到 component / card / DAPM。
+ */
 #define SOC_TPLG_MAGIC_BIG_ENDIAN            0x436F5341 /* ASoC in reverse */
 
 /*
- * We make several passes over the data (since it wont necessarily be ordered)
- * and process objects in the following order. This guarantees the component
- * drivers will be ready with any vendor data before the mixers and DAPM objects
- * are loaded (that may make use of the vendor data).
+ * topology 不保证对象顺序，所以必须分多轮 pass 处理。
+ *
+ * 先让 manifest / vendor data 落地，再创建 kcontrol / widget / DAI，
+ * 最后才处理 graph 和 link。这样 component driver 在后续对象创建前
+ * 已经拿到了它需要的私有数据。
  */
 #define SOC_TPLG_PASS_MANIFEST		0
 #define SOC_TPLG_PASS_VENDOR		1
@@ -50,7 +58,15 @@
 #define SOC_TPLG_PASS_START	SOC_TPLG_PASS_MANIFEST
 #define SOC_TPLG_PASS_END	SOC_TPLG_PASS_LINK
 
-/* topology context */
+/*
+ * topology context.
+ *
+ * 这个结构体是一次 topology 解析过程的临时状态机，保存：
+ * - 当前读到哪里
+ * - 正在处理第几轮 pass
+ * - 当前挂在哪个 component 上
+ * - vendor 扩展操作表
+ */
 struct soc_tplg {
 	const struct firmware *fw;
 
@@ -76,7 +92,11 @@ struct soc_tplg {
 	const struct snd_soc_tplg_ops *ops;
 };
 
-/* check we dont overflow the data for this control chunk */
+/*
+ * 统一检查某个 topology chunk 里的元素数量和实际 payload 是否匹配。
+ *
+ * 这一步防止 count/size 被恶意或错误固件写坏后越界读。
+ */
 static int soc_tplg_check_elem_count(struct soc_tplg *tplg, size_t elem_size,
 	unsigned int count, size_t bytes, const char *elem_type)
 {
@@ -102,6 +122,7 @@ static int soc_tplg_check_elem_count(struct soc_tplg *tplg, size_t elem_size,
 
 static inline bool soc_tplg_is_eof(struct soc_tplg *tplg)
 {
+	/* 到达固件末尾即结束。 */
 	const u8 *end = tplg->hdr_pos;
 
 	if (end >= tplg->fw->data + tplg->fw->size)
@@ -111,15 +132,22 @@ static inline bool soc_tplg_is_eof(struct soc_tplg *tplg)
 
 static inline unsigned long soc_tplg_get_hdr_offset(struct soc_tplg *tplg)
 {
+	/* 当前 header 相对固件起始地址的偏移，便于 debug 输出。 */
 	return (unsigned long)(tplg->hdr_pos - tplg->fw->data);
 }
 
 static inline unsigned long soc_tplg_get_offset(struct soc_tplg *tplg)
 {
+	/* 当前解析位置的偏移，常用于定位具体对象。 */
 	return (unsigned long)(tplg->pos - tplg->fw->data);
 }
 
-/* mapping of Kcontrol types and associated operations. */
+/*
+ * 标准 kcontrol 类型和回调的映射表。
+ *
+ * topology 里只保存类型 ID，真正的 get/put/info 回调要在这里
+ * 绑定成内核能够执行的函数指针。
+ */
 static const struct snd_soc_tplg_kcontrol_ops io_ops[] = {
 	{SND_SOC_TPLG_CTL_VOLSW, snd_soc_get_volsw,
 		snd_soc_put_volsw, snd_soc_info_volsw},
@@ -154,7 +182,11 @@ struct soc_tplg_map {
 	int kid;
 };
 
-/* mapping of widget types from UAPI IDs to kernel IDs */
+/*
+ * UAPI 里的 widget 类型和内核内部 widget 类型之间的映射表。
+ *
+ * topology 文件使用导出 ABI 的枚举值，而内核用自己的 DAPM id。
+ */
 static const struct soc_tplg_map dapm_map[] = {
 	{SND_SOC_TPLG_DAPM_INPUT, snd_soc_dapm_input},
 	{SND_SOC_TPLG_DAPM_OUTPUT, snd_soc_dapm_output},
@@ -212,6 +244,7 @@ static int get_widget_id(int tplg_type)
 {
 	int i;
 
+	/* 把 topology 导出的 widget 类型翻译为内核内部类型。 */
 	for (i = 0; i < ARRAY_SIZE(dapm_map); i++) {
 		if (tplg_type == dapm_map[i].uid)
 			return dapm_map[i].kid;
@@ -223,6 +256,7 @@ static int get_widget_id(int tplg_type)
 static inline void soc_control_err(struct soc_tplg *tplg,
 	struct snd_soc_tplg_ctl_hdr *hdr, const char *name)
 {
+	/* 一旦 kcontrol 三件套绑定不齐，就用统一错误格式报出来。 */
 	dev_err(tplg->dev,
 		"ASoC: no complete control IO handler for %s type (g,p,i) %u:%u:%u at 0x%lx\n",
 		name,
@@ -238,6 +272,7 @@ static int soc_tplg_vendor_load(struct soc_tplg *tplg,
 {
 	int ret = 0;
 
+	/* vendor blob 直接交给 component driver 按私有语义解析。 */
 	if (tplg->ops && tplg->ops->vendor_load)
 		ret = tplg->ops->vendor_load(tplg->comp, tplg->index, hdr);
 	else {
@@ -261,6 +296,7 @@ static int soc_tplg_vendor_load(struct soc_tplg *tplg,
 static int soc_tplg_widget_load(struct soc_tplg *tplg,
 	struct snd_soc_dapm_widget *w, struct snd_soc_tplg_dapm_widget *tplg_w)
 {
+	/* widget 生成后，给 component driver 一个补充私有状态的机会。 */
 	if (tplg->ops && tplg->ops->widget_load)
 		return tplg->ops->widget_load(tplg->comp, tplg->index, w,
 			tplg_w);
@@ -273,6 +309,7 @@ static int soc_tplg_widget_load(struct soc_tplg *tplg,
 static int soc_tplg_widget_ready(struct soc_tplg *tplg,
 	struct snd_soc_dapm_widget *w, struct snd_soc_tplg_dapm_widget *tplg_w)
 {
+	/* widget 真正挂入图之前，再给驱动一个完成态回调。 */
 	if (tplg->ops && tplg->ops->widget_ready)
 		return tplg->ops->widget_ready(tplg->comp, tplg->index, w,
 			tplg_w);
@@ -285,6 +322,7 @@ static int soc_tplg_dai_load(struct soc_tplg *tplg,
 	struct snd_soc_dai_driver *dai_drv,
 	struct snd_soc_tplg_pcm *pcm, struct snd_soc_dai *dai)
 {
+	/* DAI 规格从固件读出来后，可以再让驱动做一次定制化修饰。 */
 	if (tplg->ops && tplg->ops->dai_load)
 		return tplg->ops->dai_load(tplg->comp, tplg->index, dai_drv,
 			pcm, dai);
@@ -296,6 +334,7 @@ static int soc_tplg_dai_load(struct soc_tplg *tplg,
 static int soc_tplg_dai_link_load(struct soc_tplg *tplg,
 	struct snd_soc_dai_link *link, struct snd_soc_tplg_link_config *cfg)
 {
+	/* FE/BE link 在落地前也可以让机器驱动进一步调整。 */
 	if (tplg->ops && tplg->ops->link_load)
 		return tplg->ops->link_load(tplg->comp, tplg->index, link, cfg);
 
@@ -305,6 +344,7 @@ static int soc_tplg_dai_link_load(struct soc_tplg *tplg,
 /* tell the component driver that all firmware has been loaded in this request */
 static int soc_tplg_complete(struct soc_tplg *tplg)
 {
+	/* topology 全部加载完成后的收尾通知。 */
 	if (tplg->ops && tplg->ops->complete)
 		return tplg->ops->complete(tplg->comp);
 
@@ -318,8 +358,10 @@ static int soc_tplg_add_dcontrol(struct snd_card *card, struct device *dev,
 {
 	int err;
 
+	/* 先生成 ASoC 风格 kcontrol，再交给 ALSA core 注册到 card。 */
 	*kcontrol = snd_soc_cnew(control_new, data, control_new->name, prefix);
 	if (*kcontrol == NULL) {
+		/* 创建失败通常意味着控制模板不完整或内存不足。 */
 		dev_err(dev, "ASoC: Failed to create new kcontrol %s\n",
 		control_new->name);
 		return -ENOMEM;
@@ -341,6 +383,7 @@ static int soc_tplg_add_kcontrol(struct soc_tplg *tplg,
 {
 	struct snd_soc_component *comp = tplg->comp;
 
+	/* component 级控件默认挂到 card 的 ALSA 控件列表里。 */
 	return soc_tplg_add_dcontrol(comp->card->snd_card,
 				tplg->dev, k, comp->name_prefix, comp, kcontrol);
 }
@@ -351,6 +394,7 @@ static void soc_tplg_remove_kcontrol(struct snd_soc_component *comp, struct snd_
 {
 	struct snd_card *card = comp->card->snd_card;
 
+	/* 只在 CONTROL pass 里释放控件，保证对象按逆序析构。 */
 	if (pass != SOC_TPLG_PASS_CONTROL)
 		return;
 
@@ -365,6 +409,7 @@ static void soc_tplg_remove_kcontrol(struct snd_soc_component *comp, struct snd_
 static void soc_tplg_remove_route(struct snd_soc_component *comp,
 			 struct snd_soc_dobj *dobj, int pass)
 {
+	/* route 属于 graph pass，对应的释放也要在这一轮执行。 */
 	if (pass != SOC_TPLG_PASS_GRAPH)
 		return;
 
@@ -383,6 +428,7 @@ static void soc_tplg_remove_widget(struct snd_soc_component *comp,
 		container_of(dobj, struct snd_soc_dapm_widget, dobj);
 	int i;
 
+	/* widget 的 kcontrols 要先于 widget 本体释放。 */
 	if (pass != SOC_TPLG_PASS_WIDGET)
 		return;
 
@@ -406,6 +452,7 @@ static void soc_tplg_remove_dai(struct snd_soc_component *comp,
 		container_of(dobj, struct snd_soc_dai_driver, dobj);
 	struct snd_soc_dai *dai, *_dai;
 
+	/* PCM_DAI pass 里撤销 topology 创建出来的 DAI。 */
 	if (pass != SOC_TPLG_PASS_PCM_DAI)
 		return;
 
@@ -426,6 +473,7 @@ static void soc_tplg_remove_link(struct snd_soc_component *comp,
 	struct snd_soc_dai_link *link =
 		container_of(dobj, struct snd_soc_dai_link, dobj);
 
+	/* 物理 DAI link 也只在 PCM_DAI pass 里回收。 */
 	if (pass != SOC_TPLG_PASS_PCM_DAI)
 		return;
 
@@ -444,6 +492,7 @@ static void soc_tplg_remove_link(struct snd_soc_component *comp,
 static void remove_backend_link(struct snd_soc_component *comp,
 	struct snd_soc_dobj *dobj, int pass)
 {
+	/* BACKEND_LINK 只是把 link 还原到未初始化状态，不重新分配。 */
 	if (pass != SOC_TPLG_PASS_LINK)
 		return;
 
@@ -468,6 +517,7 @@ static int soc_tplg_kcontrol_bind_io(struct snd_soc_tplg_ctl_hdr *hdr,
 	const struct snd_soc_tplg_bytes_ext_ops *ext_ops;
 	int num_ops, i;
 
+	/* topology 先尝试 vendor 提供的 handler，再回退到内核标准 handler。 */
 	if (le32_to_cpu(hdr->ops.info) == SND_SOC_TPLG_CTL_BYTES
 		&& k->iface & SNDRV_CTL_ELEM_IFACE_MIXER
 		&& (k->access & SNDRV_CTL_ELEM_ACCESS_TLV_READ
@@ -559,6 +609,7 @@ int snd_soc_tplg_widget_bind_event(struct snd_soc_dapm_widget *w,
 {
 	int i;
 
+	/* topology 事件类型只要匹配，就把对应 callback 挂给 widget。 */
 	w->event = NULL;
 
 	for (i = 0; i < num_events; i++) {
@@ -581,6 +632,7 @@ static int soc_tplg_control_load(struct soc_tplg *tplg,
 {
 	int ret = 0;
 
+	/* control_load 允许 component driver 在标准控件之外再补一层私有逻辑。 */
 	if (tplg->ops && tplg->ops->control_load)
 		ret = tplg->ops->control_load(tplg->comp, tplg->index, k, hdr);
 
@@ -597,6 +649,7 @@ static int soc_tplg_create_tlv_db_scale(struct soc_tplg *tplg,
 	unsigned int item_len = 2 * sizeof(unsigned int);
 	unsigned int *p;
 
+	/* 把 topology 里的 dB scale 描述转成 ALSA TLV blob。 */
 	p = devm_kzalloc(tplg->dev, item_len + 2 * sizeof(unsigned int), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
@@ -617,6 +670,7 @@ static int soc_tplg_create_tlv(struct soc_tplg *tplg,
 	struct snd_soc_tplg_ctl_tlv *tplg_tlv;
 	u32 access = le32_to_cpu(tc->access);
 
+	/* 只有带 TLV 访问位的控件才需要构造 TLV 数据。 */
 	if (!(access & SNDRV_CTL_ELEM_ACCESS_TLV_READWRITE))
 		return 0;
 
@@ -646,7 +700,7 @@ static int soc_tplg_control_dmixer_create(struct soc_tplg *tplg, struct snd_kcon
 
 	mc = (struct snd_soc_tplg_mixer_control *)tplg->pos;
 
-	/* validate kcontrol */
+	/* mixer 控件必须带合法名字，否则后续查找和绑定都会失败。 */
 	if (strnlen(mc->hdr.name, SNDRV_CTL_ELEM_ID_NAME_MAXLEN) == SNDRV_CTL_ELEM_ID_NAME_MAXLEN)
 		return -EINVAL;
 
@@ -666,7 +720,7 @@ static int soc_tplg_control_dmixer_create(struct soc_tplg *tplg, struct snd_kcon
 	kc->iface = SNDRV_CTL_ELEM_IFACE_MIXER;
 	kc->access = le32_to_cpu(mc->hdr.access);
 
-	/* we only support FL/FR channel mapping atm */
+	/* 目前只处理 FL/FR 映射，其他 channel map 还没有在这条路径上展开。 */
 	sm->reg = tplg_chan_get_reg(tplg, mc->channel, SNDRV_CHMAP_FL);
 	sm->rreg = tplg_chan_get_reg(tplg, mc->channel, SNDRV_CHMAP_FR);
 	sm->shift = tplg_chan_get_shift(tplg, mc->channel, SNDRV_CHMAP_FL);
@@ -701,6 +755,7 @@ static int soc_tplg_denum_create_texts(struct soc_tplg *tplg, struct soc_enum *s
 {
 	int i, ret;
 
+	/* 枚举文字数组要复制到内核内存，避免依赖固件缓冲生命周期。 */
 	if (le32_to_cpu(ec->items) > ARRAY_SIZE(ec->texts))
 		return -EINVAL;
 
@@ -737,6 +792,7 @@ static int soc_tplg_denum_create_values(struct soc_tplg *tplg, struct soc_enum *
 {
 	int i;
 
+	/* value 型 enum 需要同时保留文本和枚举值映射。 */
 	/*
 	 * Following "if" checks if we have at most SND_SOC_TPLG_NUM_TEXTS
 	 * values instead of using ARRAY_SIZE(ec->values) due to the fact that
@@ -770,7 +826,7 @@ static int soc_tplg_control_denum_create(struct soc_tplg *tplg, struct snd_kcont
 
 	ec = (struct snd_soc_tplg_enum_control *)tplg->pos;
 
-	/* validate kcontrol */
+	/* 枚举控件同样依赖合法名字。 */
 	if (strnlen(ec->hdr.name, SNDRV_CTL_ELEM_ID_NAME_MAXLEN) == SNDRV_CTL_ELEM_ID_NAME_MAXLEN)
 		return -EINVAL;
 
@@ -789,7 +845,7 @@ static int soc_tplg_control_denum_create(struct soc_tplg *tplg, struct snd_kcont
 	kc->iface = SNDRV_CTL_ELEM_IFACE_MIXER;
 	kc->access = le32_to_cpu(ec->hdr.access);
 
-	/* we only support FL/FR channel mapping atm */
+	/* 这里仍然只绑定 FL/FR 通道映射。 */
 	se->reg = tplg_chan_get_reg(tplg, ec->channel, SNDRV_CHMAP_FL);
 	se->shift_l = tplg_chan_get_shift(tplg, ec->channel, SNDRV_CHMAP_FL);
 	se->shift_r = tplg_chan_get_shift(tplg, ec->channel, SNDRV_CHMAP_FR);
@@ -839,7 +895,7 @@ static int soc_tplg_control_dbytes_create(struct soc_tplg *tplg, struct snd_kcon
 
 	be = (struct snd_soc_tplg_bytes_control *)tplg->pos;
 
-	/* validate kcontrol */
+	/* bytes 控件也必须有合法名字。 */
 	if (strnlen(be->hdr.name, SNDRV_CTL_ELEM_ID_NAME_MAXLEN) == SNDRV_CTL_ELEM_ID_NAME_MAXLEN)
 		return -EINVAL;
 
@@ -861,7 +917,7 @@ static int soc_tplg_control_dbytes_create(struct soc_tplg *tplg, struct snd_kcon
 
 	sbe->max = le32_to_cpu(be->max);
 
-	/* map standard io handlers and check for external handlers */
+	/* bytes 控件既可以走标准 handlers，也可以走外部扩展 handlers。 */
 	err = soc_tplg_kcontrol_bind_io(&be->hdr, kc, tplg);
 	if (err) {
 		soc_control_err(tplg, &be->hdr, be->hdr.name);
@@ -887,7 +943,7 @@ static int soc_tplg_dbytes_create(struct soc_tplg *tplg, size_t size)
 	if (ret)
 		return ret;
 
-	/* register dynamic object */
+	/* 动态 bytes 控件同样要挂一个 dobj，方便后续统一卸载。 */
 	sbe = (struct soc_bytes_ext *)kc.private_value;
 
 	INIT_LIST_HEAD(&sbe->dobj.list);
@@ -921,7 +977,7 @@ static int soc_tplg_dmixer_create(struct soc_tplg *tplg, size_t size)
 	if (ret)
 		return ret;
 
-	/* register dynamic object */
+	/* 动态 mixer 控件要记录 dobj 元数据，供 topology 卸载时回收。 */
 	sm = (struct soc_mixer_control *)kc.private_value;
 
 	INIT_LIST_HEAD(&sm->dobj.list);
@@ -955,7 +1011,7 @@ static int soc_tplg_denum_create(struct soc_tplg *tplg, size_t size)
 	if (ret)
 		return ret;
 
-	/* register dynamic object */
+	/* 动态 enum 控件也按 dobj 管理生命周期。 */
 	se = (struct soc_enum *)kc.private_value;
 
 	INIT_LIST_HEAD(&se->dobj.list);
@@ -980,9 +1036,11 @@ static int soc_tplg_kcontrol_elems_load(struct soc_tplg *tplg,
 	int ret;
 	int i;
 
+	/* 一组 control header 里可能包含多个 mixer/enum/bytes 实例。 */
 	dev_dbg(tplg->dev, "ASoC: adding %u kcontrols at 0x%lx\n", le32_to_cpu(hdr->count),
 		soc_tplg_get_offset(tplg));
 
+	/* 每个 control 都会根据自己的 type 分流到不同创建函数。 */
 	for (i = 0; i < le32_to_cpu(hdr->count); i++) {
 		struct snd_soc_tplg_ctl_hdr *control_hdr = (struct snd_soc_tplg_ctl_hdr *)tplg->pos;
 
@@ -1020,6 +1078,7 @@ static int soc_tplg_kcontrol_elems_load(struct soc_tplg *tplg,
 static int soc_tplg_add_route(struct soc_tplg *tplg,
 	struct snd_soc_dapm_route *route)
 {
+	/* route_load 让驱动有机会在图真正落地前补充私有状态。 */
 	if (tplg->ops && tplg->ops->dapm_route_load)
 		return tplg->ops->dapm_route_load(tplg->comp, tplg->index,
 			route);
@@ -1037,6 +1096,7 @@ static int soc_tplg_dapm_graph_elems_load(struct soc_tplg *tplg,
 	int count, i;
 	int ret = 0;
 
+	/* graph 段负责把 source/sink/control 三元组编成 DAPM 路由。 */
 	count = le32_to_cpu(hdr->count);
 
 	if (soc_tplg_check_elem_count(tplg,
@@ -1047,6 +1107,7 @@ static int soc_tplg_dapm_graph_elems_load(struct soc_tplg *tplg,
 	dev_dbg(tplg->dev, "ASoC: adding %d DAPM routes for index %u\n", count,
 		le32_to_cpu(hdr->index));
 
+	/* 每条 graph 元素都会转成一条 route，再追加进 DAPM 图。 */
 	for (i = 0; i < count; i++) {
 		route = devm_kzalloc(tplg->dev, sizeof(*route), GFP_KERNEL);
 		if (!route)
@@ -1113,6 +1174,7 @@ static int soc_tplg_dapm_widget_create(struct soc_tplg *tplg,
 	int ret = 0;
 	int i;
 
+	/* widget 创建流程：先翻译模板，再创建控件，最后挂入 DAPM 图。 */
 	if (strnlen(w->name, SNDRV_CTL_ELEM_ID_NAME_MAXLEN) ==
 		SNDRV_CTL_ELEM_ID_NAME_MAXLEN)
 		return -EINVAL;
@@ -1172,6 +1234,7 @@ static int soc_tplg_dapm_widget_create(struct soc_tplg *tplg,
 		goto hdr_err;
 	}
 
+	/* 一个 widget 可以携带多个 mixer / enum / bytes 控件。 */
 	for (i = 0; i < le32_to_cpu(w->num_kcontrols); i++) {
 		control_hdr = (struct snd_soc_tplg_ctl_hdr *)tplg->pos;
 
@@ -1265,6 +1328,7 @@ static int soc_tplg_dapm_widget_elems_load(struct soc_tplg *tplg,
 {
 	int count, i;
 
+	/* widget 段会依次创建所有 DAPM widget，并把对应控件一起装进去。 */
 	count = le32_to_cpu(hdr->count);
 
 	dev_dbg(tplg->dev, "ASoC: adding %d DAPM widgets\n", count);
@@ -1308,6 +1372,7 @@ static int soc_tplg_dapm_widget_elems_load(struct soc_tplg *tplg,
 
 static int soc_tplg_dapm_complete(struct soc_tplg *tplg)
 {
+	/* 所有 widget/route 加载完毕后，再让 DAPM 收敛一次。 */
 	struct snd_soc_card *card = tplg->comp->card;
 	int ret;
 
@@ -1329,6 +1394,7 @@ static int soc_tplg_dapm_complete(struct soc_tplg *tplg)
 static int set_stream_info(struct soc_tplg *tplg, struct snd_soc_pcm_stream *stream,
 			   struct snd_soc_tplg_stream_caps *caps)
 {
+	/* topology 里的 stream_caps 直接映射到 snd_soc_pcm_stream。 */
 	stream->stream_name = devm_kstrdup(tplg->dev, caps->name, GFP_KERNEL);
 	if (!stream->stream_name)
 		return -ENOMEM;
@@ -1347,6 +1413,7 @@ static int set_stream_info(struct soc_tplg *tplg, struct snd_soc_pcm_stream *str
 static void set_dai_flags(struct snd_soc_dai_driver *dai_drv,
 			  unsigned int flag_mask, unsigned int flags)
 {
+	/* DAI flag 主要用于对称性约束等 runtime 级协商。 */
 	if (flag_mask & SND_SOC_TPLG_DAI_FLGBIT_SYMMETRIC_RATES)
 		dai_drv->symmetric_rate =
 			(flags & SND_SOC_TPLG_DAI_FLGBIT_SYMMETRIC_RATES) ? 1 : 0;
@@ -1376,6 +1443,7 @@ static int soc_tplg_dai_create(struct soc_tplg *tplg,
 	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(tplg->comp);
 	int ret;
 
+	/* PCM DAI 先创建描述，再注册到 component。 */
 	dai_drv = devm_kzalloc(tplg->dev, sizeof(struct snd_soc_dai_driver), GFP_KERNEL);
 	if (dai_drv == NULL)
 		return -ENOMEM;
@@ -1443,6 +1511,7 @@ err:
 static void set_link_flags(struct snd_soc_dai_link *link,
 		unsigned int flag_mask, unsigned int flags)
 {
+	/* link flag 主要影响 FE 的对称性、唤醒和 suspend 行为。 */
 	if (flag_mask & SND_SOC_TPLG_LNK_FLGBIT_SYMMETRIC_RATES)
 		link->symmetric_rate =
 			(flags & SND_SOC_TPLG_LNK_FLGBIT_SYMMETRIC_RATES) ? 1 : 0;
@@ -1471,6 +1540,7 @@ static int soc_tplg_fe_link_create(struct soc_tplg *tplg,
 	struct snd_soc_dai_link_component *dlc;
 	int ret;
 
+	/* FE link 默认带一组 dummy 端点，后续再由 topology 修正。 */
 	/* link + cpu + codec + platform */
 	link = devm_kzalloc(tplg->dev, sizeof(*link) + (3 * sizeof(*dlc)), GFP_KERNEL);
 	if (link == NULL)
@@ -1555,6 +1625,7 @@ static int soc_tplg_pcm_create(struct soc_tplg *tplg,
 {
 	int ret;
 
+	/* 一个 PCM 对象既会产生 DAI，也会产生 FE link。 */
 	ret = soc_tplg_dai_create(tplg, pcm);
 	if (ret < 0)
 		return ret;
@@ -1571,6 +1642,7 @@ static int soc_tplg_pcm_elems_load(struct soc_tplg *tplg,
 	int i;
 	int ret;
 
+	/* PCM 段按 ABI 版本逐项创建 FE runtime 和 DAI 结构。 */
 	count = le32_to_cpu(hdr->count);
 
 	/* check the element size and count */
@@ -1631,6 +1703,7 @@ static void set_link_hw_format(struct snd_soc_dai_link *link,
 	unsigned char invert_bclk, invert_fsync;
 	int i;
 
+	/* 从 topology 里的默认 hw_config 选出最终要下发到 link 的 dai_fmt。 */
 	for (i = 0; i < le32_to_cpu(cfg->num_hw_configs); i++) {
 		hw_config = &cfg->hw_config[i];
 		if (hw_config->id != cfg->default_hw_config_id)
@@ -1703,6 +1776,7 @@ static struct snd_soc_dai_link *snd_soc_find_dai_link(struct snd_soc_card *card,
 {
 	struct snd_soc_pcm_runtime *rtd;
 
+	/* 物理 link 通过 ID 先定位，再用 name / stream_name 做二次确认。 */
 	for_each_card_rtds(card, rtd) {
 		struct snd_soc_dai_link *link = rtd->dai_link;
 
@@ -1731,6 +1805,7 @@ static int soc_tplg_link_config(struct soc_tplg *tplg,
 	size_t len;
 	int ret;
 
+	/* 先把 topology 里的名字字段归一化，再去 card 里找对应 link。 */
 	len = strnlen(cfg->name, SNDRV_CTL_ELEM_ID_NAME_MAXLEN);
 	if (len == SNDRV_CTL_ELEM_ID_NAME_MAXLEN)
 		return -EINVAL;
@@ -1765,7 +1840,7 @@ static int soc_tplg_link_config(struct soc_tplg *tplg,
 			       le32_to_cpu(cfg->flag_mask),
 			       le32_to_cpu(cfg->flags));
 
-	/* pass control to component driver for optional further init */
+	/* physical link 也允许 driver 做最后一层私有修饰。 */
 	ret = soc_tplg_dai_link_load(tplg, link, cfg);
 	if (ret < 0) {
 		dev_err(tplg->dev, "ASoC: physical link loading failed\n");
@@ -1808,7 +1883,7 @@ static int soc_tplg_link_elems_load(struct soc_tplg *tplg,
 				      "physical link config"))
 		return -EINVAL;
 
-	/* config physical DAI links */
+	/* 链路配置段逐条修正已存在的 physical DAI link。 */
 	for (i = 0; i < count; i++) {
 		link = (struct snd_soc_tplg_link_config *)tplg->pos;
 		size = le32_to_cpu(link->size);
@@ -1846,6 +1921,7 @@ static int soc_tplg_dai_config(struct soc_tplg *tplg,
 	struct snd_soc_tplg_stream_caps *caps;
 	int ret;
 
+	/* 先找已经注册过的物理 DAI，再把 topology 描述的能力填进去。 */
 	memset(&dai_component, 0, sizeof(dai_component));
 
 	dai_component.dai_name = d->dai_name;
@@ -1906,7 +1982,7 @@ static int soc_tplg_dai_elems_load(struct soc_tplg *tplg,
 
 	count = le32_to_cpu(hdr->count);
 
-	/* config the existing BE DAIs */
+	/* DAI 段只更新已经存在的 backend DAI，不会新建对象。 */
 	for (i = 0; i < count; i++) {
 		struct snd_soc_tplg_dai *dai = (struct snd_soc_tplg_dai *)tplg->pos;
 		int ret;
@@ -1935,6 +2011,7 @@ static int soc_tplg_manifest_load(struct soc_tplg *tplg,
 	struct snd_soc_tplg_manifest *manifest;
 	int ret = 0;
 
+	/* manifest 是 topology 文件的全局声明区，通常最先被解析。 */
 	manifest = (struct snd_soc_tplg_manifest *)tplg->pos;
 
 	/* check ABI version by size, create a new manifest if abi not match */
@@ -1952,6 +2029,7 @@ static int soc_tplg_manifest_load(struct soc_tplg *tplg,
 static int soc_tplg_valid_header(struct soc_tplg *tplg,
 	struct snd_soc_tplg_hdr *hdr)
 {
+	/* header 校验主要防止 ABI 不匹配或固件越界。 */
 	if (le32_to_cpu(hdr->size) != sizeof(*hdr)) {
 		dev_err(tplg->dev,
 			"ASoC: invalid header size for type %u at offset 0x%lx size 0x%zx.\n",
@@ -2013,6 +2091,7 @@ static int soc_tplg_load_header(struct soc_tplg *tplg,
 			 struct snd_soc_tplg_hdr *hdr);
 	unsigned int hdr_pass;
 
+	/* 先根据 type 选 pass，再按当前 pass 决定是否真正处理。 */
 	tplg->pos = tplg->hdr_pos + sizeof(struct snd_soc_tplg_hdr);
 
 	tplg->index = le32_to_cpu(hdr->index);
@@ -2075,6 +2154,7 @@ static int soc_tplg_process_headers(struct soc_tplg *tplg)
 {
 	int ret;
 
+	/* 每个 pass 都会把整个 topology 扫一遍，只处理本轮关心的对象。 */
 	/* process the header types from start to end */
 	for (tplg->pass = SOC_TPLG_PASS_START; tplg->pass <= SOC_TPLG_PASS_END; tplg->pass++) {
 		struct snd_soc_tplg_hdr *hdr;
@@ -2108,7 +2188,7 @@ static int soc_tplg_process_headers(struct soc_tplg *tplg)
 
 	}
 
-	/* signal DAPM we are complete */
+	/* 全部 pass 结束后，通知 DAPM 进行最终收敛。 */
 	ret = soc_tplg_dapm_complete(tplg);
 
 	return ret;
@@ -2118,6 +2198,7 @@ static int soc_tplg_load(struct soc_tplg *tplg)
 {
 	int ret;
 
+	/* load 是外层总入口，负责驱动整个多 pass 解析流程。 */
 	ret = soc_tplg_process_headers(tplg);
 	if (ret == 0)
 		return soc_tplg_complete(tplg);
@@ -2132,6 +2213,7 @@ int snd_soc_tplg_component_load(struct snd_soc_component *comp,
 	struct soc_tplg tplg;
 	int ret;
 
+	/* 入口参数必须同时满足 component/card/fw 三者都可用。 */
 	/*
 	 * check if we have sane parameters:
 	 * comp - needs to exist to keep and reference data while parsing
@@ -2170,6 +2252,7 @@ int snd_soc_tplg_component_remove(struct snd_soc_component *comp)
 	struct snd_soc_dobj *dobj, *next_dobj;
 	int pass;
 
+	/* removal 与加载相反，从最后一个 pass 倒序回收对象。 */
 	/* process the header types from end to start */
 	for (pass = SOC_TPLG_PASS_END; pass >= SOC_TPLG_PASS_START; pass--) {
 

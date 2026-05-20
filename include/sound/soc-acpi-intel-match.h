@@ -11,8 +11,8 @@
 #include <linux/acpi.h>
 
 /*
- * these tables are not constants, some fields can be used for
- * pdata or machine ops
+ * 这些表不是 const，因为部分字段会在运行时被 machine driver
+ * 改写成 pdata 或 machine ops。
  */
 extern struct snd_soc_acpi_mach snd_soc_acpi_intel_broadwell_machines[];
 extern struct snd_soc_acpi_mach snd_soc_acpi_intel_baytrail_machines[];
@@ -49,10 +49,7 @@ extern struct snd_soc_acpi_mach snd_soc_acpi_intel_arl_sdw_machines[];
 extern struct snd_soc_acpi_mach snd_soc_acpi_intel_ptl_sdw_machines[];
 extern struct snd_soc_acpi_mach snd_soc_acpi_intel_nvl_sdw_machines[];
 
-/*
- * generic table used for HDA codec-based platforms, possibly with
- * additional ACPI-enumerated codecs
- */
+/* HDA codec 平台通用匹配表，可能还会带额外的 ACPI 枚举 codec。 */
 extern struct snd_soc_acpi_mach snd_soc_acpi_intel_hda_machines[];
 
 #endif
