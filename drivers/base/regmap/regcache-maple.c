@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Register cache access API - maple tree based cache
+// Register cache 访问 API - 基于 maple tree 的缓存
 //
 // Copyright 2023 Arm, Ltd
 //
@@ -22,6 +22,7 @@ static int regcache_maple_read(struct regmap *map,
 
 	rcu_read_lock();
 
+	/* Maple tree 里每个 entry 保存一段连续寄存器值数组。 */
 	entry = mas_walk(&mas);
 	if (!entry) {
 		rcu_read_unlock();
@@ -54,7 +55,7 @@ static int regcache_maple_write(struct regmap *map, unsigned int reg,
 		return 0;
 	}
 
-	/* Any adjacent entries to extend/merge? */
+	/* 看看左右是否已有相邻块，尽量把新值并入或桥接成更大的连续块。 */
 	mas_set_range(&mas, reg - 1, reg + 1);
 	index = reg;
 	last = reg;
@@ -84,9 +85,8 @@ static int regcache_maple_write(struct regmap *map, unsigned int reg,
 		memcpy(&entry[reg - index + 1], upper, upper_sz);
 
 	/*
-	 * This is safe because the regmap lock means the Maple lock
-	 * is redundant, but we need to take it due to lockdep asserts
-	 * in the maple tree code.
+	 * 逻辑上 regmap 自身的锁已经足够保护这里的修改，
+	 * 但 maple tree 内部有 lockdep 断言，因此仍需显式拿它的锁。
 	 */
 	mas_lock(&mas);
 
@@ -110,7 +110,7 @@ static int regcache_maple_drop(struct regmap *map, unsigned int min,
 	struct maple_tree *mt = map->cache;
 	MA_STATE(mas, mt, min, max);
 	unsigned long *entry, *lower, *upper;
-	/* initialized to work around false-positive -Wuninitialized warning */
+	/* 初始化只是为了规避编译器对未初始化路径的误报。 */
 	unsigned long lower_index = 0, lower_last = 0;
 	unsigned long upper_index, upper_last;
 	int ret = 0;
@@ -122,13 +122,12 @@ static int regcache_maple_drop(struct regmap *map, unsigned int min,
 
 	mas_for_each(&mas, entry, max) {
 		/*
-		 * This is safe because the regmap lock means the
-		 * Maple lock is redundant, but we need to take it due
-		 * to lockdep asserts in the maple tree code.
+		 * 与 write 路径相同：功能上 regmap 锁已经串行化，
+		 * 这里拿 maple 锁主要是满足其内部 lockdep 断言。
 		 */
 		mas_unlock(&mas);
 
-		/* Do we need to save any of this entry? */
+		/* 如果被删区间只覆盖 entry 的中间一段，就要把上下残留部分先备份。 */
 		if (mas.index < min) {
 			lower_index = mas.index;
 			lower_last = min -1;
@@ -159,7 +158,7 @@ static int regcache_maple_drop(struct regmap *map, unsigned int min,
 		mas_lock(&mas);
 		mas_erase(&mas);
 
-		/* Insert new nodes with the saved data */
+		/* 再把保留下来的上下半段作为新节点重新插回去。 */
 		if (lower) {
 			mas_set_range(&mas, lower_index, lower_last);
 			ret = mas_store_gfp(&mas, lower, map->alloc_flags);
@@ -199,9 +198,8 @@ static int regcache_maple_sync_block(struct regmap *map, unsigned long *entry,
 	rcu_read_unlock();
 
 	/*
-	 * Use a raw write if writing more than one register to a
-	 * device that supports raw writes to reduce transaction
-	 * overheads.
+	 * 如果是一段连续寄存器，而且后端支持 raw write，
+	 * 就尽量合并成一次大事务，以减少总线开销。
 	 */
 	if (max - min > 1 && regmap_can_raw_write(map)) {
 		buf = kmalloc_array(max - min, val_bytes, map->alloc_flags);
@@ -210,7 +208,7 @@ static int regcache_maple_sync_block(struct regmap *map, unsigned long *entry,
 			goto out;
 		}
 
-		/* Render the data for a raw write */
+		/* 先把 maple 缓存里的 machine word 重新编码成设备原生值格式。 */
 		for (r = min; r < max; r++) {
 			regcache_set_val(map, buf, r - min,
 					 entry[r - mas->index]);
@@ -247,6 +245,7 @@ static int regcache_maple_sync(struct regmap *map, unsigned int min,
 	int ret = 0;
 	bool sync_needed = false;
 
+	/* sync 阶段必须直接命中硬件，避免“从缓存再写回缓存”的自循环。 */
 	map->cache_bypass = true;
 
 	rcu_read_lock();

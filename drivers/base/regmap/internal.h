@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Register map access API internal header
+ * Register map 访问 API 内部头文件
  *
  * Copyright 2011 Wolfson Microelectronics plc
  *
@@ -27,6 +27,10 @@ struct regmap_debugfs_off_cache {
 	unsigned int max_reg;
 };
 
+/* 描述“逻辑寄存器/值”如何编码到实际总线缓冲区。
+ * regmap core 先根据 reg_bits/val_bits/pad_bits/endianness 选好格式器，
+ * 再借助这里的回调把一个抽象的读写操作落成具体字节序列。
+ */
 struct regmap_format {
 	size_t buf_size;
 	size_t reg_bytes;
@@ -44,9 +48,13 @@ struct regmap_format {
 struct regmap_async {
 	struct list_head list;
 	struct regmap *map;
-	void *work_buf;
+	void *work_buf;		/* 异步提交时独占的格式化缓冲区 */
 };
 
+/* regmap 运行时核心对象。
+ * 它既保存访问后端（bus/context/format），也保存访问约束、缓存策略、
+ * debugfs 状态和异步队列，是整个框架的中心状态容器。
+ */
 struct regmap {
 	union {
 		struct mutex mutex;
@@ -62,13 +70,13 @@ struct regmap {
 	struct lock_class_key *lock_key;
 	regmap_lock lock;
 	regmap_unlock unlock;
-	void *lock_arg; /* This is passed to lock/unlock functions */
+	void *lock_arg; /* 原样透传给 lock/unlock 回调的私有参数 */
 	gfp_t alloc_flags;
-	unsigned int reg_base;
+	unsigned int reg_base;	/* 对外逻辑寄存器到硬件地址的统一基址偏移 */
 
-	struct device *dev; /* Device we do I/O on */
-	void *work_buf;     /* Scratch buffer used to format I/O */
-	struct regmap_format format;  /* Buffer format */
+	struct device *dev; /* 实际发生寄存器访问的设备 */
+	void *work_buf;     /* 访问前拼包/解包时使用的临时缓冲区 */
+	struct regmap_format format;  /* 当前 reg/val 编码格式 */
 	const struct regmap_bus *bus;
 	void *bus_context;
 	const char *name;
@@ -113,7 +121,7 @@ struct regmap {
 	int (*reg_write)(void *context, unsigned int reg, unsigned int val);
 	int (*reg_update_bits)(void *context, unsigned int reg,
 			       unsigned int mask, unsigned int val);
-	/* Bulk read/write */
+	/* bulk read/write 层面的底层访问回调 */
 	int (*read)(void *context, const void *reg_buf, size_t reg_size,
 		    void *val_buf, size_t val_size);
 	int (*write)(void *context, const void *data, size_t count);
@@ -124,67 +132,68 @@ struct regmap {
 	unsigned long read_flag_mask;
 	unsigned long write_flag_mask;
 
-	/* number of bits to (left) shift the reg value when formatting*/
+	/* 格式化寄存器地址时，要额外左移的位数 */
 	int reg_shift;
 	int reg_stride;
 	int reg_stride_order;
 
 	bool defer_caching;
 
-	/* If set, will always write field to HW. */
+	/* 若置位，field 写操作即使值未变化也强制落到硬件。 */
 	bool force_write_field;
 
-	/* regcache specific members */
+	/* regcache 专用状态 */
 	const struct regcache_ops *cache_ops;
 	enum regcache_type cache_type;
 
-	/* number of bytes in reg_defaults_raw */
+	/* reg_defaults_raw 中的总字节数 */
 	unsigned int cache_size_raw;
-	/* number of bytes per word in reg_defaults_raw */
+	/* reg_defaults_raw 中每个寄存器值占用的字节数 */
 	unsigned int cache_word_size;
-	/* number of entries in reg_defaults */
+	/* reg_defaults 数组中的条目数 */
 	unsigned int num_reg_defaults;
-	/* number of entries in reg_defaults_raw */
+	/* reg_defaults_raw 对应的寄存器项数 */
 	unsigned int num_reg_defaults_raw;
 
-	/* if set, only the cache is modified not the HW */
+	/* 置位后只改缓存，不落硬件 */
 	bool cache_only;
-	/* if set, only the HW is modified not the cache */
+	/* 置位后只改硬件，不碰缓存 */
 	bool cache_bypass;
-	/* if set, remember to free reg_defaults_raw */
+	/* 置位后表示 reg_defaults_raw 由 regmap 动态分配并负责释放 */
 	bool cache_free;
 
 	struct reg_default *reg_defaults;
 	const void *reg_defaults_raw;
 	void *cache;
-	/* if set, the cache contains newer data than the HW */
+	/* 置位后表示缓存比硬件更新，需要后续 sync 回写 */
 	bool cache_dirty;
-	/* if set, the HW registers are known to match map->reg_defaults */
+	/* 置位后表示硬件当前状态已知与 reg_defaults 一致 */
 	bool no_sync_defaults;
 
 	struct reg_sequence *patch;
 	unsigned int patch_regs;
 
-	/* if set, the regmap core can sleep */
+	/* 置位后表示该 regmap 的底层访问允许睡眠 */
 	bool can_sleep;
 
-	/* if set, converts bulk read to single read */
+	/* 置位后把 bulk read 拆成单寄存器读 */
 	bool use_single_read;
-	/* if set, converts bulk write to single write */
+	/* 置位后把 bulk write 拆成单寄存器写 */
 	bool use_single_write;
-	/* if set, the device supports multi write mode */
+	/* 置位后表示后端支持 multi write */
 	bool can_multi_write;
 
-	/* if set, raw reads/writes are limited to this size */
+	/* 非 0 时限制 raw read/write 的最大传输大小 */
 	size_t max_raw_read;
 	size_t max_raw_write;
 
 	struct rb_root range_tree;
-	void *selector_work_buf;	/* Scratch buffer used for selector */
+	void *selector_work_buf;	/* range selector 切换时使用的临时缓冲区 */
 
 	struct hwspinlock *hwlock;
 };
 
+/* 各类寄存器缓存后端对 regmap core 暴露的统一操作表。 */
 struct regcache_ops {
 	const char *name;
 	enum regcache_type type;
@@ -230,7 +239,7 @@ struct regmap_range_node {
 struct regmap_field {
 	struct regmap *regmap;
 	unsigned int mask;
-	/* lsb */
+	/* 字段最低有效位位置 */
 	unsigned int shift;
 	unsigned int reg;
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Register map access API - debugfs
+// Register map 访问 API - debugfs 支持
 //
 // Copyright 2011 Wolfson Microelectronics plc
 //
@@ -26,7 +26,7 @@ static struct dentry *regmap_debugfs_root;
 static LIST_HEAD(regmap_debugfs_early_list);
 static DEFINE_MUTEX(regmap_debugfs_early_lock);
 
-/* Calculate the length of a fixed format  */
+/* 计算固定宽度十六进制字段需要的字符长度。 */
 static size_t regmap_calc_reg_len(int max_val)
 {
 	return snprintf(NULL, 0, "%x", max_val);
@@ -90,8 +90,9 @@ static bool regmap_printable(struct regmap *map, unsigned int reg)
 }
 
 /*
- * Work out where the start offset maps into register numbers, bearing
- * in mind that we suppress hidden registers.
+ * 把 debugfs 文件偏移量换算回“从哪个寄存器开始导出”。
+ * 这里要考虑 printable 过滤：不可打印寄存器不会出现在导出文本中，
+ * 因而文件偏移和物理寄存器地址并不是简单线性对应。
  */
 static unsigned int regmap_debugfs_get_dump_start(struct regmap *map,
 						  unsigned int base,
@@ -104,19 +105,19 @@ static unsigned int regmap_debugfs_get_dump_start(struct regmap *map,
 	unsigned int fpos_offset;
 	unsigned int reg_offset;
 
-	/* Suppress the cache if we're using a subrange */
+	/* 指定了子区间时直接走线性计算，不复用全局偏移缓存。 */
 	if (base)
 		return base;
 
 	/*
-	 * If we don't have a cache build one so we don't have to do a
-	 * linear scan each time.
+	 * 第一次访问时建立“文件偏移区间 -> 连续寄存器区间”的缓存，
+	 * 避免每次从头线性扫描整个寄存器空间。
 	 */
 	mutex_lock(&map->cache_lock);
 	i = base;
 	if (list_empty(&map->debugfs_off_cache)) {
 		for (; i <= map->max_register; i += map->reg_stride) {
-			/* Skip unprinted registers, closing off cache entry */
+			/* 碰到不可打印寄存器，就结束当前连续可导出区间。 */
 			if (!regmap_printable(map, i)) {
 				if (c) {
 					c->max = p - 1;
@@ -129,7 +130,7 @@ static unsigned int regmap_debugfs_get_dump_start(struct regmap *map,
 				continue;
 			}
 
-			/* No cache entry?  Start a new one */
+			/* 进入新的连续可导出区间时，创建一条缓存描述。 */
 			if (!c) {
 				c = kzalloc_obj(*c);
 				if (!c) {
@@ -145,7 +146,7 @@ static unsigned int regmap_debugfs_get_dump_start(struct regmap *map,
 		}
 	}
 
-	/* Close the last entry off if we didn't scan beyond it */
+	/* 若扫描结束时仍有一个打开的区间，要把它补全收尾。 */
 	if (c) {
 		c->max = p - 1;
 		c->max_reg = i - map->reg_stride;
@@ -154,14 +155,12 @@ static unsigned int regmap_debugfs_get_dump_start(struct regmap *map,
 	}
 
 	/*
-	 * This should never happen; we return above if we fail to
-	 * allocate and we should never be in this code if there are
-	 * no registers at all.
+	 * 正常不应发生：分配失败已经提前返回，而完全没有寄存器时也不会走到这里。
 	 */
 	WARN_ON(list_empty(&map->debugfs_off_cache));
 	ret = base;
 
-	/* Find the relevant block:offset */
+	/* 根据文件偏移找到对应的连续区间与区间内偏移。 */
 	list_for_each_entry(c, &map->debugfs_off_cache, list) {
 		if (from >= c->min && from <= c->max) {
 			fpos_offset = from - c->min;
@@ -182,7 +181,7 @@ static unsigned int regmap_debugfs_get_dump_start(struct regmap *map,
 static inline void regmap_calc_tot_len(struct regmap *map,
 				       void *buf, size_t count)
 {
-	/* Calculate the length of a fixed format  */
+	/* 只在第一次需要时计算一次每行导出文本的固定宽度。 */
 	if (!map->debugfs_tot_len) {
 		map->debugfs_reg_len = regmap_calc_reg_len(map->max_register);
 		map->debugfs_val_len = 2 * map->format.val_bytes;
@@ -236,24 +235,24 @@ static ssize_t regmap_read_debugfs(struct regmap *map, unsigned int from,
 
 	regmap_calc_tot_len(map, buf, count);
 
-	/* Work out which register we're starting at */
+	/* 根据用户读取偏移量，确定本轮从哪个寄存器开始转储。 */
 	start_reg = regmap_debugfs_get_dump_start(map, from, *ppos, &p);
 
 	for (i = start_reg; i >= 0 && i <= to;
 	     i = regmap_next_readable_reg(map, i)) {
 
-		/* If we're in the region the user is trying to read */
+		/* 到达用户本次真正想读的文件区间后再开始拼输出。 */
 		if (p >= *ppos) {
-			/* ...but not beyond it */
+			/* 同时不能超过这次 read() 调用允许返回的缓冲区上限。 */
 			if (buf_pos + map->debugfs_tot_len > count)
 				break;
 
-			/* Format the register */
+			/* 先格式化寄存器地址。 */
 			snprintf(buf + buf_pos, count - buf_pos, "%.*x: ",
 				 map->debugfs_reg_len, i - from);
 			buf_pos += map->debugfs_reg_len + 2;
 
-			/* Format the value, write all X if we can't read */
+			/* 再格式化寄存器值；如果读失败，就用全 X 占位。 */
 			ret = regmap_read(map, i, &val);
 			if (ret == 0)
 				snprintf(buf + buf_pos, count - buf_pos,
@@ -294,10 +293,8 @@ static ssize_t regmap_map_read_file(struct file *file, char __user *user_buf,
 #undef REGMAP_ALLOW_WRITE_DEBUGFS
 #ifdef REGMAP_ALLOW_WRITE_DEBUGFS
 /*
- * This can be dangerous especially when we have clients such as
- * PMICs, therefore don't provide any real compile time configuration option
- * for this feature, people who want to use this will need to modify
- * the source code directly.
+ * 直接从 debugfs 向寄存器写值风险很高，尤其是 PMIC 这类关键设备。
+ * 因此这里故意不提供正式的 Kconfig 开关；真要启用，必须自行改源码。
  */
 static ssize_t regmap_map_write_file(struct file *file,
 				     const char __user *user_buf,
@@ -323,7 +320,7 @@ static ssize_t regmap_map_write_file(struct file *file,
 	if (kstrtoul(start, 16, &value))
 		return -EINVAL;
 
-	/* Userspace has been fiddling around behind the kernel's back */
+	/* 用户态绕过正常驱动路径直接改寄存器，显式打 taint 标记。 */
 	add_taint(TAINT_USER, LOCKDEP_STILL_OK);
 
 	ret = regmap_write(map, reg, value);
@@ -387,16 +384,13 @@ static ssize_t regmap_reg_ranges_read_file(struct file *file,
 		return -ENOMEM;
 	}
 
-	/* While we are at it, build the register dump cache
-	 * now so the read() operation on the `registers' file
-	 * can benefit from using the cache.  We do not care
-	 * about the file position information that is contained
-	 * in the cache, just about the actual register blocks */
+	/* 顺手把 registers 文件也会用到的转储缓存先建出来。
+	 * 这里并不关心缓存里的文件偏移字段，只利用其中的“连续寄存器块”信息。
+	 */
 	regmap_calc_tot_len(map, buf, count);
 	regmap_debugfs_get_dump_start(map, 0, *ppos, &p);
 
-	/* Reset file pointer as the fixed-format of the `registers'
-	 * file is not compatible with the `range' file */
+	/* range 文件的输出格式与 registers 文件不同，因此这里重新从 0 计位置。 */
 	p = 0;
 	mutex_lock(&map->cache_lock);
 	list_for_each_entry(c, &map->debugfs_off_cache, list) {

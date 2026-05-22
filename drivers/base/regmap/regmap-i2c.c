@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Register map access API - I2C support
+// Register map 访问 API - I2C/SMBus 后端支持
 //
 // Copyright 2011 Wolfson Microelectronics plc
 //
@@ -48,6 +48,7 @@ static const struct regmap_bus regmap_smbus_byte = {
 	.reg_read = regmap_smbus_byte_reg_read,
 };
 
+/* 适用于“8bit 寄存器地址 + 16bit 数据”的标准 SMBus word data 模式。 */
 static int regmap_smbus_word_reg_read(void *context, unsigned int reg,
 				      unsigned int *val)
 {
@@ -120,6 +121,7 @@ static const struct regmap_bus regmap_smbus_word_swapped = {
 	.reg_read = regmap_smbus_word_read_swapped,
 };
 
+/* 纯 I2C 模式下，一次 write 直接发送“寄存器地址 + 数据载荷”整包。 */
 static int regmap_i2c_write(void *context, const void *data, size_t count)
 {
 	struct device *dev = context;
@@ -144,8 +146,8 @@ static int regmap_i2c_gather_write(void *context,
 	struct i2c_msg xfer[2];
 	int ret;
 
-	/* If the I2C controller can't do a gather tell the core, it
-	 * will substitute in a linear write for us.
+	/* 如果控制器不支持 gather write / NOSTART，就返回 -ENOTSUPP，
+	 * regmap core 会自动退化成线性拼包后再写。
 	 */
 	if (!i2c_check_functionality(i2c->adapter, I2C_FUNC_NOSTART))
 		return -ENOTSUPP;
@@ -205,6 +207,7 @@ static const struct regmap_bus regmap_i2c = {
 	.val_format_endian_default = REGMAP_ENDIAN_BIG,
 };
 
+/* 借助 SMBus I2C block 协议模拟“1 字节寄存器地址 + N 字节数据块”的访问。 */
 static int regmap_i2c_smbus_i2c_write(void *context, const void *data,
 				      size_t count)
 {
@@ -278,7 +281,9 @@ static int regmap_i2c_smbus_i2c_read_reg16(void *context, const void *reg,
 
 	count = 0;
 	do {
-		/* Current Address Read */
+		/* EEPROM 类器件常见的“当前地址读”模式：连续 read_byte()
+		 * 由器件内部地址指针自动递增。
+		 */
 		ret = i2c_smbus_read_byte(i2c);
 		if (ret < 0)
 			break;
@@ -304,18 +309,19 @@ static const struct regmap_bus regmap_i2c_smbus_i2c_block_reg16 = {
 };
 
 /*
- * SMBus byte/word reg16 support for adapters that have SMBUS_BYTE_DATA
- * and SMBUS_WORD_DATA but lack I2C_FUNC_I2C and I2C_FUNC_SMBUS_I2C_BLOCK,
- * such as the AMD PIIX4.
+ * 针对这类适配器提供 reg16 的 SMBus 兼容路径：
+ * 它们支持 SMBUS_BYTE_DATA / SMBUS_WORD_DATA，却不支持原生 I2C
+ * 和 SMBUS_I2C_BLOCK，例如 AMD PIIX4。
  *
- * READ:  set 16-bit EEPROM address via write_byte_data(addr_lo, addr_hi),
- *        then sequentially read bytes via read_byte() (EEPROM auto-
- *        increments the address pointer).  Same as the I2C-block reg16
- *        read path above.
+ * READ:
+ *   先用 write_byte_data(addr_lo, addr_hi) 写入 16bit EEPROM 地址，
+ *   再用 read_byte() 连续取数，依赖 EEPROM 内部地址指针自动递增。
+ *   这与上面的 I2C-block reg16 读路径本质相同。
  *
- * WRITE: encode the low address byte and data into a word transaction:
- *        write_word_data(addr_hi, (data_byte << 8) | addr_lo).
- *        Only single-byte writes are supported (one value per transaction).
+ * WRITE:
+ *   把“低地址字节 + 数据字节”编码进一个 word transaction：
+ *   write_word_data(addr_hi, (data_byte << 8) | addr_lo)。
+ *   因此这里只支持单字节写，每次事务只落一个数据字节。
  */
 static int regmap_smbus_word_write_reg16(void *context, const void *data,
 					 size_t count)
@@ -325,9 +331,9 @@ static int regmap_smbus_word_write_reg16(void *context, const void *data,
 	u8 addr_hi, addr_lo, val;
 
 	/*
-	 * data layout: [addr_hi, addr_lo, val0, val1, ...].
-	 * Only single-byte value writes are supported; multi-byte would
-	 * require raw I2C (or repeated word writes with incrementing address).
+	 * 数据布局是 [addr_hi, addr_lo, val0, val1, ...]。
+	 * 但这里只支持单字节值写入；多字节写必须依赖原生 I2C，
+	 * 或者在更高层手工循环发多次递增地址的 word write。
 	 */
 	if (count != 3)
 		return -EINVAL;
@@ -380,7 +386,7 @@ static const struct regmap_bus *regmap_get_i2c_bus(struct i2c_client *i2c,
 		case REGMAP_ENDIAN_BIG:
 			bus = &regmap_smbus_word_swapped;
 			break;
-		default:		/* everything else is not supported */
+		default:		/* 其他字节序组合在该后端上不支持 */
 			break;
 		}
 	else if (config->val_bits == 8 && config->reg_bits == 8 &&

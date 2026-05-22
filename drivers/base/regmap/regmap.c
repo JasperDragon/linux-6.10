@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Register map access API
+// Register map 访问 API
 //
 // Copyright 2011 Wolfson Microelectronics plc
 //
@@ -25,10 +25,9 @@
 #include "internal.h"
 
 /*
- * Sometimes for failures during very early init the trace
- * infrastructure isn't available early enough to be used.  For this
- * sort of problem defining LOG_DEVICE will add printks for basic
- * register I/O on a specific device.
+ * 某些极早期初始化失败场景里，trace 基础设施可能尚未可用。
+ * 如果要调这类问题，可以定义 LOG_DEVICE，让指定设备的基础寄存器 I/O
+ * 额外输出 printk。
  */
 #undef LOG_DEVICE
 
@@ -74,11 +73,11 @@ EXPORT_SYMBOL_GPL(regmap_reg_in_ranges);
 bool regmap_check_range_table(struct regmap *map, unsigned int reg,
 			      const struct regmap_access_table *table)
 {
-	/* Check "no ranges" first */
+	/* 先看是否命中明确禁止访问的 no_ranges。 */
 	if (regmap_reg_in_ranges(reg, table->no_ranges, table->n_no_ranges))
 		return false;
 
-	/* In case zero "yes ranges" are supplied, any reg is OK */
+	/* 如果没有提供 yes_ranges，则表示“除了 no_ranges 外都允许”。 */
 	if (!table->n_yes_ranges)
 		return true;
 
@@ -202,6 +201,7 @@ static bool regmap_volatile_range(struct regmap *map, unsigned int reg,
 {
 	unsigned int i;
 
+	/* 只要范围里有任何一个寄存器不是 volatile，就不能把整段视为 volatile。 */
 	for (i = 0; i < num; i++)
 		if (!regmap_volatile(map, reg + regmap_get_offset(map, i)))
 			return false;
@@ -214,6 +214,7 @@ static void regmap_format_12_20_write(struct regmap *map,
 {
 	u8 *out = map->work_buf;
 
+	/* 常见于“寄存器地址 12bit + 数据 20bit”的打包格式。 */
 	out[0] = reg >> 4;
 	out[1] = (reg << 4) | (val >> 16);
 	out[2] = val >> 8;
@@ -226,6 +227,7 @@ static void regmap_format_2_6_write(struct regmap *map,
 {
 	u8 *out = map->work_buf;
 
+	/* 单字节里高 2bit 放寄存器号，低 6bit 放数据。 */
 	*out = (reg << 6) | val;
 }
 
@@ -248,6 +250,7 @@ static void regmap_format_7_17_write(struct regmap *map,
 {
 	u8 *out = map->work_buf;
 
+	/* 第 1 字节同时承载 reg 和 val 的高位，是典型非字节对齐格式。 */
 	out[2] = val;
 	out[1] = val >> 8;
 	out[0] = (val >> 16) | (reg << 1);
@@ -587,7 +590,7 @@ int regmap_attach_dev(struct device *dev, struct regmap *map,
 	regmap_debugfs_exit(map);
 	regmap_debugfs_init(map);
 
-	/* Add a devres resource for dev_get_regmap() */
+	/* 把 regmap 挂进 devres，供 dev_get_regmap() 之类的公共路径检索。 */
 	m = devres_alloc(dev_get_regmap_release, sizeof(*m), GFP_KERNEL);
 	if (!m) {
 		regmap_debugfs_exit(map);
@@ -616,22 +619,22 @@ static enum regmap_endian regmap_get_reg_endian(const struct regmap_bus *bus,
 {
 	enum regmap_endian endian;
 
-	/* Retrieve the endianness specification from the regmap config */
+	/* 优先取调用者在 regmap_config 里显式声明的字节序。 */
 	endian = config->reg_format_endian;
 
-	/* If the regmap config specified a non-default value, use that */
+	/* 只要不是 DEFAULT，就直接采用。 */
 	if (endian != REGMAP_ENDIAN_DEFAULT)
 		return endian;
 
-	/* Retrieve the endianness specification from the bus config */
+	/* 否则退回到总线后端给出的默认格式。 */
 	if (bus && bus->reg_format_endian_default)
 		endian = bus->reg_format_endian_default;
 
-	/* If the bus specified a non-default value, use that */
+	/* 总线后端只要给了明确值，也直接采用。 */
 	if (endian != REGMAP_ENDIAN_DEFAULT)
 		return endian;
 
-	/* Use this if no other value was found */
+	/* 最终兜底仍未确定时，按历史兼容默认使用大端。 */
 	return REGMAP_ENDIAN_BIG;
 }
 
@@ -642,14 +645,14 @@ enum regmap_endian regmap_get_val_endian(struct device *dev,
 	struct fwnode_handle *fwnode = dev ? dev_fwnode(dev) : NULL;
 	enum regmap_endian endian;
 
-	/* Retrieve the endianness specification from the regmap config */
+	/* 数据字节序的优先级与寄存器地址类似，但多了固件节点属性这一层。 */
 	endian = config->val_format_endian;
 
-	/* If the regmap config specified a non-default value, use that */
+	/* 调用者显式指定时优先级最高。 */
 	if (endian != REGMAP_ENDIAN_DEFAULT)
 		return endian;
 
-	/* If the firmware node exist try to get endianness from it */
+	/* 若设备节点存在，则尝试从固件属性读取 big/little/native-endian。 */
 	if (fwnode_property_read_bool(fwnode, "big-endian"))
 		endian = REGMAP_ENDIAN_BIG;
 	else if (fwnode_property_read_bool(fwnode, "little-endian"))
@@ -657,19 +660,19 @@ enum regmap_endian regmap_get_val_endian(struct device *dev,
 	else if (fwnode_property_read_bool(fwnode, "native-endian"))
 		endian = REGMAP_ENDIAN_NATIVE;
 
-	/* If the endianness was specified in fwnode, use that */
+	/* 固件一旦给出明确字节序，就以固件为准。 */
 	if (endian != REGMAP_ENDIAN_DEFAULT)
 		return endian;
 
-	/* Retrieve the endianness specification from the bus config */
+	/* 否则回退到总线后端默认值。 */
 	if (bus && bus->val_format_endian_default)
 		endian = bus->val_format_endian_default;
 
-	/* If the bus specified a non-default value, use that */
+	/* 总线后端若给出明确值，也直接采用。 */
 	if (endian != REGMAP_ENDIAN_DEFAULT)
 		return endian;
 
-	/* Use this if no other value was found */
+	/* 最终兜底仍按历史兼容默认大端。 */
 	return REGMAP_ENDIAN_BIG;
 }
 EXPORT_SYMBOL_GPL(regmap_get_val_endian);
@@ -699,7 +702,7 @@ struct regmap *__regmap_init(struct device *dev,
 	if (ret)
 		goto err_map;
 
-	ret = -EINVAL; /* Later error paths rely on this */
+	ret = -EINVAL; /* 后续多个错误出口默认复用这个值。 */
 
 	if (config->disable_locking) {
 		map->lock = map->unlock = regmap_lock_unlock_none;
@@ -1225,15 +1228,14 @@ static void regmap_field_init(struct regmap_field *rm_field,
 }
 
 /**
- * devm_regmap_field_alloc() - Allocate and initialise a register field.
+ * devm_regmap_field_alloc() - 分配并初始化一个寄存器字段
  *
  * @dev: Device that will be interacted with
  * @regmap: regmap bank in which this register field is located.
  * @reg_field: Register field with in the bank.
  *
- * The return value will be an ERR_PTR() on error or a valid pointer
- * to a struct regmap_field. The regmap_field will be automatically freed
- * by the device management code.
+ * 返回值：失败时返回 ERR_PTR()，成功时返回有效的 struct regmap_field 指针。
+ * 分配出的 regmap_field 会在设备生命周期结束时自动释放。
  */
 struct regmap_field *devm_regmap_field_alloc(struct device *dev,
 		struct regmap *regmap, struct reg_field reg_field)
@@ -1252,16 +1254,15 @@ EXPORT_SYMBOL_GPL(devm_regmap_field_alloc);
 
 
 /**
- * regmap_field_bulk_alloc() - Allocate and initialise a bulk register field.
+ * regmap_field_bulk_alloc() - 批量分配并初始化多个寄存器字段
  *
  * @regmap: regmap bank in which this register field is located.
  * @rm_field: regmap register fields within the bank.
  * @reg_field: Register fields within the bank.
  * @num_fields: Number of register fields.
  *
- * The return value will be an -ENOMEM on error or zero for success.
- * Newly allocated regmap_fields should be freed by calling
- * regmap_field_bulk_free()
+ * 返回值：失败时返回负 errno，成功返回 0。
+ * 成功分配出的 regmap_fields 需由 regmap_field_bulk_free() 释放。
  */
 int regmap_field_bulk_alloc(struct regmap *regmap,
 			    struct regmap_field **rm_field,
@@ -1285,8 +1286,7 @@ int regmap_field_bulk_alloc(struct regmap *regmap,
 EXPORT_SYMBOL_GPL(regmap_field_bulk_alloc);
 
 /**
- * devm_regmap_field_bulk_alloc() - Allocate and initialise a bulk register
- * fields.
+ * devm_regmap_field_bulk_alloc() - 批量分配并初始化多个受管理的寄存器字段
  *
  * @dev: Device that will be interacted with
  * @regmap: regmap bank in which this register field is located.
@@ -1294,9 +1294,8 @@ EXPORT_SYMBOL_GPL(regmap_field_bulk_alloc);
  * @reg_field: Register fields within the bank.
  * @num_fields: Number of register fields.
  *
- * The return value will be an -ENOMEM on error or zero for success.
- * Newly allocated regmap_fields will be automatically freed by the
- * device management code.
+ * 返回值：失败时返回负 errno，成功返回 0。
+ * 分配出的 regmap_fields 会由 devres 自动释放。
  */
 int devm_regmap_field_bulk_alloc(struct device *dev,
 				 struct regmap *regmap,
@@ -1321,8 +1320,7 @@ int devm_regmap_field_bulk_alloc(struct device *dev,
 EXPORT_SYMBOL_GPL(devm_regmap_field_bulk_alloc);
 
 /**
- * regmap_field_bulk_free() - Free register field allocated using
- *                       regmap_field_bulk_alloc.
+ * regmap_field_bulk_free() - 释放由 regmap_field_bulk_alloc() 分配的字段数组
  *
  * @field: regmap fields which should be freed.
  */
@@ -1333,15 +1331,13 @@ void regmap_field_bulk_free(struct regmap_field *field)
 EXPORT_SYMBOL_GPL(regmap_field_bulk_free);
 
 /**
- * devm_regmap_field_bulk_free() - Free a bulk register field allocated using
- *                            devm_regmap_field_bulk_alloc.
+ * devm_regmap_field_bulk_free() - 释放由 devm_regmap_field_bulk_alloc() 分配的字段数组
  *
  * @dev: Device that will be interacted with
  * @field: regmap field which should be freed.
  *
- * Free register field allocated using devm_regmap_field_bulk_alloc(). Usually
- * drivers need not call this function, as the memory allocated via devm
- * will be freed as per device-driver life-cycle.
+ * 释放由 devm_regmap_field_bulk_alloc() 分配的寄存器字段。
+ * 一般驱动不需要显式调用它，因为 devm 分配的内存会随设备生命周期自动释放。
  */
 void devm_regmap_field_bulk_free(struct device *dev,
 				 struct regmap_field *field)
@@ -1351,15 +1347,13 @@ void devm_regmap_field_bulk_free(struct device *dev,
 EXPORT_SYMBOL_GPL(devm_regmap_field_bulk_free);
 
 /**
- * devm_regmap_field_free() - Free a register field allocated using
- *                            devm_regmap_field_alloc.
+ * devm_regmap_field_free() - 释放由 devm_regmap_field_alloc() 分配的寄存器字段
  *
  * @dev: Device that will be interacted with
  * @field: regmap field which should be freed.
  *
- * Free register field allocated using devm_regmap_field_alloc(). Usually
- * drivers need not call this function, as the memory allocated via devm
- * will be freed as per device-driver life-cyle.
+ * 释放由 devm_regmap_field_alloc() 分配的寄存器字段。
+ * 一般驱动不需要显式调用它，因为 devm 分配的内存会随设备生命周期自动释放。
  */
 void devm_regmap_field_free(struct device *dev,
 	struct regmap_field *field)
@@ -1369,14 +1363,13 @@ void devm_regmap_field_free(struct device *dev,
 EXPORT_SYMBOL_GPL(devm_regmap_field_free);
 
 /**
- * regmap_field_alloc() - Allocate and initialise a register field.
+ * regmap_field_alloc() - 分配并初始化一个寄存器字段
  *
  * @regmap: regmap bank in which this register field is located.
  * @reg_field: Register field with in the bank.
  *
- * The return value will be an ERR_PTR() on error or a valid pointer
- * to a struct regmap_field. The regmap_field should be freed by the
- * user once its finished working with it using regmap_field_free().
+ * 返回值：失败时返回 ERR_PTR()，成功时返回有效的 struct regmap_field 指针。
+ * 使用结束后，调用者需通过 regmap_field_free() 释放。
  */
 struct regmap_field *regmap_field_alloc(struct regmap *regmap,
 		struct reg_field reg_field)
@@ -1393,8 +1386,7 @@ struct regmap_field *regmap_field_alloc(struct regmap *regmap,
 EXPORT_SYMBOL_GPL(regmap_field_alloc);
 
 /**
- * regmap_field_free() - Free register field allocated using
- *                       regmap_field_alloc.
+ * regmap_field_free() - 释放由 regmap_field_alloc() 分配的寄存器字段
  *
  * @field: regmap field which should be freed.
  */
@@ -1405,18 +1397,16 @@ void regmap_field_free(struct regmap_field *field)
 EXPORT_SYMBOL_GPL(regmap_field_free);
 
 /**
- * regmap_reinit_cache() - Reinitialise the current register cache
+ * regmap_reinit_cache() - 重新初始化当前 regmap 的缓存
  *
  * @map: Register map to operate on.
  * @config: New configuration.  Only the cache data will be used.
  *
- * Discard any existing register cache for the map and initialize a
- * new cache.  This can be used to restore the cache to defaults or to
- * update the cache configuration to reflect runtime discovery of the
- * hardware.
+ * 丢弃当前 regmap 的旧缓存，并按新配置重新建立一份缓存。
+ * 这既可用于把缓存恢复到默认值，也可用于在运行期识别出硬件能力后，
+ * 动态调整缓存策略。
  *
- * No explicit locking is done here, the user needs to ensure that
- * this function will not race with other calls to regmap.
+ * 这里不额外做显式加锁，调用者必须自行保证它不会与其他 regmap 操作并发竞争。
  */
 int regmap_reinit_cache(struct regmap *map, const struct regmap_config *config)
 {
@@ -1450,7 +1440,7 @@ int regmap_reinit_cache(struct regmap *map, const struct regmap_config *config)
 EXPORT_SYMBOL_GPL(regmap_reinit_cache);
 
 /**
- * regmap_exit() - Free a previously allocated register map
+ * regmap_exit() - 释放一个已经创建的 regmap
  *
  * @map: Register map to operate on.
  */
@@ -1494,7 +1484,7 @@ static int dev_get_regmap_match(struct device *dev, void *res, void *data)
 		return 0;
 	}
 
-	/* If the user didn't specify a name match any */
+	/* 调用者未指定名字时，匹配设备上的第一份 regmap 即可。 */
 	if (data)
 		return (*r)->name && !strcmp((*r)->name, data);
 	else
@@ -1502,16 +1492,15 @@ static int dev_get_regmap_match(struct device *dev, void *res, void *data)
 }
 
 /**
- * dev_get_regmap() - Obtain the regmap (if any) for a device
+ * dev_get_regmap() - 获取设备上绑定的 regmap（如果存在）
  *
  * @dev: Device to retrieve the map for
  * @name: Optional name for the register map, usually NULL.
  *
- * Returns the regmap for the device if one is present, or NULL.  If
- * name is specified then it must match the name specified when
- * registering the device, if it is NULL then the first regmap found
- * will be used.  Devices with multiple register maps are very rare,
- * generic code should normally not need to specify a name.
+ * 如果设备上存在 regmap，则返回对应指针；否则返回 NULL。
+ * 若指定了 @name，它必须与注册 regmap 时使用的名字匹配；
+ * 若 @name 为 NULL，则返回找到的第一份 regmap。
+ * 一个设备同时挂多份 regmap 的情况很少见，通用代码通常不需要指定名字。
  */
 struct regmap *dev_get_regmap(struct device *dev, const char *name)
 {
@@ -1525,11 +1514,11 @@ struct regmap *dev_get_regmap(struct device *dev, const char *name)
 EXPORT_SYMBOL_GPL(dev_get_regmap);
 
 /**
- * regmap_get_device() - Obtain the device from a regmap
+ * regmap_get_device() - 从 regmap 反查其底层设备
  *
  * @map: Register map to operate on.
  *
- * Returns the underlying device that the regmap has been created for.
+ * 返回创建该 regmap 时绑定的底层设备。
  */
 struct device *regmap_get_device(struct regmap *map)
 {
@@ -1552,18 +1541,18 @@ static int _regmap_select_page(struct regmap *map, unsigned int *reg,
 	win_page = (*reg - range->range_min) / range->window_len;
 
 	if (val_num > 1) {
-		/* Bulk write shouldn't cross range boundary */
+		/* 批量写不允许越过虚拟 range 边界。 */
 		if (*reg + val_num - 1 > range->range_max)
 			return -EINVAL;
 
-		/* ... or single page boundary */
+		/* 也不允许一次跨越单个 page/window 的边界。 */
 		if (val_num > range->window_len - win_offset)
 			return -EINVAL;
 	}
 
 	/*
-	 * Calculate the address of the selector register in the corresponding
-	 * data window if it is located on every page.
+	 * 如果 selector 寄存器本身也映射在每个 page 的 data window 中，
+	 * 这里要先算出它在当前目标 page 上的实际地址。
 	 */
 	page_chg = in_range(range->selector_reg, range->window_start, range->window_len);
 	if (page_chg)
@@ -1571,23 +1560,20 @@ static int _regmap_select_page(struct regmap *map, unsigned int *reg,
 			       range->selector_reg - range->window_start;
 
 	/*
-	 * It is possible to have selector register inside data window.
-	 * In that case, selector register is located on every page and it
-	 * needs no page switching, when accessed alone.
+	 * selector 寄存器有可能本身就落在 data window 内。
+	 * 这种情况下，它在每个 page 上都各有一个镜像，单独访问它时通常不需要切页。
 	 *
-	 * Nevertheless we should synchronize the cache values for it.
-	 * This can't be properly achieved if the selector register is
-	 * the first and the only one to be read inside the data window.
-	 * That's why we update it in that case as well.
+	 * 但缓存中的 selector 值仍然需要被正确同步。
+	 * 如果 selector 恰好是 data window 中第一个也是唯一一个访问目标，
+	 * 单靠普通窗口访问路径无法保证这一点，所以这里也会主动更新它。
 	 *
-	 * However, we specifically avoid updating it for the default page,
-	 * when it's overlapped with the real data window, to prevent from
-	 * infinite looping.
+	 * 同时，为避免与默认页上真实 data window 重叠时形成无限递归，
+	 * 我们显式跳过那种特殊情况。
 	 */
 	if (val_num > 1 ||
 	    (page_chg && selector_reg != range->selector_reg) ||
 	    range->window_start + win_offset != range->selector_reg) {
-		/* Use separate work_buf during page switching */
+		/* 切页时临时改用 selector_work_buf，避免污染主写入缓冲区。 */
 		orig_work_buf = map->work_buf;
 		map->work_buf = map->selector_work_buf;
 
@@ -1646,9 +1632,7 @@ static int _regmap_raw_write_impl(struct regmap *map, unsigned int reg,
 	size_t len;
 	int i;
 
-	/* Check for unwritable or noinc registers in range
-	 * before we start
-	 */
+	/* 真正发 I/O 前先检查目标范围是否可写，以及是否误碰 noinc 寄存器。 */
 	if (!regmap_writeable_noinc(map, reg)) {
 		for (i = 0; i < val_len / map->format.val_bytes; i++) {
 			unsigned int element =
@@ -1663,7 +1647,7 @@ static int _regmap_raw_write_impl(struct regmap *map, unsigned int reg,
 		unsigned int ival, offset;
 		int val_bytes = map->format.val_bytes;
 
-		/* Cache the last written value for noinc writes */
+		/* noinc 写的语义是“同一寄存器重复收数据”，缓存里只保留最后一个值。 */
 		i = noinc ? val_len - val_bytes : 0;
 		for (; i < val_len; i += val_bytes) {
 			ival = map->format.parse_val(val + i);
@@ -1688,7 +1672,7 @@ static int _regmap_raw_write_impl(struct regmap *map, unsigned int reg,
 		int win_offset = (reg - range->range_min) % range->window_len;
 		int win_residue = range->window_len - win_offset;
 
-		/* If the write goes beyond the end of the window split it */
+		/* 如果写入超出当前 window 尾部，就按 window 边界拆成多段。 */
 		while (val_num > win_residue) {
 			dev_dbg(map->dev, "Writing window %d/%zu\n",
 				win_residue, val_len / map->format.val_bytes);
@@ -1719,9 +1703,8 @@ static int _regmap_raw_write_impl(struct regmap *map, unsigned int reg,
 				      map->write_flag_mask);
 
 	/*
-	 * Essentially all I/O mechanisms will be faster with a single
-	 * buffer to write.  Since register syncs often generate raw
-	 * writes of single registers optimise that case.
+	 * 对绝大多数后端来说，一次性写单缓冲区都更快。
+	 * 由于寄存器同步经常退化成“单寄存器 raw write”，这里优先优化这种路径。
 	 */
 	if (val != work_val && val_len == map->format.val_bytes) {
 		memcpy(work_val, val, map->format.val_bytes);
@@ -1756,7 +1739,7 @@ static int _regmap_raw_write_impl(struct regmap *map, unsigned int reg,
 
 		async->map = map;
 
-		/* If the caller supplied the value we can use it safely. */
+		/* 若调用者提供的是独立 value 缓冲区，这里可以直接复用其内容。 */
 		memcpy(async->work_buf, map->work_buf, map->format.pad_bytes +
 		       map->format.reg_bytes + map->format.val_bytes);
 
@@ -1791,10 +1774,7 @@ static int _regmap_raw_write_impl(struct regmap *map, unsigned int reg,
 
 	trace_regmap_hw_write_start(map, reg, val_len / map->format.val_bytes);
 
-	/* If we're doing a single register write we can probably just
-	 * send the work_buf directly, otherwise try to do a gather
-	 * write.
-	 */
+	/* 单寄存器写通常可以直接发 work_buf；否则优先尝试 gather write。 */
 	if (val == work_val)
 		ret = map->write(map->bus_context, map->work_buf,
 				 map->format.reg_bytes +
@@ -1808,7 +1788,7 @@ static int _regmap_raw_write_impl(struct regmap *map, unsigned int reg,
 	else
 		ret = -ENOTSUPP;
 
-	/* If that didn't work fall back on linearising by hand. */
+	/* gather 不支持时，再退化成手工拼一块线性缓冲区。 */
 	if (ret == -ENOTSUPP) {
 		len = map->format.reg_bytes + map->format.pad_bytes + val_len;
 		buf = kzalloc(len, GFP_KERNEL);
@@ -1822,8 +1802,8 @@ static int _regmap_raw_write_impl(struct regmap *map, unsigned int reg,
 
 		kfree(buf);
 	} else if (ret != 0 && !map->cache_bypass && map->format.parse_val) {
-		/* regcache_drop_region() takes lock that we already have,
-		 * thus call map->cache_ops->drop() directly
+		/* regcache_drop_region() 会再次取当前已经持有的锁，
+		 * 因此这里直接下钻到 cache_ops->drop()。
 		 */
 		if (map->cache_ops && map->cache_ops->drop)
 			map->cache_ops->drop(map, reg, reg + 1);
@@ -1835,7 +1815,7 @@ static int _regmap_raw_write_impl(struct regmap *map, unsigned int reg,
 }
 
 /**
- * regmap_can_raw_write - Test if regmap_raw_write() is supported
+ * regmap_can_raw_write - 检查当前 regmap 是否支持 regmap_raw_write()
  *
  * @map: Map to check.
  */
@@ -1846,7 +1826,7 @@ bool regmap_can_raw_write(struct regmap *map)
 EXPORT_SYMBOL_GPL(regmap_can_raw_write);
 
 /**
- * regmap_get_raw_read_max - Get the maximum size we can read
+ * regmap_get_raw_read_max - 获取当前 regmap 支持的最大 raw read 长度
  *
  * @map: Map to check.
  */
@@ -1857,7 +1837,7 @@ size_t regmap_get_raw_read_max(struct regmap *map)
 EXPORT_SYMBOL_GPL(regmap_get_raw_read_max);
 
 /**
- * regmap_get_raw_write_max - Get the maximum size we can read
+ * regmap_get_raw_write_max - 获取当前 regmap 支持的最大 raw write 长度
  *
  * @map: Map to check.
  */
@@ -1966,14 +1946,13 @@ int _regmap_write(struct regmap *map, unsigned int reg,
 }
 
 /**
- * regmap_write() - Write a value to a single register
+ * regmap_write() - 向单个寄存器写入一个值
  *
  * @map: Register map to write to
  * @reg: Register to write to
  * @val: Value to be written
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_write(struct regmap *map, unsigned int reg, unsigned int val)
 {
@@ -1993,14 +1972,13 @@ int regmap_write(struct regmap *map, unsigned int reg, unsigned int val)
 EXPORT_SYMBOL_GPL(regmap_write);
 
 /**
- * regmap_write_async() - Write a value to a single register asynchronously
+ * regmap_write_async() - 异步向单个寄存器写入一个值
  *
  * @map: Register map to write to
  * @reg: Register to write to
  * @val: Value to be written
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_write_async(struct regmap *map, unsigned int reg, unsigned int val)
 {
@@ -2043,7 +2021,7 @@ int _regmap_raw_write(struct regmap *map, unsigned int reg,
 	chunk_count = val_count / chunk_regs;
 	chunk_bytes = chunk_regs * val_bytes;
 
-	/* Write as many bytes as possible with chunk_size */
+	/* 先按 chunk_size 尽量写满整块。 */
 	for (i = 0; i < chunk_count; i++) {
 		ret = _regmap_raw_write_impl(map, reg, val, chunk_bytes, noinc);
 		if (ret)
@@ -2054,7 +2032,7 @@ int _regmap_raw_write(struct regmap *map, unsigned int reg,
 		val_len -= chunk_bytes;
 	}
 
-	/* Write remaining bytes */
+	/* 最后处理不足一整块的尾部残留。 */
 	if (val_len)
 		ret = _regmap_raw_write_impl(map, reg, val, val_len, noinc);
 
@@ -2062,7 +2040,7 @@ int _regmap_raw_write(struct regmap *map, unsigned int reg,
 }
 
 /**
- * regmap_raw_write() - Write raw values to one or more registers
+ * regmap_raw_write() - 向一个或多个寄存器写入原始数据
  *
  * @map: Register map to write to
  * @reg: Initial register to write to
@@ -2070,12 +2048,10 @@ int _regmap_raw_write(struct regmap *map, unsigned int reg,
  *       device
  * @val_len: Length of data pointed to by val.
  *
- * This function is intended to be used for things like firmware
- * download where a large block of data needs to be transferred to the
- * device.  No formatting will be done on the data provided.
+ * 适合固件下载等“大块数据直通设备”的场景。
+ * 传入的数据不会再被框架做任何格式化处理。
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_raw_write(struct regmap *map, unsigned int reg,
 		     const void *val, size_t val_len)
@@ -2176,25 +2152,23 @@ static int regmap_noinc_readwrite(struct regmap *map, unsigned int reg,
 }
 
 /**
- * regmap_noinc_write(): Write data to a register without incrementing the
- *			register number
+ * regmap_noinc_write() - 向同一寄存器重复写数据而不自增地址
  *
  * @map: Register map to write to
  * @reg: Register to write to
  * @val: Pointer to data buffer
  * @val_len: Length of output buffer in bytes.
  *
- * The regmap API usually assumes that bulk bus write operations will write a
- * range of registers. Some devices have certain registers for which a write
- * operation can write to an internal FIFO.
+ * regmap API 默认假设 bulk write 会写一段连续寄存器。
+ * 但有些设备的特定寄存器写入语义其实是向内部 FIFO 推数据，
+ * 因而寄存器地址不应自增。
  *
  * The target register must be volatile but registers after it can be
  * completely unrelated cacheable registers.
  *
- * This will attempt multiple writes as required to write val_len bytes.
+ * 为完成 val_len 字节写入，函数会按后端限制自动拆成多次事务。
  *
- * A value of zero will be returned on success, a negative errno will be
- * returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_noinc_write(struct regmap *map, unsigned int reg,
 		      const void *val, size_t val_len)
@@ -2219,8 +2193,8 @@ int regmap_noinc_write(struct regmap *map, unsigned int reg,
 	}
 
 	/*
-	 * Use the accelerated operation if we can. The val drops the const
-	 * typing in order to facilitate code reuse in regmap_noinc_readwrite().
+	 * 若后端提供了专门的 noinc 写接口，就优先走加速路径。
+	 * 这里去掉 val 的 const 属性，只是为了复用 regmap_noinc_readwrite()。
 	 */
 	if (map->bus->reg_noinc_write) {
 		ret = regmap_noinc_readwrite(map, reg, (void *)val, val_len, true);
@@ -2246,8 +2220,7 @@ out_unlock:
 EXPORT_SYMBOL_GPL(regmap_noinc_write);
 
 /**
- * regmap_field_update_bits_base() - Perform a read/modify/write cycle a
- *                                   register field.
+ * regmap_field_update_bits_base() - 对寄存器字段执行读改写循环
  *
  * @field: Register field to write to
  * @mask: Bitmask to change
@@ -2256,11 +2229,9 @@ EXPORT_SYMBOL_GPL(regmap_noinc_write);
  * @async: Boolean indicating asynchronously
  * @force: Boolean indicating use force update
  *
- * Perform a read/modify/write cycle on the register field with change,
- * async, force option.
+ * 对指定字段执行 read/modify/write，并支持 change/async/force 这些控制选项。
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_field_update_bits_base(struct regmap_field *field,
 				  unsigned int mask, unsigned int val,
@@ -2275,8 +2246,7 @@ int regmap_field_update_bits_base(struct regmap_field *field,
 EXPORT_SYMBOL_GPL(regmap_field_update_bits_base);
 
 /**
- * regmap_field_test_bits() - Check if all specified bits are set in a
- *                            register field.
+ * regmap_field_test_bits() - 检查寄存器字段中的指定 bit 是否全部置位
  *
  * @field: Register field to operate on
  * @bits: Bits to test
@@ -2299,8 +2269,7 @@ int regmap_field_test_bits(struct regmap_field *field, unsigned int bits)
 EXPORT_SYMBOL_GPL(regmap_field_test_bits);
 
 /**
- * regmap_fields_update_bits_base() - Perform a read/modify/write cycle a
- *                                    register field with port ID
+ * regmap_fields_update_bits_base() - 对带端口 ID 的寄存器字段执行读改写循环
  *
  * @field: Register field to write to
  * @id: port ID
@@ -2310,8 +2279,7 @@ EXPORT_SYMBOL_GPL(regmap_field_test_bits);
  * @async: Boolean indicating asynchronously
  * @force: Boolean indicating use force update
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_fields_update_bits_base(struct regmap_field *field, unsigned int id,
 				   unsigned int mask, unsigned int val,
@@ -2330,18 +2298,16 @@ int regmap_fields_update_bits_base(struct regmap_field *field, unsigned int id,
 EXPORT_SYMBOL_GPL(regmap_fields_update_bits_base);
 
 /**
- * regmap_bulk_write() - Write multiple registers to the device
+ * regmap_bulk_write() - 向设备写入多个连续寄存器
  *
  * @map: Register map to write to
  * @reg: First register to be write from
  * @val: Block of data to be written, in native register size for device
  * @val_count: Number of registers to write
  *
- * This function is intended to be used for writing a large block of
- * data to the device either in single transfer or multiple transfer.
+ * 适合把一大块连续寄存器数据一次或分多次写入设备。
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_bulk_write(struct regmap *map, unsigned int reg, const void *val,
 		     size_t val_count)
@@ -2353,8 +2319,7 @@ int regmap_bulk_write(struct regmap *map, unsigned int reg, const void *val,
 		return -EINVAL;
 
 	/*
-	 * Some devices don't support bulk write, for them we have a series of
-	 * single write operations.
+	 * 有些设备不支持真正的 bulk write，这时就退化成一连串单寄存器写。
 	 */
 	if (!map->write || !map->format.parse_inplace) {
 		map->lock(map->lock_arg);
@@ -2409,9 +2374,9 @@ EXPORT_SYMBOL_GPL(regmap_bulk_write);
 /*
  * _regmap_raw_multi_reg_write()
  *
- * the (register,newvalue) pairs in regs have not been formatted, but
- * they are all in the same page and have been changed to being page
- * relative. The page register has been written if that was necessary.
+ * regs 里的 (register, newvalue) 对尚未做总线格式化，
+ * 但它们已经被规整到同一个 page，并且寄存器地址已转换成 page 内相对偏移。
+ * 若需要切页，对应的 page selector 也已经提前写好了。
  */
 static int _regmap_raw_multi_reg_write(struct regmap *map,
 				       const struct reg_sequence *regs,
@@ -2434,7 +2399,7 @@ static int _regmap_raw_multi_reg_write(struct regmap *map,
 	if (!buf)
 		return -ENOMEM;
 
-	/* We have to linearise by hand. */
+	/* 这里必须手工把 R1,V1,R2,V2... 序列线性打包。 */
 
 	u8 = buf;
 
@@ -2481,10 +2446,8 @@ static int _regmap_range_multi_paged_reg_write(struct regmap *map,
 	unsigned int this_page = 0;
 	unsigned int page_change = 0;
 	/*
-	 * the set of registers are not neccessarily in order, but
-	 * since the order of write must be preserved this algorithm
-	 * chops the set each time the page changes. This also applies
-	 * if there is a delay required at any point in the sequence.
+	 * 这组寄存器不一定按地址有序，但写入顺序必须保持不变。
+	 * 因此算法会在“page 发生切换”或“当前项要求延迟”时把序列切开。
 	 */
 	base = regs;
 	for (i = 0, n = 0; i < num_regs; i++, n++) {
@@ -2504,18 +2467,15 @@ static int _regmap_range_multi_paged_reg_write(struct regmap *map,
 			}
 		}
 
-		/* If we have both a page change and a delay make sure to
-		 * write the regs and apply the delay before we change the
-		 * page.
+		/* 若同时遇到 page 切换和 delay，必须先把当前段写完并执行延迟，
+		 * 然后再切换 page。
 		 */
 
 		if (page_change || regs[i].delay_us) {
 
-				/* For situations where the first write requires
-				 * a delay we need to make sure we don't call
-				 * raw_multi_reg_write with n=0
-				 * This can't occur with page breaks as we
-				 * never write on the first iteration
+				/* 如果第一条写就要求 delay，要避免以 n=0 调用
+				 * raw_multi_reg_write()。page break 场景不会出现这个问题，
+				 * 因为首轮迭代前还不会触发真正写出。
 				 */
 				if (regs[i].delay_us && i == 0)
 					n = 1;
@@ -2611,9 +2571,7 @@ static int _regmap_multi_reg_write(struct regmap *map,
 		unsigned int reg = regs[i].reg;
 		struct regmap_range_node *range;
 
-		/* Coalesce all the writes between a page break or a delay
-		 * in a sequence
-		 */
+		/* 把同一 page 且中间没有 delay 的连续写尽量合并成一段。 */
 		range = _regmap_range_lookup(map, reg);
 		if (range || regs[i].delay_us) {
 			size_t len = sizeof(struct reg_sequence)*num_regs;
@@ -2632,23 +2590,20 @@ static int _regmap_multi_reg_write(struct regmap *map,
 }
 
 /**
- * regmap_multi_reg_write() - Write multiple registers to the device
+ * regmap_multi_reg_write() - 以多寄存器模式向设备写入一组寄存器
  *
  * @map: Register map to write to
  * @regs: Array of structures containing register,value to be written
  * @num_regs: Number of registers to write
  *
- * Write multiple registers to the device where the set of register, value
- * pairs are supplied in any order, possibly not all in a single range.
+ * 向设备写入多组寄存器/值对；这些对可以是任意顺序，也不必落在同一连续范围内。
  *
- * The 'normal' block write mode will send ultimately send data on the
- * target bus as R,V1,V2,V3,..,Vn where successively higher registers are
- * addressed. However, this alternative block multi write mode will send
- * the data as R1,V1,R2,V2,..,Rn,Vn on the target bus. The target device
- * must of course support the mode.
+ * 普通 block write 最终在总线上发送的是 `R, V1, V2, V3 ... Vn`，
+ * 即默认假定目标寄存器连续递增。
+ * 而 multi-reg write 发送的是 `R1, V1, R2, V2 ... Rn, Vn`。
+ * 目标设备当然必须原生支持这种事务格式。
  *
- * A value of zero will be returned on success, a negative errno will be
- * returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_multi_reg_write(struct regmap *map, const struct reg_sequence *regs,
 			   int num_regs)
@@ -2666,22 +2621,18 @@ int regmap_multi_reg_write(struct regmap *map, const struct reg_sequence *regs,
 EXPORT_SYMBOL_GPL(regmap_multi_reg_write);
 
 /**
- * regmap_multi_reg_write_bypassed() - Write multiple registers to the
- *                                     device but not the cache
+ * regmap_multi_reg_write_bypassed() - 向设备写多寄存器，但绕过缓存
  *
  * @map: Register map to write to
  * @regs: Array of structures containing register,value to be written
  * @num_regs: Number of registers to write
  *
- * Write multiple registers to the device but not the cache where the set
- * of register are supplied in any order.
+ * 把一组任意顺序的寄存器写到设备，但不更新缓存。
  *
- * This function is intended to be used for writing a large block of data
- * atomically to the device in single transfer for those I2C client devices
- * that implement this alternative block write mode.
+ * 适合那些支持“替代块写模式”的设备，用单次事务把大块数据原子写进硬件，
+ * 同时避免缓存被这类特殊写路径污染。
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_multi_reg_write_bypassed(struct regmap *map,
 				    const struct reg_sequence *regs,
@@ -2706,8 +2657,7 @@ int regmap_multi_reg_write_bypassed(struct regmap *map,
 EXPORT_SYMBOL_GPL(regmap_multi_reg_write_bypassed);
 
 /**
- * regmap_raw_write_async() - Write raw values to one or more registers
- *                            asynchronously
+ * regmap_raw_write_async() - 异步向一个或多个寄存器写原始数据
  *
  * @map: Register map to write to
  * @reg: Initial register to write to
@@ -2719,13 +2669,10 @@ EXPORT_SYMBOL_GPL(regmap_multi_reg_write_bypassed);
  * download where a large block of data needs to be transferred to the
  * device.  No formatting will be done on the data provided.
  *
- * If supported by the underlying bus the write will be scheduled
- * asynchronously, helping maximise I/O speed on higher speed buses
- * like SPI.  regmap_async_complete() can be called to ensure that all
- * asynchrnous writes have been completed.
+ * 若底层总线支持异步写，这里会把事务异步排队，适合 SPI 这类高速总线尽量榨干吞吐。
+ * 之后可以调用 regmap_async_complete() 等待所有异步写真正完成。
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_raw_write_async(struct regmap *map, unsigned int reg,
 			   const void *val, size_t val_len)
@@ -2852,14 +2799,13 @@ static int _regmap_read(struct regmap *map, unsigned int reg,
 }
 
 /**
- * regmap_read() - Read a value from a single register
+ * regmap_read() - 从单个寄存器读取一个值
  *
  * @map: Register map to read from
  * @reg: Register to be read from
  * @val: Pointer to store read value
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_read(struct regmap *map, unsigned int reg, unsigned int *val)
 {
@@ -2879,15 +2825,13 @@ int regmap_read(struct regmap *map, unsigned int reg, unsigned int *val)
 EXPORT_SYMBOL_GPL(regmap_read);
 
 /**
- * regmap_read_bypassed() - Read a value from a single register direct
- *			    from the device, bypassing the cache
+ * regmap_read_bypassed() - 绕过缓存，直接从硬件读取单个寄存器
  *
  * @map: Register map to read from
  * @reg: Register to be read from
  * @val: Pointer to store read value
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_read_bypassed(struct regmap *map, unsigned int reg, unsigned int *val)
 {
@@ -2916,15 +2860,14 @@ int regmap_read_bypassed(struct regmap *map, unsigned int reg, unsigned int *val
 EXPORT_SYMBOL_GPL(regmap_read_bypassed);
 
 /**
- * regmap_raw_read() - Read raw data from the device
+ * regmap_raw_read() - 从设备读取原始数据
  *
  * @map: Register map to read from
  * @reg: First register to be read from
  * @val: Pointer to store read value
  * @val_len: Size of data to read
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_raw_read(struct regmap *map, unsigned int reg, void *val,
 		    size_t val_len)
@@ -2966,7 +2909,7 @@ int regmap_raw_read(struct regmap *map, unsigned int reg, void *val,
 		chunk_count = val_count / chunk_regs;
 		chunk_bytes = chunk_regs * val_bytes;
 
-		/* Read bytes that fit into whole chunks */
+		/* 先按整块大小尽量读取。 */
 		for (i = 0; i < chunk_count; i++) {
 			ret = _regmap_raw_read(map, reg, val, chunk_bytes, false);
 			if (ret != 0)
@@ -2977,16 +2920,14 @@ int regmap_raw_read(struct regmap *map, unsigned int reg, void *val,
 			val_len -= chunk_bytes;
 		}
 
-		/* Read remaining bytes */
+		/* 再处理尾部不足整块的残留字节。 */
 		if (val_len) {
 			ret = _regmap_raw_read(map, reg, val, val_len, false);
 			if (ret != 0)
 				goto out;
 		}
 	} else {
-		/* Otherwise go word by word for the cache; should be low
-		 * cost as we expect to hit the cache.
-		 */
+		/* 否则就按寄存器逐项走缓存读取；命中缓存时开销通常较低。 */
 		for (i = 0; i < val_count; i++) {
 			ret = _regmap_read(map, reg + regmap_get_offset(map, i),
 					   &v);
@@ -3005,25 +2946,23 @@ int regmap_raw_read(struct regmap *map, unsigned int reg, void *val,
 EXPORT_SYMBOL_GPL(regmap_raw_read);
 
 /**
- * regmap_noinc_read(): Read data from a register without incrementing the
- *			register number
+ * regmap_noinc_read() - 从同一寄存器反复读数据而不自增地址
  *
  * @map: Register map to read from
  * @reg: Register to read from
  * @val: Pointer to data buffer
  * @val_len: Length of output buffer in bytes.
  *
- * The regmap API usually assumes that bulk read operations will read a
- * range of registers. Some devices have certain registers for which a read
- * operation read will read from an internal FIFO.
+ * regmap API 默认假设 bulk read 读取的是一段连续寄存器。
+ * 但有些设备的特定寄存器读语义其实是从内部 FIFO 拉数据，
+ * 因而寄存器地址不应自增。
  *
  * The target register must be volatile but registers after it can be
  * completely unrelated cacheable registers.
  *
- * This will attempt multiple reads as required to read val_len bytes.
+ * 为读取 val_len 字节，函数会按后端限制自动拆成多次事务。
  *
- * A value of zero will be returned on success, a negative errno will be
- * returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_noinc_read(struct regmap *map, unsigned int reg,
 		      void *val, size_t val_len)
@@ -3049,17 +2988,16 @@ int regmap_noinc_read(struct regmap *map, unsigned int reg,
 	}
 
 	/*
-	 * We have not defined the FIFO semantics for cache, as the
-	 * cache is just one value deep. Should we return the last
-	 * written value? Just avoid this by always reading the FIFO
-	 * even when using cache. Cache only will not work.
+	 * FIFO 语义与普通寄存器缓存天然冲突：缓存只有一层，而 FIFO 是流。
+	 * 因此这里始终强制走真实硬件读取，不从缓存返回“最后一次值”。
+	 * 这也意味着 cache-only 模式在 FIFO/noinc 读场景下不可用。
 	 */
 	if (!map->cache_bypass && map->cache_only) {
 		ret = -EBUSY;
 		goto out_unlock;
 	}
 
-	/* Use the accelerated operation if we can */
+	/* 若后端提供专门的 noinc 读接口，就优先走加速路径。 */
 	if (map->bus->reg_noinc_read) {
 		ret = regmap_noinc_readwrite(map, reg, val, val_len, false);
 		goto out_unlock;
@@ -3084,13 +3022,12 @@ out_unlock:
 EXPORT_SYMBOL_GPL(regmap_noinc_read);
 
 /**
- * regmap_field_read(): Read a value to a single register field
+ * regmap_field_read() - 读取单个寄存器字段的值
  *
  * @field: Register field to read from
  * @val: Pointer to store read value
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_field_read(struct regmap_field *field, unsigned int *val)
 {
@@ -3109,14 +3046,13 @@ int regmap_field_read(struct regmap_field *field, unsigned int *val)
 EXPORT_SYMBOL_GPL(regmap_field_read);
 
 /**
- * regmap_fields_read() - Read a value to a single register field with port ID
+ * regmap_fields_read() - 读取带端口 ID 的寄存器字段值
  *
  * @field: Register field to read from
  * @id: port ID
  * @val: Pointer to store read value
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_fields_read(struct regmap_field *field, unsigned int id,
 		       unsigned int *val)
@@ -3187,15 +3123,14 @@ out:
 }
 
 /**
- * regmap_bulk_read() - Read multiple sequential registers from the device
+ * regmap_bulk_read() - 从设备读取多个连续寄存器
  *
  * @map: Register map to read from
  * @reg: First register to be read from
  * @val: Pointer to store read value, in native register size for device
  * @val_count: Number of registers to read
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_bulk_read(struct regmap *map, unsigned int reg, void *val,
 		     size_t val_count)
@@ -3226,15 +3161,14 @@ int regmap_bulk_read(struct regmap *map, unsigned int reg, void *val,
 EXPORT_SYMBOL_GPL(regmap_bulk_read);
 
 /**
- * regmap_multi_reg_read() - Read multiple non-sequential registers from the device
+ * regmap_multi_reg_read() - 从设备读取多个不连续寄存器
  *
  * @map: Register map to read from
  * @regs: Array of registers to read from
  * @val: Pointer to store read value, in native register size for device
  * @val_count: Number of registers to read
  *
- * A value of zero will be returned on success, a negative errno will
- * be returned in error cases.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_multi_reg_read(struct regmap *map, const unsigned int *regs, void *val,
 			  size_t val_count)
@@ -3280,7 +3214,7 @@ static int _regmap_update_bits(struct regmap *map, unsigned int reg,
 }
 
 /**
- * regmap_update_bits_base() - Perform a read/modify/write cycle on a register
+ * regmap_update_bits_base() - 对寄存器执行读改写循环
  *
  * @map: Register map to update
  * @reg: Register to update
@@ -3290,16 +3224,13 @@ static int _regmap_update_bits(struct regmap *map, unsigned int reg,
  * @async: Boolean indicating asynchronously
  * @force: Boolean indicating use force update
  *
- * Perform a read/modify/write cycle on a register map with change, async, force
- * options.
+ * 按 change/async/force 这些控制选项，对寄存器执行标准 read/modify/write。
  *
- * If async is true:
+ * 如果 async 为 true：
+ * 大多数总线上的“读当前值”仍必须同步完成，
+ * 因而它最适合那些能直接从缓存拿到旧值、不必访问硬件求当前值的设备。
  *
- * With most buses the read must be done synchronously so this is most useful
- * for devices with a cache which do not need to interact with the hardware to
- * determine the current register value.
- *
- * Returns zero for success, a negative number on error.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regmap_update_bits_base(struct regmap *map, unsigned int reg,
 			    unsigned int mask, unsigned int val,
@@ -3322,15 +3253,14 @@ int regmap_update_bits_base(struct regmap *map, unsigned int reg,
 EXPORT_SYMBOL_GPL(regmap_update_bits_base);
 
 /**
- * regmap_test_bits() - Check if all specified bits are set in a register.
+ * regmap_test_bits() - 检查寄存器中的指定 bit 是否全部置位
  *
  * @map: Register map to operate on
  * @reg: Register to read from
  * @bits: Bits to test
  *
- * Returns 0 if at least one of the tested bits is not set, 1 if all tested
- * bits are set and a negative error number if the underlying regmap_read()
- * fails.
+ * 返回值：若至少有一个测试位未置位则返回 0；若全部置位则返回 1；
+ * 若底层 regmap_read() 失败，则返回负 errno。
  */
 int regmap_test_bits(struct regmap *map, unsigned int reg, unsigned int bits)
 {
@@ -3379,19 +3309,19 @@ static int regmap_async_is_done(struct regmap *map)
 }
 
 /**
- * regmap_async_complete - Ensure all asynchronous I/O has completed.
+ * regmap_async_complete - 等待所有异步 I/O 完成
  *
  * @map: Map to operate on.
  *
- * Blocks until any pending asynchronous I/O has completed.  Returns
- * an error code for any failed I/O operations.
+ * 阻塞等待所有未完成的异步 I/O 结束。
+ * 如果期间有任意异步 I/O 失败，则返回对应错误码。
  */
 int regmap_async_complete(struct regmap *map)
 {
 	unsigned long flags;
 	int ret;
 
-	/* Nothing to do with no async support */
+	/* 后端根本不支持异步写时，这里无需做任何事情。 */
 	if (!map->bus || !map->bus->async_write)
 		return 0;
 
@@ -3411,21 +3341,18 @@ int regmap_async_complete(struct regmap *map)
 EXPORT_SYMBOL_GPL(regmap_async_complete);
 
 /**
- * regmap_register_patch - Register and apply register updates to be applied
- *                         on device initialistion
+ * regmap_register_patch - 注册并立即应用一组“补丁寄存器”写入
  *
  * @map: Register map to apply updates to.
  * @regs: Values to update.
  * @num_regs: Number of entries in regs.
  *
- * Register a set of register updates to be applied to the device
- * whenever the device registers are synchronised with the cache and
- * apply them immediately.  Typically this is used to apply
- * corrections to be applied to the device defaults on startup, such
- * as the updates some vendors provide to undocumented registers.
+ * 注册一组寄存器修正值：
+ * 之后每次设备寄存器与缓存重新同步时，都会优先重放这组 patch；
+ * 同时当前调用也会立即把它们写到设备上。
+ * 典型用途是在启动时修正芯片默认值，例如厂商给出的 undocumented register 修补序列。
  *
- * The caller must ensure that this function cannot be called
- * concurrently with either itself or regcache_sync().
+ * 调用者必须保证本函数不会与自己或 regcache_sync() 并发执行。
  */
 int regmap_register_patch(struct regmap *map, const struct reg_sequence *regs,
 			  int num_regs)
@@ -3470,12 +3397,11 @@ int regmap_register_patch(struct regmap *map, const struct reg_sequence *regs,
 EXPORT_SYMBOL_GPL(regmap_register_patch);
 
 /**
- * regmap_get_val_bytes() - Report the size of a register value
+ * regmap_get_val_bytes() - 返回寄存器值占用的字节数
  *
  * @map: Register map to operate on.
  *
- * Report the size of a register value, mainly intended to for use by
- * generic infrastructure built on top of regmap.
+ * 主要供构建在 regmap 之上的通用基础设施查询使用。
  */
 int regmap_get_val_bytes(struct regmap *map)
 {
@@ -3487,12 +3413,11 @@ int regmap_get_val_bytes(struct regmap *map)
 EXPORT_SYMBOL_GPL(regmap_get_val_bytes);
 
 /**
- * regmap_get_max_register() - Report the max register value
+ * regmap_get_max_register() - 返回最大合法寄存器地址
  *
  * @map: Register map to operate on.
  *
- * Report the max register value, mainly intended to for use by
- * generic infrastructure built on top of regmap.
+ * 主要供构建在 regmap 之上的通用基础设施查询使用。
  */
 int regmap_get_max_register(struct regmap *map)
 {
@@ -3501,12 +3426,11 @@ int regmap_get_max_register(struct regmap *map)
 EXPORT_SYMBOL_GPL(regmap_get_max_register);
 
 /**
- * regmap_get_reg_stride() - Report the register address stride
+ * regmap_get_reg_stride() - 返回寄存器地址步长
  *
  * @map: Register map to operate on.
  *
- * Report the register address stride, mainly intended to for use by
- * generic infrastructure built on top of regmap.
+ * 主要供构建在 regmap 之上的通用基础设施查询使用。
  */
 int regmap_get_reg_stride(struct regmap *map)
 {
@@ -3515,11 +3439,11 @@ int regmap_get_reg_stride(struct regmap *map)
 EXPORT_SYMBOL_GPL(regmap_get_reg_stride);
 
 /**
- * regmap_might_sleep() - Returns whether a regmap access might sleep.
+ * regmap_might_sleep() - 返回一次 regmap 访问是否可能睡眠
  *
  * @map: Register map to operate on.
  *
- * Returns true if an access to the register might sleep, else false.
+ * 若访问寄存器可能睡眠则返回 true，否则返回 false。
  */
 bool regmap_might_sleep(struct regmap *map)
 {

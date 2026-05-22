@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Register cache access API - rbtree caching support
+// Register cache 访问 API - rbtree cache 支持
 //
 // Copyright 2011 Wolfson Microelectronics plc
 //
@@ -19,21 +19,21 @@ static int regcache_rbtree_write(struct regmap *map, unsigned int reg,
 static int regcache_rbtree_exit(struct regmap *map);
 
 struct regcache_rbtree_node {
-	/* block of adjacent registers */
+	/* 一段连续寄存器缓存块 */
 	void *block;
-	/* Which registers are present */
+	/* 该块里哪些寄存器已经真正缓存过 */
 	unsigned long *cache_present;
-	/* base register handled by this block */
+	/* 该块覆盖的起始寄存器 */
 	unsigned int base_reg;
-	/* number of registers available in the block */
+	/* 该块内可容纳的寄存器个数 */
 	unsigned int blklen;
-	/* the actual rbtree node holding this block */
+	/* 挂到 rbtree 上的节点 */
 	struct rb_node node;
 };
 
 struct regcache_rbtree_ctx {
 	struct rb_root root;
-	struct regcache_rbtree_node *cached_rbnode;
+	struct regcache_rbtree_node *cached_rbnode; /* 最近命中的块，优化局部访问 */
 };
 
 static inline void regcache_rbtree_get_base_top_reg(
@@ -67,6 +67,7 @@ static struct regcache_rbtree_node *regcache_rbtree_lookup(struct regmap *map,
 	struct regcache_rbtree_node *rbnode;
 	unsigned int base_reg, top_reg;
 
+	/* 先尝试命中最近一次访问的块，很多寄存器访问都有明显局部性。 */
 	rbnode = rbtree_ctx->cached_rbnode;
 	if (rbnode) {
 		regcache_rbtree_get_base_top_reg(map, rbnode, &base_reg,
@@ -105,13 +106,13 @@ static int regcache_rbtree_insert(struct regmap *map, struct rb_root *root,
 	new = &root->rb_node;
 	while (*new) {
 		rbnode_tmp = rb_entry(*new, struct regcache_rbtree_node, node);
-		/* base and top registers of the current rbnode */
+		/* 当前节点覆盖的寄存器范围 */
 		regcache_rbtree_get_base_top_reg(map, rbnode_tmp, &base_reg_tmp,
 						 &top_reg_tmp);
-		/* base register of the rbnode to be added */
+		/* 待插入节点的起始寄存器 */
 		base_reg = rbnode->base_reg;
 		parent = *new;
-		/* if this register has already been inserted, just return */
+		/* 如果目标范围已被现有块覆盖，就不再重复插入。 */
 		if (base_reg >= base_reg_tmp &&
 		    base_reg <= top_reg_tmp)
 			return 0;
@@ -121,7 +122,7 @@ static int regcache_rbtree_insert(struct regmap *map, struct rb_root *root,
 			new = &((*new)->rb_left);
 	}
 
-	/* insert the node into the rbtree */
+	/* 按标准 rbtree 方式挂入新节点。 */
 	rb_link_node(&rbnode->node, parent, new);
 	rb_insert_color(&rbnode->node, root);
 
@@ -202,12 +203,12 @@ static int regcache_rbtree_exit(struct regmap *map)
 	struct regcache_rbtree_ctx *rbtree_ctx;
 	struct regcache_rbtree_node *rbtree_node;
 
-	/* if we've already been called then just return */
+	/* 防御性处理：允许重复 exit。 */
 	rbtree_ctx = map->cache;
 	if (!rbtree_ctx)
 		return 0;
 
-	/* free up the rbtree */
+	/* 逐个释放缓存块及其位图。 */
 	next = rb_first(&rbtree_ctx->root);
 	while (next) {
 		rbtree_node = rb_entry(next, struct regcache_rbtree_node, node);
@@ -218,7 +219,7 @@ static int regcache_rbtree_exit(struct regmap *map)
 		kfree(rbtree_node);
 	}
 
-	/* release the resources */
+	/* 最后再释放上下文本身。 */
 	kfree(map->cache);
 	map->cache = NULL;
 
@@ -297,7 +298,7 @@ static int regcache_rbtree_insert_to_block(struct regmap *map,
 		present = rbnode->cache_present;
 	}
 
-	/* insert the register value in the correct place in the rbnode block */
+	/* 把新寄存器值插到扩容后的块里，并同步平移原有内容。 */
 	if (pos == 0) {
 		memmove(blk + offset * map->cache_word_size,
 			blk, rbnode->blklen * map->cache_word_size);

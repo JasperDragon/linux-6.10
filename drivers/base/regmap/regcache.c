@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Register cache access API
+// Register cache 访问 API
 //
 // Copyright 2011 Wolfson Microelectronics plc
 //
@@ -22,6 +22,7 @@ static const struct regcache_ops *cache_types[] = {
 	&regcache_flat_ops,
 };
 
+/* 供排序/二分查找使用的默认值比较函数，按寄存器地址升序排列。 */
 static int regcache_defaults_cmp(const void *a, const void *b)
 {
 	const struct reg_default *x = a;
@@ -46,7 +47,9 @@ static int regcache_count_cacheable_registers(struct regmap *map)
 {
 	unsigned int count;
 
-	/* calculate the size of reg_defaults */
+	/* 统计真正可放入缓存的寄存器数。
+	 * 只有“可读且非 volatile”的寄存器才有缓存意义。
+	 */
 	count = 0;
 	for (unsigned int i = 0; i < map->num_reg_defaults_raw; i++)
 		if (regmap_readable(map, i * map->reg_stride) &&
@@ -66,7 +69,7 @@ static int regcache_hw_init(struct regmap *map)
 		bool cache_bypass = map->cache_bypass;
 		dev_dbg(map->dev, "No cache defaults, reading back from HW\n");
 
-		/* Bypass the cache access till data read from HW */
+		/* 在构造默认值阶段临时绕过缓存，直接从硬件回读整块默认镜像。 */
 		map->cache_bypass = true;
 		tmp_buf = kmalloc(map->cache_size_raw, GFP_KERNEL);
 		if (!tmp_buf)
@@ -82,7 +85,7 @@ static int regcache_hw_init(struct regmap *map)
 		}
 	}
 
-	/* fill the reg_defaults */
+	/* 把“原始默认值镜像”转换成 reg_default 数组形式，供 cache 后端使用。 */
 	for (unsigned int i = 0, j = 0; i < map->num_reg_defaults_raw; i++) {
 		reg = i * map->reg_stride;
 
@@ -129,6 +132,7 @@ int regcache_init(struct regmap *map, const struct regmap_config *config)
 	void *tmp_buf;
 
 	if (map->cache_type == REGCACHE_NONE) {
+		/* 用户明确不要缓存时，任何默认值描述都不会真正生效。 */
 		if (config->reg_defaults || config->num_reg_defaults_raw)
 			dev_warn(map->dev,
 				 "No cache used with register defaults set!\n");
@@ -177,9 +181,8 @@ int regcache_init(struct regmap *map, const struct regmap_config *config)
 	    !map->cache_ops->name)
 		return -EINVAL;
 
-	/* We still need to ensure that the reg_defaults
-	 * won't vanish from under us.  We'll need to make
-	 * a copy of it.
+	/* reg_defaults 可能来自调用者的静态/临时内存，这里复制一份，
+	 * 确保 regmap 生命周期内都可安全访问。
 	 */
 	if (config->reg_defaults) {
 		tmp_buf = kmemdup_array(config->reg_defaults, map->num_reg_defaults,
@@ -192,7 +195,7 @@ int regcache_init(struct regmap *map, const struct regmap_config *config)
 		if (!count)
 			map->cache_bypass = true;
 
-		/* All registers are unreadable or volatile, so just bypass */
+		/* 如果所有寄存器都不可缓存，就退化成纯直通访问模式。 */
 		if (map->cache_bypass)
 			return 0;
 
@@ -218,9 +221,9 @@ int regcache_init(struct regmap *map, const struct regmap_config *config)
 	}
 
 	/*
-	 * Some devices such as PMICs don't have cache defaults,
-	 * we cope with this by reading back the HW registers and
-	 * crafting the cache defaults by hand.
+	 * 有些设备，例如部分 PMIC，不提供寄存器默认值表。
+	 * 对这类设备，只能在初始化阶段直接回读硬件，
+	 * 再由 regmap core 手工拼出 cache 默认值。
 	 */
 	if (count) {
 		ret = regcache_hw_init(map);
@@ -306,13 +309,13 @@ int regcache_read(struct regmap *map,
 }
 
 /**
- * regcache_write - Set the value of a given register in the cache.
+ * regcache_write - 在缓存中写入一个寄存器值
  *
  * @map: map to configure.
  * @reg: The register index.
  * @value: The new register value.
  *
- * Return a negative value on failure, 0 on success.
+ * 返回值：成功返回 0，失败返回负 errno。
  */
 int regcache_write(struct regmap *map,
 		   unsigned int reg, unsigned int value)
@@ -336,11 +339,11 @@ bool regcache_reg_needs_sync(struct regmap *map, unsigned int reg,
 	if (!regmap_writeable(map, reg))
 		return false;
 
-	/* If we don't know the chip just got reset, then sync everything. */
+	/* 只要我们无法确认硬件仍保持默认态，就宁可把缓存值全部回写一遍。 */
 	if (!map->no_sync_defaults)
 		return true;
 
-	/* Is this the hardware default?  If so skip. */
+	/* 已知硬件仍在默认态时，若缓存值恰好等于默认值，就没必要再写一次。 */
 	ret = regcache_lookup_reg(map, reg);
 	if (ret >= 0 && val == map->reg_defaults[ret].def)
 		return false;
@@ -352,6 +355,7 @@ static int regcache_default_sync(struct regmap *map, unsigned int min,
 {
 	unsigned int reg;
 
+	/* 通用同步路径：逐寄存器读取缓存，再按需写回硬件。 */
 	for (reg = min; reg <= max; reg += map->reg_stride) {
 		unsigned int val;
 		int ret;
@@ -413,7 +417,7 @@ int regcache_sync(struct regmap *map)
 	BUG_ON(!map->cache_ops);
 
 	map->lock(map->lock_arg);
-	/* Remember the initial bypass state */
+	/* 记住调用前的 bypass 状态，函数退出前必须恢复。 */
 	bypass = map->cache_bypass;
 	dev_dbg(map->dev, "Syncing %s cache\n",
 		map->cache_ops->name);
@@ -423,7 +427,7 @@ int regcache_sync(struct regmap *map)
 	if (!map->cache_dirty)
 		goto out;
 
-	/* Apply any patch first */
+	/* patch 始终优先于普通缓存内容，先写它，确保后续同步基于补丁后的硬件状态。 */
 	map->cache_bypass = true;
 	for (i = 0; i < map->patch_regs; i++) {
 		ret = _regmap_write(map, map->patch[i].reg, map->patch[i].def);
@@ -444,21 +448,20 @@ int regcache_sync(struct regmap *map)
 		map->cache_dirty = false;
 
 out:
-	/* Restore the bypass state */
+	/* 恢复调用前的 bypass 状态。 */
 	map->cache_bypass = bypass;
 	map->no_sync_defaults = false;
 
 	/*
-	 * If we did any paging with cache bypassed and a cached
-	 * paging register then the register and cache state might
-	 * have gone out of sync, force writes of all the paging
-	 * registers.
+	 * 如果前面在 cache_bypass 模式下做过分页切换，而 selector/page 寄存器
+	 * 本身又是缓存寄存器，那么“硬件当前页”和“缓存记住的页”可能已经偏离。
+	 * 这里强制把所有 paging selector 再按缓存值写回一遍，重新对齐状态。
 	 */
 	rb_for_each(node, NULL, &map->range_tree, rbtree_all) {
 		struct regmap_range_node *this =
 			rb_entry(node, struct regmap_range_node, node);
 
-		/* If there's nothing in the cache there's nothing to sync */
+		/* selector 没有缓存值就跳过，不额外制造硬件写。 */
 		if (regcache_read(map, this->selector_reg, &i) != 0)
 			continue;
 
@@ -481,14 +484,13 @@ out:
 EXPORT_SYMBOL_GPL(regcache_sync);
 
 /**
- * regcache_sync_region - Sync part  of the register cache with the hardware.
+ * regcache_sync_region - 仅同步缓存中的一段寄存器区间
  *
  * @map: map to sync.
  * @min: first register to sync
  * @max: last register to sync
  *
- * Write all non-default register values in the specified region to
- * the hardware.
+ * 将指定区间内的非默认缓存值回写到硬件。
  *
  * Return a negative value on failure, 0 on success.
  */
@@ -506,7 +508,7 @@ int regcache_sync_region(struct regmap *map, unsigned int min,
 
 	map->lock(map->lock_arg);
 
-	/* Remember the initial bypass state */
+	/* 记住调用前的 bypass 状态。 */
 	bypass = map->cache_bypass;
 
 	name = map->cache_ops->name;
@@ -525,7 +527,7 @@ int regcache_sync_region(struct regmap *map, unsigned int min,
 		ret = regcache_default_sync(map, min, max);
 
 out:
-	/* Restore the bypass state */
+	/* 恢复调用前的 bypass 状态。 */
 	map->cache_bypass = bypass;
 	map->async = false;
 	map->no_sync_defaults = false;
@@ -540,7 +542,7 @@ out:
 EXPORT_SYMBOL_GPL(regcache_sync_region);
 
 /**
- * regcache_drop_region - Discard part of the register cache
+ * regcache_drop_region - 丢弃缓存中的一段寄存器区间
  *
  * @map: map to operate on
  * @min: first register to discard
@@ -571,16 +573,15 @@ int regcache_drop_region(struct regmap *map, unsigned int min,
 EXPORT_SYMBOL_GPL(regcache_drop_region);
 
 /**
- * regcache_cache_only - Put a register map into cache only mode
+ * regcache_cache_only - 把 regmap 切换到“只改缓存”模式
  *
- * @map: map to configure
- * @enable: flag if changes should be written to the hardware
+ * @map: 要配置的 regmap
+ * @enable: 为 true 时启用 cache-only 模式
  *
- * When a register map is marked as cache only writes to the register
- * map API will only update the register cache, they will not cause
- * any hardware changes.  This is useful for allowing portions of
- * drivers to act as though the device were functioning as normal when
- * it is disabled for power saving reasons.
+ * 进入 cache-only 后，所有通过 regmap API 发起的写操作都只更新缓存，
+ * 不会真正触碰硬件。
+ * 这适合设备因省电而暂时断电/不可访问时，驱动仍希望照常修改“逻辑寄存器状态”
+ * 的场景。
  */
 void regcache_cache_only(struct regmap *map, bool enable)
 {
@@ -594,17 +595,15 @@ void regcache_cache_only(struct regmap *map, bool enable)
 EXPORT_SYMBOL_GPL(regcache_cache_only);
 
 /**
- * regcache_mark_dirty - Indicate that HW registers were reset to default values
+ * regcache_mark_dirty - 告知 regcache：硬件寄存器已回到默认态
  *
- * @map: map to mark
+ * @map: 要标记的 regmap
  *
- * Inform regcache that the device has been powered down or reset, so that
- * on resume, regcache_sync() knows to write out all non-default values
- * stored in the cache.
+ * 用于通知 regcache：设备刚刚掉电、复位，或硬件寄存器已经丢失到默认值。
+ * 这样在后续 regcache_sync() 时，框架就知道要把缓存里的所有非默认值重新写回。
  *
- * If this function is not called, regcache_sync() will assume that
- * the hardware state still matches the cache state, modulo any writes that
- * happened when cache_only was true.
+ * 如果不调用这个接口，regcache_sync() 会默认认为硬件状态仍与缓存一致，
+ * 只考虑 cache_only 期间积累下来的那些写入差异。
  */
 void regcache_mark_dirty(struct regmap *map)
 {
@@ -616,15 +615,13 @@ void regcache_mark_dirty(struct regmap *map)
 EXPORT_SYMBOL_GPL(regcache_mark_dirty);
 
 /**
- * regcache_cache_bypass - Put a register map into cache bypass mode
+ * regcache_cache_bypass - 把 regmap 切换到“绕过缓存”模式
  *
- * @map: map to configure
- * @enable: flag if changes should not be written to the cache
+ * @map: 要配置的 regmap
+ * @enable: 为 true 时启用 bypass 模式
  *
- * When a register map is marked with the cache bypass option, writes
- * to the register map API will only update the hardware and not
- * the cache directly.  This is useful when syncing the cache back to
- * the hardware.
+ * 进入 cache-bypass 后，regmap API 的写操作只更新硬件，不会同步写入缓存。
+ * 这通常用于 cache sync、特殊恢复路径或需要避免缓存自污染的场景。
  */
 void regcache_cache_bypass(struct regmap *map, bool enable)
 {
@@ -637,12 +634,12 @@ void regcache_cache_bypass(struct regmap *map, bool enable)
 EXPORT_SYMBOL_GPL(regcache_cache_bypass);
 
 /**
- * regcache_reg_cached - Check if a register is cached
+ * regcache_reg_cached - 检查某个寄存器当前是否存在缓存项
  *
  * @map: map to check
  * @reg: register to check
  *
- * Reports if a register is cached.
+ * 返回该寄存器是否能从当前缓存后端中直接取到值。
  */
 bool regcache_reg_cached(struct regmap *map, unsigned int reg)
 {
@@ -662,7 +659,7 @@ EXPORT_SYMBOL_GPL(regcache_reg_cached);
 void regcache_set_val(struct regmap *map, void *base, unsigned int idx,
 		      unsigned int val)
 {
-	/* Use device native format if possible */
+	/* 能用设备原生格式编码时，优先走设备原生格式。 */
 	if (map->format.format_val) {
 		map->format.format_val(base + (map->cache_word_size * idx),
 				       val, 0);
@@ -699,7 +696,7 @@ unsigned int regcache_get_val(struct regmap *map, const void *base,
 	if (!base)
 		return -EINVAL;
 
-	/* Use device native format if possible */
+	/* 能按设备原生格式解析时，优先直接解析。 */
 	if (map->format.parse_val)
 		return map->format.parse_val(regcache_get_val_addr(map, base,
 								   idx));
@@ -723,7 +720,7 @@ unsigned int regcache_get_val(struct regmap *map, const void *base,
 	default:
 		BUG();
 	}
-	/* unreachable */
+	/* 理论不可达，保留给编译器和静态分析器。 */
 	return -1;
 }
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Register cache access API - flat caching support
+// Register cache 访问 API - flat cache 支持
 //
 // Copyright 2012 Wolfson Microelectronics plc
 //
@@ -23,8 +23,8 @@ static inline unsigned int regcache_flat_get_index(const struct regmap *map,
 }
 
 struct regcache_flat_data {
-	unsigned long *valid;
-	unsigned int data[];
+	unsigned long *valid;	/* 哪些缓存槽位已经被真正初始化/写入 */
+	unsigned int data[];	/* 按寄存器索引直接寻址的平铺缓存数组 */
 };
 
 static int regcache_flat_init(struct regmap *map)
@@ -35,6 +35,7 @@ static int regcache_flat_init(struct regmap *map)
 	if (!map || map->reg_stride_order < 0 || !map->max_register_is_set)
 		return -EINVAL;
 
+	/* flat cache 直接按“最大寄存器索引 + 1”分配数组空间，换取 O(1) 定位。 */
 	cache_size = regcache_flat_get_index(map, map->max_register) + 1;
 	cache = kzalloc_flex(*cache, data, cache_size, map->alloc_flags);
 	if (!cache)
@@ -83,6 +84,7 @@ static int regcache_flat_populate(struct regmap *map)
 		dev_dbg(map->dev,
 			"Populating regcache_flat using reg_default_cb callback\n");
 
+		/* 对于默认值表没有覆盖到的空洞寄存器，再逐项回调查询默认值。 */
 		for (i = 0; i <= map->max_register; i += map->reg_stride) {
 			unsigned int index = regcache_flat_get_index(map, i);
 			unsigned int value;
@@ -107,7 +109,10 @@ static int regcache_flat_read(struct regmap *map,
 	struct regcache_flat_data *cache = map->cache;
 	unsigned int index = regcache_flat_get_index(map, reg);
 
-	/* legacy behavior: ignore validity, but warn the user */
+	/* 传统 flat cache 的兼容语义是：即使槽位未标记 valid，也直接返回数组内容。
+	 * 这种行为可能把“零初始化的空洞值”误当成真实寄存器值，因此只保留兼容，
+	 * 同时发一次警告提示调用者。
+	 */
 	if (unlikely(!test_bit(index, cache->valid)))
 		dev_warn_once(map->dev,
 			"using zero-initialized flat cache, this may cause unexpected behavior");
@@ -123,6 +128,7 @@ static int regcache_flat_sparse_read(struct regmap *map,
 	struct regcache_flat_data *cache = map->cache;
 	unsigned int index = regcache_flat_get_index(map, reg);
 
+	/* sparse 版本要求显式命中 valid 位，否则视为缓存中不存在。 */
 	if (unlikely(!test_bit(index, cache->valid)))
 		return -ENOENT;
 

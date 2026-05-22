@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Register map access API - SPI support
+// Register map 访问 API - SPI 后端支持
 //
 // Copyright 2011 Wolfson Microelectronics plc
 //
@@ -15,7 +15,7 @@
 struct regmap_async_spi {
 	struct regmap_async core;
 	struct spi_message m;
-	struct spi_transfer t[2];
+	struct spi_transfer t[2]; /* 常见场景只需“寄存器头 + 数据体”两段传输 */
 };
 
 static void regmap_spi_complete(void *data)
@@ -47,6 +47,9 @@ static int regmap_spi_gather_write(void *context,
 	spi_message_add_tail(&t[0], &m);
 	spi_message_add_tail(&t[1], &m);
 
+	/* SPI 天然支持一条 message 内挂多段 transfer，因此 gather write
+	 * 不需要像部分 I2C 控制器那样额外探测能力位。
+	 */
 	return spi_sync(spi, &m);
 }
 
@@ -66,6 +69,7 @@ static int regmap_spi_async_write(void *context,
 	async->t[1].tx_buf = val;
 	async->t[1].len = val_len;
 
+	/* regmap core 负责生命周期，SPI 后端这里只需把缓冲区挂进 message。 */
 	spi_message_init(&async->m);
 	spi_message_add_tail(&async->t[0], &async->m);
 	if (val)
@@ -117,6 +121,9 @@ static const struct regmap_bus *regmap_get_spi_bus(struct spi_device *spi,
 	struct regmap_bus *bus;
 
 	if (max_size != SIZE_MAX) {
+		/* 某些 SPI 控制器会给出动态消息长度上限。
+		 * 这里克隆一份 regmap_bus，并把 raw read/write 上限缩到控制器允许值。
+		 */
 		bus = kmemdup(&regmap_spi, sizeof(*bus), GFP_KERNEL);
 		if (!bus)
 			return ERR_PTR(-ENOMEM);

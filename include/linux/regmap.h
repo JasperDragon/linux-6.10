@@ -3,7 +3,7 @@
 #define __LINUX_REGMAP_H
 
 /*
- * Register map access API
+ * Register map 访问 API
  *
  * Copyright 2011 Wolfson Microelectronics plc
  *
@@ -40,32 +40,32 @@ struct snd_ac97;
 struct sdw_slave;
 
 /*
- * regmap_mdio address encoding. IEEE 802.3ae clause 45 addresses consist of a
- * device address and a register address.
+ * regmap_mdio 地址编码。
+ * IEEE 802.3ae clause 45 地址由“设备地址 + 寄存器地址”拼成一个逻辑地址。
  */
 #define REGMAP_MDIO_C45_DEVAD_SHIFT	16
 #define REGMAP_MDIO_C45_DEVAD_MASK	GENMASK(20, 16)
 #define REGMAP_MDIO_C45_REGNUM_MASK	GENMASK(15, 0)
 
 /*
- * regmap.reg_shift indicates by how much we must shift registers prior to
- * performing any operation. It's a signed value, positive numbers means
- * downshifting the register's address, while negative numbers means upshifting.
+ * regmap.reg_shift 表示在发起任何访问前，需要对寄存器地址做多少位移。
+ * 这是带符号值：
+ * 正数表示把原始寄存器地址右移（downshift），
+ * 负数表示把原始寄存器地址左移（upshift）。
  */
 #define REGMAP_UPSHIFT(s)	(-(s))
 #define REGMAP_DOWNSHIFT(s)	(s)
 
 /*
- * The supported cache types, the default is no cache.  Any new caches should
- * usually use the maple tree cache unless they specifically require that there
- * are never any allocations at runtime in which case they should use the sparse
- * flat cache.  The rbtree cache *may* have some performance advantage for very
- * low end systems that make heavy use of cache syncs but is mainly legacy.
- * These caches are sparse and entries will be initialized from hardware if no
- * default has been provided.
- * The non-sparse flat cache is provided for compatibility with existing users
- * and will zero-initialize cache entries for which no defaults are provided.
- * New users should use the sparse flat cache.
+ * 支持的缓存类型，默认是不使用缓存。
+ * 新增用户通常优先选 maple tree cache；只有在“运行期绝不允许动态分配”
+ * 这类很强的约束下，才更适合 sparse flat cache。
+ * rbtree cache 可能在非常低端、且频繁做 cache sync 的系统上略有优势，
+ * 但整体上已经更偏历史兼容。
+ *
+ * 这些 sparse cache 在没有提供默认值时，会按需从硬件回读初始化。
+ * 非 sparse 的 flat cache 主要为兼容旧用户保留；若缺失默认值，
+ * 它会把对应缓存项初始化成 0。新用户应优先使用 sparse flat cache。
  */
 enum regcache_type {
 	REGCACHE_NONE,
@@ -76,13 +76,13 @@ enum regcache_type {
 };
 
 /**
- * struct reg_default - Default value for a register.
+ * struct reg_default - 单个寄存器的默认值描述
  *
  * @reg: Register address.
  * @def: Register default value.
  *
- * We use an array of structs rather than a simple array as many modern devices
- * have very sparse register maps.
+ * 之所以使用结构体数组而不是简单线性数组，是因为很多现代设备的寄存器图
+ * 都很稀疏，不适合按连续地址逐项展开。
  */
 struct reg_default {
 	unsigned int reg;
@@ -90,14 +90,14 @@ struct reg_default {
 };
 
 /**
- * struct reg_sequence - An individual write from a sequence of writes.
+ * struct reg_sequence - 一组顺序写操作中的单条写入项
  *
  * @reg: Register address.
  * @def: Register value.
  * @delay_us: Delay to be applied after the register write in microseconds
  *
- * Register/value pairs for sequences of writes with an optional delay in
- * microseconds to be applied after each write.
+ * 用于描述一串“寄存器/值”写入项，每次写入后还可附带一个可选延迟，
+ * 延迟单位为微秒。
  */
 struct reg_sequence {
 	unsigned int reg;
@@ -113,7 +113,7 @@ struct reg_sequence {
 #define REG_SEQ0(_reg, _def)	REG_SEQ(_reg, _def, 0)
 
 /**
- * regmap_read_poll_timeout - Poll until a condition is met or a timeout occurs
+ * regmap_read_poll_timeout - 轮询读取寄存器，直到条件满足或超时
  *
  * @map: Regmap to read from
  * @addr: Address to poll
@@ -124,12 +124,11 @@ struct reg_sequence {
  *            limitations.
  * @timeout_us: Timeout in us, 0 means never timeout
  *
- * This is modelled after the readx_poll_timeout macros in linux/iopoll.h.
+ * 该宏的风格与 linux/iopoll.h 里的 readx_poll_timeout 宏一致。
  *
- * Returns: 0 on success and -ETIMEDOUT upon a timeout or the regmap_read
- * error return value in case of a error read. In the two former cases,
- * the last read value at @addr is stored in @val. Must not be called
- * from atomic context if sleep_us or timeout_us are used.
+ * 返回值：成功返回 0；超时返回 -ETIMEDOUT；若 regmap_read 本身失败，
+ * 则返回其错误码。在成功或超时这两种情况下，@val 中都会保留最后一次读取值。
+ * 若使用了 sleep_us 或 timeout_us，则不能在原子上下文中调用。
  */
 #define regmap_read_poll_timeout(map, addr, val, cond, sleep_us, timeout_us) \
 ({ \
@@ -140,7 +139,7 @@ struct reg_sequence {
 })
 
 /**
- * regmap_read_poll_timeout_atomic - Poll until a condition is met or a timeout occurs
+ * regmap_read_poll_timeout_atomic - 原子上下文可用的轮询读取宏
  *
  * @map: Regmap to read from
  * @addr: Address to poll
@@ -151,15 +150,14 @@ struct reg_sequence {
  *            limitations.
  * @timeout_us: Timeout in us, 0 means never timeout
  *
- * This is modelled after the readx_poll_timeout_atomic macros in linux/iopoll.h.
+ * 该宏的风格与 linux/iopoll.h 里的 readx_poll_timeout_atomic 宏一致。
  *
- * Note: In general regmap cannot be used in atomic context. If you want to use
- * this macro then first setup your regmap for atomic use (flat or no cache
- * and MMIO regmap).
+ * 注意：通常 regmap 并不适合原子上下文。
+ * 如果确实要在原子上下文中使用这个宏，必须先把 regmap 配成可原子访问模式，
+ * 典型组合是 MMIO regmap，并关闭缓存或使用 flat/no cache。
  *
- * Returns: 0 on success and -ETIMEDOUT upon a timeout or the regmap_read
- * error return value in case of a error read. In the two former cases,
- * the last read value at @addr is stored in @val.
+ * 返回值：成功返回 0；超时返回 -ETIMEDOUT；若 regmap_read 失败，则返回其错误码。
+ * 在成功或超时这两种情况下，@val 中都会保留最后一次读取值。
  */
 #define regmap_read_poll_timeout_atomic(map, addr, val, cond, delay_us, timeout_us) \
 ({ \
@@ -185,7 +183,7 @@ struct reg_sequence {
 })
 
 /**
- * regmap_field_read_poll_timeout - Poll until a condition is met or timeout
+ * regmap_field_read_poll_timeout - 轮询读取 bitfield，直到条件满足或超时
  *
  * @field: Regmap field to read from
  * @val: Unsigned integer variable to read the value into
@@ -195,12 +193,11 @@ struct reg_sequence {
  *            limitations.
  * @timeout_us: Timeout in us, 0 means never timeout
  *
- * This is modelled after the readx_poll_timeout macros in linux/iopoll.h.
+ * 该宏的风格与 linux/iopoll.h 里的 readx_poll_timeout 宏一致。
  *
- * Returns: 0 on success and -ETIMEDOUT upon a timeout or the regmap_field_read
- * error return value in case of a error read. In the two former cases,
- * the last read value at @addr is stored in @val. Must not be called
- * from atomic context if sleep_us or timeout_us are used.
+ * 返回值：成功返回 0；超时返回 -ETIMEDOUT；若 regmap_field_read 失败，
+ * 则返回其错误码。在成功或超时这两种情况下，@val 中都会保留最后一次读取值。
+ * 若使用了 sleep_us 或 timeout_us，则不能在原子上下文中调用。
  */
 #define regmap_field_read_poll_timeout(field, val, cond, sleep_us, timeout_us) \
 ({ \
@@ -221,11 +218,12 @@ enum regmap_endian {
 };
 
 /**
- * struct regmap_range - A register range, used for access related checks
- *                       (readable/writeable/volatile/precious checks)
+ * struct regmap_range - 一段连续寄存器区间
  *
- * @range_min: address of first register
- * @range_max: address of last register
+ * 主要用于访问属性判断，例如 readable/writeable/volatile/precious。
+ *
+ * @range_min: 区间首寄存器地址
+ * @range_max: 区间尾寄存器地址
  */
 struct regmap_range {
 	unsigned int range_min;
@@ -235,17 +233,17 @@ struct regmap_range {
 #define regmap_reg_range(low, high) { .range_min = low, .range_max = high, }
 
 /**
- * struct regmap_access_table - A table of register ranges for access checks
+ * struct regmap_access_table - 用于访问属性检查的寄存器区间表
  *
- * @yes_ranges : pointer to an array of regmap ranges used as "yes ranges"
- * @n_yes_ranges: size of the above array
- * @no_ranges: pointer to an array of regmap ranges used as "no ranges"
- * @n_no_ranges: size of the above array
+ * @yes_ranges : “允许访问”区间数组
+ * @n_yes_ranges: 上面数组的元素个数
+ * @no_ranges: “禁止访问”区间数组
+ * @n_no_ranges: 上面数组的元素个数
  *
- * A table of ranges including some yes ranges and some no ranges.
- * If a register belongs to a no_range, the corresponding check function
- * will return false. If a register belongs to a yes range, the corresponding
- * check function will return true. "no_ranges" are searched first.
+ * 这张表同时支持 yes_ranges 和 no_ranges。
+ * 如果寄存器命中 no_ranges，对应检查函数直接返回 false。
+ * 如果命中 yes_ranges，则返回 true。
+ * 查找顺序永远是先看 no_ranges，再看 yes_ranges。
  */
 struct regmap_access_table {
 	const struct regmap_range *yes_ranges;
@@ -258,153 +256,92 @@ typedef void (*regmap_lock)(void *);
 typedef void (*regmap_unlock)(void *);
 
 /**
- * struct regmap_config - Configuration for the register map of a device.
+ * struct regmap_config - 描述一个设备寄存器图的配置模板
  *
- * @name: Optional name of the regmap. Useful when a device has multiple
- *        register regions.
+ * @name: regmap 的可选名字。一个设备有多片寄存器区时很有用。
  *
- * @reg_bits: Number of bits in a register address, mandatory.
- * @reg_stride: The register address stride. Valid register addresses are a
- *              multiple of this value. If set to 0, a value of 1 will be
- *              used.
- * @reg_shift: The number of bits to shift the register before performing any
- *	       operations. Any positive number will be downshifted, and negative
- *	       values will be upshifted
- * @reg_base: Value to be added to every register address before performing any
- *	      operation.
- * @pad_bits: Number of bits of padding between register and value.
- * @val_bits: Number of bits in a register value, mandatory.
+ * @reg_bits: 寄存器地址宽度，单位 bit，必填。
+ * @reg_stride: 寄存器地址步长。合法地址必须是它的整数倍；若填 0，则按 1 处理。
+ * @reg_shift: 访问前对寄存器地址额外做的位移。正数表示右移，负数表示左移。
+ * @reg_base: 每次访问前统一加到寄存器地址上的基址偏移。
+ * @pad_bits: 寄存器地址和寄存器值之间的填充位数。
+ * @val_bits: 寄存器值宽度，单位 bit，必填。
  *
- * @writeable_reg: Optional callback returning true if the register
- *		   can be written to. If this field is NULL but wr_table
- *		   (see below) is not, the check is performed on such table
- *                 (a register is writeable if it belongs to one of the ranges
- *                  specified by wr_table).
- * @readable_reg: Optional callback returning true if the register
- *		  can be read from. If this field is NULL but rd_table
- *		   (see below) is not, the check is performed on such table
- *                 (a register is readable if it belongs to one of the ranges
- *                  specified by rd_table).
- * @volatile_reg: Optional callback returning true if the register
- *		  value can't be cached. If this field is NULL but
- *		  volatile_table (see below) is not, the check is performed on
- *                such table (a register is volatile if it belongs to one of
- *                the ranges specified by volatile_table).
- * @precious_reg: Optional callback returning true if the register
- *		  should not be read outside of a call from the driver
- *		  (e.g., a clear on read interrupt status register). If this
- *                field is NULL but precious_table (see below) is not, the
- *                check is performed on such table (a register is precious if
- *                it belongs to one of the ranges specified by precious_table).
- * @writeable_noinc_reg: Optional callback returning true if the register
- *			supports multiple write operations without incrementing
- *			the register number. If this field is NULL but
- *			wr_noinc_table (see below) is not, the check is
- *			performed on such table (a register is no increment
- *			writeable if it belongs to one of the ranges specified
- *			by wr_noinc_table).
- * @readable_noinc_reg: Optional callback returning true if the register
- *			supports multiple read operations without incrementing
- *			the register number. If this field is NULL but
- *			rd_noinc_table (see below) is not, the check is
- *			performed on such table (a register is no increment
- *			readable if it belongs to one of the ranges specified
- *			by rd_noinc_table).
- * @reg_read:	  Optional callback that if filled will be used to perform
- *           	  all the reads from the registers. Should only be provided for
- *		  devices whose read operation cannot be represented as a simple
- *		  read operation on a bus such as SPI, I2C, etc. Most of the
- *		  devices do not need this.
- * @reg_write:	  Same as above for writing.
- * @reg_update_bits: Optional callback that if filled will be used to perform
- *		     all the update_bits(rmw) operation. Should only be provided
- *		     if the function require special handling with lock and reg
- *		     handling and the operation cannot be represented as a simple
- *		     update_bits operation on a bus such as SPI, I2C, etc.
- * @read: Optional callback that if filled will be used to perform all the
- *        bulk reads from the registers. Data is returned in the buffer used
- *        to transmit data.
- * @write: Same as above for writing.
- * @max_raw_read: Max raw read size that can be used on the device.
- * @max_raw_write: Max raw write size that can be used on the device.
- * @can_sleep:	  Optional, specifies whether regmap operations can sleep.
- * @fast_io:	  Register IO is fast. Use a spinlock instead of a mutex
- *	     	  to perform locking. This field is ignored if custom lock/unlock
- *	     	  functions are used (see fields lock/unlock of struct regmap_config).
- *		  This field is a duplicate of a similar file in
- *		  'struct regmap_bus' and serves exact same purpose.
- *		   Use it only for "no-bus" cases.
- * @io_port:	  Support IO port accessors. Makes sense only when MMIO vs. IO port
- *		  access can be distinguished.
- * @disable_locking: This regmap is either protected by external means or
- *		     is guaranteed not to be accessed from multiple threads.
- *		     Don't use any locking mechanisms.
- * @lock:	  Optional lock callback (overrides regmap's default lock
- *		  function, based on spinlock or mutex).
- * @unlock:	  As above for unlocking.
- * @lock_arg:	  This field is passed as the only argument of lock/unlock
- *		  functions (ignored in case regular lock/unlock functions
- *		  are not overridden).
- * @max_register: Optional, specifies the maximum valid register address.
- * @max_register_is_0: Optional, specifies that zero value in @max_register
- *                     should be taken into account. This is a workaround to
- *                     apply handling of @max_register for regmap that contains
- *                     only one register.
- * @wr_table:     Optional, points to a struct regmap_access_table specifying
- *                valid ranges for write access.
- * @rd_table:     As above, for read access.
- * @volatile_table: As above, for volatile registers.
- * @precious_table: As above, for precious registers.
- * @wr_noinc_table: As above, for no increment writeable registers.
- * @rd_noinc_table: As above, for no increment readable registers.
- * @reg_defaults: Power on reset values for registers (for use with
- *                register cache support).
- * @num_reg_defaults: Number of elements in reg_defaults.
- * @reg_default_cb: Optional callback to return default values for registers
- *                  not listed in reg_defaults. This is only used for
- *                  REGCACHE_FLAT population; drivers must ensure the readable_reg/
- *                  writeable_reg callbacks are defined to handle holes.
+ * @writeable_reg: 可选回调，返回寄存器是否可写。若为空但 wr_table 有效，
+ *		   则改为查表判断。
+ * @readable_reg: 可选回调，返回寄存器是否可读。若为空但 rd_table 有效，
+ *		  则改为查表判断。
+ * @volatile_reg: 可选回调，返回寄存器是否为 volatile，即值不应缓存。
+ *		  若为空但 volatile_table 有效，则改为查表判断。
+ * @precious_reg: 可选回调，返回寄存器是否为 precious。
+ *		  precious 寄存器通常不能被框架随意读取，例如“读后清除”的状态寄存器。
+ *		  若为空但 precious_table 有效，则改为查表判断。
+ * @writeable_noinc_reg: 可选回调，标记支持“地址不自增的多次写”寄存器。
+ *			若为空但 wr_noinc_table 有效，则改为查表判断。
+ * @readable_noinc_reg: 可选回调，标记支持“地址不自增的多次读”寄存器。
+ *			若为空但 rd_noinc_table 有效，则改为查表判断。
+ * @reg_read:	  可选的单寄存器读回调。只有在设备读操作无法抽象成普通总线读时
+ *		  才需要自己实现；大多数设备不需要。
+ * @reg_write:	  单寄存器写回调，语义同上。
+ * @reg_update_bits: 可选的 update_bits/rmw 回调。仅当该操作需要特殊锁语义
+ *		     或特殊寄存器处理，无法由通用 regmap 流程表达时才需要。
+ * @read: 可选的 bulk read 回调。
+ * @write: 可选的 bulk write 回调。
+ * @max_raw_read: 设备支持的 raw read 最大长度。
+ * @max_raw_write: 设备支持的 raw write 最大长度。
+ * @can_sleep:	  可选，声明 regmap 访问路径是否允许睡眠。
+ * @fast_io:	  声明寄存器 I/O 很快，框架可优先用 spinlock 而不是 mutex。
+ *		  若自定义了 lock/unlock，则该字段被忽略。
+ *		  这个字段和 struct regmap_bus 里的同名语义一致，主要用于“无总线”场景。
+ * @io_port:	  支持 IO port 访问器。只有在 MMIO 和 IO port 可区分时才有意义。
+ * @disable_locking: 该 regmap 已由外部机制保护，或保证不会被多线程并发访问；
+ *		     因此完全关闭框架内部锁。
+ * @lock:	  可选自定义加锁回调，覆盖 regmap 默认锁实现。
+ * @unlock:	  可选自定义解锁回调。
+ * @lock_arg:	  作为唯一参数传给 lock/unlock 的私有指针。
+ * @max_register: 可选，最大合法寄存器地址。
+ * @max_register_is_0: 可选，表示 @max_register 即使为 0 也应视为有效。
+ *                     主要用于“整个 regmap 只有一个寄存器”的特殊场景。
+ * @wr_table:     可选，写访问区间表。
+ * @rd_table:     可选，读访问区间表。
+ * @volatile_table: 可选，volatile 区间表。
+ * @precious_table: 可选，precious 区间表。
+ * @wr_noinc_table: 可选，不自增写区间表。
+ * @rd_noinc_table: 可选，不自增读区间表。
+ * @reg_defaults: 上电复位默认值表，供 regcache 初始化使用。
+ * @num_reg_defaults: reg_defaults 中的元素个数。
+ * @reg_default_cb: 可选回调，用于补齐 reg_defaults 没列出的默认值。
+ *                  当前主要用于 REGCACHE_FLAT 的填充；驱动必须自己保证
+ *                  readable_reg/writeable_reg 能正确处理这些空洞地址。
  *
- * @read_flag_mask: Mask to be set in the top bytes of the register when doing
- *                  a read.
- * @write_flag_mask: Mask to be set in the top bytes of the register when doing
- *                   a write. If both read_flag_mask and write_flag_mask are
- *                   empty and zero_flag_mask is not set the regmap_bus default
- *                   masks are used.
- * @zero_flag_mask: If set, read_flag_mask and write_flag_mask are used even
- *                   if they are both empty.
- * @use_relaxed_mmio: If set, MMIO R/W operations will not use memory barriers.
- *                    This can avoid load on devices which don't require strict
- *                    orderings, but drivers should carefully add any explicit
- *                    memory barriers when they may require them.
- * @use_single_read: If set, converts the bulk read operation into a series of
- *                   single read operations. This is useful for a device that
- *                   does not support  bulk read.
- * @use_single_write: If set, converts the bulk write operation into a series of
- *                    single write operations. This is useful for a device that
- *                    does not support bulk write.
- * @can_multi_write: If set, the device supports the multi write mode of bulk
- *                   write operations, if clear multi write requests will be
- *                   split into individual write operations
+ * @read_flag_mask: 读操作时要 OR 到寄存器地址高位的标志位。
+ * @write_flag_mask: 写操作时要 OR 到寄存器地址高位的标志位。
+ *                   如果 read_flag_mask/write_flag_mask 都为空，
+ *                   且 zero_flag_mask 未置位，就使用 regmap_bus 默认值。
+ * @zero_flag_mask: 若置位，则即使读写 flag mask 都为 0，也视为“显式指定 0”。
+ * @use_relaxed_mmio: 若置位，MMIO 读写不带内存屏障。
+ *                    这能降低某些设备的访存开销，但驱动必须自行补足必要屏障。
+ * @use_single_read: 若置位，把 bulk read 拆成一串单寄存器读。
+ *                   适合不支持 bulk read 的设备。
+ * @use_single_write: 若置位，把 bulk write 拆成一串单寄存器写。
+ *                    适合不支持 bulk write 的设备。
+ * @can_multi_write: 若置位，表示设备支持 bulk write 的 multi write 模式；
+ *                   若未置位，则 multi write 请求会被拆成单条写操作。
  *
- * @cache_type: The actual cache type.
- * @reg_defaults_raw: Power on reset values for registers (for use with
- *                    register cache support).
- * @num_reg_defaults_raw: Number of elements in reg_defaults_raw.
- * @use_hwlock: Indicate if a hardware spinlock should be used.
- * @use_raw_spinlock: Indicate if a raw spinlock should be used.
- * @hwlock_id: Specify the hardware spinlock id.
- * @hwlock_mode: The hardware spinlock mode, should be HWLOCK_IRQSTATE,
- *		 HWLOCK_IRQ or 0.
- * @reg_format_endian: Endianness for formatted register addresses. If this is
- *		       DEFAULT, the @reg_format_endian_default value from the
- *		       regmap bus is used.
- * @val_format_endian: Endianness for formatted register values. If this is
- *		       DEFAULT, the @reg_format_endian_default value from the
- *		       regmap bus is used.
+ * @cache_type: 选择实际使用的缓存类型。
+ * @reg_defaults_raw: 以原始线性格式给出的上电默认值，供 regcache 初始化使用。
+ * @num_reg_defaults_raw: reg_defaults_raw 里的寄存器项个数。
+ * @use_hwlock: 若置位，表示需要使用硬件 spinlock。
+ * @use_raw_spinlock: 若置位，表示软件锁层使用 raw spinlock。
+ * @hwlock_id: 指定硬件 spinlock 的编号。
+ * @hwlock_mode: 硬件 spinlock 的模式，应为 HWLOCK_IRQSTATE、HWLOCK_IRQ 或 0。
+ * @reg_format_endian: 格式化寄存器地址时使用的字节序。
+ *		       若为 DEFAULT，则回退到 regmap bus 给出的默认值。
+ * @val_format_endian: 格式化寄存器值时使用的字节序。
+ *		       若为 DEFAULT，则回退到 regmap bus 给出的默认值。
  *
- * @ranges: Array of configuration entries for virtual address ranges.
- * @num_ranges: Number of range configuration entries.
+ * @ranges: 虚拟地址范围配置项数组。
+ * @num_ranges: ranges 数组中的配置项个数。
  */
 struct regmap_config {
 	const char *name;
@@ -427,7 +364,7 @@ struct regmap_config {
 	int (*reg_write)(void *context, unsigned int reg, unsigned int val);
 	int (*reg_update_bits)(void *context, unsigned int reg,
 			       unsigned int mask, unsigned int val);
-	/* Bulk read/write */
+	/* bulk read/write 回调 */
 	int (*read)(void *context, const void *reg_buf, size_t reg_size,
 		    void *val_buf, size_t val_size);
 	int (*write)(void *context, const void *data, size_t count);
@@ -482,60 +419,53 @@ struct regmap_config {
 };
 
 /**
- * struct regmap_range_cfg - Configuration for indirectly accessed or paged
- *                           registers.
+ * struct regmap_range_cfg - 间接访问/分页寄存器的范围配置
  *
- * @name: Descriptive name for diagnostics
+ * @name: 供诊断和调试输出使用的描述性名字
  *
- * @range_min: Address of the lowest register address in virtual range.
- * @range_max: Address of the highest register in virtual range.
+ * @range_min: 虚拟范围内的最低寄存器地址
+ * @range_max: 虚拟范围内的最高寄存器地址
  *
- * @selector_reg: Register with selector field.
- * @selector_mask: Bit mask for selector value.
- * @selector_shift: Bit shift for selector value.
+ * @selector_reg: 选择器字段所在的寄存器
+ * @selector_mask: 选择器字段的位掩码
+ * @selector_shift: 选择器字段的位移
  *
- * @window_start: Address of first (lowest) register in data window.
- * @window_len: Number of registers in data window.
+ * @window_start: 数据窗口中第一个寄存器的地址
+ * @window_len: 数据窗口包含的寄存器个数
  *
- * Registers, mapped to this virtual range, are accessed in two steps:
- *     1. page selector register update;
- *     2. access through data window registers.
+ * 映射到这个虚拟范围的寄存器访问会分两步完成：
+ * 1. 先更新 page selector；
+ * 2. 再通过 data window 里的寄存器实际读写数据。
  */
 struct regmap_range_cfg {
 	const char *name;
 
-	/* Registers of virtual address range */
+	/* 虚拟地址范围 */
 	unsigned int range_min;
 	unsigned int range_max;
 
-	/* Page selector for indirect addressing */
+	/* 间接寻址使用的 page selector */
 	unsigned int selector_reg;
 	unsigned int selector_mask;
 	int selector_shift;
 
-	/* Data window (per each page) */
+	/* 每个 page 对应的一段数据窗口 */
 	unsigned int window_start;
 	unsigned int window_len;
 };
 
 /**
- * struct regmap_sdw_mbq_cfg - Configuration for Multi-Byte Quantities
+ * struct regmap_sdw_mbq_cfg - SoundWire Multi-Byte Quantities 配置
  *
- * @mbq_size: Callback returning the actual size of the given register.
- * @deferrable: Callback returning true if the hardware can defer
- *              transactions to the given register. Deferral should
- *              only be used by SDCA parts and typically which controls
- *              are deferrable will be specified in either as a hard
- *              coded list or from the DisCo tables in the platform
- *              firmware.
+ * @mbq_size: 回调，返回指定寄存器实际占用的字节数。
+ * @deferrable: 回调，返回硬件是否允许对该寄存器做 deferred transaction。
+ *              这种延迟事务通常只应由 SDCA 器件使用；哪些 control 可延迟，
+ *              一般由驱动内建表或平台固件中的 DisCo table 指定。
  *
- * @timeout_us: The time in microseconds after which waiting for a deferred
- *              transaction should time out.
- * @retry_us: The time in microseconds between polls of the function busy
- *            status whilst waiting for an opportunity to retry a deferred
- *            transaction.
+ * @timeout_us: 等待 deferred transaction 完成的超时时间，单位微秒。
+ * @retry_us: 轮询 function busy 状态、等待重试机会的时间间隔，单位微秒。
  *
- * Provides additional configuration required for SoundWire MBQ register maps.
+ * 为 SoundWire MBQ 寄存器图提供附加配置。
  */
 struct regmap_sdw_mbq_cfg {
 	int (*mbq_size)(struct device *dev, unsigned int reg);
@@ -572,42 +502,29 @@ typedef struct regmap_async *(*regmap_hw_async_alloc)(void);
 typedef void (*regmap_hw_free_context)(void *context);
 
 /**
- * struct regmap_bus - Description of a hardware bus for the register map
- *                     infrastructure.
+ * struct regmap_bus - regmap 框架所需的硬件总线描述
  *
- * @fast_io: Register IO is fast. Use a spinlock instead of a mutex
- *	     to perform locking. This field is ignored if custom lock/unlock
- *	     functions are used (see fields lock/unlock of
- *	     struct regmap_config).
- * @free_on_exit: kfree this on exit of regmap
- * @write: Write operation.
- * @gather_write: Write operation with split register/value, return -ENOTSUPP
- *                if not implemented  on a given device.
- * @async_write: Write operation which completes asynchronously, optional and
- *               must serialise with respect to non-async I/O.
- * @reg_write: Write a single register value to the given register address. This
- *             write operation has to complete when returning from the function.
- * @reg_write_noinc: Write multiple register value to the same register. This
- *             write operation has to complete when returning from the function.
- * @reg_update_bits: Update bits operation to be used against volatile
- *                   registers, intended for devices supporting some mechanism
- *                   for setting clearing bits without having to
- *                   read/modify/write.
- * @read: Read operation.  Data is returned in the buffer used to transmit
- *         data.
- * @reg_read: Read a single register value from a given register address.
- * @free_context: Free context.
- * @async_alloc: Allocate a regmap_async() structure.
- * @read_flag_mask: Mask to be set in the top byte of the register when doing
- *                  a read.
- * @reg_format_endian_default: Default endianness for formatted register
- *     addresses. Used when the regmap_config specifies DEFAULT. If this is
- *     DEFAULT, BIG is assumed.
- * @val_format_endian_default: Default endianness for formatted register
- *     values. Used when the regmap_config specifies DEFAULT. If this is
- *     DEFAULT, BIG is assumed.
- * @max_raw_read: Max raw read size that can be used on the bus.
- * @max_raw_write: Max raw write size that can be used on the bus.
+ * @fast_io: 寄存器 I/O 很快，框架可优先用 spinlock 而不是 mutex。
+ *	     若 regmap_config 自定义了 lock/unlock，则该字段被忽略。
+ * @free_on_exit: regmap 退出时是否需要 kfree 这个 bus 描述。
+ * @write: 线性写操作。
+ * @gather_write: 拆分的“寄存器头 + 数据体”写操作；若不支持，应返回 -ENOTSUPP。
+ * @async_write: 异步写操作，可选；必须与同步 I/O 串行化。
+ * @reg_write: 单寄存器写操作，函数返回前必须完成。
+ * @reg_write_noinc: 向同一寄存器做多值写入，函数返回前必须完成。
+ * @reg_update_bits: 对 volatile 寄存器使用的 update_bits 操作。
+ *                   适合底层硬件支持 set/clear 位，而不必先读改写回的场景。
+ * @read: bulk read 操作，数据放回传入的接收缓冲区。
+ * @reg_read: 单寄存器读操作。
+ * @free_context: 释放底层 bus context。
+ * @async_alloc: 分配 regmap_async 结构。
+ * @read_flag_mask: 读操作时要 OR 到寄存器地址最高字节的标志位。
+ * @reg_format_endian_default: 格式化寄存器地址时的默认字节序。
+ *     当 regmap_config 指定 DEFAULT 时使用；若仍为 DEFAULT，则按 BIG 处理。
+ * @val_format_endian_default: 格式化寄存器值时的默认字节序。
+ *     当 regmap_config 指定 DEFAULT 时使用；若仍为 DEFAULT，则按 BIG 处理。
+ * @max_raw_read: 该总线允许的 raw read 最大长度。
+ * @max_raw_write: 该总线允许的 raw write 最大长度。
  */
 struct regmap_bus {
 	bool fast_io;
@@ -631,11 +548,10 @@ struct regmap_bus {
 };
 
 /*
- * __regmap_init functions.
+ * __regmap_init 系列底层入口。
  *
- * These functions take a lock key and name parameter, and should not be called
- * directly. Instead, use the regmap_init macros that generate a key and name
- * for each call.
+ * 这些函数需要显式传入 lockdep key 和 lockdep name，不建议直接调用。
+ * 驱动应使用下面的 regmap_init* 宏，由宏自动为每个调用点生成独立的 key/name。
  */
 struct regmap *__regmap_init(struct device *dev,
 			     const struct regmap_bus *bus,
@@ -777,11 +693,11 @@ struct regmap *__devm_regmap_init_fsi(struct fsi_device *fsi_dev,
 				      const char *lock_name);
 
 /*
- * Wrapper for regmap_init macros to include a unique lockdep key and name
- * for each call. No-op if CONFIG_LOCKDEP is not set.
+ * regmap_init 宏的包装层：为每个调用点自动附带独立的 lockdep key/name。
+ * 若未开启 CONFIG_LOCKDEP，则退化成普通函数调用。
  *
- * @fn: Real function to call (in the form __[*_]regmap_init[_*])
- * @name: Config variable name (#config in the calling macro)
+ * @fn: 实际要调用的底层函数（形如 __[*_]regmap_init[_*]）
+ * @name: 调用宏里 config 参数的名字（即 #config）
  **/
 #ifdef CONFIG_LOCKDEP
 #define __regmap_lockdep_wrapper(fn, name, ...)				\
@@ -799,16 +715,15 @@ struct regmap *__devm_regmap_init_fsi(struct fsi_device *fsi_dev,
 #endif
 
 /**
- * regmap_init() - Initialise register map
+ * regmap_init() - 初始化一个寄存器映射
  *
- * @dev: Device that will be interacted with
- * @bus: Bus-specific callbacks to use with device
- * @bus_context: Data passed to bus-specific callbacks
- * @config: Configuration for register map
+ * @dev: 要访问的设备
+ * @bus: 与该设备配套的总线回调集合
+ * @bus_context: 透传给总线回调的私有上下文
+ * @config: regmap 配置
  *
- * The return value will be an ERR_PTR() on error or a valid pointer to
- * a struct regmap.  This function should generally not be called
- * directly, it should be called by bus-specific init functions.
+ * 返回值：失败时返回 ERR_PTR()，成功时返回有效的 struct regmap 指针。
+ * 一般不应直接调用，应由各总线专用的 regmap_init_* 包装宏调用。
  */
 #define regmap_init(dev, bus, bus_context, config)			\
 	__regmap_lockdep_wrapper(__regmap_init, #config,		\
@@ -817,13 +732,12 @@ int regmap_attach_dev(struct device *dev, struct regmap *map,
 		      const struct regmap_config *config);
 
 /**
- * regmap_init_i2c() - Initialise register map
+ * regmap_init_i2c() - 为 I2C 设备初始化 regmap
  *
  * @i2c: Device that will be interacted with
  * @config: Configuration for register map
  *
- * The return value will be an ERR_PTR() on error or a valid pointer to
- * a struct regmap.
+ * 返回值：失败时返回 ERR_PTR()，成功时返回有效 regmap。
  */
 #define regmap_init_i2c(i2c, config)					\
 	__regmap_lockdep_wrapper(__regmap_init_i2c, #config,		\
@@ -869,7 +783,7 @@ int regmap_attach_dev(struct device *dev, struct regmap *map,
 				slimbus, config)
 
 /**
- * regmap_init_spi() - Initialise register map
+ * regmap_init_spi() - 为 SPI 设备初始化 regmap
  *
  * @dev: Device that will be interacted with
  * @config: Configuration for register map
@@ -1044,17 +958,16 @@ bool regmap_ac97_default_volatile(struct device *dev, unsigned int reg);
 				 config)
 
 /**
- * devm_regmap_init() - Initialise managed register map
+ * devm_regmap_init() - 初始化受 devres 管理的 regmap
  *
  * @dev: Device that will be interacted with
  * @bus: Bus-specific callbacks to use with device
  * @bus_context: Data passed to bus-specific callbacks
  * @config: Configuration for register map
  *
- * The return value will be an ERR_PTR() on error or a valid pointer
- * to a struct regmap.  This function should generally not be called
- * directly, it should be called by bus-specific init functions.  The
- * map will be automatically freed by the device management code.
+ * 返回值：失败时返回 ERR_PTR()，成功时返回有效 regmap。
+ * 一般不应直接调用，应由总线专用的 devm_regmap_init_* 宏调用。
+ * 成功创建后，regmap 会在设备解绑时自动释放。
  */
 #define devm_regmap_init(dev, bus, bus_context, config)			\
 	__regmap_lockdep_wrapper(__devm_regmap_init, #config,		\

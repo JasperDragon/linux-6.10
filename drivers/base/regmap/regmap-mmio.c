@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Register map access API - MMIO support
+// Register map 访问 API - MMIO 后端支持
 //
 // Copyright (c) 2012, NVIDIA CORPORATION.  All rights reserved.
 
@@ -19,7 +19,7 @@ struct regmap_mmio_context {
 	unsigned int val_bytes;
 	bool big_endian;
 
-	bool attached_clk;
+	bool attached_clk;	/* clk 由 regmap_mmio_attach_clk() 动态挂进来 */
 	struct clk *clk;
 
 	void (*reg_write)(struct regmap_mmio_context *ctx,
@@ -46,7 +46,7 @@ static int regmap_mmio_get_min_stride(size_t val_bits)
 
 	switch (val_bits) {
 	case 8:
-		/* The core treats 0 as 1 */
+		/* regmap core 会把 0 解释成 stride 1。 */
 		min_stride = 0;
 		break;
 	case 16:
@@ -153,6 +153,7 @@ static int regmap_mmio_write(void *context, unsigned int reg, unsigned int val)
 	struct regmap_mmio_context *ctx = context;
 	int ret;
 
+	/* 某些寄存器窗口只有在外设时钟打开时才能安全访问。 */
 	if (!IS_ERR(ctx->clk)) {
 		ret = clk_enable(ctx->clk);
 		if (ret < 0)
@@ -181,10 +182,9 @@ static int regmap_mmio_noinc_write(void *context, unsigned int reg,
 	}
 
 	/*
-	 * There are no native, assembly-optimized write single register
-	 * operations for big endian, so fall back to emulation if this
-	 * is needed. (Single bytes are fine, they are not affected by
-	 * endianness.)
+	 * 大端 noinc write 没有像 writesw/writesl 那样现成的原生批量接口，
+	 * 因此只能退化成逐元素 swab 后单次写寄存器的模拟实现。
+	 * 单字节场景不受字节序影响，不需要特殊处理。
 	 */
 	if (ctx->big_endian && (ctx->val_bytes > 1)) {
 		switch (ctx->val_bytes) {

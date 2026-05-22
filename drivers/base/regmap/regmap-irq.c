@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// regmap based irq_chip
+// 基于 regmap 的 irq_chip 框架
 //
 // Copyright 2011 Wolfson Microelectronics plc
 //
@@ -49,9 +49,10 @@ struct regmap_irq_chip_data {
 	unsigned int (*get_irq_reg)(struct regmap_irq_chip_data *data,
 				    unsigned int base, int index);
 
-	unsigned int clear_status:1;
+	unsigned int clear_status:1; /* 下次 sync_unlock 前先清一次状态寄存器 */
 };
 
+/* 把 Linux IRQ 域里的 hwirq 编号映射回 regmap_irq 描述项。 */
 static inline const
 struct regmap_irq *irq_to_regmap_irq(struct regmap_irq_chip_data *data,
 				     int irq)
@@ -64,9 +65,9 @@ static bool regmap_irq_can_bulk_read_status(struct regmap_irq_chip_data *data)
 	struct regmap *map = data->map;
 
 	/*
-	 * While possible that a user-defined ->get_irq_reg() callback might
-	 * be linear enough to support bulk reads, most of the time it won't.
-	 * Therefore only allow them if the default callback is being used.
+	 * 用户自定义的 ->get_irq_reg() 理论上也可能是线性的，
+	 * 但绝大多数情况下不是。因此只有在使用默认线性映射函数时，
+	 * 才允许状态寄存器走 bulk read 快路径。
 	 */
 	return data->irq_reg_stride == 1 && map->reg_stride == 1 &&
 	       data->get_irq_reg == regmap_irq_get_irq_reg_linear &&
@@ -109,9 +110,9 @@ static void regmap_irq_sync_unlock(struct irq_data *data)
 	}
 
 	/*
-	 * If there's been a change in the mask write it back to the
-	 * hardware.  We rely on the use of the regmap core cache to
-	 * suppress pointless writes.
+	 * 如果 mask 发生变化，就在解锁阶段统一回写到硬件。
+	 * 这里依赖 regmap core 自身的缓存与 update_bits 逻辑，
+	 * 来压掉那些“写了但值没变”的无效访问。
 	 */
 	for (i = 0; i < d->chip->num_regs; i++) {
 		if (d->chip->handle_mask_sync)
@@ -156,9 +157,9 @@ static void regmap_irq_sync_unlock(struct irq_data *data)
 		if (!d->chip->init_ack_masked)
 			continue;
 		/*
-		 * Ack all the masked interrupts unconditionally,
-		 * OR if there is masked interrupt which hasn't been Acked,
-		 * it'll be ignored in irq handler, then may introduce irq storm
+		 * 对已 mask 的中断无条件做 ack。
+		 * 否则如果某个中断已被屏蔽但状态位仍悬挂，它不会再被 handler 处理，
+		 * 反而可能持续触发，最终演化成 irq storm。
 		 */
 		if (d->mask_buf[i] && (d->chip->ack_base || d->chip->use_ack)) {
 			reg = d->get_irq_reg(d, d->chip->ack_base, i);
@@ -194,7 +195,7 @@ static void regmap_irq_sync_unlock(struct irq_data *data)
 	if (d->chip->runtime_pm)
 		pm_runtime_put(map->dev);
 
-	/* If we've changed our wakeup count propagate it to the parent */
+	/* wakeup 使能计数若有变化，要同步折算到父中断线上。 */
 	if (d->wake_count < 0)
 		for (i = d->wake_count; i < 0; i++)
 			disable_irq_wake(d->irq);
@@ -216,14 +217,12 @@ static void regmap_irq_enable(struct irq_data *data)
 	unsigned int mask;
 
 	/*
-	 * The type_in_mask flag means that the underlying hardware uses
-	 * separate mask bits for each interrupt trigger type, but we want
-	 * to have a single logical interrupt with a configurable type.
+	 * type_in_mask 表示底层硬件并不是“一个中断对应一个 mask 位”，
+	 * 而是不同触发类型各自拥有独立 mask 位。
+	 * 对 Linux IRQ 层来说，我们仍希望暴露成“一个逻辑 IRQ + 可配置触发类型”。
 	 *
-	 * If the interrupt we're enabling defines any supported types
-	 * then instead of using the regular mask bits for this interrupt,
-	 * use the value previously written to the type buffer at the
-	 * corresponding offset in regmap_irq_set_type().
+	 * 因此，如果这个 IRQ 支持设置触发类型，就不用普通 mask 位，
+	 * 而是取 regmap_irq_set_type() 之前写好的 type_buf 结果。
 	 */
 	if (d->chip->type_in_mask && irq_data->type.types_supported)
 		mask = d->type_buf[reg] & irq_data->mask;
@@ -319,8 +318,8 @@ static inline int read_sub_irq_data(struct regmap_irq_chip_data *data,
 		ret = regmap_read(map, reg, &data->status_buf[b]);
 	} else {
 		/*
-		 * Note we can't use ->get_irq_reg() here because the offsets
-		 * in 'subreg' are *not* interchangeable with indices.
+		 * 这里不能直接套用 ->get_irq_reg()：
+		 * subreg 里保存的是“真实偏移数组”，并不是可与线性 index 互换的编号。
 		 */
 		subreg = &chip->sub_reg_offsets[b];
 		for (i = 0; i < subreg->num_regs; i++) {
@@ -344,26 +343,25 @@ static int read_irq_data(struct regmap_irq_chip_data *data)
 	u32 reg;
 
 	/*
-	 * Read only registers with active IRQs if the chip has 'main status
-	 * register'. Else read in the statuses, using a single bulk read if
-	 * possible in order to reduce the I/O overheads.
+	 * 如果芯片有 main status register，就先读主状态，再只下钻读取那些真的有活动位的
+	 * 子状态寄存器；否则就直接把所有状态寄存器读出来。
+	 * 对“线性且可 bulk”的布局，优先走 bulk read 以减少 I/O 开销。
 	 */
 
 	if (chip->no_status) {
-		/* no status register so default to all active */
+		/* 没有状态寄存器时，只能把所有位都视为“可能活动”。 */
 		memset32(data->status_buf, GENMASK(31, 0), chip->num_regs);
 	} else if (chip->num_main_regs) {
 		unsigned int max_main_bits;
 
 		max_main_bits = (chip->num_main_status_bits) ?
 				 chip->num_main_status_bits : chip->num_regs;
-		/* Clear the status buf as we don't read all status regs */
+		/* 因为这里只会读活动分支下的子寄存器，先把整块状态缓存清零。 */
 		memset32(data->status_buf, 0, chip->num_regs);
 
-		/* We could support bulk read for main status registers
-		 * but I don't expect to see devices with really many main
-		 * status registers so let's only support single reads for the
-		 * sake of simplicity. and add bulk reads only if needed
+		/* main status 寄存器理论上也能支持 bulk read，
+		 * 但这类寄存器通常数量不多，当前实现先保持简单，按单寄存器读取。
+		 * 真有大规模场景再补 bulk 路径。
 		 */
 		for (i = 0; i < chip->num_main_regs; i++) {
 			reg = data->get_irq_reg(data, chip->main_status, i);
@@ -374,7 +372,7 @@ static int read_irq_data(struct regmap_irq_chip_data *data)
 			}
 		}
 
-		/* Read sub registers with active IRQs */
+		/* 再只读取被 main status 指出来的活动子寄存器。 */
 		for (i = 0; i < chip->num_main_regs; i++) {
 			unsigned int b;
 			const unsigned long mreg = data->main_status_buf[i];
@@ -559,8 +557,8 @@ static const struct irq_domain_ops regmap_domain_ops = {
  * @base: Base register
  * @index: Register index
  *
- * Returns the register address corresponding to the given @base and @index
- * by the formula ``base + index * regmap_stride * irq_reg_stride``.
+ * 按公式 ``base + index * regmap_stride * irq_reg_stride``
+ * 计算给定 @base 和 @index 对应的实际寄存器地址。
  */
 unsigned int regmap_irq_get_irq_reg_linear(struct regmap_irq_chip_data *data,
 					   unsigned int base, int index)
@@ -572,17 +570,17 @@ unsigned int regmap_irq_get_irq_reg_linear(struct regmap_irq_chip_data *data,
 EXPORT_SYMBOL_GPL(regmap_irq_get_irq_reg_linear);
 
 /**
- * regmap_irq_set_type_config_simple() - Simple IRQ type configuration callback.
- * @buf: Buffer containing configuration register values, this is a 2D array of
- *       `num_config_bases` rows, each of `num_config_regs` elements.
- * @type: The requested IRQ type.
- * @irq_data: The IRQ being configured.
- * @idx: Index of the irq's config registers within each array `buf[i]`
- * @irq_drv_data: Driver specific IRQ data
+ * regmap_irq_set_type_config_simple() - 简单 IRQ 类型配置回调
+ * @buf: 保存配置寄存器值的二维数组，布局为
+ *       `num_config_bases` 行、每行 `num_config_regs` 个元素
+ * @type: 请求设置的 IRQ 触发类型
+ * @irq_data: 当前正在配置的 IRQ 描述项
+ * @idx: 该 IRQ 在每个 `buf[i]` 数组中的配置寄存器索引
+ * @irq_drv_data: 驱动私有 IRQ 数据
  *
- * This is a &struct regmap_irq_chip->set_type_config callback suitable for
- * chips with one config register. Register values are updated according to
- * the &struct regmap_irq_type data associated with an IRQ.
+ * 这是一个适用于“每个 IRQ 只有一组配置寄存器”的
+ * &struct regmap_irq_chip->set_type_config 回调。
+ * 它会根据对应 IRQ 的 &struct regmap_irq_type 描述，更新配置寄存器值。
  */
 int regmap_irq_set_type_config_simple(unsigned int **buf, unsigned int type,
 				      const struct regmap_irq *irq_data,
@@ -653,21 +651,20 @@ static int regmap_irq_create_domain(struct fwnode_handle *fwnode, int irq_base,
 
 
 /**
- * regmap_add_irq_chip_fwnode() - Use standard regmap IRQ controller handling
+ * regmap_add_irq_chip_fwnode() - 使用标准 regmap IRQ 控制器框架
  *
- * @fwnode: The firmware node where the IRQ domain should be added to.
- * @map: The regmap for the device.
- * @irq: The IRQ the device uses to signal interrupts.
- * @irq_flags: The IRQF_ flags to use for the primary interrupt.
- * @irq_base: Allocate at specific IRQ number if irq_base > 0.
- * @chip: Configuration for the interrupt controller.
- * @data: Runtime data structure for the controller, allocated on success.
+ * @fwnode: 要挂载 IRQ domain 的 firmware node
+ * @map: 设备对应的 regmap
+ * @irq: 设备用于上报中断的主 IRQ
+ * @irq_flags: 主 IRQ 使用的 IRQF_ 标志
+ * @irq_base: 若大于 0，则从指定 IRQ 号开始分配
+ * @chip: 中断控制器配置
+ * @data: 成功时返回分配好的运行时数据结构
  *
- * Returns 0 on success or an errno on failure.
+ * 返回值：成功返回 0，失败返回 errno。
  *
- * In order for this to be efficient the chip really should use a
- * register cache.  The chip driver is responsible for restoring the
- * register values used by the IRQ controller over suspend and resume.
+ * 为了获得较好的效率，芯片最好配套寄存器缓存使用。
+ * 挂起/恢复过程中，IRQ 控制器依赖的寄存器值仍需由芯片驱动自行保证恢复。
  */
 int regmap_add_irq_chip_fwnode(struct fwnode_handle *fwnode,
 			       struct regmap *map, int irq,
@@ -760,8 +757,8 @@ int regmap_add_irq_chip_fwnode(struct fwnode_handle *fwnode,
 	}
 
 	if (chip->num_config_bases && chip->num_config_regs) {
-		/*
-		 * Create config_buf[num_config_bases][num_config_regs]
+		/* 为类型配置寄存器分配二维缓冲区：
+		 * config_buf[num_config_bases][num_config_regs]
 		 */
 		d->config_buf = kcalloc(chip->num_config_bases,
 					sizeof(*d->config_buf), GFP_KERNEL);
@@ -803,9 +800,8 @@ int regmap_add_irq_chip_fwnode(struct fwnode_handle *fwnode,
 	}
 
 	/*
-	 * If one regmap-irq is the parent of another then we'll try
-	 * to lock the child with the parent locked, use an explicit
-	 * lock_key so lockdep can figure out what's going on.
+	 * 如果一个 regmap-irq 叠在另一个 regmap-irq 之上，父 handler 里可能继续拿子锁。
+	 * 这里显式注册 lock_key，便于 lockdep 正确理解锁层级关系。
 	 */
 	lockdep_register_key(&d->lock_key);
 	mutex_init_with_key(&d->lock, &d->lock_key);
@@ -814,7 +810,7 @@ int regmap_add_irq_chip_fwnode(struct fwnode_handle *fwnode,
 		d->mask_buf_def[chip->irqs[i].reg_offset / map->reg_stride]
 			|= chip->irqs[i].mask;
 
-	/* Mask all the interrupts by default */
+	/* 初始化阶段先把所有已知中断都 mask 住，再逐步建立软件侧状态。 */
 	for (i = 0; i < chip->num_regs; i++) {
 		d->mask_buf[i] = d->mask_buf_def[i];
 
@@ -852,9 +848,9 @@ int regmap_add_irq_chip_fwnode(struct fwnode_handle *fwnode,
 		if (!chip->init_ack_masked)
 			continue;
 
-		/* Ack masked but set interrupts */
+		/* 对“已 mask 但状态位仍然挂起”的中断，初始化时就顺手清掉。 */
 		if (d->chip->no_status) {
-			/* no status register so default to all active */
+			/* 没有状态寄存器时，只能保守地把所有位都看作有效。 */
 			d->status_buf[i] = UINT_MAX;
 		} else {
 			reg = d->get_irq_reg(d, d->chip->status_base, i);
@@ -891,7 +887,7 @@ int regmap_add_irq_chip_fwnode(struct fwnode_handle *fwnode,
 		}
 	}
 
-	/* Wake is disabled by default */
+	/* wake 功能默认关闭，先把 wake 寄存器编程成“全部不允许唤醒”。 */
 	if (d->wake_buf) {
 		for (i = 0; i < chip->num_regs; i++) {
 			d->wake_buf[i] = d->mask_buf_def[i];
@@ -913,7 +909,7 @@ int regmap_add_irq_chip_fwnode(struct fwnode_handle *fwnode,
 		}
 	}
 
-	/* Store current levels */
+	/* 对 level 型状态，先记住一份当前硬件电平，后续才能做边沿/变化判定。 */
 	if (chip->status_is_level) {
 		ret = read_irq_data(d);
 		if (ret < 0)
@@ -941,7 +937,7 @@ int regmap_add_irq_chip_fwnode(struct fwnode_handle *fwnode,
 	return 0;
 
 err_domain:
-	/* Should really dispose of the domain but... */
+	/* 这里理论上还应更早销毁 domain，但当前错误路径先保持现有清理顺序。 */
 err_mutex:
 	mutex_destroy(&d->lock);
 	lockdep_unregister_key(&d->lock_key);
@@ -966,7 +962,7 @@ err_alloc:
 EXPORT_SYMBOL_GPL(regmap_add_irq_chip_fwnode);
 
 /**
- * regmap_add_irq_chip() - Use standard regmap IRQ controller handling
+ * regmap_add_irq_chip() - 使用标准 regmap IRQ 控制器框架
  *
  * @map: The regmap for the device.
  * @irq: The IRQ the device uses to signal interrupts.
@@ -977,8 +973,7 @@ EXPORT_SYMBOL_GPL(regmap_add_irq_chip_fwnode);
  *
  * Returns 0 on success or an errno on failure.
  *
- * This is the same as regmap_add_irq_chip_fwnode, except that the firmware
- * node of the regmap is used.
+ * 与 regmap_add_irq_chip_fwnode() 相同，只是直接使用 regmap 绑定设备的 firmware node。
  */
 int regmap_add_irq_chip(struct regmap *map, int irq, int irq_flags,
 			int irq_base, const struct regmap_irq_chip *chip,
@@ -990,12 +985,12 @@ int regmap_add_irq_chip(struct regmap *map, int irq, int irq_flags,
 EXPORT_SYMBOL_GPL(regmap_add_irq_chip);
 
 /**
- * regmap_del_irq_chip() - Stop interrupt handling for a regmap IRQ chip
+ * regmap_del_irq_chip() - 停止一个 regmap IRQ 控制器的中断处理
  *
  * @irq: Primary IRQ for the device
  * @d: &regmap_irq_chip_data allocated by regmap_add_irq_chip()
  *
- * This function also disposes of all mapped IRQs on the chip.
+ * 该函数还会一并释放这个芯片上已经映射出去的所有虚拟 IRQ。
  */
 void regmap_del_irq_chip(int irq, struct regmap_irq_chip_data *d)
 {
@@ -1007,16 +1002,13 @@ void regmap_del_irq_chip(int irq, struct regmap_irq_chip_data *d)
 
 	free_irq(irq, d);
 
-	/* Dispose all virtual irq from irq domain before removing it */
+	/* 在拆掉 domain 之前，先释放掉所有已映射的虚拟 IRQ。 */
 	for (hwirq = 0; hwirq < d->chip->num_irqs; hwirq++) {
-		/* Ignore hwirq if holes in the IRQ list */
+		/* IRQ 列表中的空洞项没有有效 mask，直接跳过。 */
 		if (!d->chip->irqs[hwirq].mask)
 			continue;
 
-		/*
-		 * Find the virtual irq of hwirq on chip and if it is
-		 * there then dispose it
-		 */
+		/* 找到 hwirq 对应的 virq，如果存在就释放。 */
 		virq = irq_find_mapping(d->domain, hwirq);
 		if (virq)
 			irq_dispose_mapping(virq);
@@ -1063,7 +1055,7 @@ static int devm_regmap_irq_chip_match(struct device *dev, void *res, void *data)
 }
 
 /**
- * devm_regmap_add_irq_chip_fwnode() - Resource managed regmap_add_irq_chip_fwnode()
+ * devm_regmap_add_irq_chip_fwnode() - devres 管理版 regmap_add_irq_chip_fwnode()
  *
  * @dev: The device pointer on which irq_chip belongs to.
  * @fwnode: The firmware node where the IRQ domain should be added to.
@@ -1074,10 +1066,9 @@ static int devm_regmap_irq_chip_match(struct device *dev, void *res, void *data)
  * @chip: Configuration for the interrupt controller.
  * @data: Runtime data structure for the controller, allocated on success
  *
- * Returns 0 on success or an errno on failure.
+ * 返回值：成功返回 0，失败返回 errno。
  *
- * The &regmap_irq_chip_data will be automatically released when the device is
- * unbound.
+ * 设备解绑时，&regmap_irq_chip_data 会自动释放。
  */
 int devm_regmap_add_irq_chip_fwnode(struct device *dev,
 				    struct fwnode_handle *fwnode,
@@ -1109,7 +1100,7 @@ int devm_regmap_add_irq_chip_fwnode(struct device *dev,
 EXPORT_SYMBOL_GPL(devm_regmap_add_irq_chip_fwnode);
 
 /**
- * devm_regmap_add_irq_chip() - Resource managed regmap_add_irq_chip()
+ * devm_regmap_add_irq_chip() - devres 管理版 regmap_add_irq_chip()
  *
  * @dev: The device pointer on which irq_chip belongs to.
  * @map: The regmap for the device.
@@ -1121,8 +1112,7 @@ EXPORT_SYMBOL_GPL(devm_regmap_add_irq_chip_fwnode);
  *
  * Returns 0 on success or an errno on failure.
  *
- * The &regmap_irq_chip_data will be automatically released when the device is
- * unbound.
+ * 设备解绑时，&regmap_irq_chip_data 会自动释放。
  */
 int devm_regmap_add_irq_chip(struct device *dev, struct regmap *map, int irq,
 			     int irq_flags, int irq_base,
@@ -1136,13 +1126,13 @@ int devm_regmap_add_irq_chip(struct device *dev, struct regmap *map, int irq,
 EXPORT_SYMBOL_GPL(devm_regmap_add_irq_chip);
 
 /**
- * devm_regmap_del_irq_chip() - Resource managed regmap_del_irq_chip()
+ * devm_regmap_del_irq_chip() - devres 管理版 regmap_del_irq_chip()
  *
  * @dev: Device for which the resource was allocated.
  * @irq: Primary IRQ for the device.
  * @data: &regmap_irq_chip_data allocated by regmap_add_irq_chip().
  *
- * A resource managed version of regmap_del_irq_chip().
+ * regmap_del_irq_chip() 的资源托管版本。
  */
 void devm_regmap_del_irq_chip(struct device *dev, int irq,
 			      struct regmap_irq_chip_data *data)
@@ -1159,11 +1149,11 @@ void devm_regmap_del_irq_chip(struct device *dev, int irq,
 EXPORT_SYMBOL_GPL(devm_regmap_del_irq_chip);
 
 /**
- * regmap_irq_chip_get_base() - Retrieve interrupt base for a regmap IRQ chip
+ * regmap_irq_chip_get_base() - 取回 regmap IRQ 控制器的中断基号
  *
  * @data: regmap irq controller to operate on.
  *
- * Useful for drivers to request their own IRQs.
+ * 便于驱动按偏移自行申请子 IRQ。
  */
 int regmap_irq_chip_get_base(struct regmap_irq_chip_data *data)
 {
@@ -1173,16 +1163,16 @@ int regmap_irq_chip_get_base(struct regmap_irq_chip_data *data)
 EXPORT_SYMBOL_GPL(regmap_irq_chip_get_base);
 
 /**
- * regmap_irq_get_virq() - Map an interrupt on a chip to a virtual IRQ
+ * regmap_irq_get_virq() - 把芯片内部 IRQ 号映射成 Linux virq
  *
  * @data: regmap irq controller to operate on.
- * @irq: index of the interrupt requested in the chip IRQs.
+ * @irq: 芯片 IRQ 数组中的索引
  *
- * Useful for drivers to request their own IRQs.
+ * 便于驱动自行申请和管理子 IRQ。
  */
 int regmap_irq_get_virq(struct regmap_irq_chip_data *data, int irq)
 {
-	/* Handle holes in the IRQ list */
+	/* IRQ 表中可能留有空洞项，直接视为非法。 */
 	if (!data->chip->irqs[irq].mask)
 		return -EINVAL;
 
@@ -1191,14 +1181,13 @@ int regmap_irq_get_virq(struct regmap_irq_chip_data *data, int irq)
 EXPORT_SYMBOL_GPL(regmap_irq_get_virq);
 
 /**
- * regmap_irq_get_domain() - Retrieve the irq_domain for the chip
+ * regmap_irq_get_domain() - 取回该芯片对应的 irq_domain
  *
  * @data: regmap_irq controller to operate on.
  *
- * Useful for drivers to request their own IRQs and for integration
- * with subsystems.  For ease of integration NULL is accepted as a
- * domain, allowing devices to just call this even if no domain is
- * allocated.
+ * 便于驱动自行申请 IRQ，或与其他子系统做集成。
+ * 为了方便调用，即使没有分配 domain，这个接口也允许传入 NULL，
+ * 并直接返回 NULL。
  */
 struct irq_domain *regmap_irq_get_domain(struct regmap_irq_chip_data *data)
 {
