@@ -23,6 +23,30 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+/*
+ * DRM Debugfs 接口 - 为 DRM 设备提供调试文件系统（debugfs）支持
+ *
+ * 本文件实现了 DRM 框架的 debugfs 调试接口，通过 debugfs 文件系统暴露
+ * DRM 设备的内部状态信息，便于驱动开发和调试。主要功能包括：
+ *
+ *   设备级别：
+ *     - name：显示驱动名称、设备和主控信息
+ *     - clients：列出所有连接的客户端及其认证状态
+ *     - gem_names：列出 GEM 命名对象
+ *
+ *   连接器级别：
+ *     - force：强制连接器状态（on/off/digital）
+ *     - edid_override：覆盖/重置 EDID
+ *     - vrr_range：显示可变刷新率范围
+ *     - output_bpc：显示最大输出位深
+ *     - infoframes：HDMI 信息帧调试
+ *
+ *   其他：
+ *     - CRTC 级别：CRC 数据采集（通过 drm_debugfs_crc）
+ *     - 编码器级别：桥接参数
+ *     - 客户端级别：进程信息
+ */
+
 #include <linux/debugfs.h>
 #include <linux/export.h>
 #include <linux/seq_file.h>
@@ -194,6 +218,18 @@ static const struct file_operations drm_debugfs_fops = {
 	.release = single_release,
 };
 
+/*
+ * drm_debugfs_gpuva_info - 输出 DRM GPU 虚拟地址空间信息
+ * @m: 指向 seq_file 的指针，用于输出
+ * @gpuvm: 表示 GPU VA 空间的 drm_gpuvm
+ *
+ * 输出指定 DRM GPU VA 管理器的虚拟地址映射信息，包括地址范围、
+ * 内核保留节点和所有用户 VA 映射的起始地址、范围、结束地址和
+ * 关联的 GEM 对象信息。驱动应在 &drm_info_list 的 show 回调中
+ * 调用此函数。
+ *
+ * 返回：0 表示成功，-ENODEV 表示 gpuvm 未初始化。
+ */
 /**
  * drm_debugfs_gpuva_info - dump the given DRM GPU VA space
  * @m: pointer to the &seq_file to write
@@ -234,6 +270,17 @@ int drm_debugfs_gpuva_info(struct seq_file *m,
 }
 EXPORT_SYMBOL(drm_debugfs_gpuva_info);
 
+/*
+ * drm_debugfs_create_files - 为 DRM minor 初始化一组 debugfs 文件
+ * @files: 要创建的文件数组（drm_info_list）
+ * @count: 文件数量
+ * @root: DRI debugfs 目录项
+ * @minor: 设备 minor 编号
+ *
+ * 在给定的根目录下创建由 drm_info_list 数组描述的一组 debugfs 文件。
+ * 这些文件在调用 drm_debugfs_dev_fini() 时会被自动移除。
+ * 仅创建与设备驱动特性匹配的文件（通过 driver_features 过滤）。
+ */
 /**
  * drm_debugfs_create_files - Initialize a given set of debugfs files for DRM
  * 			minor
@@ -343,6 +390,14 @@ static const struct file_operations drm_debugfs_proc_info_fops = {
 	.release = single_release,
 };
 
+/*
+ * drm_debugfs_clients_add - 为每个客户端创建 debugfs 目录
+ * @file: 客户端的 drm_file
+ *
+ * 为每个 DRM 客户端创建独立的 debugfs 目录，用于存放驱动特定的
+ * 客户端数据。同时创建指向 DRM 设备的符号链接和包含进程信息的
+ * proc_info 文件，便于识别哪个客户端属于哪个进程。
+ */
 /**
  * drm_debugfs_clients_add - Add a per client debugfs directory
  * @file: drm_file for a client
@@ -378,13 +433,13 @@ void drm_debugfs_clients_add(struct drm_file *file)
 }
 
 /**
- * drm_debugfs_clients_remove - removes all debugfs directories and files
- * @file: drm_file for a client
+ * drm_debugfs_clients_remove - 移除客户端的所有 debugfs 目录和文件
+ * @file: 客户端的 drm_file
  *
- * Removes the debugfs directories recursively from the client directory.
+ * 递归地移除客户端 debugfs 目录中的所有文件和子目录。
  *
- * There is also a possibility that debugfs files are open while the drm_file
- * is released.
+ * 注意：存在 drm_file 被释放时 debugfs 文件仍被打开的可能性，
+ * 调用者需要确保正确处理这种情况，避免访问已释放的内存。
  */
 void drm_debugfs_clients_remove(struct drm_file *file)
 {
@@ -392,11 +447,21 @@ void drm_debugfs_clients_remove(struct drm_file *file)
 	file->debugfs_client = NULL;
 }
 
-/**
- * drm_debugfs_dev_init - create debugfs directory for the device
- * @dev: the device which we want to create the directory for
+/*
+ * drm_debugfs_dev_init - 为设备创建 debugfs 目录
+ * @dev: 要创建目录的 DRM 设备
  *
- * Creates the debugfs directory for the device under the given root directory.
+ * 在全局 DRM debugfs 根目录下创建以设备 unique 标识符命名的子目录，
+ * 用于存放该设备相关的所有调试文件。计算加速设备使用独立的 accel 根目录。
+ */
+/**
+ * drm_debugfs_dev_init - 为设备创建 debugfs 目录
+ * @dev: 要创建 debugfs 目录的设备
+ *
+ * 在 debugfs 根目录下为指定设备创建调试文件系统目录。
+ * 目录名称使用设备的 unique 标识符。对于计算加速设备（DRIVER_COMPUTE_ACCEL），
+ * 目录创建在 accel 根目录下；否则创建在 DRM 根目录下。
+ * 此目录将包含该设备相关的所有调试文件。
  */
 void drm_debugfs_dev_init(struct drm_device *dev)
 {
@@ -407,10 +472,11 @@ void drm_debugfs_dev_init(struct drm_device *dev)
 }
 
 /**
- * drm_debugfs_dev_fini - cleanup debugfs directory
- * @dev: the device to cleanup the debugfs stuff
+ * drm_debugfs_dev_fini - 清理设备的 debugfs 目录
+ * @dev: 要清理 debugfs 的设备
  *
- * Remove the debugfs directory, might be called multiple times.
+ * 移除设备的 debugfs 目录及其所有内容。此函数可能被多次调用，
+ * 实现上保证多次调用安全（第二次调用时 dev->debugfs_root 为 NULL）。
  */
 void drm_debugfs_dev_fini(struct drm_device *dev)
 {
@@ -454,6 +520,16 @@ void drm_debugfs_unregister(struct drm_minor *minor)
 	minor->debugfs_symlink = NULL;
 }
 
+/*
+ * drm_debugfs_add_file - 向 DRM 设备 debugfs 文件列表添加单个文件
+ * @dev: DRM 设备
+ * @name: debugfs 文件名
+ * @show: 文件内容显示回调函数
+ * @data: 驱动私有数据（不应是设备特定的）
+ *
+ * 在设备的 debugfs 根目录下创建指定名称的调试文件，并注册其
+ * show 回调函数。文件权限默认为 0444（全局可读）。
+ */
 /**
  * drm_debugfs_add_file - Add a given file to the DRM device debugfs file list
  * @dev: drm device for the ioctl
@@ -482,6 +558,15 @@ void drm_debugfs_add_file(struct drm_device *dev, const char *name,
 }
 EXPORT_SYMBOL(drm_debugfs_add_file);
 
+/*
+ * drm_debugfs_add_files - 向 DRM 设备 debugfs 文件列表添加一组文件
+ * @dev: DRM 设备
+ * @files: 要创建的文件数组（drm_debugfs_info）
+ * @count: 文件数量
+ *
+ * 批量添加一组 debugfs 文件到设备的 debugfs 根目录，逐个调用
+ * drm_debugfs_add_file() 创建每个文件。
+ */
 /**
  * drm_debugfs_add_files - Add an array of files to the DRM device debugfs file list
  * @dev: drm device for the ioctl

@@ -6,6 +6,28 @@
  *     Matthew Brost <matthew.brost@intel.com>
  */
 
+/**
+ * DOC: GPU 共享虚拟内存概述 (中文)
+ *
+ * 该文件实现了 DRM GPU 共享虚拟内存（SVM）层，用于管理 CPU 和 GPU 之间的
+ * 共享虚拟地址空间。它使 GPU 和 CPU 能够通过相同的虚拟地址访问内存，从而
+ * 实现高效的数据交换和处理。
+ *
+ * 核心组件包括：
+ *   1. Notifiers（通知器）：跟踪内存区间并在 CPU 修改时通知 GPU。
+ *      基于 mmu_interval_notifier 实现，维护红黑树和区间列表。
+ *   2. Ranges（范围）：表示 DRM 设备中映射的内存范围，由 GPU SVM 管理。
+ *      范围在 GPU 缺页时动态分配，在 MMU 通知 UNMAP 事件时移除。
+ *   3. Operations（操作）：驱动特定的 GPU SVM 操作接口，包括范围分配、
+ *      notifier 分配和无效化回调。
+ *   4. 设备内存分配：包含迁移所需的信息，支持在设备内存和系统内存之间迁移。
+ *
+ * 典型组件集成：
+ *   - GPU 缺页处理程序：基于缺页地址创建范围和 notifier，迁移到设备内存
+ *   - 垃圾回收器：解除并销毁 GPU 绑定
+ *   - Notifier 回调：无效化和 DMA 解除映射 GPU 绑定
+ */
+
 #include <linux/dma-mapping.h>
 #include <linux/export.h>
 #include <linux/hmm.h>
@@ -271,10 +293,15 @@ npages_in_range(unsigned long start, unsigned long end)
 }
 
 /**
- * drm_gpusvm_notifier_find() - Find GPU SVM notifier from GPU SVM
- * @gpusvm: Pointer to the GPU SVM structure.
- * @start: Start address of the notifier
- * @end: End address of the notifier
+ * drm_gpusvm_notifier_find() - 在 GPU SVM 中查找 GPU SVM notifier
+ *
+ * 中文: 在 GPU SVM 的红黑树（gpusvm->root）中查找覆盖指定地址范围
+ * （@start 到 @end - 1）的 notifier。使用 interval_tree_iter_first()
+ * 进行区间树搜索，找到第一个与范围重叠的 notifier。
+ *
+ * @gpusvm: 指向 GPU SVM 结构体的指针
+ * @start: notifier 的起始地址
+ * @end: notifier 的结束地址
  *
  * Return: A pointer to the drm_gpusvm_notifier if found or NULL
  */
@@ -294,10 +321,15 @@ drm_gpusvm_notifier_find(struct drm_gpusvm *gpusvm, unsigned long start,
 EXPORT_SYMBOL_GPL(drm_gpusvm_notifier_find);
 
 /**
- * drm_gpusvm_range_find() - Find GPU SVM range from GPU SVM notifier
- * @notifier: Pointer to the GPU SVM notifier structure.
- * @start: Start address of the range
- * @end: End address of the range
+ * drm_gpusvm_range_find() - 从 GPU SVM notifier 中查找 GPU SVM range
+ *
+ * 中文: 在指定 notifier 的红黑树（notifier->root）中查找覆盖指定地址
+ * 范围的 GPU SVM range。返回第一个与范围重叠的 range，未找到时返回 NULL。
+ * 该函数不获取任何锁，调用者需确保适当的同步。
+ *
+ * @notifier: 指向 GPU SVM notifier 结构体的指针
+ * @start: range 的起始地址
+ * @end: range 的结束地址
  *
  * Return: A pointer to the drm_gpusvm_range if found or NULL
  */
@@ -356,27 +388,24 @@ static const struct mmu_interval_notifier_ops drm_gpusvm_notifier_ops = {
 };
 
 /**
- * drm_gpusvm_init() - Initialize the GPU SVM.
- * @gpusvm: Pointer to the GPU SVM structure.
- * @name: Name of the GPU SVM.
- * @drm: Pointer to the DRM device structure.
- * @mm: Pointer to the mm_struct for the address space.
- * @mm_start: Start address of GPU SVM.
- * @mm_range: Range of the GPU SVM.
- * @notifier_size: Size of individual notifiers.
- * @ops: Pointer to the operations structure for GPU SVM.
- * @chunk_sizes: Pointer to the array of chunk sizes used in range allocation.
- *               Entries should be powers of 2 in descending order with last
- *               entry being SZ_4K.
- * @num_chunks: Number of chunks.
+ * drm_gpusvm_init() - 初始化 GPU SVM
  *
- * This function initializes the GPU SVM.
+ * 中文: 初始化 GPU 共享虚拟内存管理器。如果提供 @mm 参数则启用完整的 SVM
+ * 模式（需要设置 @ops、@chunk_sizes、@mm_range 等参数）；如果仅使用简单的
+ * drm_gpusvm_pages API（get/unmap/free），则只需提供 @gpusvm、@name 和
+ * @drm，@mm 为 NULL。两种模式可以共存在同一个 @gpusvm 实例中。
+ * 初始化包括设置 notifier 红黑树、列表、notifier_lock 读写信号量等。
  *
- * Note: If only using the simple drm_gpusvm_pages API (get/unmap/free),
- * then only @gpusvm, @name, and @drm are expected. However, the same base
- * @gpusvm can also be used with both modes together in which case the full
- * setup is needed, where the core drm_gpusvm_pages API will simply never use
- * the other fields.
+ * @gpusvm: 指向 GPU SVM 结构体的指针
+ * @name: GPU SVM 的名称
+ * @drm: 指向 DRM 设备结构体的指针
+ * @mm: 指向地址空间 mm_struct 的指针
+ * @mm_start: GPU SVM 的起始地址
+ * @mm_range: GPU SVM 的范围大小
+ * @notifier_size: 单个 notifier 的大小
+ * @ops: GPU SVM 操作结构体指针
+ * @chunk_sizes: 范围分配使用的块大小数组（2 的幂降序，最后一项须为 SZ_4K）
+ * @num_chunks: 块数量
  *
  * Return: 0 on success, a negative error code on failure.
  */
@@ -475,11 +504,14 @@ static void drm_gpusvm_notifier_remove(struct drm_gpusvm *gpusvm,
 }
 
 /**
- * drm_gpusvm_fini() - Finalize the GPU SVM.
- * @gpusvm: Pointer to the GPU SVM structure.
+ * drm_gpusvm_fini() - 清理 GPU SVM
  *
- * This function finalizes the GPU SVM by cleaning up any remaining ranges and
- * notifiers, and dropping a reference to struct MM.
+ * 中文: 清理 GPU SVM，移除所有剩余的 notifier 和 range。首先遍历所有
+ * notifier，对每个 notifier 先移除 mmu_interval_notifier 以避免与无效化
+ * 操作并发，然后移除该 notifier 中的所有 range。最后释放 mm_struct 引用。
+ * 完成后验证红黑树为空。
+ *
+ * @gpusvm: 指向 GPU SVM 结构体的指针
  */
 void drm_gpusvm_fini(struct drm_gpusvm *gpusvm)
 {
@@ -744,18 +776,17 @@ err_free:
 }
 
 /**
- * drm_gpusvm_scan_mm() - Check the migration state of a drm_gpusvm_range
- * @range: Pointer to the struct drm_gpusvm_range to check.
- * @dev_private_owner: The struct dev_private_owner to use to determine
- * compatible device-private pages.
- * @pagemap: The struct dev_pagemap pointer to use for pagemap-specific
- * checks.
+ * drm_gpusvm_scan_mm() - 检查 drm_gpusvm_range 的迁移状态
  *
- * Scan the CPU address space corresponding to @range and return the
- * current migration state. Note that the result may be invalid as
- * soon as the function returns. It's an advisory check.
+ * 中文: 扫描 @range 对应的 CPU 地址空间，返回当前的迁移状态。
+ * 使用 HMM 的 hmm_range_fault() 获取物理页面信息，然后分析每个页面
+ * 的类型（系统内存、本地设备内存、其他设备内存）和分布情况。
+ * 注意：该结果在函数返回后可能立即失效，仅作为建议性的状态检查。
+ * 返回值指示了扫描结果，如全部在系统内存、全部在设备内存、混合等状态。
  *
- * TODO: Bail early and call hmm_range_fault() for subranges.
+ * @range: 要检查的 struct drm_gpusvm_range 指针
+ * @dev_private_owner: 用于确定兼容设备私有页面的所有者
+ * @pagemap: 用于特定 pagemap 检查的 struct dev_pagemap 指针
  *
  * Return: See &enum drm_gpusvm_scan_result.
  */
@@ -964,10 +995,16 @@ static void drm_gpusvm_driver_lock_held(struct drm_gpusvm *gpusvm)
 #endif
 
 /**
- * drm_gpusvm_find_vma_start() - Find start address for first VMA in range
- * @gpusvm: Pointer to the GPU SVM structure
- * @start: The inclusive start user address.
- * @end: The exclusive end user address.
+ * drm_gpusvm_find_vma_start() - 查找范围内第一个 VMA 的起始地址
+ *
+ * 中文: 在指定的用户地址范围内查找第一个 VMA（虚拟内存区域）的起始地址。
+ * 使用 find_vma_intersection() 在 mm_struct 中搜索与范围重叠的 VMA。
+ * 如果没有找到 VMA，返回 ULONG_MAX。用于 GPU 缺页处理时确定可用的
+ * CPU 地址空间边界。
+ *
+ * @gpusvm: 指向 GPU SVM 结构体的指针
+ * @start: 用户地址范围起始（包含）
+ * @end: 用户地址范围结束（不包含）
  *
  * Returns: The start address of first VMA within the provided range,
  * ULONG_MAX otherwise. Assumes start_addr < end_addr.
@@ -998,15 +1035,19 @@ drm_gpusvm_find_vma_start(struct drm_gpusvm *gpusvm,
 EXPORT_SYMBOL_GPL(drm_gpusvm_find_vma_start);
 
 /**
- * drm_gpusvm_range_find_or_insert() - Find or insert GPU SVM range
- * @gpusvm: Pointer to the GPU SVM structure
- * @fault_addr: Fault address
- * @gpuva_start: Start address of GPUVA which mirrors CPU
- * @gpuva_end: End address of GPUVA which mirrors CPU
- * @ctx: GPU SVM context
+ * drm_gpusvm_range_find_or_insert() - 查找或插入 GPU SVM range
  *
- * This function finds or inserts a newly allocated a GPU SVM range based on the
- * fault address. Caller must hold a lock to protect range lookup and insertion.
+ * 中文: 基于缺页地址查找或插入 GPU SVM range。如果不存在覆盖缺页地址的
+ * notifier，则分配并插入新 notifier。然后在 notifier 中查找现有 range，
+ * 如果未找到则计算最优块大小（chunk_size）并分配新的 range，插入到 notifier
+ * 的红黑树和列表中。范围大小根据缺页地址、GPU VA 边界、VMA 边界和现有 range
+ * 位置综合确定。调用者必须持有驱动锁以保护查找和插入操作。
+ *
+ * @gpusvm: 指向 GPU SVM 结构体的指针
+ * @fault_addr: 缺页地址
+ * @gpuva_start: GPUVA 起始地址（镜像 CPU）
+ * @gpuva_end: GPUVA 结束地址（镜像 CPU）
+ * @ctx: GPU SVM 上下文
  *
  * Return: Pointer to the GPU SVM range on success, ERR_PTR() on failure.
  */
@@ -1183,14 +1224,16 @@ static void __drm_gpusvm_free_pages(struct drm_gpusvm *gpusvm,
 }
 
 /**
- * drm_gpusvm_free_pages() - Free dma-mapping associated with GPU SVM pages
- * struct
- * @gpusvm: Pointer to the GPU SVM structure
- * @svm_pages: Pointer to the GPU SVM pages structure
- * @npages: Number of mapped pages
+ * drm_gpusvm_free_pages() - 释放 GPU SVM pages 结构体关联的 DMA 映射
  *
- * This function unmaps and frees the dma address array associated with a GPU
- * SVM pages struct.
+ * 中文: 解除 GPU SVM pages 结构体关联页面的 DMA 映射并释放 DMA 地址数组。
+ * 在 notifier_lock 保护下，依次调用 __drm_gpusvm_unmap_pages() 解除映射，
+* 然后调用 __drm_gpusvm_free_pages() 释放 dma_addr 数组。
+ * 此函数用于清理不再需要的页面映射。
+ *
+ * @gpusvm: 指向 GPU SVM 结构体的指针
+ * @svm_pages: 指向 GPU SVM pages 结构体的指针
+ * @npages: 映射的页面数量
  */
 void drm_gpusvm_free_pages(struct drm_gpusvm *gpusvm,
 			   struct drm_gpusvm_pages *svm_pages,
@@ -1204,13 +1247,14 @@ void drm_gpusvm_free_pages(struct drm_gpusvm *gpusvm,
 EXPORT_SYMBOL_GPL(drm_gpusvm_free_pages);
 
 /**
- * drm_gpusvm_range_remove() - Remove GPU SVM range
- * @gpusvm: Pointer to the GPU SVM structure
- * @range: Pointer to the GPU SVM range to be removed
+ * drm_gpusvm_range_remove() - 移除 GPU SVM range
  *
- * This function removes the specified GPU SVM range and also removes the parent
- * GPU SVM notifier if no more ranges remain in the notifier. The caller must
- * hold a lock to protect range and notifier removal.
+ * 中文: 移除指定的 GPU SVM range，解除其 DMA 映射，释放页面相关资源。
+ * 如果移除后 notifier 中不再有 range，一并移除 notifier（包括从 mmu 区间
+ * 通知系统中移除）。调用者必须持有驱动锁以保护操作。
+ *
+ * @gpusvm: 指向 GPU SVM 结构体的指针
+ * @range: 要移除的 GPU SVM range
  */
 void drm_gpusvm_range_remove(struct drm_gpusvm *gpusvm,
 			     struct drm_gpusvm_range *range)
@@ -1245,10 +1289,12 @@ void drm_gpusvm_range_remove(struct drm_gpusvm *gpusvm,
 EXPORT_SYMBOL_GPL(drm_gpusvm_range_remove);
 
 /**
- * drm_gpusvm_range_get() - Get a reference to GPU SVM range
- * @range: Pointer to the GPU SVM range
+ * drm_gpusvm_range_get() - 获取 GPU SVM range 的引用
  *
- * This function increments the reference count of the specified GPU SVM range.
+ * 中文: 递增指定 GPU SVM range 的引用计数。用于在使用 range 时确保其在
+ * 期间不会被释放。每个 get 必须对应一个 put。
+ *
+ * @range: 指向 GPU SVM range 的指针
  *
  * Return: Pointer to the GPU SVM range.
  */
@@ -1282,11 +1328,13 @@ static void drm_gpusvm_range_destroy(struct kref *refcount)
 }
 
 /**
- * drm_gpusvm_range_put() - Put a reference to GPU SVM range
- * @range: Pointer to the GPU SVM range
+ * drm_gpusvm_range_put() - 释放 GPU SVM range 的引用
  *
- * This function decrements the reference count of the specified GPU SVM range
- * and frees it when the count reaches zero.
+ * 中文: 递减指定 GPU SVM range 的引用计数，当计数归零时销毁 range。
+ * 销毁时如果驱动提供了 range_free 回调则调用之，否则使用 kfree() 释放。
+ * 此函数可能触发 range 的最终释放，因此调用后不应再访问 range 指针。
+ *
+ * @range: 指向 GPU SVM range 的指针
  */
 void drm_gpusvm_range_put(struct drm_gpusvm_range *range)
 {
@@ -1317,16 +1365,15 @@ static bool drm_gpusvm_pages_valid(struct drm_gpusvm *gpusvm,
 }
 
 /**
- * drm_gpusvm_range_pages_valid() - GPU SVM range pages valid
- * @gpusvm: Pointer to the GPU SVM structure
- * @range: Pointer to the GPU SVM range structure
+ * drm_gpusvm_range_pages_valid() - GPU SVM range 页面是否有效
  *
- * This function determines if a GPU SVM range pages are valid. Expected be
- * called holding gpusvm->notifier_lock and as the last step before committing a
- * GPU binding. This is akin to a notifier seqno check in the HMM documentation
- * but due to wider notifiers (i.e., notifiers which span multiple ranges) this
- * function is required for finer grained checking (i.e., per range) if pages
- * are valid.
+ * 中文: 检查 GPU SVM range 的页面是否仍然有效。应在持有 gpusvm->notifier_lock
+ * 时调用，并作为提交 GPU 绑定的最后一步。这类似于 HMM 文档中的 notifier
+ * seqno 检查，但由于 notifier 可能覆盖多个 range，需要此函数提供更细粒度的
+ * （按 range）有效性检查。
+ *
+ * @gpusvm: 指向 GPU SVM 结构体的指针
+ * @range: 指向 GPU SVM range 结构体的指针
  *
  * Return: True if GPU SVM range has valid pages, False otherwise
  */
@@ -1365,17 +1412,23 @@ static bool drm_gpusvm_pages_valid_unlocked(struct drm_gpusvm *gpusvm,
 }
 
 /**
- * drm_gpusvm_get_pages() - Get pages and populate GPU SVM pages struct
- * @gpusvm: Pointer to the GPU SVM structure
- * @svm_pages: The SVM pages to populate. This will contain the dma-addresses
- * @mm: The mm corresponding to the CPU range
- * @notifier: The corresponding notifier for the given CPU range
- * @pages_start: Start CPU address for the pages
- * @pages_end: End CPU address for the pages (exclusive)
- * @ctx: GPU SVM context
+ * drm_gpusvm_get_pages() - 获取页面并填充 GPU SVM pages 结构体
  *
- * This function gets and maps pages for CPU range and ensures they are
- * mapped for DMA access.
+ * 中文: 获取 CPU 地址范围对应的物理页面并执行 DMA 映射。使用 HMM
+ * （ Heterogeneous Memory Management）的 hmm_range_fault() 获取页面的
+ * PFN 数组。然后对每个页面执行 DMA 映射——系统内存页面使用 dma_map_page()
+ * 映射，设备私有页面使用驱动提供的 device_map() 回调映射。
+ * 所有 DMA 映射在 notifier_lock 保护下执行，以避免与 notifier 回调并发
+ * 访问已释放的页面。该函数支持多个设备内存分配来源的页面，支持混合模式
+ * 检查。
+ *
+ * @gpusvm: 指向 GPU SVM 结构体的指针
+ * @svm_pages: 要填充的 SVM pages 结构体，包含 DMA 地址
+ * @mm: CPU 范围对应的 mm_struct
+ * @notifier: CPU 范围对应的 mmu_interval_notifier
+ * @pages_start: 页面的 CPU 起始地址
+ * @pages_end: 页面的 CPU 结束地址（不包含）
+ * @ctx: GPU SVM 上下文
  *
  * Return: 0 on success, negative error code on failure.
  */
@@ -1587,13 +1640,16 @@ err_free:
 EXPORT_SYMBOL_GPL(drm_gpusvm_get_pages);
 
 /**
- * drm_gpusvm_range_get_pages() - Get pages for a GPU SVM range
- * @gpusvm: Pointer to the GPU SVM structure
- * @range: Pointer to the GPU SVM range structure
- * @ctx: GPU SVM context
+ * drm_gpusvm_range_get_pages() - 获取 GPU SVM range 的页面
  *
- * This function gets pages for a GPU SVM range and ensures they are mapped for
- * DMA access.
+ * 中文: 获取 GPU SVM range 对应的 CPU 页面并确保它们已为 DMA 访问完成映射。
+ * 该函数是 drm_gpusvm_get_pages() 的便捷封装，自动传入 range 的起始/结束
+ * 地址及其关联的 mm 和 notifier。用于 GPU 缺页处理流程中，在建立 GPU 页表
+ * 映射前获取页面的 DMA 地址。
+ *
+ * @gpusvm: 指向 GPU SVM 结构体的指针
+ * @range: 指向 GPU SVM range 结构体的指针
+ * @ctx: GPU SVM 上下文
  *
  * Return: 0 on success, negative error code on failure.
  */
@@ -1609,17 +1665,18 @@ int drm_gpusvm_range_get_pages(struct drm_gpusvm *gpusvm,
 EXPORT_SYMBOL_GPL(drm_gpusvm_range_get_pages);
 
 /**
- * drm_gpusvm_unmap_pages() - Unmap GPU svm pages
- * @gpusvm: Pointer to the GPU SVM structure
- * @svm_pages: Pointer to the GPU SVM pages structure
- * @npages: Number of pages in @svm_pages.
- * @ctx: GPU SVM context
+ * drm_gpusvm_unmap_pages() - 解除 GPU SVM pages 的 DMA 映射
  *
- * This function unmaps pages associated with a GPU SVM pages struct. If
- * @in_notifier is set, it is assumed that gpusvm->notifier_lock is held in
- * write mode; if it is clear, it acquires gpusvm->notifier_lock in read mode.
- * Must be called in the invalidate() callback of the corresponding notifier for
- * IOMMU security model.
+ * 中文: 解除 GPU SVM pages 结构体关联页面的 DMA 映射。如果在 notifier 回调
+ * 中调用（ctx->in_notifier 为 true），调用者需已持有 notifier_lock 写锁；
+ * 否则自动获取 notifier_lock 读锁。此函数必须在对应 notifier 的 invalidate()
+ * 回调中调用，以确保 IOMMU 安全模型——在 CPU 修改页面后，GPU 无法再通过
+ * 旧 DMA 映射访问这些页面。
+ *
+ * @gpusvm: 指向 GPU SVM 结构体的指针
+ * @svm_pages: 指向 GPU SVM pages 结构体的指针
+ * @npages: @svm_pages 中的页面数量
+ * @ctx: GPU SVM 上下文
  */
 void drm_gpusvm_unmap_pages(struct drm_gpusvm *gpusvm,
 			    struct drm_gpusvm_pages *svm_pages,
@@ -1639,16 +1696,15 @@ void drm_gpusvm_unmap_pages(struct drm_gpusvm *gpusvm,
 EXPORT_SYMBOL_GPL(drm_gpusvm_unmap_pages);
 
 /**
- * drm_gpusvm_range_unmap_pages() - Unmap pages associated with a GPU SVM range
- * @gpusvm: Pointer to the GPU SVM structure
- * @range: Pointer to the GPU SVM range structure
- * @ctx: GPU SVM context
+ * drm_gpusvm_range_unmap_pages() - 解除 GPU SVM range 关联页面的 DMA 映射
  *
- * This function unmaps pages associated with a GPU SVM range. If @in_notifier
- * is set, it is assumed that gpusvm->notifier_lock is held in write mode; if it
- * is clear, it acquires gpusvm->notifier_lock in read mode. Must be called on
- * each GPU SVM range attached to notifier in gpusvm->ops->invalidate for IOMMU
- * security model.
+ * 中文: drm_gpusvm_unmap_pages() 的 range 封装版本，用于解除指定 range
+ * 关联页面的 DMA 映射。必须在 gpusvm->ops->invalidate 中对每个附加到
+ * notifier 的 GPU SVM range 调用此函数，以维护 IOMMU 安全模型。
+ *
+ * @gpusvm: 指向 GPU SVM 结构体的指针
+ * @range: 指向 GPU SVM range 结构体的指针
+ * @ctx: GPU SVM 上下文
  */
 void drm_gpusvm_range_unmap_pages(struct drm_gpusvm *gpusvm,
 				  struct drm_gpusvm_range *range,
@@ -1662,11 +1718,15 @@ void drm_gpusvm_range_unmap_pages(struct drm_gpusvm *gpusvm,
 EXPORT_SYMBOL_GPL(drm_gpusvm_range_unmap_pages);
 
 /**
- * drm_gpusvm_range_evict() - Evict GPU SVM range
- * @gpusvm: Pointer to the GPU SVM structure
- * @range: Pointer to the GPU SVM range to be removed
+ * drm_gpusvm_range_evict() - 驱逐 GPU SVM range
  *
- * This function evicts the specified GPU SVM range.
+ * 中文: 将指定 GPU SVM range 从设备内存驱逐回系统内存。使用 HMM 的
+ * hmm_range_fault() 触发 CPU 页面错误，将设备私有页面迁移回系统 RAM。
+ * 此函数在垃圾回收流程中使用，当 range 被部分取消映射或需要将设备内存
+ * 页面迁回时调用。
+ *
+ * @gpusvm: 指向 GPU SVM 结构体的指针
+ * @range: 要驱逐的 GPU SVM range
  *
  * Return: 0 on success, a negative error code on failure.
  */
@@ -1719,10 +1779,15 @@ int drm_gpusvm_range_evict(struct drm_gpusvm *gpusvm,
 EXPORT_SYMBOL_GPL(drm_gpusvm_range_evict);
 
 /**
- * drm_gpusvm_has_mapping() - Check if GPU SVM has mapping for the given address range
- * @gpusvm: Pointer to the GPU SVM structure.
- * @start: Start address
- * @end: End address
+ * drm_gpusvm_has_mapping() - 检查 GPU SVM 是否具有指定地址范围的映射
+ *
+ * 中文: 遍历所有与指定地址范围重叠的 notifier，检查是否存在任何 range
+ * 覆盖该范围。用于判断某个 CPU 地址范围是否已有 GPU SVM 映射，
+ * 避免重复创建映射。
+ *
+ * @gpusvm: 指向 GPU SVM 结构体的指针
+ * @start: 起始地址
+ * @end: 结束地址
  *
  * Return: True if GPU SVM has mapping, False otherwise
  */
@@ -1743,12 +1808,15 @@ bool drm_gpusvm_has_mapping(struct drm_gpusvm *gpusvm, unsigned long start,
 EXPORT_SYMBOL_GPL(drm_gpusvm_has_mapping);
 
 /**
- * drm_gpusvm_range_set_unmapped() - Mark a GPU SVM range as unmapped
- * @range: Pointer to the GPU SVM range structure.
- * @mmu_range: Pointer to the MMU notifier range structure.
+ * drm_gpusvm_range_set_unmapped() - 将 GPU SVM range 标记为已取消映射
  *
- * This function marks a GPU SVM range as unmapped and sets the partial_unmap flag
- * if the range partially falls within the provided MMU notifier range.
+ * 中文: 将 GPU SVM range 标记为 unmapped 状态。如果 range 仅部分位于
+ * MMU notifier 指定的范围内，还会设置 partial_unmap 标志，表示该 range
+ * 被部分取消映射。partial_unmap 标志在垃圾回收时用于决定是否需要将剩余
+ * 的设备内存页面迁移回系统 RAM。调用者需持有 notifier_lock 写锁。
+ *
+ * @range: 指向 GPU SVM range 结构体的指针
+ * @mmu_range: 指向 MMU notifier range 结构体的指针
  */
 void drm_gpusvm_range_set_unmapped(struct drm_gpusvm_range *range,
 				   const struct mmu_notifier_range *mmu_range)

@@ -8,6 +8,32 @@
  * (at your option) any later version.
  */
 
+/*
+ * DRM 格式转换辅助函数
+ *
+ * 本文件提供了帧缓冲区像素格式转换的辅助函数。在 DRM 子系统中，
+ * 用户空间应用程序通常使用 XRGB8888 作为标准像素格式，但许多
+ * 显示硬件（特别是小型 LCD 控制器）只支持更简单的格式。本模块
+ * 在两者之间进行转换，使得驱动可以对外宣称支持 XRGB8888，同时
+ * 在内核内部自动转换为硬件原生格式。
+ *
+ * 支持的格式转换：
+ *   32位 -> 16位：XRGB8888 -> RGB565, XRGB1555, ARGB1555, RGBA5551, ARGB4444
+ *   32位 -> 24位：XRGB8888 -> RGB888, BGR888
+ *   32位 -> 32位：XRGB8888 -> ARGB8888, ABGR8888, XBGR8888, BGRX8888,
+ *                            XRGB2101010, ARGB2101010
+ *   32位 -> 8位： XRGB8888 -> RGB332, 灰度8
+ *   32位 -> 单色：XRGB8888 -> 单色（1bpp）
+ *   32位 -> 2位灰度：XRGB8888 -> 灰度2
+ *
+ * 辅助功能还包括：
+ *   - drm_format_conv_state：格式转换状态管理，用于管理临时缓冲区的
+ *     生命周期，避免在循环中重复分配/释放内存
+ *   - drm_fb_memcpy：直接内存复制（无格式转换）
+ *   - drm_fb_swab：字节交换复制（用于处理端序问题）
+ *   - drm_fb_clip_offset：计算裁剪矩形在帧缓冲区中的字节偏移
+ */
+
 #include <linux/export.h>
 #include <linux/io.h>
 #include <linux/iosys-map.h>
@@ -24,11 +50,12 @@
 #include "drm_format_internal.h"
 
 /**
- * drm_format_conv_state_init - Initialize format-conversion state
- * @state: The state to initialize
+ * drm_format_conv_state_init - 初始化格式转换状态
+ * @state: 要初始化的状态
  *
- * Clears all fields in struct drm_format_conv_state. The state will
- * be empty with no preallocated resources.
+ * 清除 struct drm_format_conv_state 中的所有字段。状态将为空，
+ * 不包含任何预分配的资源。在开始使用格式转换状态之前必须先
+ * 调用此函数进行初始化。
  */
 void drm_format_conv_state_init(struct drm_format_conv_state *state)
 {
@@ -39,12 +66,13 @@ void drm_format_conv_state_init(struct drm_format_conv_state *state)
 EXPORT_SYMBOL(drm_format_conv_state_init);
 
 /**
- * drm_format_conv_state_copy - Copy format-conversion state
- * @state: Destination state
- * @old_state: Source state
+ * drm_format_conv_state_copy - 复制格式转换状态
+ * @state: 目标状态
+ * @old_state: 源状态
  *
- * Copies format-conversion state from @old_state to @state; except for
- * temporary storage.
+ * 将格式转换状态从 @old_state 复制到 @state，但不复制临时存储
+ * 缓冲区。在驱动需要保存和恢复格式转换状态时使用，例如在多个
+ * 帧缓冲区之间共享状态信息。
  */
 void drm_format_conv_state_copy(struct drm_format_conv_state *state,
 				const struct drm_format_conv_state *old_state)
@@ -60,18 +88,21 @@ void drm_format_conv_state_copy(struct drm_format_conv_state *state,
 EXPORT_SYMBOL(drm_format_conv_state_copy);
 
 /**
- * drm_format_conv_state_reserve - Allocates storage for format conversion
- * @state: The format-conversion state
- * @new_size: The minimum allocation size
- * @flags: Flags for kmalloc()
+ * drm_format_conv_state_reserve - 为格式转换分配存储空间
+ * @state: 格式转换状态
+ * @new_size: 最小分配大小
+ * @flags: kmalloc() 的标志
  *
- * Allocates at least @new_size bytes and returns a pointer to the memory
- * range. After calling this function, previously returned memory blocks
- * are invalid. It's best to collect all memory requirements of a format
- * conversion and call this function once to allocate the range.
+ * 分配至少 @new_size 字节的内存并返回指向该内存范围的指针。
+ * 调用此函数后，之前返回的内存块将失效。最佳实践是收集一次
+ * 格式转换所需的所有内存需求，然后一次性调用此函数分配空间。
  *
- * Returns:
- * A pointer to the allocated memory range, or NULL otherwise.
+ * 该函数会尝试复用之前分配的缓冲区（如果大小足够），避免频繁
+ * 的重新分配。但如果之前的缓冲区是预分配的（preallocated），
+ * 则不能重新分配。
+ *
+ * 返回：
+ * 成功返回分配的内存范围指针，失败返回 NULL。
  */
 void *drm_format_conv_state_reserve(struct drm_format_conv_state *state,
 				    size_t new_size, gfp_t flags)
@@ -96,12 +127,15 @@ out:
 EXPORT_SYMBOL(drm_format_conv_state_reserve);
 
 /**
- * drm_format_conv_state_release - Releases an format-conversion storage
- * @state: The format-conversion state
+ * drm_format_conv_state_release - 释放格式转换存储空间
+ * @state: 格式转换状态
  *
- * Releases the memory range references by the format-conversion state.
- * After this call, all pointers to the memory are invalid. Prefer
- * drm_format_conv_state_init() for cleaning up and unloading a driver.
+ * 释放格式转换状态引用的内存范围。调用此函数后，所有指向该内存
+ * 的指针都将失效。如果状态使用的是预分配缓冲区，则不会释放，
+ * 以避免破坏外部生命周期管理。
+ *
+ * 在驱动卸载或清理时，推荐使用 drm_format_conv_state_init() 来
+ * 重置状态，它会直接清空字段而不是释放内存。
  */
 void drm_format_conv_state_release(struct drm_format_conv_state *state)
 {
@@ -120,13 +154,17 @@ static unsigned int clip_offset(const struct drm_rect *clip, unsigned int pitch,
 }
 
 /**
- * drm_fb_clip_offset - Returns the clipping rectangles byte-offset in a framebuffer
- * @pitch: Framebuffer line pitch in byte
- * @format: Framebuffer format
- * @clip: Clip rectangle
+ * drm_fb_clip_offset - 返回裁剪矩形在帧缓冲区中的字节偏移
+ * @pitch: 帧缓冲区行跨度（字节）
+ * @format: 帧缓冲区格式
+ * @clip: 裁剪矩形
  *
- * Returns:
- * The byte offset of the clip rectangle's top-left corner within the framebuffer.
+ * 计算裁剪矩形左上角在帧缓冲区中的字节偏移量。这个偏移量用于
+ * 定位帧缓冲区中需要处理的起始位置，从而只处理裁剪区域内的
+ * 像素数据，提高处理效率。
+ *
+ * 返回：
+ * 裁剪矩形左上角在帧缓冲区中的字节偏移。
  */
 unsigned int drm_fb_clip_offset(unsigned int pitch, const struct drm_format_info *format,
 				const struct drm_rect *clip)
@@ -394,22 +432,19 @@ static __always_inline void drm_fb_xfrm_line_32to32(void *dbuf, const void *sbuf
 }
 
 /**
- * drm_fb_memcpy - Copy clip buffer
- * @dst: Array of destination buffers
- * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
- *             within @dst; can be NULL if scanlines are stored next to each other.
- * @src: Array of source buffers
- * @fb: DRM framebuffer
- * @clip: Clip rectangle area to copy
+ * drm_fb_memcpy - 复制裁剪区域缓冲区（无格式转换）
+ * @dst: 目标缓冲区数组
+ * @dst_pitch: 目标缓冲区中两行之间的字节数数组；如果行紧密排列可为 NULL
+ * @src: 源缓冲区数组
+ * @fb: DRM 帧缓冲区
+ * @clip: 要复制的裁剪矩形区域
  *
- * This function copies parts of a framebuffer to display memory. Destination and
- * framebuffer formats must match. No conversion takes place. The parameters @dst,
- * @dst_pitch and @src refer to arrays. Each array must have at least as many entries
- * as there are planes in @fb's format. Each entry stores the value for the format's
- * respective color plane at the same index.
+ * 将帧缓冲区的一部分复制到显示内存中。目标格式必须与帧缓冲区格式
+ * 相同，不执行任何格式转换。参数 @dst、@dst_pitch 和 @src 是数组，
+ * 每个数组至少需要有与 @fb 格式的平面数相同的条目数，每个条目存储
+ * 对应颜色平面的值。
  *
- * This function does not apply clipping on @dst (i.e. the destination is at the
- * top-left corner).
+ * 该函数不会对 @dst 进行裁剪（即目标始终从左上角开始）。
  */
 void drm_fb_memcpy(struct iosys_map *dst, const unsigned int *dst_pitch,
 		   const struct iosys_map *src, const struct drm_framebuffer *fb,
@@ -468,26 +503,23 @@ static void drm_fb_swab32_line(void *dbuf, const void *sbuf, unsigned int pixels
 }
 
 /**
- * drm_fb_swab - Swap bytes into clip buffer
- * @dst: Array of destination buffers
- * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
- *             within @dst; can be NULL if scanlines are stored next to each other.
- * @src: Array of source buffers
- * @fb: DRM framebuffer
- * @clip: Clip rectangle area to copy
- * @cached: Source buffer is mapped cached (eg. not write-combined)
- * @state: Transform and conversion state
+ * drm_fb_swab - 字节交换复制到裁剪区域缓冲区
+ * @dst: 目标缓冲区数组
+ * @dst_pitch: 目标缓冲区中两行之间的字节数数组；如果行紧密排列可为 NULL
+ * @src: 源缓冲区数组
+ * @fb: DRM 帧缓冲区
+ * @clip: 要复制的裁剪矩形区域
+ * @cached: 源缓冲区是否已缓存映射（例如非 write-combine）
+ * @state: 转换和转换状态
  *
- * This function copies parts of a framebuffer to display memory and swaps per-pixel
- * bytes during the process. Destination and framebuffer formats must match. The
- * parameters @dst, @dst_pitch and @src refer to arrays. Each array must have at
- * least as many entries as there are planes in @fb's format. Each entry stores the
- * value for the format's respective color plane at the same index. If @cached is
- * false a temporary buffer is used to cache one pixel line at a time to speed up
- * slow uncached reads.
+ * 将帧缓冲区的一部分复制到显示内存，同时在过程中交换每个像素的
+ * 字节顺序。目标和帧缓冲区格式必须相同。参数 @dst、@dst_pitch 和
+ * @src 是数组，每个数组至少需要有与 @fb 格式的平面数相同的条目数。
  *
- * This function does not apply clipping on @dst (i.e. the destination is at the
- * top-left corner).
+ * 如果 @cached 为 false，则使用临时缓冲区逐行缓存像素数据，以
+ * 加速慢速的非缓存读取操作（如 WC 内存）。
+ *
+ * 该函数不会对 @dst 进行裁剪（即目标始终从左上角开始）。
  */
 void drm_fb_swab(struct iosys_map *dst, const unsigned int *dst_pitch,
 		 const struct iosys_map *src, const struct drm_framebuffer *fb,
@@ -521,25 +553,21 @@ static void drm_fb_xrgb8888_to_rgb332_line(void *dbuf, const void *sbuf, unsigne
 }
 
 /**
- * drm_fb_xrgb8888_to_rgb332 - Convert XRGB8888 to RGB332 clip buffer
- * @dst: Array of RGB332 destination buffers
- * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
- *             within @dst; can be NULL if scanlines are stored next to each other.
- * @src: Array of XRGB8888 source buffers
- * @fb: DRM framebuffer
- * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
+ * drm_fb_xrgb8888_to_rgb332 - 将 XRGB8888 转换为 RGB332 裁剪缓冲区
+ * @dst: RGB332 目标缓冲区数组
+ * @dst_pitch: 目标缓冲区中两行之间的字节数数组；如果行紧密排列可为 NULL
+ * @src: XRGB8888 源缓冲区数组
+ * @fb: DRM 帧缓冲区
+ * @clip: 要复制的裁剪矩形区域
+ * @state: 格式转换状态
  *
- * This function copies parts of a framebuffer to display memory and converts the
- * color format during the process. Destination and framebuffer formats must match. The
- * parameters @dst, @dst_pitch and @src refer to arrays. Each array must have at
- * least as many entries as there are planes in @fb's format. Each entry stores the
- * value for the format's respective color plane at the same index.
+ * 将帧缓冲区的一部分复制到显示内存，同时将颜色格式从 XRGB8888 转换
+ * 为 RGB332（8位，R:3位 G:3位 B:2位）。参数 @dst、@dst_pitch 和 @src
+ * 是数组，每个数组至少需要有与 @fb 格式的平面数相同的条目数。
  *
- * This function does not apply clipping on @dst (i.e. the destination is at the
- * top-left corner).
+ * 该函数不会对 @dst 进行裁剪（即目标始终从左上角开始）。
  *
- * Drivers can use this function for RGB332 devices that don't support XRGB8888 natively.
+ * 驱动可以使用此函数为本机不支持 XRGB8888 的 RGB332 设备提供支持。
  */
 void drm_fb_xrgb8888_to_rgb332(struct iosys_map *dst, const unsigned int *dst_pitch,
 			       const struct iosys_map *src, const struct drm_framebuffer *fb,
@@ -560,25 +588,21 @@ static void drm_fb_xrgb8888_to_rgb565_line(void *dbuf, const void *sbuf, unsigne
 }
 
 /**
- * drm_fb_xrgb8888_to_rgb565 - Convert XRGB8888 to RGB565 clip buffer
- * @dst: Array of RGB565 destination buffers
- * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
- *             within @dst; can be NULL if scanlines are stored next to each other.
- * @src: Array of XRGB8888 source buffer
- * @fb: DRM framebuffer
- * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
+ * drm_fb_xrgb8888_to_rgb565 - 将 XRGB8888 转换为 RGB565 裁剪缓冲区
+ * @dst: RGB565 目标缓冲区数组
+ * @dst_pitch: 目标缓冲区中两行之间的字节数数组；如果行紧密排列可为 NULL
+ * @src: XRGB8888 源缓冲区数组
+ * @fb: DRM 帧缓冲区
+ * @clip: 要复制的裁剪矩形区域
+ * @state: 格式转换状态
  *
- * This function copies parts of a framebuffer to display memory and converts the
- * color format during the process. Destination and framebuffer formats must match. The
- * parameters @dst, @dst_pitch and @src refer to arrays. Each array must have at
- * least as many entries as there are planes in @fb's format. Each entry stores the
- * value for the format's respective color plane at the same index.
+ * 将帧缓冲区的一部分复制到显示内存，同时将颜色格式从 XRGB8888 转换
+ * 为 RGB565（16位，R:5位 G:6位 B:5位）。这是嵌入式显示设备中最
+ * 常用的格式转换之一，因为许多小型 LCD 控制器原生支持 RGB565。
  *
- * This function does not apply clipping on @dst (i.e. the destination is at the
- * top-left corner).
+ * 该函数不会对 @dst 进行裁剪（即目标始终从左上角开始）。
  *
- * Drivers can use this function for RGB565 devices that don't support XRGB8888 natively.
+ * 驱动可以使用此函数为本机不支持 XRGB8888 的 RGB565 设备提供支持。
  */
 void drm_fb_xrgb8888_to_rgb565(struct iosys_map *dst, const unsigned int *dst_pitch,
 			       const struct iosys_map *src, const struct drm_framebuffer *fb,
@@ -600,25 +624,21 @@ static void drm_fb_xrgb8888_to_rgb565be_line(void *dbuf, const void *sbuf,
 }
 
 /**
- * drm_fb_xrgb8888_to_rgb565be - Convert XRGB8888 to RGB565|DRM_FORMAT_BIG_ENDIAN clip buffer
- * @dst: Array of RGB565BE destination buffers
- * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
- *             within @dst; can be NULL if scanlines are stored next to each other.
- * @src: Array of XRGB8888 source buffer
- * @fb: DRM framebuffer
- * @clip: Clip rectangle area to copy
- * @state: Transform and conversion state
+ * drm_fb_xrgb8888_to_rgb565be - 将 XRGB8888 转换为大端 RGB565 裁剪缓冲区
+ * @dst: RGB565BE 目标缓冲区数组
+ * @dst_pitch: 目标缓冲区中两行之间的字节数数组；如果行紧密排列可为 NULL
+ * @src: XRGB8888 源缓冲区数组
+ * @fb: DRM 帧缓冲区
+ * @clip: 要复制的裁剪矩形区域
+ * @state: 格式转换状态
  *
- * This function copies parts of a framebuffer to display memory and converts the
- * color format during the process. Destination and framebuffer formats must match. The
- * parameters @dst, @dst_pitch and @src refer to arrays. Each array must have at
- * least as many entries as there are planes in @fb's format. Each entry stores the
- * value for the format's respective color plane at the same index.
+ * 将帧缓冲区的一部分复制到显示内存，同时将颜色格式从 XRGB8888 转换
+ * 为大端字节序的 RGB565。某些显示控制器（如 MIPI DBI Type C Option 1）
+ * 使用大端字节序，需要进行此转换。
  *
- * This function does not apply clipping on @dst (i.e. the destination is at the
- * top-left corner).
+ * 该函数不会对 @dst 进行裁剪（即目标始终从左上角开始）。
  *
- * Drivers can use this function for RGB565BE devices that don't support XRGB8888 natively.
+ * 驱动可以使用此函数为本机不支持 XRGB8888 的 RGB565BE 设备提供支持。
  */
 void drm_fb_xrgb8888_to_rgb565be(struct iosys_map *dst, const unsigned int *dst_pitch,
 				 const struct iosys_map *src, const struct drm_framebuffer *fb,
@@ -639,7 +659,7 @@ static void drm_fb_xrgb8888_to_xrgb1555_line(void *dbuf, const void *sbuf, unsig
 }
 
 /**
- * drm_fb_xrgb8888_to_xrgb1555 - Convert XRGB8888 to XRGB1555 clip buffer
+ * drm_fb_xrgb8888_to_xrgb1555 - 将 XRGB8888 转换为 XRGB1555 裁剪缓冲区
  * @dst: Array of XRGB1555 destination buffers
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -679,7 +699,7 @@ static void drm_fb_xrgb8888_to_argb1555_line(void *dbuf, const void *sbuf, unsig
 }
 
 /**
- * drm_fb_xrgb8888_to_argb1555 - Convert XRGB8888 to ARGB1555 clip buffer
+ * drm_fb_xrgb8888_to_argb1555 - 将 XRGB8888 转换为 ARGB1555 裁剪缓冲区
  * @dst: Array of ARGB1555 destination buffers
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -719,7 +739,7 @@ static void drm_fb_xrgb8888_to_rgba5551_line(void *dbuf, const void *sbuf, unsig
 }
 
 /**
- * drm_fb_xrgb8888_to_rgba5551 - Convert XRGB8888 to RGBA5551 clip buffer
+ * drm_fb_xrgb8888_to_rgba5551 - 将 XRGB8888 转换为 RGBA5551 裁剪缓冲区
  * @dst: Array of RGBA5551 destination buffers
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -759,7 +779,7 @@ static void drm_fb_xrgb8888_to_rgb888_line(void *dbuf, const void *sbuf, unsigne
 }
 
 /**
- * drm_fb_xrgb8888_to_rgb888 - Convert XRGB8888 to RGB888 clip buffer
+ * drm_fb_xrgb8888_to_rgb888 - 将 XRGB8888 转换为 RGB888 裁剪缓冲区
  * @dst: Array of RGB888 destination buffers
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -799,7 +819,7 @@ static void drm_fb_xrgb8888_to_bgr888_line(void *dbuf, const void *sbuf, unsigne
 }
 
 /**
- * drm_fb_xrgb8888_to_bgr888 - Convert XRGB8888 to BGR888 clip buffer
+ * drm_fb_xrgb8888_to_bgr888 - 将 XRGB8888 转换为 BGR888 裁剪缓冲区
  * @dst: Array of BGR888 destination buffers
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -839,7 +859,7 @@ static void drm_fb_xrgb8888_to_argb8888_line(void *dbuf, const void *sbuf, unsig
 }
 
 /**
- * drm_fb_xrgb8888_to_argb8888 - Convert XRGB8888 to ARGB8888 clip buffer
+ * drm_fb_xrgb8888_to_argb8888 - 将 XRGB8888 转换为 ARGB8888 裁剪缓冲区
  * @dst: Array of ARGB8888 destination buffers
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -879,7 +899,7 @@ static void drm_fb_xrgb8888_to_abgr8888_line(void *dbuf, const void *sbuf, unsig
 }
 
 /**
- * drm_fb_xrgb8888_to_abgr8888 - Convert XRGB8888 to ABGR8888 clip buffer
+ * drm_fb_xrgb8888_to_abgr8888 - 将 XRGB8888 转换为 ABGR8888 裁剪缓冲区
  * @dst: Array of ABGR8888 destination buffers
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -921,7 +941,7 @@ static void drm_fb_xrgb8888_to_xbgr8888_line(void *dbuf, const void *sbuf, unsig
 }
 
 /**
- * drm_fb_xrgb8888_to_xbgr8888 - Convert XRGB8888 to XBGR8888 clip buffer
+ * drm_fb_xrgb8888_to_xbgr8888 - 将 XRGB8888 转换为 XBGR8888 裁剪缓冲区
  * @dst: Array of XBGR8888 destination buffers
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -963,7 +983,7 @@ static void drm_fb_xrgb8888_to_bgrx8888_line(void *dbuf, const void *sbuf, unsig
 }
 
 /**
- * drm_fb_xrgb8888_to_bgrx8888 - Convert XRGB8888 to BGRX8888 clip buffer
+ * drm_fb_xrgb8888_to_bgrx8888 - 将 XRGB8888 转换为 BGRX8888 裁剪缓冲区
  * @dst: Array of BGRX8888 destination buffers
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -1005,7 +1025,7 @@ static void drm_fb_xrgb8888_to_xrgb2101010_line(void *dbuf, const void *sbuf, un
 }
 
 /**
- * drm_fb_xrgb8888_to_xrgb2101010 - Convert XRGB8888 to XRGB2101010 clip buffer
+ * drm_fb_xrgb8888_to_xrgb2101010 - 将 XRGB8888 转换为 XRGB2101010 裁剪缓冲区
  * @dst: Array of XRGB2101010 destination buffers
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -1046,7 +1066,7 @@ static void drm_fb_xrgb8888_to_argb2101010_line(void *dbuf, const void *sbuf, un
 }
 
 /**
- * drm_fb_xrgb8888_to_argb2101010 - Convert XRGB8888 to ARGB2101010 clip buffer
+ * drm_fb_xrgb8888_to_argb2101010 - 将 XRGB8888 转换为 ARGB2101010 裁剪缓冲区
  * @dst: Array of ARGB2101010 destination buffers
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -1087,7 +1107,7 @@ static void drm_fb_xrgb8888_to_gray8_line(void *dbuf, const void *sbuf, unsigned
 }
 
 /**
- * drm_fb_xrgb8888_to_gray8 - Convert XRGB8888 to grayscale
+ * drm_fb_xrgb8888_to_gray8 - 将 XRGB8888 转换为 8 位灰度
  * @dst: Array of 8-bit grayscale destination buffers
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -1131,7 +1151,7 @@ static void drm_fb_argb8888_to_argb4444_line(void *dbuf, const void *sbuf, unsig
 }
 
 /**
- * drm_fb_argb8888_to_argb4444 - Convert ARGB8888 to ARGB4444 clip buffer
+ * drm_fb_argb8888_to_argb4444 - 将 ARGB8888 转换为 ARGB4444 裁剪缓冲区
  * @dst: Array of ARGB4444 destination buffers
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -1202,7 +1222,7 @@ static void drm_fb_gray8_to_mono_line(void *dbuf, const void *sbuf, unsigned int
 }
 
 /**
- * drm_fb_xrgb8888_to_mono - Convert XRGB8888 to monochrome
+ * drm_fb_xrgb8888_to_mono - 将 XRGB8888 转换为单色（1bpp）
  * @dst: Array of monochrome destination buffers (0=black, 1=white)
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.
@@ -1292,7 +1312,7 @@ void drm_fb_xrgb8888_to_mono(struct iosys_map *dst, const unsigned int *dst_pitc
 EXPORT_SYMBOL(drm_fb_xrgb8888_to_mono);
 
 /**
- * drm_fb_xrgb8888_to_gray2 - Convert XRGB8888 to gray2
+ * drm_fb_xrgb8888_to_gray2 - 将 XRGB8888 转换为 2 位灰度
  * @dst: Array of gray2 destination buffer
  * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
  *             within @dst; can be NULL if scanlines are stored next to each other.

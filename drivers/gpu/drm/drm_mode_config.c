@@ -20,6 +20,15 @@
  * OF THIS SOFTWARE.
  */
 
+/*
+ * drm_mode_config.c — KMS 全局模式配置管理。
+ *
+ * drm_mode_config 是 KMS 的全局容器:
+ *   - drm_mode_config_init(): 初始化所有对象列表 (CRTC/Encoder/Connector/Plane)
+ *   - DRM_IOCTL_MODE_GETRESOURCES: 枚举所有 KMS 对象返回用户态
+ *   - drm_mode_config_cleanup(): 清理所有注册的 KMS 对象
+ */
+
 #include <linux/export.h>
 #include <linux/uaccess.h>
 

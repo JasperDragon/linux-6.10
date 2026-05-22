@@ -23,6 +23,22 @@
  * SOFTWARE.
  */
 
+/*
+ * DRM 通用平面（plane）辅助函数
+ *
+ * 本文件实现了主平面（primary plane）的辅助函数，用于在传统 CRTC 模式设置接口
+ * 之上支持主平面操作。由于传统的 &drm_mode_config_funcs.set_config 接口将
+ * 主平面与 CRTC 状态绑定在一起，用户空间无法直接禁用主平面。
+ *
+ * 这些辅助函数为过渡性支持而存在。新的驱动应当实现完整的原子化平面支持，
+ * 并使用 atomic helpers。
+ *
+ * 主要内容：
+ *   - drm_plane_helper_update_primary：更新主平面的辅助函数
+ *   - drm_plane_helper_disable_primary：禁用主平面的辅助函数
+ *   - drm_plane_helper_destroy：主平面销毁辅助函数
+ */
+
 #include <linux/export.h>
 #include <linux/list.h>
 
@@ -140,27 +156,28 @@ static int drm_plane_helper_check_update(struct drm_plane *plane,
 }
 
 /**
- * drm_plane_helper_update_primary - Helper for updating primary planes
- * @plane: plane to update
- * @crtc: the plane's new CRTC
- * @fb: the plane's new framebuffer
- * @crtc_x: x coordinate within CRTC
- * @crtc_y: y coordinate within CRTC
- * @crtc_w: width coordinate within CRTC
- * @crtc_h: height coordinate within CRTC
- * @src_x: x coordinate within source
- * @src_y: y coordinate within source
- * @src_w: width coordinate within source
- * @src_h: height coordinate within source
- * @ctx: modeset locking context
+ * drm_plane_helper_update_primary - 更新主平面的辅助函数
+ * @plane: 要更新的平面
+ * @crtc: 平面的新 CRTC
+ * @fb: 平面的新帧缓冲
+ * @crtc_x: 在 CRTC 中的 X 坐标
+ * @crtc_y: 在 CRTC 中的 Y 坐标
+ * @crtc_w: 在 CRTC 中的宽度
+ * @crtc_h: 在 CRTC 中的高度
+ * @src_x: 源图像中的 X 坐标（16.16 固定点数）
+ * @src_y: 源图像中的 Y 坐标（16.16 固定点数）
+ * @src_w: 源图像中的宽度（16.16 固定点数）
+ * @src_h: 源图像中的高度（16.16 固定点数）
+ * @ctx: 模式设置锁上下文
  *
- * This helper validates the given parameters and updates the primary plane.
+ * 验证给定参数并更新主平面。该函数通过查找与 CRTC 关联的连接器并调用
+ * set_config 来实现平面更新。它是传统非原子模式设置的过渡性辅助函数。
  *
- * This function is only useful for non-atomic modesetting. Don't use
- * it in new drivers.
+ * 此函数仅适用于非原子模式设置。新的驱动不应使用此函数，
+ * 而应实现完整的原子平面支持。
  *
- * Returns:
- * Zero on success, or an errno code otherwise.
+ * 返回值：
+ * 成功返回 0，失败返回负的错误码。
  */
 int drm_plane_helper_update_primary(struct drm_plane *plane, struct drm_crtc *crtc,
 				    struct drm_framebuffer *fb,
@@ -241,18 +258,18 @@ int drm_plane_helper_update_primary(struct drm_plane *plane, struct drm_crtc *cr
 EXPORT_SYMBOL(drm_plane_helper_update_primary);
 
 /**
- * drm_plane_helper_disable_primary - Helper for disabling primary planes
- * @plane: plane to disable
- * @ctx: modeset locking context
+ * drm_plane_helper_disable_primary - 禁用主平面的辅助函数
+ * @plane: 要禁用的平面
+ * @ctx: 模式设置锁上下文
  *
- * This helper returns an error when trying to disable the primary
- * plane.
+ * 此辅助函数在尝试禁用主平面时始终返回错误（-EINVAL）。
+ * 因为在传统模式设置模型中，主平面与 CRTC 紧密绑定，不能独立禁用。
+ * 要禁用显示输出，应当禁用整个 CRTC 而非单独禁用它主平面。
  *
- * This function is only useful for non-atomic modesetting. Don't use
- * it in new drivers.
+ * 此函数仅适用于非原子模式设置。新的驱动不应使用此函数。
  *
- * Returns:
- * An errno code.
+ * 返回值：
+ * 始终返回 -EINVAL 错误码。
  */
 int drm_plane_helper_disable_primary(struct drm_plane *plane,
 				     struct drm_modeset_acquire_ctx *ctx)
@@ -266,12 +283,14 @@ int drm_plane_helper_disable_primary(struct drm_plane *plane,
 EXPORT_SYMBOL(drm_plane_helper_disable_primary);
 
 /**
- * drm_plane_helper_destroy() - Helper for primary plane destruction
- * @plane: plane to destroy
+ * drm_plane_helper_destroy() - 销毁主平面的辅助函数
+ * @plane: 要销毁的平面
  *
- * Provides a default plane destroy handler for primary planes.  This handler
- * is called during CRTC destruction.  We disable the primary plane, remove
- * it from the DRM plane list, and deallocate the plane structure.
+ * 提供主平面的默认销毁处理函数。在 CRTC 销毁过程中被调用。
+ * 该函数会清理平面资源（通过 drm_plane_cleanup）并释放平面结构体内存。
+ *
+ * 注意：此函数使用 kfree 释放平面结构体，因此仅适用于通过 kzalloc/kzalloc_obj
+ * 分配的平面对象。如果驱动使用其他分配方式，应提供自定义的销毁函数。
  */
 void drm_plane_helper_destroy(struct drm_plane *plane)
 {

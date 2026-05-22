@@ -7,6 +7,30 @@
  * Copyright (c) 2007 Dave Airlie <airlied@linux.ie>
  */
 
+/*
+ * DRM 客户端模式设置（Client Modesetting）
+ *
+ * 本文件实现了 DRM 客户端的模式设置功能，包括显示探测、CRTC 配置、
+ * 模式提交和电源管理等操作。这些功能是 fbdev 模拟和其他内核 DRM 客户端
+ * 的核心基础。
+ *
+ * 主要功能：
+ *   - drm_client_modeset_probe：探测显示设备并建立初始管线配置
+ *   - drm_client_modeset_commit/commit_locked：提交模式设置配置
+ *   - drm_client_modeset_check：检查模式设置配置的有效性
+ *   - drm_client_modeset_dpms：显示电源管理控制
+ *   - drm_client_modeset_wait_for_vblank：等待 VBLANK 同步
+ *   - drm_client_rotation：检查并配置面板旋转
+ *
+ * 探测算法逻辑：
+ *   1. 尝试使用固件配置（BIOS/UEFI 预置的显示配置）
+ *   2. 如果无法使用固件配置，尝试在所有连接器上进行克隆显示
+ *   3. 最后，为每个连接器选择合适的首选模式
+ *
+ * 模式提交支持原子（atomic）和传统（legacy）两种路径，
+ * 根据驱动是否使用原子模式设置自动选择。
+ */
+
 #include "drm/drm_modeset_lock.h"
 
 #include <linux/export.h>
@@ -803,16 +827,23 @@ bail:
 }
 
 /**
- * drm_client_modeset_probe() - Probe for displays
- * @client: DRM client
- * @width: Maximum display mode width (optional)
- * @height: Maximum display mode height (optional)
+ * drm_client_modeset_probe() - 探测显示设备
+ * @client: DRM 客户端
+ * @width: 最大显示模式宽度（可选，0 表示使用硬件最大宽度）
+ * @height: 最大显示模式高度（可选，0 表示使用硬件最大高度）
  *
- * This function sets up display pipelines for enabled connectors and stores the
- * config in the client's modeset array.
+ * 为已启用的连接器建立显示管线，并将配置存储到客户端的 modeset 数组中。
+ * 此函数是客户端显示配置的核心，执行以下步骤：
  *
- * Returns:
- * Zero on success or negative error code on failure.
+ *   1. 收集所有连接器并获取其支持的显示模式
+ *   2. 尝试使用固件（BIOS/UEFI）预置的配置
+ *   3. 如果固件配置不可用，尝试克隆配置
+ *   4. 为每个连接器选择合适的显示模式
+ *   5. 为每个模式选择最佳的 CRTC
+ *   6. 将最终的配置写入客户端的 modeset 数组
+ *
+ * 返回值：
+ * 成功返回 0，失败返回负的错误码。
  */
 int drm_client_modeset_probe(struct drm_client_dev *client, unsigned int width, unsigned int height)
 {
@@ -945,17 +976,23 @@ free_connectors:
 EXPORT_SYMBOL(drm_client_modeset_probe);
 
 /**
- * drm_client_rotation() - Check the initial rotation value
- * @modeset: DRM modeset
- * @rotation: Returned rotation value
+ * drm_client_rotation() - 检查初始旋转值
+ * @modeset: DRM 模式设置
+ * @rotation: 返回的旋转值
  *
- * This function checks if the primary plane in @modeset can hw rotate
- * to match the rotation needed on its connector.
+ * 检查 @modeset 中的主平面是否可以通过硬件旋转来匹配其连接器
+ * 所需要的旋转方向。考虑面板方向（panel orientation，通过
+ * &drm_connector.display_info.panel_orientation 获得）和
+ * 内核命令行中指定的旋转/反射参数。
  *
- * Note: Currently only 0 and 180 degrees are supported.
+ * 面板方向和命令行旋转参数会相加计算最终的旋转值。
+ * 反射操作（如 REFLECT_X/Y）则通过 XOR 进行组合。
  *
- * Return:
- * True if the plane can do the rotation, false otherwise.
+ * 注意：当前仅支持 0 度和 180 度旋转。90 度/270 度旋转通常
+ * 需要特定的帧缓冲 tiling 格式，尚未支持。
+ *
+ * 返回值：
+ * 如果平面可以执行旋转返回 true，否则返回 false。
  */
 bool drm_client_rotation(struct drm_mode_set *modeset, unsigned int *rotation)
 {
@@ -1163,13 +1200,15 @@ out:
 }
 
 /**
- * drm_client_modeset_check() - Check modeset configuration
- * @client: DRM client
+ * drm_client_modeset_check() - 检查模式设置配置
+ * @client: DRM 客户端
  *
- * Check modeset configuration.
+ * 检查当前模式设置配置是否有效。对于原子驱动，此函数执行
+ * drm_atomic_check_only() 来验证配置而不实际提交它。
+ * 对于传统（非原子）驱动，直接返回 0（不进行检查）。
  *
- * Returns:
- * Zero on success or negative error code on failure.
+ * 返回值：
+ * 成功返回 0，失败返回负的错误码。
  */
 int drm_client_modeset_check(struct drm_client_dev *client)
 {
@@ -1187,15 +1226,19 @@ int drm_client_modeset_check(struct drm_client_dev *client)
 EXPORT_SYMBOL(drm_client_modeset_check);
 
 /**
- * drm_client_modeset_commit_locked() - Force commit CRTC configuration
- * @client: DRM client
+ * drm_client_modeset_commit_locked() - 强制提交 CRTC 配置（已加锁版本）
+ * @client: DRM 客户端
  *
- * Commit modeset configuration to crtcs without checking if there is a DRM
- * master. The assumption is that the caller already holds an internal DRM
- * master reference acquired with drm_master_internal_acquire().
+ * 将模式设置配置提交到 CRTC，不检查当前是否存在 DRM master。
+ * 调用者必须已经通过 drm_master_internal_acquire() 获取了内部的
+ * DRM master 引用。
  *
- * Returns:
- * Zero on success or negative error code on failure.
+ * 此函数会根据驱动类型自动选择提交路径：
+ *   - 原子驱动：使用 drm_atomic_commit()
+ *   - 传统驱动：使用 drm_mode_set_config_internal()
+ *
+ * 返回值：
+ * 成功返回 0，失败返回负的错误码。
  */
 int drm_client_modeset_commit_locked(struct drm_client_dev *client)
 {
@@ -1214,13 +1257,15 @@ int drm_client_modeset_commit_locked(struct drm_client_dev *client)
 EXPORT_SYMBOL(drm_client_modeset_commit_locked);
 
 /**
- * drm_client_modeset_commit() - Commit CRTC configuration
- * @client: DRM client
+ * drm_client_modeset_commit() - 提交 CRTC 配置
+ * @client: DRM 客户端
  *
- * Commit modeset configuration to crtcs.
+ * 将模式设置配置提交到 CRTC。此函数首先尝试获取内部 DRM master 引用，
+ * 如果获取失败（存在外部 master），返回 -EBUSY。
+ * 获取成功后委托给 drm_client_modeset_commit_locked() 执行实际的提交。
  *
- * Returns:
- * Zero on success or negative error code on failure.
+ * 返回值：
+ * 成功返回 0，失败返回负的错误码。
  */
 int drm_client_modeset_commit(struct drm_client_dev *client)
 {
@@ -1264,14 +1309,17 @@ static void drm_client_modeset_dpms_legacy(struct drm_client_dev *client, int dp
 }
 
 /**
- * drm_client_modeset_dpms() - Set DPMS mode
- * @client: DRM client
- * @mode: DPMS mode
+ * drm_client_modeset_dpms() - 设置 DPMS 模式
+ * @client: DRM 客户端
+ * @mode: DPMS 模式（DRM_MODE_DPMS_ON/OFF/STANDBY/SUSPEND）
  *
- * Note: For atomic drivers @mode is reduced to on/off.
+ * 设置显示器的电源管理模式。对于原子驱动，DPMS 模式被简化为开/关
+ * （ON 对应 active=true，OFF 对应 active=false），因为原子框架
+ * 不支持 STANDBY 和 SUSPEND 之间的细粒度区别。
+ * 对于传统驱动，则逐个连接器和编码器地设置 DPMS 状态。
  *
- * Returns:
- * Zero on success or negative error code on failure.
+ * 返回值：
+ * 成功返回 0，失败返回负的错误码。
  */
 int drm_client_modeset_dpms(struct drm_client_dev *client, int mode)
 {
@@ -1295,16 +1343,20 @@ int drm_client_modeset_dpms(struct drm_client_dev *client, int mode)
 EXPORT_SYMBOL(drm_client_modeset_dpms);
 
 /**
- * drm_client_modeset_wait_for_vblank() - Wait for the next VBLANK to occur
- * @client: DRM client
- * @crtc_index: The ndex of the CRTC to wait on
+ * drm_client_modeset_wait_for_vblank() - 等待下一次 VBLANK 事件
+ * @client: DRM 客户端
+ * @crtc_index: 要等待的 CRTC 索引
  *
- * Block the caller until the given CRTC has seen a VBLANK. Do nothing
- * if the CRTC is disabled. If there's another DRM master present, fail
- * with -EBUSY.
+ * 阻塞调用者直到指定的 CRTC 经历了一次 VBLANK（垂直消隐期）。
+ * 如果 CRTC 被禁用则直接返回（不报错）。
+ * 如果有其他 DRM master 存在，返回 -EBUSY。
  *
- * Returns:
- * 0 on success, or negative error code otherwise.
+ * 此函数通过限制更新频率到 VBLANK 间隔来避免与用户空间合成器
+ * 产生竞争条件。在等待 VBLANK 期间如果有 DRM master 存在，
+ * 可能会造成干扰，因此检测到有外部 master 时就不等待。
+ *
+ * 返回值：
+ * 成功返回 0，失败返回负的错误码。
  */
 int drm_client_modeset_wait_for_vblank(struct drm_client_dev *client, unsigned int crtc_index)
 {

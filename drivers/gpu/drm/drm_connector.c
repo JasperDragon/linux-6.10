@@ -20,6 +20,16 @@
  * OF THIS SOFTWARE.
  */
 
+/*
+ * drm_connector.c — 显示连接器管理 (HDMI/DP/eDP/DSI/VGA...)。
+ *
+ * Connector 代表物理显示接口:
+ *   - 热插拔检测 (HPD): drm_connector_oob_hotplug_event()
+ *   - 显示器探测: 读取 EDID, 枚举支持的分辨率/刷新率
+ *   - 连接状态机: connected / disconnected / unknown
+ *   - 动态注册: drm_connector_dynamic_register()
+ */
+
 #include <drm/drm_auth.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_drv.h>

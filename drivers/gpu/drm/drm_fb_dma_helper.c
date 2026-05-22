@@ -9,6 +9,27 @@
  *  Copyright (C) 2012 Red Hat
  */
 
+/*
+ * 中文注释: DRM DMA 帧缓冲辅助函数 (DMA Framebuffer Helper)
+ *
+ * 本文件提供了基于 DMA-contiguous 帧缓冲的辅助函数, 适用于使用
+ * DMA API 分配连续内存的 DRM 驱动程序。根据平台不同, 这些缓冲区
+ * 可能是通过 IOMMU 映射的物理非连续内存, 或是通过 CMA 等机制分配
+ * 的物理连续内存。
+ *
+ * 主要功能:
+ *   1. drm_fb_dma_get_gem_obj: 获取帧缓冲指定平面的 DMA GEM 对象
+ *   2. drm_fb_dma_get_gem_addr: 计算帧缓冲指定平面的 DMA (总线)
+ *      地址, 考虑像素格式的块布局 (block width/height) 和子采样
+ *      因子 (hsub/vsub)
+ *   3. drm_fb_dma_sync_non_coherent: 同步非一致性 (non-coherent)
+ *      内存的 DMA 缓冲区, 确保 CPU 写入的数据对设备可见
+ *   4. drm_fb_dma_get_scanout_buffer: 获取 panic 处理程序的扫描输出
+ *      缓冲区, 在系统崩溃时显示 panic 屏幕
+ *
+ * 这些函数通常从 CRTC 或 PLANE 的回调函数中调用。
+ */
+
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
@@ -38,6 +59,11 @@
  */
 
 /**
+ * 中文注释: 获取帧缓冲的 DMA GEM 对象
+ * 根据帧缓冲和平面索引返回对应的 DMA GEM 对象。通常从 CRTC 的
+ * 回调函数中调用, 用于获取帧缓冲各平面 (如 Y/Cb/Cr) 对应的
+ * GEM 对象。
+ *
  * drm_fb_dma_get_gem_obj() - Get DMA GEM object for framebuffer
  * @fb: The framebuffer
  * @plane: Which plane
@@ -60,6 +86,15 @@ struct drm_gem_dma_object *drm_fb_dma_get_gem_obj(struct drm_framebuffer *fb,
 EXPORT_SYMBOL_GPL(drm_fb_dma_get_gem_obj);
 
 /**
+ * 中文注释: 获取帧缓冲的 DMA 总线地址
+ * 根据帧缓冲、平面状态和平面索引计算 DMA 总线地址。对于像素格式
+ * 按块 (block) 分组的情况, 此函数考虑:
+ *   - 块宽度 (block_w) 和块高度 (block_h)
+ *   - 色度子采样因子 (hsub, vsub) 对于非第一平面
+ *   - 源裁剪 (src_x, src_y) 计算出实际数据起始位置
+ * 最终地址 = GEM 对象 DMA 基址 + 平面偏移 + 行偏移 + 块内偏移。
+ * 通常从 PLANE 的回调函数中调用。
+ *
  * drm_fb_dma_get_gem_addr() - Get DMA (bus) address for framebuffer, for pixel
  * formats where values are grouped in blocks this will get you the beginning of
  * the block
@@ -109,6 +144,13 @@ dma_addr_t drm_fb_dma_get_gem_addr(struct drm_framebuffer *fb,
 EXPORT_SYMBOL_GPL(drm_fb_dma_get_gem_addr);
 
 /**
+ * 中文注释: 同步非一致性内存的 GEM 对象
+ * 适用于使用 damage clips 且 DMA GEM 对象由非一致性 (non-coherent)
+ * 内存支持的驱动程序。在平面的 .atomic_update 钩子中调用此函数,
+ * 通过 dma_sync_single_for_device() 确保 CPU 写入帧缓冲区的数据
+ * 已刷新到设备的可见范围。只同步受损区域 (damage clips) 对应的行,
+ * 而非整个帧缓冲, 以提高性能。
+ *
  * drm_fb_dma_sync_non_coherent - Sync GEM object to non-coherent backing
  *	memory
  * @drm: DRM device
@@ -153,6 +195,15 @@ void drm_fb_dma_sync_non_coherent(struct drm_device *drm,
 EXPORT_SYMBOL_GPL(drm_fb_dma_sync_non_coherent);
 
 /**
+ * 中文注释: 提供 panic 处理程序的扫描输出缓冲区
+ * 通用的 get_scanout_buffer() 实现, 适用于使用 drm_fb_dma_helper
+ * 的驱动程序。在系统 panic 时提供当前帧缓冲区的信息, 以便 panic
+ * 屏幕显示在屏幕上。
+ * 注意: 此函数不会在 panic 上下文中调用 vmap, 因此驱动程序必须
+ * 确保主平面已被 vmap, 否则 panic 屏幕无法显示。
+ * 仅支持线性修饰符 (DRM_FORMAT_MOD_LINEAR) 和非导入 (非 dma-buf)
+ * 的 GEM 对象。
+ *
  * drm_fb_dma_get_scanout_buffer - Provide a scanout buffer in case of panic
  * @plane: DRM primary plane
  * @sb: scanout buffer for the panic handler

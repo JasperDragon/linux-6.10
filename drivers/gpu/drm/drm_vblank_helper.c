@@ -1,5 +1,23 @@
 // SPDX-License-Identifier: MIT
 
+/*
+ * 文件名: drm_vblank_helper.c
+ *
+ * 中文描述: VBlank（垂直消隐期）辅助函数库
+ *
+ * 本文件为 DRM 驱动程序提供了 VBlank 相关的辅助回调函数实现。VBlank 是显示设备
+ * 在帧与帧之间切换时的垂直消隐期，驱动程序常在此时间段内执行安全的状态更新。
+ *
+ * 主要功能包括：
+ *   1. Atomic Flush 回调 - 在 atomic 事务提交时发送 VBlank 事件
+ *   2. Atomic Enable/Disable 回调 - 在 CRTC 启用/禁用时控制 VBlank
+ *   3. VBlank 定时器控制 - 基于定时器的 VBlank 启用/禁用实现
+ *   4. VBlank 时间戳获取 - 基于定时器超时时间的 VBlank 时间戳
+ *
+ * 驱动程序可通过 DRM_CRTC_VBLANK_TIMER_FUNCS 和 DRM_CRTC_HELPER_VBLANK_FUNCS
+ * 宏来便捷地初始化这些回调函数。
+ */
+
 #include <drm/drm_atomic.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_managed.h>
@@ -37,8 +55,15 @@
  */
 
 /**
- * drm_crtc_vblank_atomic_flush -
- *	Implements struct &drm_crtc_helper_funcs.atomic_flush
+ * drm_crtc_vblank_atomic_flush - CRTC atomic_flush 回调实现
+ *
+ * 在 atomic 事务的 flush 阶段触发。此函数获取 CRTC 状态中的待发送
+ * VBlank 事件，并尝试将其装载（arm）到下一个 VBlank 中断时发送。
+ * 如果 VBlank 不可用（如 CRTC 已关闭），则立即发送事件。
+ *
+ * 这是 drm_crtc_helper_funcs.atomic_flush 的默认实现，适用于只需要
+ * 在 atomic flush 时发送 VBlank 事件的 CRTC。
+ */
  * @crtc: The CRTC
  * @state: The atomic state to apply
  *
@@ -72,7 +97,14 @@ void drm_crtc_vblank_atomic_flush(struct drm_crtc *crtc,
 EXPORT_SYMBOL(drm_crtc_vblank_atomic_flush);
 
 /**
- * drm_crtc_vblank_atomic_enable - Implements struct &drm_crtc_helper_funcs.atomic_enable
+ * drm_crtc_vblank_atomic_enable - CRTC atomic_enable 回调实现
+ *
+ * 在 CRTC 启用时调用，使能 VBlank 中断。这是 drm_crtc_helper_funcs.
+ * atomic_enable 的默认实现，适用于只需要在 CRTC 启用时开启 VBlank 的驱动。
+ *
+ * 内部调用 drm_crtc_vblank_on()，该函数会启用 VBlank 计数并开始
+ * 产生 VBlank 中断事件。
+ */
  * @crtc: The CRTC
  * @state: The atomic state
  *
@@ -89,7 +121,14 @@ void drm_crtc_vblank_atomic_enable(struct drm_crtc *crtc,
 EXPORT_SYMBOL(drm_crtc_vblank_atomic_enable);
 
 /**
- * drm_crtc_vblank_atomic_disable - Implements struct &drm_crtc_helper_funcs.atomic_disable
+ * drm_crtc_vblank_atomic_disable - CRTC atomic_disable 回调实现
+ *
+ * 在 CRTC 禁用时调用，关闭 VBlank 中断。这是 drm_crtc_helper_funcs.
+ * atomic_disable 的默认实现，适用于只需要在 CRTC 禁用时关闭 VBlank 的驱动。
+ *
+ * 内部调用 drm_crtc_vblank_off()，该函数会立即关闭 VBlank 并
+ * 等待任何正在进行的 VBlank 操作完成。
+ */
  * @crtc: The CRTC
  * @state: The atomic state
  *
@@ -110,7 +149,13 @@ EXPORT_SYMBOL(drm_crtc_vblank_atomic_disable);
  */
 
 /**
- * drm_crtc_vblank_helper_enable_vblank_timer - Implements struct &drm_crtc_funcs.enable_vblank
+ * drm_crtc_vblank_helper_enable_vblank_timer - 基于定时器的 VBlank 启用回调
+ *
+ * 为需要 VBlank 定时器的 CRTC 实现 enable_vblank 回调。
+ * 首次调用时设置定时器，定时器在当前帧时长到期后触发。
+ *
+ * 适用于那些没有硬件 VBlank 中断，需要通过定时器模拟 VBlank 的驱动。
+ */
  * @crtc: The CRTC
  *
  * The helper drm_crtc_vblank_helper_enable_vblank_timer() implements
@@ -131,7 +176,11 @@ int drm_crtc_vblank_helper_enable_vblank_timer(struct drm_crtc *crtc)
 EXPORT_SYMBOL(drm_crtc_vblank_helper_enable_vblank_timer);
 
 /**
- * drm_crtc_vblank_helper_disable_vblank_timer - Implements struct &drm_crtc_funcs.disable_vblank
+ * drm_crtc_vblank_helper_disable_vblank_timer - 基于定时器的 VBlank 禁用回调
+ *
+ * 为需要 VBlank 定时器的 CRTC 实现 disable_vblank 回调。
+ * 取消正在运行的 VBlank 定时器。
+ */
  * @crtc: The CRTC
  *
  * The helper drm_crtc_vblank_helper_disable_vblank_timer() implements
@@ -147,8 +196,14 @@ void drm_crtc_vblank_helper_disable_vblank_timer(struct drm_crtc *crtc)
 EXPORT_SYMBOL(drm_crtc_vblank_helper_disable_vblank_timer);
 
 /**
- * drm_crtc_vblank_helper_get_vblank_timestamp_from_timer -
- *	Implements struct &drm_crtc_funcs.get_vblank_timestamp
+ * drm_crtc_vblank_helper_get_vblank_timestamp_from_timer - 基于定时器的 VBlank 时间戳获取
+ *
+ * 为需要 VBlank 定时器的 CRTC 实现 get_vblank_timestamp 回调。
+ * 根据定时器的超时时间返回 VBlank 时间戳。
+ *
+ * 当硬件无法提供精确的 VBlank 时间戳时，此函数提供一个合理的
+ * 时间估计值。
+ */
  * @crtc: The CRTC
  * @max_error: Maximum acceptable error
  * @vblank_time: Returns the next vblank timestamp

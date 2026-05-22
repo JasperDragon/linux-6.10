@@ -6,6 +6,30 @@
  * Tux Ascii art taken from cowsay written by Tony Monroe
  */
 
+/*
+ * 文件名: drm_panic.c
+ *
+ * 中文描述: DRM 内核崩溃（Panic）屏幕显示
+ *
+ * 本文件实现了 DRM 子系统的内核崩溃屏幕显示功能。当内核发生 panic 时，
+ * 在屏幕上显示友好的用户提示信息（而非传统的终端日志），帮助最终用户
+ * 理解系统状态。
+ *
+ * 该模块是一个 panic 处理器，因此不能使用锁、分配内存、运行任务/IRQ 或休眠。
+ * 采用"尽力而为"策略 -- 如果 panic 发生在模式设置等关键路径中间，可能无法
+ * 正常显示消息。仅显示一帧静态画面，性能优化非优先级目标。
+ *
+ * 支持三种显示模式（通过 panic_screen 模块参数选择）：
+ *   1. user - 显示友好的用户提示（默认），包含"KERNEL PANIC!"等信息
+ *   2. kmsg - 显示内核日志缓冲区的最后内容
+ *   3. qr_code - 显示 QR 码（包含内核日志），便于用户用手机扫描调试
+ *
+ * 驱动支持要求：
+ *   - 主平面（primary plane）必须实现 get_scanout_buffer() 回调
+ *   - 可选实现 panic_flush() 回调用于硬件刷新
+ *   - 支持线性缓冲区和有限颜色格式（RGB565、RGB888、XRGB8888 等）
+ */
+
 #include <linux/export.h>
 #include <linux/font.h>
 #include <linux/highmem.h>
@@ -476,6 +500,15 @@ static void drm_panic_logo_draw(struct drm_scanout_buffer *sb, struct drm_rect *
 				   fg_color);
 }
 
+/*
+ * draw_panic_screen_user - 绘制面向用户的 panic 友好提示画面
+ * @sb: 扫描输出缓冲区
+ *
+ * 在屏幕中央显示友好的用户提示信息，如 "KERNEL PANIC!" 和
+ * "Please reboot your computer."，以及启动徽标。
+ * 这是默认的 panic 显示模式，旨在为最终用户提供易于理解的
+ * 信息而非技术细节。
+ */
 static void draw_panic_screen_user(struct drm_scanout_buffer *sb)
 {
 	u32 fg_color = drm_draw_color_from_xrgb8888(CONFIG_DRM_PANIC_FOREGROUND_COLOR,
@@ -544,6 +577,14 @@ static int draw_line_with_wrap(struct drm_scanout_buffer *sb, const struct font_
 /*
  * Draw the kmsg buffer to the screen, starting from the youngest message at the bottom,
  * and going up until reaching the top of the screen.
+ */
+/*
+ * draw_panic_screen_kmsg - 绘制内核日志 panic 画面
+ * @sb: 扫描输出缓冲区
+ *
+ * 在屏幕上显示内核日志缓冲区的最新内容，从最新消息开始从底部
+ * 向上显示，直到填满整个屏幕。每行内容超过屏幕宽度时会自动换行。
+ * 适用于开发调试场景，可直接看到内核的最后日志。
  */
 static void draw_panic_screen_kmsg(struct drm_scanout_buffer *sb)
 {
@@ -862,11 +903,13 @@ MODULE_PARM_DESC(panic_screen,
 		 CONFIG_DRM_PANIC_SCREEN "]");
 
 /*
- * drm_panic_is_format_supported()
- * @format: a fourcc color code
- * Returns: true if supported, false otherwise.
+ * drm_panic_is_format_supported - 检查 panic 屏幕是否支持指定的颜色格式
+ * @format: FourCC 颜色格式码
  *
- * Check if drm_panic will be able to use this color format.
+ * 检查 drm_panic 是否能够使用指定的颜色格式进行渲染。
+ * 要求：单平面格式且可以从 XRGB8888 转换。
+ *
+ * 返回：true 支持，false 不支持
  */
 static bool drm_panic_is_format_supported(const struct drm_format_info *format)
 {
@@ -875,6 +918,13 @@ static bool drm_panic_is_format_supported(const struct drm_format_info *format)
 	return drm_draw_can_convert_from_xrgb8888(format->format);
 }
 
+/*
+ * draw_panic_dispatch - 根据选择的 panic 类型分发到对应的绘制函数
+ * @sb: 扫描输出缓冲区
+ *
+ * 根据 drm_panic_type 模块参数选择调用用户界面、内核日志或 QR 码
+ * 绘制函数。
+ */
 static void draw_panic_dispatch(struct drm_scanout_buffer *sb)
 {
 	switch (drm_panic_type) {
@@ -894,6 +944,13 @@ static void draw_panic_dispatch(struct drm_scanout_buffer *sb)
 	}
 }
 
+/*
+ * drm_panic_set_description - 设置 panic 描述信息
+ * @description: 描述字符串
+ *
+ * 将 panic 描述信息设置到 panic_msg 数组的最后一行，
+ * 用于在 panic 屏幕上显示具体的内核恐慌描述。
+ */
 static void drm_panic_set_description(const char *description)
 {
 	u32 len;
@@ -910,6 +967,11 @@ static void drm_panic_set_description(const char *description)
 	}
 }
 
+/*
+ * drm_panic_clear_description - 清除 panic 描述信息
+ *
+ * 将描述行清空，表示没有 panic 描述需要显示。
+ */
 static void drm_panic_clear_description(void)
 {
 	struct drm_panic_line *desc_line = &panic_msg[panic_msg_lines - 1];
@@ -918,6 +980,17 @@ static void drm_panic_clear_description(void)
 	desc_line->txt = NULL;
 }
 
+/*
+ * draw_panic_plane - 在指定平面上绘制 panic 屏幕
+ * @plane: DRM 主平面
+ * @description: panic 描述字符串
+ *
+ * 在 panic 处理期间在指定平面上绘制崩溃信息。此函数尝试获取扫描输出
+ * 缓冲区，检查格式支持，然后绘制对应类型的 panic 屏幕。如果驱动提供了
+ * panic_flush 回调，在绘制后调用以刷新硬件显示。
+ *
+ * 注意：此函数在 panic 上下文中执行，不能使用锁、分配内存或休眠。
+ */
 static void draw_panic_plane(struct drm_plane *plane, const char *description)
 {
 	struct drm_scanout_buffer sb = { };
@@ -953,6 +1026,15 @@ static struct drm_plane *to_drm_plane(struct kmsg_dumper *kd)
 	return container_of(kd, struct drm_plane, kmsg_panic);
 }
 
+/*
+ * drm_panic - kmsg_dump 回调函数
+ * @dumper: kmsg_dumper 指针（包含对应的 drm_plane）
+ * @detail: dump 详情（包括 panic 原因和描述）
+ *
+ * 作为 kmsg_dump 框架的回调函数被调用。当内核 panic 发生时，
+ * kmsg_dump 会遍历所有注册的 dumper 并调用此函数。
+ * 仅在 dump 原因为 KMSG_DUMP_PANIC 时触发实际的绘制操作。
+ */
 static void drm_panic(struct kmsg_dumper *dumper, struct kmsg_dump_detail *detail)
 {
 	struct drm_plane *plane = to_drm_plane(dumper);
@@ -1002,10 +1084,14 @@ static void debugfs_register_plane(struct drm_plane *plane, int index) {}
 #endif /* CONFIG_DRM_PANIC_DEBUG */
 
 /**
- * drm_panic_is_enabled
- * @dev: the drm device that may supports drm_panic
+ * drm_panic_is_enabled - 检查 DRM 设备是否支持 panic 屏幕显示
+ * @dev: 要检查的 DRM 设备
  *
- * returns true if the drm device supports drm_panic
+ * 遍历设备的所有平面，检查是否有平面实现了 get_scanout_buffer
+ * 回调函数。只要有至少一个平面支持 panic 显示，就认为该设备
+ * 启用了 drm_panic。
+ *
+ * 返回：true 设备支持 panic 屏幕，false 不支持
  */
 bool drm_panic_is_enabled(struct drm_device *dev)
 {
@@ -1022,8 +1108,14 @@ bool drm_panic_is_enabled(struct drm_device *dev)
 EXPORT_SYMBOL(drm_panic_is_enabled);
 
 /**
- * drm_panic_register() - Initialize DRM panic for a device
- * @dev: the drm device on which the panic screen will be displayed.
+ * drm_panic_register() - 为设备初始化 DRM panic 处理
+ * @dev: 将在其上显示 panic 屏幕的 DRM 设备
+ *
+ * 遍历设备的所有平面，为每个支持 get_scanout_buffer 回调的平面
+ * 注册 kmsg_dump 处理程序。当内核 panic 发生时，kmsg_dump 框架
+ * 会调用对应平面的绘制函数在屏幕上显示 panic 信息。
+ *
+ * 注册成功时还会为每个平面创建 debugfs 文件，方便调试。
  */
 void drm_panic_register(struct drm_device *dev)
 {
@@ -1050,8 +1142,11 @@ void drm_panic_register(struct drm_device *dev)
 }
 
 /**
- * drm_panic_unregister()
- * @dev: the drm device previously registered.
+ * drm_panic_unregister() - 注销设备的 DRM panic 处理
+ * @dev: 之前注册过的 DRM 设备
+ *
+ * 遍历设备的所有平面，为每个之前注册了 kmsg_dump 处理程序的平面
+ * 执行注销操作。
  */
 void drm_panic_unregister(struct drm_device *dev)
 {
@@ -1068,7 +1163,11 @@ void drm_panic_unregister(struct drm_device *dev)
 }
 
 /**
- * drm_panic_init() - initialize DRM panic.
+ * drm_panic_init() - 初始化 DRM panic 子系统
+ *
+ * 在内核启动时调用。解析 CONFIG_DRM_PANIC_SCREEN 内核配置项，
+ * 设置默认的 panic 屏幕类型。如果配置值无效，回退到 "user" 模式。
+ * 同时初始化 QR 码支持所需的预分配缓冲区。
  */
 void __init drm_panic_init(void)
 {
@@ -1081,7 +1180,9 @@ void __init drm_panic_init(void)
 }
 
 /**
- * drm_panic_exit() - Free the resources taken by drm_panic_exit()
+ * drm_panic_exit() - 释放 DRM panic 子系统占用的资源
+ *
+ * 在模块卸载时调用。释放预分配的 QR 码缓冲区和工作空间内存。
  */
 void drm_panic_exit(void)
 {

@@ -24,6 +24,27 @@
  *
  */
 
+/*
+ * DRM 色彩操作管线 - 中文注释补充
+ *
+ * 本文件实现了 DRM 色彩操作（color operation, colorop）管线机制。
+ * 当用户空间声明了 DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE 能力后，
+ * 应通过 COLOR_PIPELINE 平面属性和关联的 colorop 来进行所有色彩操作。
+ *
+ * Colorop 表示单个色彩操作步骤，多个 colorop 通过 NEXT 属性串联
+ * 形成色彩管线。每个 colorop 都有其类型，通过只读的 TYPE 属性标识。
+ *
+ * 支持的类型：
+ *   1. 1D Curve（1D 曲线）：如 sRGB EOTF、PQ 125 EOTF、BT.2020 OETF 等
+ *   2. 1D LUT（1D 查找表）：可编程的一维颜色查找表
+ *   3. 3x4 Matrix（3x4 矩阵）：色彩空间转换矩阵
+ *   4. Multiplier（乘法器）：全局亮度/增益调整
+ *   5. 3D LUT（3D 查找表）：三维颜色查找表
+ *
+ * 如果 colorop 支持 BYPASS 属性，则可将其绕过（不执行任何操作）。
+ * 色彩管线的设计文档见 rfc/color_pipeline.rst。
+ */
+
 #include <drm/drm_colorop.h>
 #include <drm/drm_print.h>
 #include <drm/drm_drv.h>
@@ -163,6 +184,10 @@ static int drm_plane_colorop_init(struct drm_device *dev, struct drm_colorop *co
  *
  * @colorop: The drm_colorop object to be cleaned
  */
+/*
+ * 中文说明：清理 colorop 对象。从全局 colorop_list 中移除，
+ * 减少设备 colorop 计数，并释放关联的状态。
+ */
 void drm_colorop_cleanup(struct drm_colorop *colorop)
 {
 	struct drm_device *dev = colorop->dev;
@@ -184,6 +209,10 @@ EXPORT_SYMBOL(drm_colorop_cleanup);
  * colorop object. This can be used by drivers if they do not
  * require any driver-specific teardown.
  */
+/*
+ * 中文说明：销毁 colorop 对象。调用 cleanup 清理后释放内存。
+ * 如果驱动需要自定义销毁逻辑，应在自己的回调中调用此函数。
+ */
 void drm_colorop_destroy(struct drm_colorop *colorop)
 {
 	drm_colorop_cleanup(colorop);
@@ -197,6 +226,11 @@ EXPORT_SYMBOL(drm_colorop_destroy);
  * @dev: - The drm_device containing the drm_planes with the color_pipelines
  *
  * Provides a default color pipeline destroy handler for drm_device.
+ */
+/*
+ * 中文说明：销毁设备上所有色彩管线中的 colorop 对象。
+ * 遍历全局 colorop_list，依次调用各 colorop 的 destroy 回调。
+ * 在设备拆除时由驱动调用。
  */
 void drm_colorop_pipeline_destroy(struct drm_device *dev)
 {
@@ -221,6 +255,12 @@ EXPORT_SYMBOL(drm_colorop_pipeline_destroy);
  *                 operator.
  * @flags: bitmask of misc, see DRM_COLOROP_FLAG_* defines.
  * @return zero on success, -E value on failure
+ */
+/*
+ * 中文说明：初始化一个 1D 曲线类型的 colorop。用于固定函数曲线
+ * （如 sRGB EOTF、PQ 125、BT.2020 OETF、Gamma 2.2 等）。
+ * supported_tfs 位掩码声明支持的曲线类型，驱动可在创建时选择。
+ * colorop 会自动挂载 CURVE_1D_TYPE 枚举属性供用户空间选择曲线。
  */
 int drm_plane_colorop_curve_1d_init(struct drm_device *dev, struct drm_colorop *colorop,
 				    struct drm_plane *plane, const struct drm_colorop_funcs *funcs,
@@ -308,6 +348,12 @@ static int drm_colorop_create_data_prop(struct drm_device *dev, struct drm_color
  * @flags: bitmask of misc, see DRM_COLOROP_FLAG_* defines.
  * @return zero on success, -E value on failure
  */
+/*
+ * 中文说明：初始化一个 1D LUT 类型的 colorop。提供可编程的
+ * 一维颜色查找表，用户可以上传自定义的 LUT 数据。
+ * lut_size 指定 LUT 表项数量，interpolation 指定插值方式。
+ * 自动挂载 SIZE（不可变）和 DATA（blob，存放 LUT 数据）属性。
+ */
 int drm_plane_colorop_curve_1d_lut_init(struct drm_device *dev, struct drm_colorop *colorop,
 					struct drm_plane *plane,
 					const struct drm_colorop_funcs *funcs,
@@ -384,6 +430,11 @@ EXPORT_SYMBOL(drm_plane_colorop_ctm_3x4_init);
  * @funcs: control functions for the new colorop
  * @flags: bitmask of misc, see DRM_COLOROP_FLAG_* defines.
  * @return zero on success, -E value on failure
+ */
+/*
+ * 中文说明：初始化一个乘法器类型的 colorop。用于全局亮度/增益调整。
+ * 自动挂载 MULTIPLIER 范围属性（0 到 U64_MAX），
+ * 用户空间通过设置该值来控制乘法系数。
  */
 int drm_plane_colorop_mult_init(struct drm_device *dev, struct drm_colorop *colorop,
 				struct drm_plane *plane, const struct drm_colorop_funcs *funcs,
@@ -623,6 +674,12 @@ const char *drm_get_colorop_lut3d_interpolation_name(enum drm_colorop_lut3d_inte
  * @next: next colorop
  *
  * Should be used when constructing the color pipeline
+ */
+/*
+ * 中文说明：设置 colorop 链中的下一个 colorop 节点。
+ * 通过 NEXT 属性将 colorop 串联成色彩管线。
+ * 用户在平面 COLOR_PIPELINE 属性中选择管线时，
+ * 驱动从管线头部开始依次执行各 colorop。
  */
 void drm_colorop_set_next_property(struct drm_colorop *colorop, struct drm_colorop *next)
 {

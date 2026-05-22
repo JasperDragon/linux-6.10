@@ -26,6 +26,15 @@
  *
  */
 
+/*
+ * drm_prime.c — PRIME (dma-buf 导入/导出) 跨设备缓冲区共享。
+ *
+ * PRIME 是 GPU 间零拷贝共享的核心机制:
+ *   - drm_gem_prime_export(): GEM 对象 → dma-buf fd (导出给另一个设备用)
+ *   - drm_gem_prime_import(): dma-buf fd → GEM 对象 (导入为本地可用的缓冲区)
+ *   - 底层通过 dma-buf 框架管理物理页/IOMMU/SG table
+ */
+
 #include <linux/export.h>
 #include <linux/dma-buf.h>
 #include <linux/rbtree.h>

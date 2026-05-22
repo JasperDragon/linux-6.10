@@ -28,6 +28,34 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+/*
+ * DRM IOCTL 分发管理 - 实现 DRM 核心和驱动的 IOCTL 调度框架
+ *
+ * 本文件实现了 DRM 框架的 IOCTL 调度机制，负责将用户空间的 IOCTL 请求
+ * 分发到对应的处理函数。它是 DRM 用户空间 API 的核心路由层。
+ *
+ * 核心功能：
+ *
+ *   IOCTL 分发表：
+ *     - drm_ioctls[] - 核心 IOCTL 分发表，涵盖所有 DRM 标准 IOCTL，
+ *       包括版本查询、能力获取、GEM 操作、模式设置、同步对象、租赁等
+ *
+ *   权限检查（drm_ioctl_permit）：
+ *     - DRM_ROOT_ONLY：需要 CAP_SYS_ADMIN 权限
+ *     - DRM_AUTH：需要经过认证的客户端
+ *     - DRM_MASTER：需要当前主控权限
+ *     - DRM_RENDER_ALLOW：渲染客户端允许访问
+ *
+ *   主分发函数：
+ *     - drm_ioctl() - 文件操作的主入口，查找 IOCTL 表并调用处理函数
+ *     - drm_ioctl_kernel() - 内核侧 IOCTL 分发，执行权限检查后调用实现
+ *     - drm_ioctl_flags() - 获取核心 IOCTL 的权限标志
+ *
+ *   驱动私有 IOCTL 支持：
+ *     驱动程序可以定义自己的 IOCTL 表，通过 &drm_driver.ioctls 字段注册。
+ *     驱动私有 IOCTL 号必须位于 DRM_COMMAND_BASE 到 DRM_COMMAND_END 范围内。
+ */
+
 #include <linux/export.h>
 #include <linux/nospec.h>
 #include <linux/pci.h>
@@ -443,6 +471,17 @@ done:
 	return retcode;
 }
 
+/*
+ * drm_noop - DRM 空操作（no-op）IOCTL 实现
+ * @dev: 执行 IOCTL 的 DRM 设备
+ * @data: IOCTL 数据指针
+ * @file_priv: 调用 IOCTL 的 DRM 文件
+ *
+ * 对于已废弃的功能提供空操作实现。当现有用户空间检查 IOCTL 的返回值
+ * 但不关心实际操作时使用，返回成功（0）以避免破坏旧的用户空间程序。
+ *
+ * 返回：总是 0（成功）。
+ */
 /**
  * drm_noop - DRM no-op ioctl implementation
  * @dev: DRM device for the ioctl
@@ -463,6 +502,19 @@ int drm_noop(struct drm_device *dev, void *data,
 }
 EXPORT_SYMBOL(drm_noop);
 
+/*
+ * drm_invalid_op - DRM 无效操作 IOCTL 实现
+ * @dev: 执行 IOCTL 的 DRM 设备
+ * @data: IOCTL 数据指针
+ * @file_priv: 调用 IOCTL 的 DRM 文件
+ *
+ * 对于已废弃且不希望用户空间继续调用的 IOCTL 提供此实现。
+ * 适用于逐步过渡到 KMS 的旧 UMS 驱动（如 radeon 和 i915），
+ * 这些驱动保留了旧的遗留 IOCTL 表但不再允许使用。
+ * 其他驱动通常不需要使用此函数。
+ *
+ * 返回：总是 -EINVAL（无效参数）。
+ */
 /**
  * drm_invalid_op - DRM invalid ioctl implementation
  * @dev: DRM device for the ioctl
@@ -784,6 +836,21 @@ static const struct drm_ioctl_desc drm_ioctls[] = {
  * the driver-specific IOCTLs are wired up.
  */
 
+/*
+ * drm_ioctl_kernel - 内核侧 IOCTL 分发函数
+ * @file: 文件指针
+ * @func: IOCTL 处理函数
+ * @kdata: 已拷贝到内核空间的 IOCTL 数据
+ * @flags: IOCTL 权限标志
+ *
+ * 在内核空间执行 IOCTL 分发。执行流程：
+ *   1. 更新 drm_file 的文件所有者（如果文件描述符被传递）
+ *   2. 检查设备是否已拔出
+ *   3. 检查调用者的权限（ROOT_ONLY、AUTH、MASTER、RENDER_ALLOW）
+ *   4. 调用具体的 IOCTL 处理函数
+ *
+ * 返回：IOCTL 处理函数的返回值，或负错误码。
+ */
 long drm_ioctl_kernel(struct file *file, drm_ioctl_t *func, void *kdata,
 		      u32 flags)
 {
@@ -805,6 +872,23 @@ long drm_ioctl_kernel(struct file *file, drm_ioctl_t *func, void *kdata,
 }
 EXPORT_SYMBOL(drm_ioctl_kernel);
 
+/*
+ * drm_ioctl - DRM 驱动的 IOCTL 回调实现
+ * @filp: 调用 IOCTL 的文件
+ * @cmd: IOCTL 命令号
+ * @arg: 用户空间参数
+ *
+ * 核心 IOCTL 分发函数。流程如下：
+ *   1. 根据 IOCTL 类型判断是核心 IOCTL 还是驱动私有 IOCTL
+ *   2. 在相应的分发表（核心表或驱动表）中查找处理函数
+ *   3. 将用户空间参数拷贝到内核空间（自动处理大小差异和零扩展）
+ *   4. 调用 drm_ioctl_kernel() 执行权限检查和函数分发
+ *   5. 将输出数据拷贝回用户空间
+ *
+ * 此函数自动处理 32/64 位兼容性和数据结构大小的差异。
+ *
+ * 返回：0 表示成功，负错误码表示失败。
+ */
 /**
  * drm_ioctl - ioctl callback implementation for DRM drivers
  * @filp: file this ioctl is called on
@@ -919,6 +1003,17 @@ long drm_ioctl(struct file *filp,
 }
 EXPORT_SYMBOL(drm_ioctl);
 
+/*
+ * drm_ioctl_flags - 检查核心 IOCTL 并返回其权限标志
+ * @nr: IOCTL 编号
+ * @flags: 输出参数，返回 IOCTL 的权限标志
+ *
+ * 根据 IOCTL 编号在核心 IOCTL 表中查找对应的权限标志。
+ * 目前仅由 vmwgfx 驱动用于增强 DRM 核心的访问检查，
+ * 这在一定程度上是层次违反，其他驱动不应使用此函数。
+ *
+ * 返回：如果 @nr 对应于 DRM 核心 IOCTL 编号则返回 true，否则返回 false。
+ */
 /**
  * drm_ioctl_flags - Check for core ioctl and return ioctl permission flags
  * @nr: ioctl number

@@ -6,6 +6,36 @@
  * Hans de Goede <hdegoede@redhat.com>
  */
 
+/*
+ * DRM 隐私屏幕（Privacy Screen）核心
+ *
+ * 本文件实现了隐私屏幕功能的 DRM 核心支持。隐私屏幕是一种特殊
+ * 的显示功能，允许用户在屏幕上覆盖一层可切换的过滤层，限制屏幕
+ * 的可视角度，防止旁人窥视屏幕内容，从而保护用户隐私。
+ *
+ * 架构设计：
+ *   本模块采用三层架构设计：
+ *     1. 机器特定层（drm_privacy_screen_machine.h）：非 KMS 驱动
+ *        （如 platform/x86 驱动）通过此接口注册隐私屏幕设备
+ *     2. 消费者层（drm_privacy_screen_consumer.h）：KMS 驱动通过
+ *        此接口获取和使用隐私屏幕功能
+ *     3. 驱动层（drm_privacy_screen_driver.h）：实际硬件驱动的
+ *        注册接口
+ *
+ * 与 DRM 连接器属性的集成：
+ *   KMS 驱动应使用 drm_connector_attach_privacy_screen_provider()
+ *   和 drm_connector_update_privacy_screen() 辅助函数来实现标准
+ *   的隐私屏幕连接器属性，参见：
+ *   :ref:`Standard Connector Properties<standard_connector_properties>`
+ *
+ * 状态管理：
+ *   隐私屏幕维护两种状态：
+ *     - sw_state（软件状态）：驱动期望设置的状态
+ *     - hw_state（硬件状态）：硬件实际处于的状态
+ *   当硬件状态被锁定时（如被 BIOS 锁定），软件状态更改会被暂存，
+ *   直到硬件解锁后才会生效。
+ */
+
 #include <linux/device.h>
 #include <linux/export.h>
 #include <linux/kernel.h>
@@ -43,15 +73,17 @@ static LIST_HEAD(drm_privacy_screen_devs);
 /*** drm_privacy_screen_machine.h functions ***/
 
 /**
- * drm_privacy_screen_lookup_add - add an entry to the static privacy-screen
- *    lookup list
- * @lookup: lookup list entry to add
+ * drm_privacy_screen_lookup_add - 添加隐私屏幕静态查找条目
+ * @lookup: 要添加的查找条目
  *
- * Add an entry to the static privacy-screen lookup list. Note the
- * &struct list_head which is part of the &struct drm_privacy_screen_lookup
- * gets added to a list owned by the privacy-screen core. So the passed in
- * &struct drm_privacy_screen_lookup must not be free-ed until it is removed
- * from the lookup list by calling drm_privacy_screen_lookup_remove().
+ * 将条目添加到静态隐私屏幕查找列表中。注意，传入的
+ * &struct drm_privacy_screen_lookup 中的 &struct list_head 会被添加到
+ * 隐私屏幕核心拥有的列表中。因此，传入的 &struct drm_privacy_screen_lookup
+ * 在通过 drm_privacy_screen_lookup_remove() 从列表中移除之前，
+ * 不能被释放。
+ *
+ * 此函数供平台特定代码（如 x86 平台检测代码）使用，用于注册
+ * 已知的隐私屏幕提供者信息。
  */
 void drm_privacy_screen_lookup_add(struct drm_privacy_screen_lookup *lookup)
 {
@@ -62,12 +94,13 @@ void drm_privacy_screen_lookup_add(struct drm_privacy_screen_lookup *lookup)
 EXPORT_SYMBOL(drm_privacy_screen_lookup_add);
 
 /**
- * drm_privacy_screen_lookup_remove - remove an entry to the static
- *    privacy-screen lookup list
- * @lookup: lookup list entry to remove
+ * drm_privacy_screen_lookup_remove - 移除隐私屏幕静态查找条目
+ * @lookup: 要移除的查找条目
  *
- * Remove an entry previously added with drm_privacy_screen_lookup_add()
- * from the static privacy-screen lookup list.
+ * 从静态隐私屏幕查找列表中移除之前通过 drm_privacy_screen_lookup_add()
+ * 添加的条目。
+ *
+ * 通常在系统关闭或模块卸载时调用，以确保资源被正确清理。
  */
 void drm_privacy_screen_lookup_remove(struct drm_privacy_screen_lookup *lookup)
 {
@@ -100,18 +133,24 @@ static struct drm_privacy_screen *drm_privacy_screen_get_by_name(
 }
 
 /**
- * drm_privacy_screen_get - get a privacy-screen provider
- * @dev: consumer-device for which to get a privacy-screen provider
- * @con_id: (video)connector name for which to get a privacy-screen provider
+ * drm_privacy_screen_get - 获取隐私屏幕提供者
+ * @dev: 要获取隐私屏幕提供者的消费者设备
+ * @con_id: （视频）连接器名称
  *
- * Get a privacy-screen provider for a privacy-screen attached to the
- * display described by the @dev and @con_id parameters.
+ * 获取连接到 @dev 和 @con_id 参数描述的显示器上的隐私屏幕提供者。
  *
- * Return:
- * * A pointer to a &struct drm_privacy_screen on success.
- * * ERR_PTR(-ENODEV) if no matching privacy-screen is found
- * * ERR_PTR(-EPROBE_DEFER) if there is a matching privacy-screen,
- *                          but it has not been registered yet.
+ * 查找算法（借鉴自时钟框架）：
+ *   使用模糊匹配方式：
+ *     - ID 为 NULL 的条目被视为通配符
+ *     - 如果条目有设备 ID，则必须匹配
+ *     - 如果条目有连接器 ID，则必须匹配
+ *   然后选择最具体的条目，优先级顺序为：
+ *     设备+连接器 > 仅设备 > 仅连接器
+ *
+ * 返回：
+ * * 成功时返回指向 &struct drm_privacy_screen 的指针
+ * * 未找到匹配时返回 ERR_PTR(-ENODEV)
+ * * 有匹配但尚未注册时返回 ERR_PTR(-EPROBE_DEFER)
  */
 struct drm_privacy_screen *drm_privacy_screen_get(struct device *dev,
 						  const char *con_id)
@@ -177,12 +216,11 @@ struct drm_privacy_screen *drm_privacy_screen_get(struct device *dev,
 EXPORT_SYMBOL(drm_privacy_screen_get);
 
 /**
- * drm_privacy_screen_put - release a privacy-screen reference
- * @priv: privacy screen reference to release
+ * drm_privacy_screen_put - 释放隐私屏幕引用
+ * @priv: 要释放的隐私屏幕引用
  *
- * Release a privacy-screen provider reference gotten through
- * drm_privacy_screen_get(). May be called with a NULL or ERR_PTR,
- * in which case it is a no-op.
+ * 释放通过 drm_privacy_screen_get() 获取的隐私屏幕提供者引用。
+ * 如果传入 NULL 或 ERR_PTR，则该函数不执行任何操作。
  */
 void drm_privacy_screen_put(struct drm_privacy_screen *priv)
 {
@@ -194,17 +232,20 @@ void drm_privacy_screen_put(struct drm_privacy_screen *priv)
 EXPORT_SYMBOL(drm_privacy_screen_put);
 
 /**
- * drm_privacy_screen_set_sw_state - set a privacy-screen's sw-state
- * @priv: privacy screen to set the sw-state for
- * @sw_state: new sw-state value to set
+ * drm_privacy_screen_set_sw_state - 设置隐私屏幕的软件状态
+ * @priv: 要设置软件状态的隐私屏幕
+ * @sw_state: 要设置的新软件状态值
  *
- * Set the sw-state of a privacy screen. If the privacy-screen is not
- * in a locked hw-state, then the actual and hw-state of the privacy-screen
- * will be immediately updated to the new value. If the privacy-screen is
- * in a locked hw-state, then the new sw-state will be remembered as the
- * requested state to put the privacy-screen in when it becomes unlocked.
+ * 设置隐私屏幕的软件状态。如果隐私屏幕未处于硬件锁定状态，
+ * 则实际的硬件状态会立即更新为新值。如果隐私屏幕处于硬件
+ * 锁定状态，则新的软件状态会被记住作为解除锁定后应设置的
+ * 目标状态。
  *
- * Return: 0 on success, negative error code on failure.
+ * 根据 DRM 连接器属性文档，在硬件状态被锁定时设置软件状态
+ * 是允许的。此时除了保存新状态以便解锁后生效外，不执行其他操作。
+ * 同样，如果硬件已处于目标状态，也跳过设置操作。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int drm_privacy_screen_set_sw_state(struct drm_privacy_screen *priv,
 				    enum drm_privacy_screen_status sw_state)
@@ -239,13 +280,13 @@ out:
 EXPORT_SYMBOL(drm_privacy_screen_set_sw_state);
 
 /**
- * drm_privacy_screen_get_state - get privacy-screen's current state
- * @priv: privacy screen to get the state for
- * @sw_state_ret: address where to store the privacy-screens current sw-state
- * @hw_state_ret: address where to store the privacy-screens current hw-state
+ * drm_privacy_screen_get_state - 获取隐私屏幕当前状态
+ * @priv: 要获取状态的隐私屏幕
+ * @sw_state_ret: 用于存储当前软件状态的地址
+ * @hw_state_ret: 用于存储当前硬件状态的地址
  *
- * Get the current state of a privacy-screen, both the sw-state and the
- * hw-state.
+ * 获取隐私屏幕的当前状态，包括软件状态和硬件状态。
+ * 该函数通过互斥锁保证读取的一致性。
  */
 void drm_privacy_screen_get_state(struct drm_privacy_screen *priv,
 				  enum drm_privacy_screen_status *sw_state_ret,
@@ -259,24 +300,21 @@ void drm_privacy_screen_get_state(struct drm_privacy_screen *priv,
 EXPORT_SYMBOL(drm_privacy_screen_get_state);
 
 /**
- * drm_privacy_screen_register_notifier - register a notifier
- * @priv: Privacy screen to register the notifier with
- * @nb: Notifier-block for the notifier to register
+ * drm_privacy_screen_register_notifier - 注册通知器
+ * @priv: 要注册通知器的隐私屏幕
+ * @nb: 要注册的通知器块
  *
- * Register a notifier with the privacy-screen to be notified of changes made
- * to the privacy-screen state from outside of the privacy-screen class.
- * E.g. the state may be changed by the hardware itself in response to a
- * hotkey press.
+ * 注册一个通知器到隐私屏幕，以便在隐私屏幕状态被外部（非本驱动）
+ * 改变时得到通知。例如，硬件自身可能因为用户按下热键而改变状态。
  *
- * The notifier is called with no locks held. The new hw_state and sw_state
- * can be retrieved using the drm_privacy_screen_get_state() function.
- * A pointer to the drm_privacy_screen's struct is passed as the ``void *data``
- * argument of the notifier_block's notifier_call.
+ * 通知器在不持有锁的情况下被调用。可以使用 drm_privacy_screen_get_state()
+ * 函数获取新的硬件状态和软件状态。隐私屏幕的 &struct drm_privacy_screen
+ * 指针会作为 notifier_block 的 notifier_call 的 ``void *data`` 参数传递。
  *
- * The notifier will NOT be called when changes are made through
- * drm_privacy_screen_set_sw_state(). It is only called for external changes.
+ * 注意：通过 drm_privacy_screen_set_sw_state() 进行的更改不会触发通知，
+ * 通知仅用于外部状态变化。
  *
- * Return: 0 on success, negative error code on failure.
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int drm_privacy_screen_register_notifier(struct drm_privacy_screen *priv,
 					 struct notifier_block *nb)
@@ -286,13 +324,13 @@ int drm_privacy_screen_register_notifier(struct drm_privacy_screen *priv,
 EXPORT_SYMBOL(drm_privacy_screen_register_notifier);
 
 /**
- * drm_privacy_screen_unregister_notifier - unregister a notifier
- * @priv: Privacy screen to register the notifier with
- * @nb: Notifier-block for the notifier to register
+ * drm_privacy_screen_unregister_notifier - 注销通知器
+ * @priv: 要注销通知器的隐私屏幕
+ * @nb: 要注销的通知器块
  *
- * Unregister a notifier registered with drm_privacy_screen_register_notifier().
+ * 注销之前通过 drm_privacy_screen_register_notifier() 注册的通知器。
  *
- * Return: 0 on success, negative error code on failure.
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int drm_privacy_screen_unregister_notifier(struct drm_privacy_screen *priv,
 					   struct notifier_block *nb)
@@ -377,16 +415,22 @@ static void drm_privacy_screen_device_release(struct device *dev)
 }
 
 /**
- * drm_privacy_screen_register - register a privacy-screen
- * @parent: parent-device for the privacy-screen
- * @ops: &struct drm_privacy_screen_ops pointer with ops for the privacy-screen
- * @data: Private data owned by the privacy screen provider
+ * drm_privacy_screen_register - 注册隐私屏幕
+ * @parent: 隐私屏幕的父设备
+ * @ops: 指向 &struct drm_privacy_screen_ops 的操作函数指针
+ * @data: 隐私屏幕提供者拥有的私有数据
  *
- * Create and register a privacy-screen.
+ * 创建并注册一个隐私屏幕设备。该函数会：
+ *   1. 分配并初始化隐私屏幕结构体
+ *   2. 设置互斥锁和通知器链表
+ *   3. 初始化设备结构体并设置设备名
+ *   4. 调用驱动的 get_hw_state 获取初始硬件状态
+ *   5. 注册设备到系统设备模型
+ *   6. 将隐私屏幕添加到全局设备列表
  *
- * Return:
- * * A pointer to the created privacy-screen on success.
- * * An ERR_PTR(errno) on failure.
+ * 返回：
+ * * 成功时返回指向创建的隐私屏幕的指针
+ * * 失败时返回 ERR_PTR(errno)
  */
 struct drm_privacy_screen *drm_privacy_screen_register(
 	struct device *parent, const struct drm_privacy_screen_ops *ops,
@@ -427,11 +471,16 @@ struct drm_privacy_screen *drm_privacy_screen_register(
 EXPORT_SYMBOL(drm_privacy_screen_register);
 
 /**
- * drm_privacy_screen_unregister - unregister privacy-screen
- * @priv: privacy-screen to unregister
+ * drm_privacy_screen_unregister - 注销隐私屏幕
+ * @priv: 要注销的隐私屏幕
  *
- * Unregister a privacy-screen registered with drm_privacy_screen_register().
- * May be called with a NULL or ERR_PTR, in which case it is a no-op.
+ * 注销之前通过 drm_privacy_screen_register() 注册的隐私屏幕。
+ * 该函数会：
+ *   1. 从全局设备列表中移除设备
+ *   2. 清空驱动数据和操作函数指针
+ *   3. 注销系统设备
+ *
+ * 可以传入 NULL 或 ERR_PTR，此时函数不执行任何操作。
  */
 void drm_privacy_screen_unregister(struct drm_privacy_screen *priv)
 {
@@ -452,18 +501,20 @@ void drm_privacy_screen_unregister(struct drm_privacy_screen *priv)
 EXPORT_SYMBOL(drm_privacy_screen_unregister);
 
 /**
- * drm_privacy_screen_call_notifier_chain - notify consumers of state change
- * @priv: Privacy screen to register the notifier with
+ * drm_privacy_screen_call_notifier_chain - 通知消费者状态已更改
+ * @priv: 要触发通知的隐私屏幕
  *
- * A privacy-screen provider driver can call this functions upon external
- * changes to the privacy-screen state. E.g. the state may be changed by the
- * hardware itself in response to a hotkey press.
- * This function must be called without holding the privacy-screen lock.
- * the driver must update sw_state and hw_state to reflect the new state before
- * calling this function.
- * The expected behavior from the driver upon receiving an external state
- * change event is: 1. Take the lock; 2. Update sw_state and hw_state;
- * 3. Release the lock. 4. Call drm_privacy_screen_call_notifier_chain().
+ * 隐私屏幕提供者驱动可以在外部状态更改时调用此函数。例如，硬件
+ * 自身可能因为用户按下热键而改变状态。
+ *
+ * 调用此函数时不能持有隐私屏幕锁。驱动必须在调用此函数之前更新
+ * sw_state 和 hw_state 以反映新状态。
+ *
+ * 驱动在收到外部状态更改事件时的预期行为：
+ *   1. 获取锁
+ *   2. 更新 sw_state 和 hw_state
+ *   3. 释放锁
+ *   4. 调用 drm_privacy_screen_call_notifier_chain()
  */
 void drm_privacy_screen_call_notifier_chain(struct drm_privacy_screen *priv)
 {

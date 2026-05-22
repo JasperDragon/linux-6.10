@@ -22,6 +22,27 @@
  * OF THIS SOFTWARE.
  */
 
+/*
+ * DRM 像素格式辅助 - 中文注释补充
+ *
+ * 本文件提供 DRM 像素格式（FourCC）的查询和转换辅助函数。
+ * DRM 使用四字符码（FourCC）唯一标识像素格式，每个格式定义了
+ * 颜色分量在内存中的排列方式。
+ *
+ * 主要功能：
+ *   1. legacy fb 格式转换：将传统的 bpp/depth 描述转换为 FourCC 格式
+ *   2. 格式信息查询：通过 drm_format_info() 获取格式的详细描述
+ *      （包括平面数、每像素字节数、色度采样、是否有 alpha 通道等）
+ *   3. 格式信息辅助：计算块宽度、块高度、每像素位数、最小 pitch
+ *
+ * 支持的格式涵盖：
+ *   - 索引色格式（C1/C2/C4/C8）
+ *   - RGB 格式（各种位深的 RGB/BGR/XRGB/ARGB 等）
+ *   - YUV 格式（平面/半平面/打包格式，各种采样率）
+ *   - 高动态范围格式（HDR，如 10/12/16 位格式）
+ *   - 自定义块格式（block-based 压缩格式）
+ */
+
 #include <linux/bug.h>
 #include <linux/ctype.h>
 #include <linux/export.h>
@@ -36,6 +57,11 @@
  * @depth: bit depth per pixel
  *
  * Computes a drm fourcc pixel format code for the given @bpp/@depth values.
+ */
+/*
+ * 中文说明：将传统的 bpp（每像素位数）和 depth（颜色深度）描述
+ * 转换为 DRM FourCC 像素格式码。用于处理遗留 fb 驱动和
+ * 传统用户空间的格式请求。
  */
 uint32_t drm_mode_legacy_fb_format(uint32_t bpp, uint32_t depth)
 {
@@ -114,6 +140,12 @@ EXPORT_SYMBOL(drm_mode_legacy_fb_format);
  * Unlike drm_mode_legacy_fb_format() this looks at the drivers mode_config,
  * and depending on the &drm_mode_config.quirk_addfb_prefer_host_byte_order flag
  * it returns little endian byte order or host byte order framebuffer formats.
+ */
+/*
+ * 中文说明：驱动级别的 legacy fb 格式转换。在基本转换基础上，
+ * 考虑驱动的 quirks 标志：
+ *   - quirk_addfb_prefer_host_byte_order：优先使用主机字节序
+ *   - quirk_addfb_prefer_xbgr_30bpp：使用 XBGR2101010 替代 XRGB2101010
  */
 uint32_t drm_driver_legacy_fb_format(struct drm_device *dev,
 				     uint32_t bpp, uint32_t depth)
@@ -404,6 +436,12 @@ const struct drm_format_info *__drm_format_info(u32 format)
  * The instance of struct drm_format_info that describes the pixel format, or
  * NULL if the format is unsupported.
  */
+/*
+ * 中文说明：查询给定 FourCC 像素格式的详细信息。
+ * 返回的信息包括：平面数、每像素字节数、块大小、
+ * 色度采样率、是否有 alpha 通道、是否为 YUV 等。
+ * 如果格式不支持，会触发 WARN 并返回 NULL。
+ */
 const struct drm_format_info *drm_format_info(u32 format)
 {
 	const struct drm_format_info *info;
@@ -423,6 +461,11 @@ EXPORT_SYMBOL(drm_format_info);
  * Returns:
  * The instance of struct drm_format_info that describes the pixel format, or
  * NULL if the format is unsupported.
+ */
+/*
+ * 中文说明：获取给定像素格式和修饰符（modifier）对应的格式信息。
+ * 优先使用驱动的 get_format_info 回调（可处理自定义格式和修饰符），
+ * 若驱动未实现则回退到标准 drm_format_info() 查询。
  */
 const struct drm_format_info *
 drm_get_format_info(struct drm_device *dev,
@@ -449,6 +492,11 @@ EXPORT_SYMBOL(drm_get_format_info);
  * Returns:
  * The width in pixels of a block, depending on the plane index.
  */
+/*
+ * 中文说明：获取指定平面的块宽度（像素单位）。
+ * 对于非块格式返回 1。块格式（如压缩纹理）使用
+ * block_w/block_h 描述一个压缩块覆盖的像素区域。
+ */
 unsigned int drm_format_info_block_width(const struct drm_format_info *info,
 					 int plane)
 {
@@ -468,6 +516,10 @@ EXPORT_SYMBOL(drm_format_info_block_width);
  *
  * Returns:
  * The height in pixels of a block, depending on the plane index.
+ */
+/*
+ * 中文说明：获取指定平面的块高度（像素单位）。
+ * 对于非块格式返回 1。与 drm_format_info_block_width() 配合使用。
  */
 unsigned int drm_format_info_block_height(const struct drm_format_info *info,
 					  int plane)
@@ -489,6 +541,11 @@ EXPORT_SYMBOL(drm_format_info_block_height);
  * Returns:
  * The actual number of bits per pixel, depending on the plane index.
  */
+/*
+ * 中文说明：计算指定平面的每像素位数（bpp）。
+ * 通过 char_per_block / (block_width * block_height) * 8 计算得出。
+ * 对于 YUV 半平面格式，chroma 平面的 bpp 会反映出采样率的影响。
+ */
 unsigned int drm_format_info_bpp(const struct drm_format_info *info, int plane)
 {
 	if (!info || plane < 0 || plane >= info->num_planes)
@@ -509,6 +566,11 @@ EXPORT_SYMBOL(drm_format_info_bpp);
  * Returns:
  * The minimum required pitch in bytes for a buffer by taking into consideration
  * the pixel format information and the buffer width.
+ */
+/*
+ * 中文说明：计算给定宽度下至少需要的 pitch（行跨度，字节数）。
+ * 考虑了块格式的对齐要求：pitch = ceil(width * char_per_block /
+ * (block_width * block_height))。用于 framebuffer 创建时的校验。
  */
 uint64_t drm_format_info_min_pitch(const struct drm_format_info *info,
 				   int plane, unsigned int buffer_width)

@@ -6,6 +6,23 @@
  * Hans de Goede <hdegoede@redhat.com>
  */
 
+/*
+ * x86 平台隐私屏幕支持
+ *
+ * 本文件实现了 x86 平台上隐私屏幕（privacy screen）提供者的自动
+ * 检测和查找功能。隐私屏幕是一种特殊的显示功能，可以在屏幕上覆盖
+ * 一层可切换的过滤层，使得只有正面视角的用户能够看到屏幕内容，
+ * 侧方视角则看不清，从而保护用户隐私。
+ *
+ * 在 x86 平台上，隐私屏幕功能通常通过以下方式实现：
+ *   - ThinkPad 笔记本：通过嵌入式控制器（EC）的 ACPI 接口控制
+ *   - ChromeOS 设备：通过专用的 ACPI 设备（GOOG0010）控制
+ *
+ * 本模块在启动时自动检测平台是否支持隐私屏幕功能，如果检测到，
+ * 则向隐私屏幕核心注册一个查找条目，使得 DRM 驱动程序能够找到
+ * 并使用对应的隐私屏幕提供者。
+ */
+
 #include <linux/acpi.h>
 #include <drm/drm_privacy_screen_machine.h>
 
@@ -80,6 +97,21 @@ static const struct arch_init_data arch_init_data[] __initconst = {
 #endif
 };
 
+/**
+ * drm_privacy_screen_lookup_init - 初始化 x86 平台隐私屏幕查找表
+ *
+ * 该函数在系统启动时被调用，用于检测当前 x86 平台是否支持隐私屏幕
+ * 功能。它遍历平台特定的检测函数列表，依次尝试检测已知的隐私屏幕
+ * 实现方式（如 ThinkPad EC 接口、ChromeOS ACPI 设备等）。
+ *
+ * 当检测到某个隐私屏幕提供者时：
+ *   1. 记录日志信息，指示找到了哪个提供者
+ *   2. 将对应的查找条目添加到隐私屏幕核心的静态查找列表中
+ *   3. 停止进一步检测（只使用第一个匹配的提供者）
+ *
+ * 此函数在系统启动早期被调用，确保 DRM 驱动初始化时能够找到
+ * 对应的隐私屏幕设备。
+ */
 void __init drm_privacy_screen_lookup_init(void)
 {
 	int i;
@@ -98,6 +130,12 @@ void __init drm_privacy_screen_lookup_init(void)
 	}
 }
 
+/**
+ * drm_privacy_screen_lookup_exit - 清理 x86 平台隐私屏幕查找表
+ *
+ * 该函数在系统关闭或模块卸载时被调用。如果之前已成功添加了隐私屏幕
+ * 查找条目，则将其从核心的静态查找列表中移除，完成清理工作。
+ */
 void drm_privacy_screen_lookup_exit(void)
 {
 	if (arch_lookup.provider)

@@ -22,6 +22,22 @@
  * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+/*
+ * 文件名: drm_pci.c
+ *
+ * 中文描述: DRM PCI 辅助函数
+ *
+ * 本文件提供了 DRM 子系统与 PCI 总线相关的辅助功能。PCI（Peripheral Component
+ * Interconnect，外设组件互连标准）是显卡设备最常用的总线接口之一。
+ *
+ * 核心功能：
+ *   1. drm_pci_set_busid() - 为 DRM master 设置 PCI 总线标识符
+ *   2. drm_get_pci_domain() - 获取 PCI domain 号（处理了 Alpha 架构的特殊情况）
+ *
+ * 总线标识符的格式为 "pci:domain:bus:device.function"，用于在用户空间唯一
+ * 标识一个 PCI 显卡设备。
+ */
+
 #include <linux/dma-mapping.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
@@ -35,6 +51,16 @@
 
 #include "drm_internal.h"
 
+/*
+ * drm_get_pci_domain - 获取 PCI domain 号
+ * @dev: DRM 设备
+ *
+ * 获取 PCI domain（域）号。在大多数架构上，由于历史原因，
+ * 为了保持用户空间接口兼容性，当驱动接口版本低于 1.4 时返回 0。
+ * 只有 Alpha 架构从一开始就正确地返回了 domain 号。
+ *
+ * 返回：PCI domain 号
+ */
 static int drm_get_pci_domain(struct drm_device *dev)
 {
 #ifndef __alpha__
@@ -49,6 +75,17 @@ static int drm_get_pci_domain(struct drm_device *dev)
 	return pci_domain_nr(to_pci_dev(dev->dev)->bus);
 }
 
+/*
+ * drm_pci_set_busid - 为 DRM master 设置 PCI 总线标识符
+ * @dev: DRM 设备
+ * @master: DRM master 对象
+ *
+ * 生成 PCI 总线标识符字符串，格式为 "pci:domain:bus:device.function"，
+ * 并将其设置到 master->unique 中。该标识符用于在用户空间唯一标识
+ * PCI 显卡设备，是 DRM 设备认证和查找的重要依据。
+ *
+ * 返回：0 成功，-ENOMEM 内存不足
+ */
 int drm_pci_set_busid(struct drm_device *dev, struct drm_master *master)
 {
 	struct pci_dev *pdev = to_pci_dev(dev->dev);

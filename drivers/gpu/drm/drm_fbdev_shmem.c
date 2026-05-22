@@ -1,5 +1,23 @@
 // SPDX-License-Identifier: MIT
 
+/*
+ * DRM fbdev SHMEM 模拟实现
+ *
+ * 本文件为使用 SHMEM（共享内存）后端的 DRM 驱动提供 fbdev 模拟支持。
+ * SHMEM 后端基于页式内存管理，支持内存交换，适用于需要较大帧缓冲
+ * 或更灵活内存管理的场景。
+ *
+ * 功能特点：
+ *   - 创建由 SHMEM 支持的 dumb 缓冲区 fbdev 帧缓冲
+ *   - 使用 deferred I/O 进行脏区域追踪
+ *   - 支持 mmap 操作，可选择 write-combine 映射
+ *   - 处理 fbdev 的 open/release/mmap/destroy 等文件操作
+ *
+ * 适用场景：
+ *   - 使用 drm_gem_shmem_helper 的驱动
+ *   - 需要内存交换支持的显示系统
+ */
+
 #include <linux/export.h>
 #include <linux/fb.h>
 
@@ -130,6 +148,23 @@ static const struct drm_fb_helper_funcs drm_fbdev_shmem_helper_funcs = {
  * struct drm_driver
  */
 
+/**
+ * drm_fbdev_shmem_driver_fbdev_probe - SHMEM fbdev 探测回调
+ * @fb_helper: fbdev 辅助结构
+ * @sizes: 所需的表面尺寸
+ *
+ * 这是 &drm_driver.fbdev_probe 的 SHMEM 实现。该函数：
+ *   1. 创建一个由 SHMEM 后端的 dumb 缓冲区支持的客户端缓冲区
+ *   2. 将缓冲区映射到内核地址空间
+ *   3. 设置 fbdev 信息结构（fbops, flags, 屏幕缓冲区）
+ *   4. 初始化 deferred I/O 用于脏区域追踪
+ *
+ * SHMEM 实现自动为 fbcon 设置 fb_deferred_io，并配置 get_page 回调
+ * 以便在页面级别追踪对帧缓冲的写入操作。
+ *
+ * 返回值：
+ * 成功返回 0，失败返回负的错误码。
+ */
 int drm_fbdev_shmem_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
 				       struct drm_fb_helper_surface_size *sizes)
 {

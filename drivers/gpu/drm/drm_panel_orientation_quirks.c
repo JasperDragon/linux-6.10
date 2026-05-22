@@ -8,6 +8,28 @@
  * must not depend on other drm code.
  */
 
+/*
+ * 面板方向特殊处理（quirks）模块
+ *
+ * 本文件提供面板方向（orientation）的特殊处理机制。在某些 x86
+ * 硬件平台上，设备使用的屏幕是竖屏（portrait）面板，但显示引擎
+ * 无法在硬件层面进行旋转。为了正确显示（特别是在 fbcon 控制台中），
+ * 需要通过软件方式对显示内容进行旋转补偿。
+ *
+ * 主要场景：
+ *   这类问题通常出现在一些廉价的小型平板/变形本设备上，这些设备
+ *   为了降低成本而使用了竖屏面板，但没有配套的硬件旋转能力。
+ *
+ * 工作原理：
+ *   通过 DMI 系统信息（厂商、产品名、BIOS 日期等）匹配特定设备，
+ *   并结合屏幕分辨率进行二次确认以避免误匹配。返回正确的面板方向
+ *   值（如右旋90度、左旋90度等），供显示驱动进行软件旋转。
+ *
+ * 注意：
+ *   本文件中的 quirks 同时被 fbdev/efifb 共享，因此不能依赖其他
+ *   DRM 特有代码。这使得在早期的启动阶段（efifb）也能正确显示。
+ */
+
 #include <linux/dmi.h>
 #include <linux/export.h>
 #include <linux/module.h>
@@ -537,23 +559,25 @@ static const struct dmi_system_id orientation_data[] = {
 };
 
 /**
- * drm_get_panel_orientation_quirk - Check for panel orientation quirks
- * @width: width in pixels of the panel
- * @height: height in pixels of the panel
+ * drm_get_panel_orientation_quirk - 检查面板方向特殊处理
+ * @width: 面板宽度（像素）
+ * @height: 面板高度（像素）
  *
- * This function checks for platform specific (e.g. DMI based) quirks
- * providing info on panel_orientation for systems where this cannot be
- * probed from the hard-/firm-ware. To avoid false-positive this function
- * takes the panel resolution as argument and checks that against the
- * resolution expected by the quirk-table entry.
+ * 该函数检查平台特定（如基于 DMI 的）特殊处理配置，提供无法从
+ * 硬件/固件正确探测的面板方向信息。为了避免误匹配，该函数接受
+ * 面板分辨率作为参数，并与特殊处理表中的分辨率进行对比验证。
  *
- * Note this function is also used outside of the drm-subsys, by for example
- * the efifb code. Because of this this function gets compiled into its own
- * kernel-module when built as a module.
+ * 需要注意的是，此函数也用于 DRM 子系统之外的其他组件（如 efifb
+ * 代码）。因此，该函数在作为模块构建时会被编译到独立的内核模块中。
  *
- * Returns:
- * A DRM_MODE_PANEL_ORIENTATION_* value if there is a quirk for this system,
- * or DRM_MODE_PANEL_ORIENTATION_UNKNOWN if there is no quirk.
+ * 匹配策略：
+ *   1. 首先通过 DMI 数据匹配设备型号
+ *   2. 然后验证面板分辨率是否匹配预期值
+ *   3. 如果条目包含 BIOS 日期限制，还需要验证 BIOS 日期
+ *
+ * 返回：
+ * 找到匹配时返回 DRM_MODE_PANEL_ORIENTATION_* 值，
+ * 未找到时返回 DRM_MODE_PANEL_ORIENTATION_UNKNOWN。
  */
 int drm_get_panel_orientation_quirk(int width, int height)
 {

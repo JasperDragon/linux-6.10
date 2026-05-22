@@ -27,6 +27,34 @@
  *      Dave Airlie <airlied@linux.ie>
  *      Jesse Barnes <jesse.barnes@intel.com>
  */
+
+/*
+ * DRM fbdev 模拟辅助函数
+ *
+ * 本文件是 DRM fbdev 模拟层的核心实现，在 DRM KMS 驱动之上提供一个
+ * 兼容的 fbdev 接口。它使得传统的 fbdev 用户空间程序（如 fbcon）
+ * 可以在不修改的情况下运行在现代 DRM 驱动之上。
+ *
+ * 主要功能：
+ *   - 初始化和配置 fbdev 模拟（drm_fb_helper_init/initial_config）
+ *   - 实现标准的 fbdev 文件操作（fb_check_var, fb_set_par, fb_pan_display 等）
+ *   - 处理热插拔事件和显示配置更改（drm_fb_helper_hotplug_event）
+ *   - 管理脏区域追踪和刷新（damage tracking）
+ *   - 电源管理（DPMS 控制和 suspend/resume）
+ *   - 颜色映射表设置（setcmap）
+ *
+ * 工作流程：
+ *   1. 驱动调用 drm_fb_helper_prepare() 和 drm_fb_helper_init() 进行初始化
+ *   2. drm_fb_helper_initial_config() 探测连接器并初始化显示配置
+ *   3. 运行时通过 drm_fb_helper_hotplug_event() 响应热插拔事件
+ *   4. 驱动卸载时调用 drm_fb_helper_fini() 清理资源
+ *
+ * 自刷新机制：
+ *   如果 &drm_framebuffer_funcs.dirty 设置了，fbdev 辅助函数会累积
+ *   脏区域的变化并调度 &drm_fb_helper.dirty_work 工作队列进行刷新。
+ *   确保了脏区域回调总是在进程上下文中执行（因为 fb_* 函数可能在
+ *   原子上下文中运行）。
+ */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/console.h>
@@ -153,16 +181,16 @@ __drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper,
 }
 
 /**
- * drm_fb_helper_restore_fbdev_mode_unlocked - restore fbdev configuration
- * @fb_helper: driver-allocated fbdev helper, can be NULL
- * @force: ignore present DRM master
+ * drm_fb_helper_restore_fbdev_mode_unlocked - 恢复 fbdev 配置
+ * @fb_helper: 驱动分配的 fbdev 辅助结构，可以为 NULL
+ * @force: 是否忽略当前 DRM master（强制恢复）
  *
- * This helper should be called from fbdev emulation's &drm_client_funcs.restore
- * callback. It ensures that the user isn't greeted with a black screen when the
- * userspace compositor releases the display device.
+ * 此辅助函数应从 fbdev 模拟的 &drm_client_funcs.restore 回调中调用。
+ * 当用户空间合成器释放显示设备时，确保用户不会面对黑屏。
+ * 在 Xorg 退出时，master 状态变化后，此函数将显示恢复到 fbdev 控制台。
  *
- * Returns:
- * 0 on success, or a negative errno code otherwise.
+ * 返回值：
+ * 成功返回 0，失败返回负的错误码。
  */
 int drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper, bool force)
 {
@@ -180,9 +208,13 @@ static void drm_fb_helper_dpms(struct fb_info *info, int dpms_mode)
 }
 
 /**
- * drm_fb_helper_blank - implementation for &fb_ops.fb_blank
- * @blank: desired blanking state
- * @info: fbdev registered by the helper
+ * drm_fb_helper_blank - 实现 &fb_ops.fb_blank 回调
+ * @blank: 所需的空白（blank）状态
+ * @info: 由辅助函数注册的 fbdev 实例
+ *
+ * 处理 fbdev 的空白/取消空白操作。将 fbdev 的空白请求映射到
+ * DRM 的 DPMS 状态（DRM_MODE_DPMS_ON/OFF/STANDBY/SUSPEND）。
+ * 在 oops 进行中时返回 -EBUSY 以防止死锁。
  */
 int drm_fb_helper_blank(int blank, struct fb_info *info)
 {
@@ -276,14 +308,17 @@ static void drm_fb_helper_damage_work(struct work_struct *work)
 }
 
 /**
- * drm_fb_helper_prepare - setup a drm_fb_helper structure
- * @dev: DRM device
- * @helper: driver-allocated fbdev helper structure to set up
- * @preferred_bpp: Preferred bits per pixel for the device.
- * @funcs: pointer to structure of functions associate with this helper
+ * drm_fb_helper_prepare - 设置 drm_fb_helper 结构的最小初始化
+ * @dev: DRM 设备
+ * @helper: 驱动分配的 fbdev 辅助结构
+ * @preferred_bpp: 设备的首选每像素位数
+ * @funcs: 与此辅助结构关联的函数表
  *
- * Sets up the bare minimum to make the framebuffer helper usable. This is
- * useful to implement race-free initialization of the polling helpers.
+ * 完成使帧缓冲辅助功能可用所需的最小初始化。
+ * 这对于实现轮询辅助函数的竞态安全初始化非常有用。
+ *
+ * 如果 preferred_bpp == 0，会自动选择 32bpp（即 XRGB8888 格式），
+ * 因为所有驱动都必须向后兼容支持 XRGB8888。
  */
 void drm_fb_helper_prepare(struct drm_device *dev, struct drm_fb_helper *helper,
 			   unsigned int preferred_bpp,
@@ -315,10 +350,11 @@ void drm_fb_helper_prepare(struct drm_device *dev, struct drm_fb_helper *helper,
 EXPORT_SYMBOL(drm_fb_helper_prepare);
 
 /**
- * drm_fb_helper_unprepare - clean up a drm_fb_helper structure
- * @fb_helper: driver-allocated fbdev helper structure to set up
+ * drm_fb_helper_unprepare - 清理 drm_fb_helper 结构
+ * @fb_helper: 驱动分配的 fbdev 辅助结构
  *
- * Cleans up the framebuffer helper. Inverse of drm_fb_helper_prepare().
+ * 清理帧缓冲辅助结构，是 drm_fb_helper_prepare() 的逆操作。
+ * 销毁在 prepare 中初始化的互斥锁。
  */
 void drm_fb_helper_unprepare(struct drm_fb_helper *fb_helper)
 {
@@ -327,19 +363,18 @@ void drm_fb_helper_unprepare(struct drm_fb_helper *fb_helper)
 EXPORT_SYMBOL(drm_fb_helper_unprepare);
 
 /**
- * drm_fb_helper_init - initialize a &struct drm_fb_helper
- * @dev: drm device
- * @fb_helper: driver-allocated fbdev helper structure to initialize
+ * drm_fb_helper_init - 初始化 &struct drm_fb_helper
+ * @dev: DRM 设备
+ * @fb_helper: 驱动分配的 fbdev 辅助结构
  *
- * This allocates the structures for the fbdev helper with the given limits.
- * Note that this won't yet touch the hardware (through the driver interfaces)
- * nor register the fbdev. This is only done in drm_fb_helper_initial_config()
- * to allow driver writes more control over the exact init sequence.
+ * 初始化 fbdev 辅助结构。注意，此时还不会接触硬件（通过驱动接口）
+ * 也不会注册 fbdev。真正的硬件初始化和注册在 drm_fb_helper_initial_config()
+ * 中完成，这样驱动可以对初始化序列有更多控制权。
  *
- * Drivers must call drm_fb_helper_prepare() before calling this function.
+ * 驱动必须在调用此函数之前先调用 drm_fb_helper_prepare()。
  *
- * RETURNS:
- * Zero if everything went ok, nonzero otherwise.
+ * 返回值：
+ * 成功返回 0，失败返回非零错误码。
  */
 int drm_fb_helper_init(struct drm_device *dev,
 		       struct drm_fb_helper *fb_helper)
@@ -393,12 +428,11 @@ static void drm_fb_helper_release_info(struct drm_fb_helper *fb_helper)
 }
 
 /**
- * drm_fb_helper_unregister_info - unregister fb_info framebuffer device
- * @fb_helper: driver-allocated fbdev helper, must not be NULL
+ * drm_fb_helper_unregister_info - 注销 fb_info 帧缓冲设备
+ * @fb_helper: 驱动分配的 fbdev 辅助结构，不能为 NULL
  *
- * A wrapper around unregister_framebuffer, to release the fb_info
- * framebuffer device. This must be called before releasing all resources for
- * @fb_helper by calling drm_fb_helper_fini().
+ * unregister_framebuffer() 的封装，用于释放 fb_info 帧缓冲设备。
+ * 必须在调用 drm_fb_helper_fini() 释放 @fb_helper 的所有资源之前调用。
  */
 void drm_fb_helper_unregister_info(struct drm_fb_helper *fb_helper)
 {
@@ -407,10 +441,11 @@ void drm_fb_helper_unregister_info(struct drm_fb_helper *fb_helper)
 EXPORT_SYMBOL(drm_fb_helper_unregister_info);
 
 /**
- * drm_fb_helper_fini - finialize a &struct drm_fb_helper
- * @fb_helper: driver-allocated fbdev helper, can be NULL
+ * drm_fb_helper_fini - 终结 &struct drm_fb_helper
+ * @fb_helper: 驱动分配的 fbdev 辅助结构，可以为 NULL
  *
- * This cleans up all remaining resources associated with @fb_helper.
+ * 清理与 @fb_helper 关联的所有剩余资源。包括取消调度挂起的
+ * 恢复和脏区域工作队列，以及释放 fb_info 结构。
  */
 void drm_fb_helper_fini(struct drm_fb_helper *fb_helper)
 {
@@ -523,12 +558,16 @@ EXPORT_SYMBOL(drm_fb_helper_damage_area);
 
 #ifdef CONFIG_FB_DEFERRED_IO
 /**
- * drm_fb_helper_deferred_io() - fbdev deferred_io callback function
- * @info: fb_info struct pointer
- * @pagereflist: list of mmap framebuffer pages that have to be flushed
+ * drm_fb_helper_deferred_io() - fbdev deferred_io 回调函数
+ * @info: fb_info 结构指针
+ * @pagereflist: 需要刷新的 mmap 帧缓冲页面列表
  *
- * This function is used as the &fb_deferred_io.deferred_io
- * callback function for flushing the fbdev mmap writes.
+ * 用作 &fb_deferred_io.deferred_io 回调函数，用于刷新通过 mmap 写入
+ * 帧缓冲的脏区域。此函数收集所有脏页，将其转换为脏区域矩形，
+ * 然后调度脏区域工作队列进行实际的刷新操作。
+ *
+ * deferred I/O 机制允许用户空间通过 mmap 直接写入帧缓冲时，
+ * 延迟触发实际的刷新操作，从而将多次小的写入合并为一次批量更新。
  */
 void drm_fb_helper_deferred_io(struct fb_info *info, struct list_head *pagereflist)
 {
@@ -568,13 +607,12 @@ EXPORT_SYMBOL(drm_fb_helper_deferred_io);
 #endif
 
 /**
- * drm_fb_helper_set_suspend - wrapper around fb_set_suspend
- * @fb_helper: driver-allocated fbdev helper, can be NULL
- * @suspend: whether to suspend or resume
+ * drm_fb_helper_set_suspend - fb_set_suspend 的包装函数
+ * @fb_helper: 驱动分配的 fbdev 辅助结构，可以为 NULL
+ * @suspend: 是否挂起（true=挂起，false=恢复）
  *
- * A wrapper around fb_set_suspend implemented by fbdev core.
- * Use drm_fb_helper_set_suspend_unlocked() if you don't need to take
- * the lock yourself
+ * fbdev 核心提供的 fb_set_suspend() 函数的简单包装。
+ * 如果不需要自己获取控制台锁，请使用 drm_fb_helper_set_suspend_unlocked()。
  */
 void drm_fb_helper_set_suspend(struct drm_fb_helper *fb_helper, bool suspend)
 {
@@ -589,20 +627,19 @@ void drm_fb_helper_set_suspend(struct drm_fb_helper *fb_helper, bool suspend)
 EXPORT_SYMBOL(drm_fb_helper_set_suspend);
 
 /**
- * drm_fb_helper_set_suspend_unlocked - wrapper around fb_set_suspend that also
- *                                      takes the console lock
- * @fb_helper: driver-allocated fbdev helper, can be NULL
- * @suspend: whether to suspend or resume
+ * drm_fb_helper_set_suspend_unlocked - 包装 fb_set_suspend 并自动获取控制台锁
+ * @fb_helper: 驱动分配的 fbdev 辅助结构，可以为 NULL
+ * @suspend: 是否挂起（true=挂起，false=恢复）
  *
- * A wrapper around fb_set_suspend() that takes the console lock. If the lock
- * isn't available on resume, a worker is tasked with waiting for the lock
- * to become available. The console lock can be pretty contented on resume
- * due to all the printk activity.
+ * fb_set_suspend() 的包装函数，自动处理控制台锁的获取。
+ * 如果在恢复时控制台锁不可用（被其他线程持有），会调度一个工作项
+ * 在后台等待锁可用后再执行恢复。这是因为在恢复过程中控制台锁
+ * 的竞争可能非常激烈（由于大量的 printk 活动）。
  *
- * This function can be called multiple times with the same state since
- * &fb_info.state is checked to see if fbdev is running or not before locking.
+ * 此函数可以以相同状态多次调用，因为在加锁前会检查 &fb_info.state
+ * 来确定 fbdev 是否正在运行。
  *
- * Use drm_fb_helper_set_suspend() if you need to take the lock yourself.
+ * 如果需要自己获取控制台锁，请使用 drm_fb_helper_set_suspend()。
  */
 void drm_fb_helper_set_suspend_unlocked(struct drm_fb_helper *fb_helper,
 					bool suspend)
@@ -845,9 +882,14 @@ backoff:
 }
 
 /**
- * drm_fb_helper_setcmap - implementation for &fb_ops.fb_setcmap
- * @cmap: cmap to set
- * @info: fbdev registered by the helper
+ * drm_fb_helper_setcmap - 实现 &fb_ops.fb_setcmap 回调
+ * @cmap: 要设置的颜色映射表
+ * @info: 由辅助函数注册的 fbdev 实例
+ *
+ * 设置 fbdev 的颜色映射表（colormap/ palette）。根据驱动类型选择不同的路径：
+ *   - 真彩色（TrueColor）：填充伪调色板
+ *   - 原子驱动：使用 atomic commit 设置 gamma LUT
+ *   - 传统驱动：使用 gamma_set 回调设置 gamma 值
  */
 int drm_fb_helper_setcmap(struct fb_cmap *cmap, struct fb_info *info)
 {
@@ -883,13 +925,16 @@ unlock:
 EXPORT_SYMBOL(drm_fb_helper_setcmap);
 
 /**
- * drm_fb_helper_ioctl - legacy ioctl implementation
- * @info: fbdev registered by the helper
- * @cmd: ioctl command
- * @arg: ioctl argument
+ * drm_fb_helper_ioctl - 传统 fbdev ioctl 实现
+ * @info: 由辅助函数注册的 fbdev 实例
+ * @cmd: ioctl 命令
+ * @arg: ioctl 参数
  *
- * A helper to implement the standard fbdev ioctl. Only
- * FBIO_WAITFORVSYNC is implemented for now.
+ * 实现标准 fbdev ioctl 的辅助函数。当前只实现了 FBIO_WAITFORVSYNC。
+ * 其他 ioctl 命令返回 -ENOTTY（未实现）。
+ *
+ * FBIO_WAITFORVSYNC 实现中只考虑第一个 CRTC（索引 0），
+ * 因为历史上用户空间的实现通常是硬编码 0 作为参数。
  */
 int drm_fb_helper_ioctl(struct fb_info *info, unsigned int cmd,
 			unsigned long arg)
@@ -1032,9 +1077,13 @@ static void __fill_var(struct fb_var_screeninfo *var, struct fb_info *info,
 }
 
 /**
- * drm_fb_helper_check_var - implementation for &fb_ops.fb_check_var
- * @var: screeninfo to check
- * @info: fbdev registered by the helper
+ * drm_fb_helper_check_var - 实现 &fb_ops.fb_check_var 回调
+ * @var: 要检查的屏幕变量信息
+ * @info: 由辅助函数注册的 fbdev 实例
+ *
+ * 验证用户空间请求的帧缓冲变量设置是否有效。
+ * fbdev 模拟不支持改变像素时钟、像素格式或超过当前帧缓冲尺寸的分辨率。
+ * 还特别处理了 SDL 1.2 将所有像素格式字段设置为 0 的兼容性问题。
  */
 int drm_fb_helper_check_var(struct fb_var_screeninfo *var,
 			    struct fb_info *info)
@@ -1128,12 +1177,15 @@ int drm_fb_helper_check_var(struct fb_var_screeninfo *var,
 EXPORT_SYMBOL(drm_fb_helper_check_var);
 
 /**
- * drm_fb_helper_set_par - implementation for &fb_ops.fb_set_par
- * @info: fbdev registered by the helper
+ * drm_fb_helper_set_par - 实现 &fb_ops.fb_set_par 回调
+ * @info: 由辅助函数注册的 fbdev 实例
  *
- * This will let fbcon do the mode init and is called at initialization time by
- * the fbdev core when registering the driver, and later on through the hotplug
- * callback.
+ * 设置帧缓冲参数。这会让 fbcon 进行模式初始化，
+ * 在驱动注册时由 fbdev 核心在初始化时调用，以及后续通过热插拔回调调用。
+ *
+ * 特殊处理 FB_ACTIVATE_KD_TEXT 标志：当 Xorg 退出时，它会先将
+ * 虚拟终端切换回文本模式（使用 KDSET IOCTL 和 KD_TEXT），然后再
+ * 释放 master 权限。此时需要强制恢复 fbdev 模式以确保控制台可见。
  */
 int drm_fb_helper_set_par(struct fb_info *info)
 {
@@ -1229,9 +1281,13 @@ static int pan_display_legacy(struct fb_var_screeninfo *var,
 }
 
 /**
- * drm_fb_helper_pan_display - implementation for &fb_ops.fb_pan_display
- * @var: updated screen information
- * @info: fbdev registered by the helper
+ * drm_fb_helper_pan_display - 实现 &fb_ops.fb_pan_display 回调
+ * @var: 更新的屏幕变量信息
+ * @info: 由辅助函数注册的 fbdev 实例
+ *
+ * 处理 fbdev 的显示平移（panning）操作。当帧缓冲大于显示区域时，
+ * 可以通过偏移 x/y 来滚动显示区域。该函数根据驱动类型选择
+ * 原子或传统路径来更新 CRTC 的显示偏移。
  */
 int drm_fb_helper_pan_display(struct fb_var_screeninfo *var,
 			      struct fb_info *info)
@@ -1510,17 +1566,16 @@ static void drm_fb_helper_fill_var(struct fb_info *info,
 }
 
 /**
- * drm_fb_helper_fill_info - initializes fbdev information
- * @info: fbdev instance to set up
- * @fb_helper: fb helper instance to use as template
- * @sizes: describes fbdev size and scanout surface size
+ * drm_fb_helper_fill_info - 初始化 fbdev 信息结构
+ * @info: 要设置的 fbdev 实例
+ * @fb_helper: 作为模板的 fb helper 实例
+ * @sizes: 描述 fbdev 尺寸和扫描输出表面尺寸
  *
- * Sets up the variable and fixed fbdev metainformation from the given fb helper
- * instance and the drm framebuffer allocated in &drm_fb_helper.fb.
+ * 根据给定的 fb helper 实例和在 &drm_fb_helper.fb 中分配的 drm 帧缓冲，
+ * 设置 fbdev 的变量（var）和固定（fix）元信息。
  *
- * Drivers should call this (or their equivalent setup code) from their
- * &drm_driver.fbdev_probe callback after having allocated the fbdev
- * backing storage framebuffer.
+ * 驱动应在其 &drm_driver.fbdev_probe 回调中，分配了 fbdev 后端存储
+ * 帧缓冲之后调用此函数（或调用其等效的初始化代码）。
  */
 void drm_fb_helper_fill_info(struct fb_info *info,
 			     struct drm_fb_helper *fb_helper,
@@ -1668,44 +1723,29 @@ err_drm_fb_helper_release_info:
 }
 
 /**
- * drm_fb_helper_initial_config - setup a sane initial connector configuration
- * @fb_helper: fb_helper device struct
+ * drm_fb_helper_initial_config - 设置初始连接器配置
+ * @fb_helper: fb_helper 设备结构
  *
- * Scans the CRTCs and connectors and tries to put together an initial setup.
- * At the moment, this is a cloned configuration across all heads with
- * a new framebuffer object as the backing store.
+ * 扫描所有 CRTC 和连接器，尝试构建一个初始显示配置。
+ * 初始配置在所有显示头上进行克隆，并使用一个新的帧缓冲对象作为后端存储。
  *
- * Note that this also registers the fbdev and so allows userspace to call into
- * the driver through the fbdev interfaces.
+ * 注意：此函数会注册 fbdev，从而允许用户空间通过 fbdev 接口
+ * 调用到驱动中。同时会调用 &drm_driver.fbdev_probe 回调，
+ * 让驱动分配和初始化 fbdev 信息结构以及用来支持 fbdev 的 drm 帧缓冲。
  *
- * This function will call down into the &drm_driver.fbdev_probe callback
- * to let the driver allocate and initialize the fbdev info structure and the
- * drm framebuffer used to back the fbdev. drm_fb_helper_fill_info() is provided
- * as a helper to setup simple default values for the fbdev info structure.
+ * 调试说明：
+ * 如果 fbcon 编译进内核或已加载，此函数会执行一次完整的模设设置来
+ * 建立 fbdev 控制台。由于 VT/fbdev 子系统的锁设计问题，整个模式设置
+ * 序列必须在持有 console_lock 的情况下进行。在 console_unlock 之前，
+ * 不会有任何 dmesg 行发送到控制台（包括串行控制台）。
+ * 这意味着如果驱动崩溃，你将看不到任何输出。
  *
- * HANG DEBUGGING:
+ * 调试技巧：
+ * - 设置 fb.lockless_register_fb=1 内核参数以绕过 console_lock
+ * - 设置 drm_kms_helper.fbdev_emulation=0 禁用 fbdev 模拟
  *
- * When you have fbcon support built-in or already loaded, this function will do
- * a full modeset to setup the fbdev console. Due to locking misdesign in the
- * VT/fbdev subsystem that entire modeset sequence has to be done while holding
- * console_lock. Until console_unlock is called no dmesg lines will be sent out
- * to consoles, not even serial console. This means when your driver crashes,
- * you will see absolutely nothing else but a system stuck in this function,
- * with no further output. Any kind of printk() you place within your own driver
- * or in the drm core modeset code will also never show up.
- *
- * Standard debug practice is to run the fbcon setup without taking the
- * console_lock as a hack, to be able to see backtraces and crashes on the
- * serial line. This can be done by setting the fb.lockless_register_fb=1 kernel
- * cmdline option.
- *
- * The other option is to just disable fbdev emulation since very likely the
- * first modeset from userspace will crash in the same way, and is even easier
- * to debug. This can be done by setting the drm_kms_helper.fbdev_emulation=0
- * kernel cmdline option.
- *
- * RETURNS:
- * Zero if everything went ok, nonzero otherwise.
+ * 返回值：
+ * 成功返回 0，失败返回非零错误码。
  */
 int drm_fb_helper_initial_config(struct drm_fb_helper *fb_helper)
 {
@@ -1722,25 +1762,20 @@ int drm_fb_helper_initial_config(struct drm_fb_helper *fb_helper)
 EXPORT_SYMBOL(drm_fb_helper_initial_config);
 
 /**
- * drm_fb_helper_hotplug_event - respond to a hotplug notification by
- *                               probing all the outputs attached to the fb
- * @fb_helper: driver-allocated fbdev helper, can be NULL
+ * drm_fb_helper_hotplug_event - 响应热插拔通知，重新探测所有输出
+ * @fb_helper: 驱动分配的 fbdev 辅助结构，可以为 NULL
  *
- * Scan the connectors attached to the fb_helper and try to put together a
- * setup after notification of a change in output configuration.
+ * 当输出配置发生变化时，扫描连接到 fb_helper 的连接器并尝试构建
+ * 新的显示配置。在运行时调用，需要获取模式配置锁以检查/更改
+ * 模式设置配置。必须在进程上下文中运行（通常是输出轮询工作或
+ * 从驱动的热插拔中断发起的工作项）。
  *
- * Called at runtime, takes the mode config locks to be able to check/change the
- * modeset configuration. Must be run from process context (which usually means
- * either the output polling work or a work item launched from the driver's
- * hotplug interrupt).
+ * 驱动可以在调用 drm_fb_helper_initial_config 之前调用此函数
+ * （但必须在 drm_fb_helper_init 之后）。这样可以实现无竞态的
+ * fbcon 设置，并确保 fbdev 模拟不会错过任何热插拔事件。
  *
- * Note that drivers may call this even before calling
- * drm_fb_helper_initial_config but only after drm_fb_helper_init. This allows
- * for a race-free fbcon setup and will make sure that the fbdev emulation will
- * not miss any hotplug events.
- *
- * RETURNS:
- * 0 on success and a non-zero error code otherwise.
+ * 返回值：
+ * 成功返回 0，失败返回非零错误码。
  */
 int drm_fb_helper_hotplug_event(struct drm_fb_helper *fb_helper)
 {
@@ -1776,16 +1811,18 @@ int drm_fb_helper_hotplug_event(struct drm_fb_helper *fb_helper)
 EXPORT_SYMBOL(drm_fb_helper_hotplug_event);
 
 /**
- * drm_fb_helper_gem_is_fb - Tests if GEM object is framebuffer
- * @fb_helper: fb_helper instance, can be NULL
- * @obj: The GEM object to test, can be NULL
+ * drm_fb_helper_gem_is_fb - 测试 GEM 对象是否为 fbdev 的帧缓冲
+ * @fb_helper: fb_helper 实例，可以为 NULL
+ * @obj: 要测试的 GEM 对象，可以为 NULL
  *
- * Call drm_fb_helper_gem_is_fb to test is a DRM device's fbdev emulation
- * uses the specified GEM object for its framebuffer. The result is always
- * false if either poiner is NULL.
+ * 测试 DRM 设备的 fbdev 模拟是否使用指定的 GEM 对象作为其帧缓冲。
+ * 如果任一指针为 NULL，结果始终为 false。
  *
- * Returns:
- * True if fbdev emulation uses the provided GEM object, or false otherwise.
+ * 这在某些需要判断一个 GEM 对象是否被 fbdev 使用的场景中非常有用，
+ * 例如在内存回收时避免回收正在被 fbdev 使用的缓冲区。
+ *
+ * 返回值：
+ * 如果 fbdev 模拟使用了提供的 GEM 对象返回 true，否则返回 false。
  */
 bool drm_fb_helper_gem_is_fb(const struct drm_fb_helper *fb_helper,
 			     const struct drm_gem_object *obj)

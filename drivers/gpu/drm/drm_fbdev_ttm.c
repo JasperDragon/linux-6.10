@@ -1,5 +1,23 @@
 // SPDX-License-Identifier: MIT
 
+/*
+ * DRM fbdev TTM 模拟实现
+ *
+ * 本文件为使用 TTM（Translation Table Manager）内存管理后端的
+ * DRM 驱动提供 fbdev 模拟支持。TTM 是 DRM 中最早的内存管理器，
+ * 支持 VRAM、GTT 等多种内存域以及内存迁移操作。
+ *
+ * 功能特点：
+ *   - 创建由 TTM 管理的 dumb 缓冲区 fbdev 帧缓冲
+ *   - 使用 shadow buffer 进行脏区域追踪和刷新
+ *   - 在刷新时通过 vmap_local/vunmap_local 安全地访问缓冲
+ *   - 支持 deferred I/O 和脏区域回调
+ *
+ * 适用场景：
+ *   - 使用 TTM 内存管理的 DRM 驱动（如大多数独立 GPU）
+ *   - 需要 VRAM 管理的显示系统
+ */
+
 #include <linux/export.h>
 #include <linux/moduleparam.h>
 #include <linux/vmalloc.h>
@@ -169,6 +187,24 @@ static const struct drm_fb_helper_funcs drm_fbdev_ttm_helper_funcs = {
  * struct drm_driver
  */
 
+/**
+ * drm_fbdev_ttm_driver_fbdev_probe - TTM fbdev 探测回调
+ * @fb_helper: fbdev 辅助结构
+ * @sizes: 所需的表面尺寸
+ *
+ * 这是 &drm_driver.fbdev_probe 的 TTM 实现。该函数：
+ *   1. 创建一个由 TTM 后端的 dumb 缓冲区支持的客户端缓冲区
+ *   2. 分配 shadow buffer（系统内存中的影子缓冲区）
+ *   3. 设置 fbdev 信息结构
+ *   4. 初始化 deferred I/O 用于脏区域追踪
+ *
+ * 与 DMA/SHMEM 实现不同，TTM 不使用直接映射，而是通过 shadow buffer
+ * 和缓存脏区域后通过 damage_blit 将变化复制到 TTM 管理的帧缓冲中。
+ * 这种设计避免了在 TTM 缓冲上进行昂贵的页面错误处理。
+ *
+ * 返回值：
+ * 成功返回 0，失败返回负的错误码。
+ */
 int drm_fbdev_ttm_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
 				     struct drm_fb_helper_surface_size *sizes)
 {

@@ -25,6 +25,25 @@
  *
  */
 
+/*
+ * DRM KMS 辅助模块通用文件
+ *
+ * 本文件是 DRM KMS（内核模式设置）辅助模块的入口点。
+ * KMS 辅助模块提供了一组通用的辅助函数，用于简化 DRM 驱动程序的开发。
+ * 这些函数涵盖了模式设置、显示管道管理、输出轮询、framebuffer 处理等
+ * 多个方面的通用操作，帮助驱动开发者避免重复实现相同的功能逻辑。
+ *
+ * 本模块的核心功能分布在多个辅助文件中：
+ *   - drm_atomic_helper.c: 原子接口辅助函数
+ *   - drm_crtc_helper.c: CRTC 辅助函数
+ *   - drm_plane_helper.c: 平面辅助函数
+ *   - drm_probe_helper.c: 输出探测辅助函数
+ *   - drm_fb_helper.c: framebuffer 辅助函数
+ *
+ * 本文件仅包含模块的许可证和作者信息，实际的辅助函数实现分散在
+ * 各个子模块中。
+ */
+
 #include <linux/module.h>
 
 MODULE_AUTHOR("David Airlie, Jesse Barnes");

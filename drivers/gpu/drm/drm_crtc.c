@@ -29,6 +29,29 @@
  *      Dave Airlie <airlied@linux.ie>
  *      Jesse Barnes <jesse.barnes@intel.com>
  */
+
+/*
+ * drm_crtc.c -- CRTC（阴极射线管控制器）管理核心
+ *
+ * CRTC 是整个显示管线的核心控制器，负责从 plane（平面）接收像素数据、
+ * 进行合成（blending），并将最终图像数据发送到 encoder（编码器）。
+ * 每个 CRTC 都关联一个显示模式（drm_display_mode），用于控制显示时序。
+ *
+ * 核心职责包括：
+ *   1. 管理显示管线的整体配置（分辨率、刷新率等）
+ *   2. 协调 primary plane 和 cursor plane 的合成
+ *   3. 处理传统 modeset 操作（set_config、page_flip 等）
+ *   4. 管理 CRTC 的电源状态（ACTIVE 属性）
+ *   5. 提供 vblank 相关功能
+ *
+ * 关键 API：
+ *   - drm_crtc_init_with_planes() / drmm_crtc_init_with_planes(): CRTC 初始化
+ *   - drm_crtc_cleanup(): CRTC 清理
+ *   - drm_mode_setcrtc(): 用户态设置 CRTC 配置的 ioctl 入口
+ *   - drm_crtc_create_scaling_filter_property(): 创建缩放滤镜属性
+ *   - drm_crtc_in_clone_mode(): 检查 CRTC 是否处于克隆模式
+ */
+
 #include <linux/ctype.h>
 #include <linux/list.h>
 #include <linux/slab.h>
@@ -71,6 +94,17 @@
  * operations like &drm_crtc_funcs.gamma_set. For atomic drivers all these
  * features are controlled through &drm_property and
  * &drm_mode_config_funcs.atomic_check.
+ */
+
+/*
+ * drm_crtc_from_index -- 通过索引查找已注册的 CRTC
+ *
+ * 给定一个 CRTC 索引值，在 DRM 设备的 CRTC 列表中查找并返回匹配的 CRTC
+ * 对象指针。该函数是 drm_crtc_index() 的逆操作，主要用于 vblank 回调
+ *（如 enable_vblank/disable_vblank）中，因为这些回调仍使用索引而非
+ * CRTC 对象指针来标识 CRTC。
+ *
+ * 返回值：匹配的 CRTC 指针，未找到则返回 NULL。
  */
 
 /**
@@ -327,6 +361,22 @@ static int __drm_crtc_init_with_planes(struct drm_device *dev, struct drm_crtc *
 	return 0;
 }
 
+/*
+ * drm_crtc_init_with_planes -- 使用指定的 primary 和 cursor plane 初始化 CRTC 对象
+ *
+ * 初始化驱动 CRTC 对象的基本部分。驱动应优先使用此函数而非已废弃的
+ * drm_crtc_init()。该函数会：
+ *   1. 将 CRTC 对象添加到 DRM 设备对象空间
+ *   2. 关联 primary plane 和 cursor plane
+ *   3. 为 atomic 驱动附加 ACTIVE、MODE_ID、OUT_FENCE_PTR 等标准属性
+ *   4. 初始化 fence 上下文用于同步
+ *
+ * 注意：推荐使用 drmm_crtc_alloc_with_planes() 或 drmm_crtc_init_with_planes()
+ * 来利用 DRM 托管资源基础设施自动处理清理和释放。
+ *
+ * 返回值：成功返回 0，失败返回负的错误码。
+ */
+
 /**
  * drm_crtc_init_with_planes - Initialise a new CRTC object with
  *    specified primary and cursor planes.
@@ -488,6 +538,20 @@ void *__drmm_crtc_alloc_with_planes(struct drm_device *dev,
 	return container;
 }
 EXPORT_SYMBOL(__drmm_crtc_alloc_with_planes);
+
+/*
+ * drm_crtc_cleanup -- 清理 CRTC 核心资源
+ *
+ * 清理指定的 CRTC 对象并将其从 DRM 模式设置核心中移除。该函数会：
+ *   1. 释放 CRC 相关资源
+ *   2. 释放 gamma 查找表存储
+ *   3. 销毁 modeset 锁
+ *   4. 从 CRTC 列表中删除并递减设备 CRTC 计数
+ *   5. 销毁 atomic 状态对象（如果存在）
+ *
+ * 注意：此函数不释放 CRTC 结构体本身，释放由调用者负责。
+ * CRTC 结构体不应使用 devm_kzalloc() 分配。
+ */
 
 /**
  * drm_crtc_cleanup - Clean up the core crtc usage
@@ -663,6 +727,15 @@ int drm_mode_set_config_internal(struct drm_mode_set *set)
 	return __drm_mode_set_config_internal(set, NULL);
 }
 EXPORT_SYMBOL(drm_mode_set_config_internal);
+
+/*
+ * drm_crtc_check_viewport -- 检查 framebuffer 是否足够容纳 CRTC 视口
+ *
+ * 验证 framebuffer 的尺寸是否满足 CRTC 显示模式的要求（考虑 panning
+ * 偏移量）。对于启用了 90/270 度旋转的 CRTC，还会交换宽高判断。
+ *
+ * 返回值：尺寸足够返回 0，不足返回负的错误码。
+ */
 
 /**
  * drm_crtc_check_viewport - Checks that a framebuffer is big enough for the
@@ -925,6 +998,18 @@ int drm_mode_crtc_set_obj_prop(struct drm_mode_object *obj,
 	return ret;
 }
 
+/*
+ * drm_crtc_create_scaling_filter_property -- 创建 CRTC 缩放滤镜属性
+ *
+ * 为 CRTC 创建并附加缩放滤镜（scaling filter）属性，允许用户空间选择
+ * 不同的缩放算法。支持的滤镜类型包括默认（Default）和最近邻
+ *（Nearest Neighbor），通过 supported_filters 位掩码指定。
+ *
+ * @supported_filters 必须包含 BIT(DRM_SCALING_FILTER_DEFAULT)。
+ *
+ * 返回值：成功返回 0，失败返回负的错误码。
+ */
+
 /**
  * drm_crtc_create_scaling_filter_property - create a new scaling filter
  * property
@@ -956,6 +1041,16 @@ int drm_crtc_create_scaling_filter_property(struct drm_crtc *crtc,
 }
 EXPORT_SYMBOL(drm_crtc_create_scaling_filter_property);
 
+/*
+ * drm_crtc_create_sharpness_strength_property -- 创建 CRTC 锐度强度属性
+ *
+ * 创建范围为 0-255 的 SHARPNESS_STRENGTH 属性，允许用户空间调节
+ * 显示内容的锐化强度。0 表示禁用锐化功能，1-255 表示不同程度的锐化。
+ * 该属性不需要 modeset 操作即可生效，锐化效果在合成后的最终输出上应用。
+ *
+ * 返回值：成功返回 0，失败返回负的错误码。
+ */
+
 int drm_crtc_create_sharpness_strength_property(struct drm_crtc *crtc)
 {
 	struct drm_device *dev = crtc->dev;
@@ -971,6 +1066,16 @@ int drm_crtc_create_sharpness_strength_property(struct drm_crtc *crtc)
 	return 0;
 }
 EXPORT_SYMBOL(drm_crtc_create_sharpness_strength_property);
+
+/*
+ * drm_crtc_in_clone_mode -- 检查指定 CRTC 状态是否处于克隆模式
+ *
+ * 克隆模式指同一个 CRTC 的输出被多个编码器（encoder）同时使用，
+ * 从而实现多个显示设备显示相同内容的功能。通过检查 CRTC 状态中
+ * 编码器掩码（encoder_mask）的位数来判断：多于 1 位表示处于克隆模式。
+ *
+ * 返回值：克隆模式返回 true，否则返回 false。
+ */
 
 /**
  * drm_crtc_in_clone_mode - check if the given CRTC state is in clone mode

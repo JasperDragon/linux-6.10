@@ -26,6 +26,33 @@
  *
  */
 
+/*
+ * DRM 同步对象（Sync Object）管理 - 中文注释补充
+ *
+ * 本文件实现了 DRM 同步对象（syncobj）机制，为用户空间提供显式的
+ * GPU 同步原语。同步对象是 DRM 驱动中实现 Vulkan fence 和
+ * semaphore 的核心基础设施。
+ *
+ * 核心功能:
+ *   - 创建和销毁同步对象
+ *   - 同步对象的文件描述符导入/导出（进程间共享）
+ *   - 同步对象底层 fence 的同步文件（sync_file）导入/导出
+ *   - 重置同步对象（将 fence 置为 NULL）
+ *   - 触发同步对象（设置一个已触发的 fence）
+ *   - 等待同步对象的 fence 被触发
+ *   - 时间线（Timeline）同步操作（支持有序时间点）
+ *   - eventfd 集成，用于非阻塞等待
+ *
+ * 两种操作模式:
+ *   1. 二进制（Binary）模式: 同步对象处于已触发或未触发两种状态，
+ *      通过单个 fence 表示
+ *   2. 时间线（Timeline）模式: 支持多个有序时间点（u64 序列号），
+ *      通过 dma_fence_chain 实现，用于更灵活的 GPU 同步语义
+ *
+ * 时间线同步对象使用 dma_fence_chain 链表结构，每个时间点对应
+ * 一个 fence 链节点，新添加的时间点追加到链表头部。
+ */
+
 /**
  * DOC: Overview
  *
@@ -237,6 +264,22 @@ static void
 syncobj_eventfd_entry_func(struct drm_syncobj *syncobj,
 			   struct syncobj_eventfd_entry *entry);
 
+/*
+ * drm_syncobj_find - 查找并引用同步对象 - 中文注释
+ *
+ * 通过句柄在 DRM 文件私有数据的 xarray 中查找同步对象。
+ * 如果找到，增加其引用计数并返回指针。调用者使用完毕后
+ * 必须通过 drm_syncobj_put() 释放引用。
+ *
+ * 使用 xa_lock 保护 xarray 的并发访问，确保引用计数的
+ * 原子性操作。
+ *
+ * 参数:
+ *   @file_private - DRM 文件私有数据
+ *   @handle - 同步对象句柄（用户空间 ID）
+ *
+ * 返回值: 找到的同步对象指针，未找到返回 NULL
+ */
 /**
  * drm_syncobj_find - lookup and reference a sync object.
  * @file_private: drm file private pointer
@@ -321,6 +364,31 @@ drm_syncobj_add_eventfd(struct drm_syncobj *syncobj,
 	spin_unlock(&syncobj->lock);
 }
 
+/*
+ * drm_syncobj_add_point - 向同步对象添加时间线点 - 中文注释
+ *
+ * 将新的 dma_fence_chain 节点作为时间线点添加到同步对象中。
+ * 新的链节点会链接到原有的 fence 上，形成 fence 链。
+ *
+ * 处理流程:
+ *   1. 获取当前同步对象的 fence（prev）
+ *   2. 初始化新的 dma_fence_chain，prev 作为前驱，
+ *      fence 作为当前节点，point 作为序列号
+ *   3. 使用 RCU 机制将新链节点设置为同步对象的 fence
+ *   4. 唤醒所有等待该同步对象的 waiter（通过回调机制）
+ *   5. 通知所有 eventfd 监听者
+ *   6. 遍历 fence 链触发垃圾回收
+ *
+ * 注意: 如果添加的时间点序列号小于前一个点的序列号，
+ * 会触发 DRM_DEBUG 警告，因为这可能导致 query_ioctl
+ * 返回 0。
+ *
+ * 参数:
+ *   @syncobj - 目标同步对象
+ *   @chain - 分配的 fence 链节点
+ *   @fence - 要封装到链节点中的 fence
+ *   @point - 时间点序列号
+ */
 /**
  * drm_syncobj_add_point - add new timeline point to the syncobj
  * @syncobj: sync object to add timeline point do
@@ -362,6 +430,22 @@ void drm_syncobj_add_point(struct drm_syncobj *syncobj,
 }
 EXPORT_SYMBOL(drm_syncobj_add_point);
 
+/*
+ * drm_syncobj_replace_fence - 替换同步对象中的 fence - 中文注释
+ *
+ * 原子地替换同步对象中的 fence。旧 fence 的引用会被释放，
+ * 新 fence 的引用计数会增加。此操作会在持有 syncobj->lock
+ * 自旋锁的情况下完成，确保并发安全。
+ *
+ * fence 替换后，会唤醒所有正在等待该同步对象的 waiter
+ * 和 eventfd 监听者，通知它们 fence 已变更。
+ *
+ * 如果新 fence 和旧 fence 相同，则不会触发通知。
+ *
+ * 参数:
+ *   @syncobj - 目标同步对象
+ *   @fence - 要安装的新 fence，NULL 表示清除 fence
+ */
 /**
  * drm_syncobj_replace_fence - replace fence in a sync object.
  * @syncobj: Sync object to replace fence in
@@ -418,6 +502,30 @@ static int drm_syncobj_assign_null_handle(struct drm_syncobj *syncobj)
 
 /* 5s default for wait submission */
 #define DRM_SYNCOBJ_WAIT_FOR_SUBMIT_TIMEOUT 5000000000ULL
+/*
+ * drm_syncobj_find_fence - 查找并引用同步对象中的 fence - 中文注释
+ *
+ * 组合了 drm_syncobj_find() 和 drm_syncobj_fence_get() 的便捷函数。
+ * 通过句柄查找同步对象，然后从中提取指定时间点的 fence。
+ *
+ * 支持 WAIT_FOR_SUBMIT 标志: 如果同步对象当前没有 fence
+ * （NULL），且设置了此标志，函数会阻塞等待直到 fence 被提交。
+ * 等待超时时间为 5 秒（DRM_SYNCOBJ_WAIT_FOR_SUBMIT_TIMEOUT）。
+ *
+ * 如果请求的时间点已被触发且后续还有更新的时间点，
+ * 函数可能返回 NULL fence，此时会用已触发的 stub fence
+ * 替代，确保接收者获得已触发信号。
+ *
+ * 参数:
+ *   @file_private - DRM 文件私有数据
+ *   @handle - 同步对象句柄
+ *   @point - 时间线点（二进制模式为 0）
+ *   @flags - 标志位，目前仅支持 WAIT_FOR_SUBMIT
+ *   @fence - 输出参数，指向找到的 fence
+ *
+ * 返回值: 0 成功，-ENOENT 未找到同步对象，
+ *         -EINVAL 无效参数，-ETIME 等待超时
+ */
 /**
  * drm_syncobj_find_fence - lookup and reference the fence in a sync object
  * @file_private: drm file private pointer
@@ -517,6 +625,17 @@ out:
 }
 EXPORT_SYMBOL(drm_syncobj_find_fence);
 
+/*
+ * drm_syncobj_free - 释放同步对象 - 中文注释
+ *
+ * 当引用计数降为 0 时由 kref_put 调用。释放操作包括:
+ *   1. 替换 fence 为 NULL（释放所有 fence 引用）
+ *   2. 释放所有注册的 eventfd 条目（syncobj_eventfd_entry_free）
+ *   3. 释放同步对象本身的内存
+ *
+ * 注意: 此函数不应直接调用，应通过 drm_syncobj_put() 宏
+ * 间接调用。
+ */
 /**
  * drm_syncobj_free - free a sync object.
  * @kref: kref to free.
@@ -539,6 +658,29 @@ void drm_syncobj_free(struct kref *kref)
 }
 EXPORT_SYMBOL(drm_syncobj_free);
 
+/*
+ * drm_syncobj_create - 创建新的同步对象 - 中文注释
+ *
+ * 分配并初始化一个新的同步对象。创建时支持以下选项:
+ *   - DRM_SYNCOBJ_CREATE_SIGNALED: 创建一个已触发状态的同步对象
+ *     （内部关联一个已触发的 stub fence）
+ *   - fence 参数: 如果非 NULL，将此 fence 设置为同步对象的初始值
+ *
+ * 创建的同步对象初始化为:
+ *   - 引用计数为 1（kref_init）
+ *   - cb_list 和 ev_fd_list 初始化为空链表
+ *   - spin_lock 初始化
+ *
+ * 创建后驱动通常通过 drm_syncobj_get_handle() 或
+ * drm_syncobj_get_fd() 将其暴露给用户空间。
+ *
+ * 参数:
+ *   @out_syncobj - 输出参数，指向新创建的同步对象
+ *   @flags - DRM_SYNCOBJ_CREATE_* 标志
+ *   @fence - 初始 fence，可为 NULL
+ *
+ * 返回值: 0 成功，负值表示错误
+ */
 /**
  * drm_syncobj_create - create a new syncobj
  * @out_syncobj: returned syncobj
@@ -582,6 +724,21 @@ int drm_syncobj_create(struct drm_syncobj **out_syncobj, uint32_t flags,
 }
 EXPORT_SYMBOL(drm_syncobj_create);
 
+/*
+ * drm_syncobj_get_handle - 从同步对象获取用户空间句柄 - 中文注释
+ *
+ * 将同步对象导出为用户空间可通过 IOCTL 引用的句柄。
+ * 句柄存储在 DRM 文件私有数据的 xarray 中，关联到
+ * 对应的 DRM 文件实例。同一同步对象可在多个文件实例中
+ * 有不同句柄。
+ *
+ * 参数:
+ *   @file_private - DRM 文件私有数据
+ *   @syncobj - 要导出的同步对象
+ *   @handle - 输出参数，新分配的句柄
+ *
+ * 返回值: 0 成功，负值表示错误
+ */
 /**
  * drm_syncobj_get_handle - get a handle from a syncobj
  * @file_private: drm file private pointer
@@ -650,6 +807,22 @@ static const struct file_operations drm_syncobj_file_fops = {
 	.release = drm_syncobj_file_release,
 };
 
+/*
+ * drm_syncobj_get_fd - 从同步对象获取文件描述符 - 中文注释
+ *
+ * 将同步对象导出为文件描述符，用于进程间共享。
+ * 文件描述符关联到一个匿名 inode，通过 drm_syncobj_file_fops
+ * 操作。当文件描述符被关闭时，同步对象的引用计数递减。
+ *
+ * 与句柄不同，文件描述符可以被传递到其他进程中，
+ * 从而实现跨进程的同步对象共享。
+ *
+ * 参数:
+ *   @syncobj - 要导出的同步对象
+ *   @p_fd - 输出参数，新分配的文件描述符
+ *
+ * 返回值: 0 成功，负值表示错误
+ */
 /**
  * drm_syncobj_get_fd - get a file descriptor from a syncobj
  * @syncobj: Sync object to export
@@ -786,6 +959,14 @@ err_put_fd:
 	put_unused_fd(fd);
 	return ret;
 }
+/*
+ * drm_syncobj_open - 初始化同步对象文件私有结构 - 中文注释
+ *
+ * 在 DRM 设备节点打开时调用，初始化同步对象的 xarray。
+ * xarray 使用 XA_FLAGS_ALLOC1 标志，支持自动分配句柄。
+ * 每个打开的文件实例有独立的 xarray，用于管理该文件
+ * 实例所拥有的同步对象句柄。
+ */
 /**
  * drm_syncobj_open - initializes syncobj file-private structures at devnode open time
  * @file_private: drm file-private structure to set up
@@ -799,6 +980,14 @@ drm_syncobj_open(struct drm_file *file_private)
 	xa_init_flags(&file_private->syncobj_xa, XA_FLAGS_ALLOC1);
 }
 
+/*
+ * drm_syncobj_release - 释放文件私有同步对象资源 - 中文注释
+ *
+ * 在 DRM 文件实例关闭时调用。遍历 xarray 中所有同步对象，
+ * 释放每个对象的引用（drm_syncobj_put），然后销毁 xarray。
+ * 确保在文件关闭时所有通过此文件实例引用的同步对象
+ * 都被正确清理。
+ */
 /**
  * drm_syncobj_release - release file-private sync object resources
  * @file_private: drm file-private structure to clean up
@@ -1191,6 +1380,24 @@ err_free_points:
 	return timeout;
 }
 
+/*
+ * drm_timeout_abs_to_jiffies - 从绝对时间计算 jiffies 超时值 - 中文注释
+ *
+ * 将用户空间传入的绝对超时时间（CLOCK_MONOTONIC 纳秒）转换为
+ * jiffies 相对超时值。0 表示轮询（立即返回）。
+ *
+ * 实现逻辑:
+ *   1. 如果 timeout_nsec 为 0，直接返回 0（轮询模式）
+ *   2. 计算绝对超时时间与当前时间的差值
+ *   3. 如果已超时，返回 0
+ *   4. 将纳秒差值转换为 jiffies，并做上限裁剪防止溢出
+ *
+ * 参数:
+ *   @timeout_nsec - 绝对超时时间（纳秒，CLOCK_MONOTONIC），
+ *                   0 表示轮询
+ *
+ * 返回值: jiffies 相对超时值，0 表示轮询或已超时
+ */
 /**
  * drm_timeout_abs_to_jiffies - calculate jiffies timeout from absolute value
  *

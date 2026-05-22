@@ -20,6 +20,26 @@
  * OF THIS SOFTWARE.
  */
 
+/*
+ * drm_encoder.c -- 编码器管理核心
+ *
+ * 编码器（Encoder）是 CRTC 和连接器（Connector）之间的桥梁。它从 CRTC
+ * 接收像素数据，并转换为连接器所需的特定格式（如 TMDS、LVDS、DSI 等）。
+ * 编码器是暴露给用户空间的对象，最初用于推断克隆能力和 CRTC/连接器
+ * 限制，但由于几乎所有驱动都未能正确实现，其 UABI 价值有限。
+ *
+ * 核心职责包括：
+ *   1. 将 CRTC 输出的像素数据转换为特定接口格式
+ *   2. 管理 encoder 与 bridge（桥接芯片）的链接
+ *   3. 提供可能的 CRTC 掩码（possible_crtcs）以指示兼容性
+ *   4. 作为 bridge 链的入口点
+ *
+ * 关键 API：
+ *   - drm_encoder_init(): 编码器初始化
+ *   - drm_encoder_cleanup(): 编码器清理
+ *   - drmm_encoder_init() / drmm_encoder_alloc(): 托管式编码器初始化和分配
+ */
+
 #include <linux/export.h>
 
 #include <drm/drm_bridge.h>
@@ -139,6 +159,23 @@ out_put:
 	return ret;
 }
 
+/*
+ * drm_encoder_init -- 初始化预分配的编码器对象
+ *
+ * 初始化驱动编码器对象的基本部分。编码器是 CRTC 和连接器之间的桥梁，
+ * 负责将像素数据转换为特定接口所需的格式。该函数会：
+ *   1. 将编码器对象添加到 DRM 设备对象空间
+ *   2. 设置编码器类型（TMDS、LVDS、DSI 等）
+ *   3. 初始化 bridge 链链表
+ *   4. 将编码器加入设备的编码器列表
+ *
+ * 注意：推荐使用 drmm_encoder_alloc() 或 drmm_encoder_init() 来利用
+ * DRM 托管资源基础设施自动处理清理和释放。编码器结构体不应使用
+ * devm_kzalloc() 分配。
+ *
+ * 返回值：成功返回 0，失败返回负的错误码。
+ */
+
 /**
  * drm_encoder_init - Init a preallocated encoder
  * @dev: drm device
@@ -177,6 +214,16 @@ int drm_encoder_init(struct drm_device *dev,
 	return ret;
 }
 EXPORT_SYMBOL(drm_encoder_init);
+
+/*
+ * drm_encoder_cleanup -- 清理已初始化的编码器
+ *
+ * 清理编码器资源但不释放对象本身。该函数会：
+ *   1. 分离并清理所有关联的 bridge
+ *   2. 从对象空间中注销编码器
+ *   3. 释放编码器名称
+ *   4. 从编码器列表中删除并递减设备的编码器计数
+ */
 
 /**
  * drm_encoder_cleanup - cleans up an initialised encoder

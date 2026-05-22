@@ -42,6 +42,35 @@
  * Thomas Hellström <thomas-at-tungstengraphics-dot-com>
  */
 
+/*
+ * 中文注释: DRM 内存管理 (drm_mm) - VRAM 范围分配器
+ *
+ * 本文件实现了 DRM 子系统中的通用范围分配器 (range allocator), 用于管理 GPU
+ * 视频内存 (VRAM) 中的地址空间分配。该分配器基于红黑树 (red-black tree) 实现
+ * 空闲空间的快速查找和插入, 并采用最差适应 (worst-fit) 算法来分配内存, 以
+ * 平衡内存碎片化和分配效率。
+ *
+ * 核心数据结构:
+ *   - struct drm_mm: 内存管理器实例, 维护空闲块的红黑树和链表
+ *   - struct drm_mm_node: 单个内存节点, 表示已分配或空闲的内存块
+ *
+ * 主要特性:
+ *   1. 支持对齐分配 (alignment), 确保分配地址满足硬件对齐要求
+ *   2. 支持颜色调整 (color), 通过回调函数实现复杂的放置限制 (如 i915 的
+ *      缓存域隔离页)
+ *   3. 四种插入模式:
+ *      - DRM_MM_INSERT_BEST: 最佳匹配, 从最大的空闲块中分配
+ *      - DRM_MM_INSERT_LOW:  低地址优先, 从低地址开始搜索
+ *      - DRM_MM_INSERT_HIGH: 高地址优先, 从高地址开始搜索
+ *      - DRM_MM_INSERT_EVICT: 快速分配, 从最近释放的块中分配
+ *   4. 支持范围限制 (range restriction), 可在指定地址范围内分配
+ *   5. 支持 LRU 扫描回收 (scan), 用于逐出对象以腾出空间
+ *
+ * 线程安全性: 该分配器不是线程安全的, 驱动程序需要自行加锁保护。这种设计
+ * 的出发点在于, 完整的内存管理器还需要保护其他数据, 内部再加锁完全冗余。
+ * 空闲块搜索的时间复杂度为 O(num_holes), 节点删除为 O(1)。
+ */
+
 #include <linux/export.h>
 #include <linux/interval_tree_generic.h>
 #include <linux/seq_file.h>
@@ -435,6 +464,11 @@ next_hole(struct drm_mm *mm,
 }
 
 /**
+ * 中文注释: 插入已预先初始化的节点
+ * 该函数将已设置好的 drm_mm_node 插入分配器。调用者必须预先设置好 start、
+ * size 和 color 字段, 其他字段必须清零。这在用预分配对象初始化分配器时
+ * 非常有用, 例如接管固件帧缓冲区时, 需要在范围分配器初始化之前就设置好对象。
+ *
  * drm_mm_reserve_node - insert an pre-initialized node
  * @mm: drm_mm allocator to insert @node into
  * @node: drm_mm_node to insert
@@ -497,6 +531,17 @@ static u64 rb_to_hole_size_or_zero(struct rb_node *rb)
 }
 
 /**
+ * 中文注释: 在指定范围内搜索空洞并插入节点
+ * 这是 drm_mm 最核心的分配函数。它在给定的地址范围内搜索合适的空闲空洞,
+ * 并插入分配节点。支持多种插入模式和颜色调整。分配过程:
+ *   1. 根据插入模式找到第一个候选空洞
+ *   2. 对空洞应用颜色调整回调 (如果存在)
+ *   3. 根据范围限制裁剪候选区域
+ *   4. 应用对齐约束调整起始地址
+ *   5. 如果找到合适区域, 插入节点并更新空闲空洞链表和红黑树
+ *
+ * 预先分配的 @node 必须清零。
+ *
  * drm_mm_insert_node_in_range - ranged search for space and insert @node
  * @mm: drm_mm to allocate from
  * @node: preallocate node to insert
@@ -618,6 +663,11 @@ static inline __maybe_unused bool drm_mm_node_scanned_block(const struct drm_mm_
 }
 
 /**
+ * 中文注释: 从分配器中移除内存节点
+ * 从 drm_mm 分配器中移除一个已分配的节点。移除后, 前一个节点的空洞会与
+ * 当前节点所在的空洞合并。节点无需再次清零即可重新插入到分配器中。
+ * 注意: 对未分配的节点调用此函数是一个 bug。
+ *
  * drm_mm_remove_node - Remove a memory node from the allocator.
  * @node: drm_mm_node to remove
  *
@@ -682,6 +732,17 @@ EXPORT_SYMBOL(drm_mm_remove_node);
  */
 
 /**
+ * 中文注释: 初始化范围受限的 LRU 扫描
+ * LRU 扫描机制用于 GPU 需要连续分配的场景。当需要逐出对象来为新分配腾出
+ * 空间时, 简单地按 LRU 顺序选择对象并不高效——可能会逐出许多小对象却无济
+ * 于事。扫描流程:
+ *   1. 初始化扫描状态, 设置目标分配参数
+ *   2. 驱动遍历 LRU 列表, 通过 drm_mm_scan_add_block() 添加候选对象
+ *   3. 找到合适空洞后, 通过 drm_mm_scan_remove_block() 确认应逐出的对象
+ *   4. 驱动按相反顺序恢复分配器状态并逐出选中的对象
+ *
+ * 警告: 扫描列表非空时, 不允许执行添加/删除扫描列表节点之外的操作。
+ *
  * drm_mm_scan_init_with_range - initialize range-restricted lru scanning
  * @scan: scan state
  * @mm: drm_mm to scan
@@ -733,6 +794,11 @@ void drm_mm_scan_init_with_range(struct drm_mm_scan *scan,
 EXPORT_SYMBOL(drm_mm_scan_init_with_range);
 
 /**
+ * 中文注释: 将节点添加到扫描列表
+ * 将候选节点添加到逐出扫描列表。此函数会临时从 node_list 中移除该节点,
+ * 从而扩大前一个节点与下一个节点之间的空洞。如果扩大后的空洞能够满足
+ * 分配需求, 则返回 true 并记录命中位置 (hit_start/hit_end)。
+ *
  * drm_mm_scan_add_block - add a node to the scan list
  * @scan: the active drm_mm scanner
  * @node: drm_mm_node to add
@@ -816,6 +882,13 @@ bool drm_mm_scan_add_block(struct drm_mm_scan *scan,
 EXPORT_SYMBOL(drm_mm_scan_add_block);
 
 /**
+ * 中文注释: 从扫描列表中移除节点
+ * 节点**必须**按照添加时的严格相反顺序移除, 否则内存管理器的内部状态将
+ * 被破坏。函数会将节点恢复到原来的 node_list 位置 (在 scan_add_block 中
+ * 被临时移除)。返回值指示该块是否与扫描找到的命中区域重叠:
+ *   - true: 该块需要被逐出
+ *   - false: 该块不需要被逐出
+ *
  * drm_mm_scan_remove_block - remove a node from the scan list
  * @scan: the active drm_mm scanner
  * @node: drm_mm_node to remove
@@ -865,6 +938,12 @@ bool drm_mm_scan_remove_block(struct drm_mm_scan *scan,
 EXPORT_SYMBOL(drm_mm_scan_remove_block);
 
 /**
+ * 中文注释: 逐出目标空洞两侧重叠的节点
+ * 在完成逐出扫描并移除选中节点后, 如果使用了 mm.color_adjust 颜色调整
+ * 回调, 可能需要从目标空洞的两侧再移除更多节点。这是因为颜色调整可能
+ * 导致空洞的实际可用范围缩小, 使得原本被视为"空洞"的区域实际上被两侧
+ * 节点的颜色限制所侵占。
+ *
  * drm_mm_scan_color_evict - evict overlapping nodes on either side of hole
  * @scan: drm_mm scan with target hole
  *
@@ -919,6 +998,14 @@ struct drm_mm_node *drm_mm_scan_color_evict(struct drm_mm_scan *scan)
 EXPORT_SYMBOL(drm_mm_scan_color_evict);
 
 /**
+ * 中文注释: 初始化 drm_mm 分配器
+ * 初始化一个 drm_mm 范围分配器实例, 管理从 @start 开始的 @size 字节的
+ * 地址空间。初始化过程创建一个哨兵节点 (head_node), 其起始位置在
+ * start + size 处, 大小为负值, 代表整个管理区域为一个空洞。
+ * 这是一种巧妙的技巧, 避免在空闲空洞跟踪中处理特殊情况。
+ *
+ * 注意: 调用此函数前 @mm 必须清零。
+ *
  * drm_mm_init - initialize a drm-mm allocator
  * @mm: the drm_mm structure to initialize
  * @start: start of the range managed by @mm
@@ -954,6 +1041,13 @@ void drm_mm_init(struct drm_mm *mm, u64 start, u64 size)
 EXPORT_SYMBOL(drm_mm_init);
 
 /**
+ * 中文注释: 清理 drm_mm 分配器
+ * 销毁 drm_mm 分配器。如果分配器中还有未释放的节点 (即分配器不干净),
+ * 会发出警告。在 CONFIG_DRM_DEBUG_MM 启用时, 还会打印所有泄漏节点的
+ * 分配堆栈信息以帮助调试。
+ *
+ * 注意: 对未清理干净的分配器调用此函数是一个 bug。
+ *
  * drm_mm_takedown - clean up a drm_mm allocator
  * @mm: drm_mm allocator to clean up
  *
@@ -982,6 +1076,11 @@ static u64 drm_mm_dump_hole(struct drm_printer *p, const struct drm_mm_node *ent
 	return size;
 }
 /**
+ * 中文注释: 打印分配器状态
+ * 遍历所有节点和空闲空洞, 打印分配器的完整状态信息, 包括每个已分配
+ * 节点的地址范围和大小, 以及空闲空洞的位置和大小, 最后汇总总大小、
+ * 已使用和空闲空间统计。
+ *
  * drm_mm_print - print allocator state
  * @mm: drm_mm allocator to print
  * @p: DRM printer to use

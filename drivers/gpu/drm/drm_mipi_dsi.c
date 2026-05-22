@@ -25,6 +25,48 @@
  * USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+/*
+ * MIPI DSI（Display Serial Interface）总线基础设施
+ *
+ * MIPI DSI 是 MIPI 联盟定义的一种显示串行接口标准，广泛应用于
+ * 智能手机、平板电脑等移动设备的显示面板连接。DSI 使用高速串行
+ * 差分信号传输，相比传统的并行 RGB 接口，具有引脚数少、传输速率高、
+ * 功耗低、抗干扰能力强等优点。
+ *
+ * 本文件实现了 MIPI DSI 总线的基础架构，包括：
+ *
+ * 1. 总线类型管理：
+ *    - 定义 mipi_dsi_bus_type 总线类型，用于 DSI 设备和驱动的匹配
+ *    - 提供设备和驱动的注册/注销函数
+ *    - 支持 OF（Device Tree）风格的设备匹配
+ *
+ * 2. DSI 设备管理：
+ *    - DSI 设备的创建、注册和注销（mipi_dsi_device_register_full 等）
+ *    - 设备生命周期的托管版本（devm_ 系列函数）
+ *    - DSI 虚拟通道管理（支持 4 个虚拟通道）
+ *
+ * 3. DSI 主机管理：
+ *    - DSI 主机的注册和注销（mipi_dsi_host_register/unregister）
+ *    - 主机与从设备的连接和断开（mipi_dsi_attach/detach）
+ *    - 设备树节点的遍历和 DSI 设备创建
+ *
+ * 4. DSI 数据包传输：
+ *    - 短数据包和长数据包的创建
+ *    - 通用写/读操作（mipi_dsi_generic_write/read）
+ *    - DCS（Display Command Set）命令的写/读操作
+ *    - 支持压缩数据流（DSC）传输
+ *
+ * 5. DCS 标准命令集：
+ *    - 显示控制：开/关、睡眠模式、复位
+ *    - 显示参数设置：列地址、页地址、像素格式、亮度
+ *    - 状态读取：电源模式、像素格式、亮度
+ *    - 撕裂效果（Tearing Effect）控制
+ *
+ * 6. 批量操作支持：
+ *    - 多个 DSI 事务的累积错误处理（_multi 系列函数）
+ *    - 双通道 DSI 的同时写入支持
+ */
+
 #include <linux/device.h>
 #include <linux/export.h>
 #include <linux/module.h>
@@ -101,12 +143,14 @@ const struct bus_type mipi_dsi_bus_type = {
 EXPORT_SYMBOL_GPL(mipi_dsi_bus_type);
 
 /**
- * of_find_mipi_dsi_device_by_node() - find the MIPI DSI device matching a
- *    device tree node
- * @np: device tree node
+ * of_find_mipi_dsi_device_by_node() - 通过设备树节点查找 MIPI DSI 设备
+ * @np: 设备树节点
  *
- * Return: A pointer to the MIPI DSI device corresponding to @np or NULL if no
- *    such device exists (or has not been registered yet).
+ * 在 DSI 总线中查找与指定设备树节点对应的 MIPI DSI 设备。
+ * 该函数遍历已注册的 DSI 设备，找到与给定 OF 节点匹配的设备。
+ *
+ * 返回：与 @np 对应的 MIPI DSI 设备指针，如果没有找到（或尚未注册）
+ * 则返回 NULL。
  */
 struct mipi_dsi_device *of_find_mipi_dsi_device_by_node(struct device_node *np)
 {
@@ -191,16 +235,19 @@ of_mipi_dsi_device_add(struct mipi_dsi_host *host, struct device_node *node)
 #endif
 
 /**
- * mipi_dsi_device_register_full - create a MIPI DSI device
- * @host: DSI host to which this device is connected
- * @info: pointer to template containing DSI device information
+ * mipi_dsi_device_register_full - 创建 MIPI DSI 设备
+ * @host: 此设备连接的 DSI 主机
+ * @info: 包含 DSI 设备信息的模板指针
  *
- * Create a MIPI DSI device by using the device information provided by
- * mipi_dsi_device_info template
+ * 使用 mipi_dsi_device_info 模板提供的设备信息创建 MIPI DSI 设备。
+ * 该函数会：
+ *   1. 验证 info 指针和虚拟通道号（0-3）的有效性
+ *   2. 分配并初始化 DSI 设备结构体
+ *   3. 设置设备名称、通道号和 OF 节点
+ *   4. 将设备添加到系统中
  *
- * Returns:
- * A pointer to the newly created MIPI DSI device, or, a pointer encoded
- * with an error
+ * 返回：
+ * 成功返回新创建的 MIPI DSI 设备指针，失败返回错误编码指针。
  */
 struct mipi_dsi_device *
 mipi_dsi_device_register_full(struct mipi_dsi_host *host,
@@ -242,8 +289,10 @@ mipi_dsi_device_register_full(struct mipi_dsi_host *host,
 EXPORT_SYMBOL(mipi_dsi_device_register_full);
 
 /**
- * mipi_dsi_device_unregister - unregister MIPI DSI device
- * @dsi: DSI peripheral device
+ * mipi_dsi_device_unregister - 注销 MIPI DSI 设备
+ * @dsi: DSI 外设设备
+ *
+ * 从系统中注销一个之前注册的 MIPI DSI 设备，释放相关资源。
  */
 void mipi_dsi_device_unregister(struct mipi_dsi_device *dsi)
 {
@@ -259,21 +308,20 @@ static void devm_mipi_dsi_device_unregister(void *arg)
 }
 
 /**
- * devm_mipi_dsi_device_register_full - create a managed MIPI DSI device
- * @dev: device to tie the MIPI-DSI device lifetime to
- * @host: DSI host to which this device is connected
- * @info: pointer to template containing DSI device information
+ * devm_mipi_dsi_device_register_full - 创建托管的 MIPI DSI 设备
+ * @dev: 与 MIPI DSI 设备生命周期绑定的设备
+ * @host: 此设备连接的 DSI 主机
+ * @info: 包含 DSI 设备信息的模板指针
  *
- * Create a MIPI DSI device by using the device information provided by
- * mipi_dsi_device_info template
+ * 使用 mipi_dsi_device_info 模板提供的设备信息创建 MIPI DSI 设备。
+ * 这是 mipi_dsi_device_register_full() 的托管版本，会在 @dev
+ * 解除绑定时自动调用 mipi_dsi_device_unregister() 进行清理。
  *
- * This is the managed version of mipi_dsi_device_register_full() which
- * automatically calls mipi_dsi_device_unregister() when @dev is
- * unbound.
+ * 使用托管版本可以简化驱动的错误处理路径，无需手动管理
+ * DSI 设备的注销。
  *
- * Returns:
- * A pointer to the newly created MIPI DSI device, or, a pointer encoded
- * with an error
+ * 返回：
+ * 成功返回新创建的 MIPI DSI 设备指针，失败返回错误编码指针。
  */
 struct mipi_dsi_device *
 devm_mipi_dsi_device_register_full(struct device *dev,
@@ -301,13 +349,15 @@ static DEFINE_MUTEX(host_lock);
 static LIST_HEAD(host_list);
 
 /**
- * of_find_mipi_dsi_host_by_node() - find the MIPI DSI host matching a
- *				     device tree node
- * @node: device tree node
+ * of_find_mipi_dsi_host_by_node() - 通过设备树节点查找 MIPI DSI 主机
+ * @node: 设备树节点
  *
- * Returns:
- * A pointer to the MIPI DSI host corresponding to @node or NULL if no
- * such device exists (or has not been registered yet).
+ * 在已注册的 DSI 主机列表中查找与指定设备树节点匹配的主机。
+ * 遍历全局主机列表，通过比较 OF 节点指针来进行匹配。
+ *
+ * 返回：
+ * 与 @node 对应的 MIPI DSI 主机指针，如果没有找到（或尚未注册）
+ * 则返回 NULL。
  */
 struct mipi_dsi_host *of_find_mipi_dsi_host_by_node(struct device_node *node)
 {
@@ -369,8 +419,15 @@ void mipi_dsi_host_unregister(struct mipi_dsi_host *host)
 EXPORT_SYMBOL(mipi_dsi_host_unregister);
 
 /**
- * mipi_dsi_attach - attach a DSI device to its DSI host
- * @dsi: DSI peripheral
+ * mipi_dsi_attach - 将 DSI 设备连接到其 DSI 主机
+ * @dsi: DSI 外设
+ *
+ * 将 DSI 外设设备连接到其所属的 DSI 主机。连接成功后，主机和
+ * 外设之间可以开始数据传输。该函数会调用主机的 attach 回调
+ * 来完成实际的硬件连接操作。
+ *
+ * 返回：成功返回 0，失败返回负错误码（如 -ENOSYS 表示主机未
+ * 实现 attach 操作）。
  */
 int mipi_dsi_attach(struct mipi_dsi_device *dsi)
 {
@@ -391,8 +448,14 @@ int mipi_dsi_attach(struct mipi_dsi_device *dsi)
 EXPORT_SYMBOL(mipi_dsi_attach);
 
 /**
- * mipi_dsi_detach - detach a DSI device from its DSI host
- * @dsi: DSI peripheral
+ * mipi_dsi_detach - 将 DSI 设备从其 DSI 主机断开
+ * @dsi: DSI 外设
+ *
+ * 将 DSI 外设设备从其所属的 DSI 主机断开。断开后，主机和外设
+ * 之间的数据传输将停止。该函数会检查设备是否已连接，如果未连接
+ * 则发出警告。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_detach(struct mipi_dsi_device *dsi)
 {
@@ -418,15 +481,16 @@ static void devm_mipi_dsi_detach(void *arg)
 }
 
 /**
- * devm_mipi_dsi_attach - Attach a MIPI-DSI device to its DSI Host
- * @dev: device to tie the MIPI-DSI device attachment lifetime to
- * @dsi: DSI peripheral
+ * devm_mipi_dsi_attach - 托管的 MIPI DSI 设备连接
+ * @dev: 与 MIPI DSI 设备连接生命周期绑定的设备
+ * @dsi: DSI 外设
  *
- * This is the managed version of mipi_dsi_attach() which automatically
- * calls mipi_dsi_detach() when @dev is unbound.
+ * 这是 mipi_dsi_attach() 的托管版本，会在 @dev 解除绑定时
+ * 自动调用 mipi_dsi_detach() 断开连接。使用托管版本可以简化
+ * 驱动的错误处理和清理路径。
  *
- * Returns:
- * 0 on success, a negative error code on failure.
+ * 返回：
+ * 成功返回 0，失败返回负错误码。
  */
 int devm_mipi_dsi_attach(struct device *dev,
 			 struct mipi_dsi_device *dsi)
@@ -460,11 +524,16 @@ static ssize_t mipi_dsi_device_transfer(struct mipi_dsi_device *dsi,
 }
 
 /**
- * mipi_dsi_packet_format_is_short - check if a packet is of the short format
- * @type: MIPI DSI data type of the packet
+ * mipi_dsi_packet_format_is_short - 检查数据包是否为短格式
+ * @type: 数据包的 MIPI DSI 数据类型
  *
- * Return: true if the packet for the given data type is a short packet, false
- * otherwise.
+ * MIPI DSI 协议定义了两类数据包：
+ *   短数据包（4字节）：包含一个字节的数据类型和最多两个字节的参数，
+ *   用于命令和控制信息传输。
+ *   长数据包（可变长度）：包含头部、数据负载和 CRC 校验，用于传输
+ *   大量数据（如图像数据）。
+ *
+ * 返回：如果给定数据类型的包是短数据包则返回 true，否则返回 false。
  */
 bool mipi_dsi_packet_format_is_short(u8 type)
 {
@@ -498,11 +567,15 @@ bool mipi_dsi_packet_format_is_short(u8 type)
 EXPORT_SYMBOL(mipi_dsi_packet_format_is_short);
 
 /**
- * mipi_dsi_packet_format_is_long - check if a packet is of the long format
- * @type: MIPI DSI data type of the packet
+ * mipi_dsi_packet_format_is_long - 检查数据包是否为长格式
+ * @type: 数据包的 MIPI DSI 数据类型
  *
- * Return: true if the packet for the given data type is a long packet, false
- * otherwise.
+ * 长数据包用于传输大量数据，如图像数据流。长数据包包含：
+ *   1. 头部（4字节）：数据类型 + 字计数
+ *   2. 数据负载：字计数指定长度的有效数据
+ *   3. CRC（2字节）：校验和
+ *
+ * 返回：如果给定数据类型的包是长数据包则返回 true，否则返回 false。
  */
 bool mipi_dsi_packet_format_is_long(u8 type)
 {
@@ -531,12 +604,19 @@ bool mipi_dsi_packet_format_is_long(u8 type)
 EXPORT_SYMBOL(mipi_dsi_packet_format_is_long);
 
 /**
- * mipi_dsi_create_packet - create a packet from a message according to the
- *     DSI protocol
- * @packet: pointer to a DSI packet structure
- * @msg: message to translate into a packet
+ * mipi_dsi_create_packet - 根据 DSI 协议从消息创建数据包
+ * @packet: DSI 数据包结构指针
+ * @msg: 要转换为数据包的消息
  *
- * Return: 0 on success or a negative error code on failure.
+ * 根据 MIPI DSI 协议将消息转换为数据包格式。该函数会：
+ *   1. 验证输入的包和消息指针的有效性
+ *   2. 检查数据类型是否为有效的短包或长包类型
+ *   3. 验证虚拟通道号（0-3）的有效性
+ *   4. 构建数据包头：编码通道号和数据类型
+ *   5. 对于长数据包，在头部设置字计数并复制负载
+ *   6. 对于短数据包，在头部参数位置填充最多两个参数字节
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_create_packet(struct mipi_dsi_packet *packet,
 			   const struct mipi_dsi_msg *msg)
@@ -584,10 +664,13 @@ int mipi_dsi_create_packet(struct mipi_dsi_packet *packet,
 EXPORT_SYMBOL(mipi_dsi_create_packet);
 
 /**
- * mipi_dsi_shutdown_peripheral() - sends a Shutdown Peripheral command
- * @dsi: DSI peripheral device
+ * mipi_dsi_shutdown_peripheral() - 发送关闭外设命令
+ * @dsi: DSI 外设设备
  *
- * Return: 0 on success or a negative error code on failure.
+ * 向 DSI 外设发送 Shutdown Peripheral 命令。该命令用于关闭
+ * 显示外设的电源，进入低功耗状态。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_shutdown_peripheral(struct mipi_dsi_device *dsi)
 {
@@ -604,12 +687,15 @@ int mipi_dsi_shutdown_peripheral(struct mipi_dsi_device *dsi)
 EXPORT_SYMBOL(mipi_dsi_shutdown_peripheral);
 
 /**
- * mipi_dsi_turn_on_peripheral() - sends a Turn On Peripheral command
- * @dsi: DSI peripheral device
+ * mipi_dsi_turn_on_peripheral() - 发送开启外设命令
+ * @dsi: DSI 外设设备
  *
- * This function is deprecated. Use mipi_dsi_turn_on_peripheral_multi() instead.
+ * 向 DSI 外设发送 Turn On Peripheral 命令，使外设从关闭状态
+ * 恢复到正常工作状态。
  *
- * Return: 0 on success or a negative error code on failure.
+ * 此函数已被弃用，请使用 mipi_dsi_turn_on_peripheral_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_turn_on_peripheral(struct mipi_dsi_device *dsi)
 {
@@ -651,16 +737,22 @@ int mipi_dsi_set_maximum_return_packet_size(struct mipi_dsi_device *dsi,
 EXPORT_SYMBOL(mipi_dsi_set_maximum_return_packet_size);
 
 /**
- * mipi_dsi_compression_mode_ext() - enable/disable DSC on the peripheral
- * @dsi: DSI peripheral device
- * @enable: Whether to enable or disable the DSC
- * @algo: Selected compression algorithm
- * @pps_selector: Select PPS from the table of pre-stored or uploaded PPS entries
+ * mipi_dsi_compression_mode_ext() - 在外设上启用/禁用 DSC（显示流压缩）
+ * @dsi: DSI 外设设备
+ * @enable: 是否启用 DSC
+ * @algo: 选择的压缩算法
+ * @pps_selector: 从预存或上传的 PPS 条目表中选择 PPS
  *
- * Enable or disable Display Stream Compression on the peripheral.
- * This function is deprecated. Use mipi_dsi_compression_mode_ext_multi() instead.
+ * 在外设上启用或禁用显示流压缩（Display Stream Compression）功能。
+ * DSC 是一种高效的图像压缩技术，可以在高分辨率显示中显著降低
+ * 带宽需求。参数编码方式：
+ *   - bit 0: 启用/禁用
+ *   - bits 1-2: 压缩算法选择
+ *   - bits 4-5: PPS 条目选择
  *
- * Return: 0 on success or a negative error code on failure.
+ * 此函数已被弃用，请使用 mipi_dsi_compression_mode_ext_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_compression_mode_ext(struct mipi_dsi_device *dsi, bool enable,
 				  enum mipi_dsi_compression_algo algo,
@@ -689,14 +781,15 @@ int mipi_dsi_compression_mode_ext(struct mipi_dsi_device *dsi, bool enable,
 EXPORT_SYMBOL(mipi_dsi_compression_mode_ext);
 
 /**
- * mipi_dsi_compression_mode() - enable/disable DSC on the peripheral
- * @dsi: DSI peripheral device
- * @enable: Whether to enable or disable the DSC
+ * mipi_dsi_compression_mode() - 在外设上启用/禁用 DSC（使用默认参数）
+ * @dsi: DSI 外设设备
+ * @enable: 是否启用 DSC
  *
- * Enable or disable Display Stream Compression on the peripheral using the
- * default Picture Parameter Set and VESA DSC 1.1 algorithm.
+ * 使用默认的 Picture Parameter Set 和 VESA DSC 1.1 算法在外设上
+ * 启用或禁用显示流压缩。这是 mipi_dsi_compression_mode_ext() 的
+ * 简化封装，使用 MIPI_DSI_COMPRESSION_DSC 算法和 PPS 选择器 0。
  *
- * Return: 0 on success or a negative error code on failure.
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_compression_mode(struct mipi_dsi_device *dsi, bool enable)
 {
@@ -705,14 +798,18 @@ int mipi_dsi_compression_mode(struct mipi_dsi_device *dsi, bool enable)
 EXPORT_SYMBOL(mipi_dsi_compression_mode);
 
 /**
- * mipi_dsi_picture_parameter_set() - transmit the DSC PPS to the peripheral
- * @dsi: DSI peripheral device
- * @pps: VESA DSC 1.1 Picture Parameter Set
+ * mipi_dsi_picture_parameter_set() - 向外设传输 DSC PPS（图像参数集）
+ * @dsi: DSI 外设设备
+ * @pps: VESA DSC 1.1 图像参数集
  *
- * Transmit the VESA DSC 1.1 Picture Parameter Set to the peripheral.
- * This function is deprecated. Use mipi_dsi_picture_parameter_set_multi() instead.
+ * 向 DSI 外设传输 VESA DSC 1.1 图像参数集（Picture Parameter Set）。
+ * PPS 包含了 DSC 压缩过程中所需的全部参数，如图片尺寸、切片配置、
+ * 比特率、初始延迟等。外设根据 PPS 中的参数正确解码压缩后的
+ * 显示数据流。
  *
- * Return: 0 on success or a negative error code on failure.
+ * 此函数已被弃用，请使用 mipi_dsi_picture_parameter_set_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_picture_parameter_set(struct mipi_dsi_device *dsi,
 				   const struct drm_dsc_picture_parameter_set *pps)
@@ -730,16 +827,19 @@ int mipi_dsi_picture_parameter_set(struct mipi_dsi_device *dsi,
 EXPORT_SYMBOL(mipi_dsi_picture_parameter_set);
 
 /**
- * mipi_dsi_generic_write() - transmit data using a generic write packet
- * @dsi: DSI peripheral device
- * @payload: buffer containing the payload
- * @size: size of payload buffer
+ * mipi_dsi_generic_write() - 使用通用写数据包传输数据
+ * @dsi: DSI 外设设备
+ * @payload: 包含负载的缓冲区
+ * @size: 负载缓冲区大小
  *
- * This function will automatically choose the right data type depending on
- * the payload length.
+ * 通过通用写数据包向 DSI 外设发送数据。该函数会根据负载长度
+ * 自动选择合适的数据类型：
+ *   - size == 0: 无参数短写 (GENERIC_SHORT_WRITE_0_PARAM)
+ *   - size == 1: 1参数短写 (GENERIC_SHORT_WRITE_1_PARAM)
+ *   - size == 2: 2参数短写 (GENERIC_SHORT_WRITE_2_PARAM)
+ *   - size >= 3: 长写 (GENERIC_LONG_WRITE)
  *
- * Return: The number of bytes transmitted on success or a negative error code
- * on failure.
+ * 返回：成功返回传输的字节数，失败返回负错误码。
  */
 ssize_t mipi_dsi_generic_write(struct mipi_dsi_device *dsi, const void *payload,
 			       size_t size)
@@ -825,18 +925,21 @@ void mipi_dsi_dual_generic_write_multi(struct mipi_dsi_multi_context *ctx,
 EXPORT_SYMBOL(mipi_dsi_dual_generic_write_multi);
 
 /**
- * mipi_dsi_generic_read() - receive data using a generic read packet
- * @dsi: DSI peripheral device
- * @params: buffer containing the request parameters
- * @num_params: number of request parameters
- * @data: buffer in which to return the received data
- * @size: size of receive buffer
+ * mipi_dsi_generic_read() - 使用通用读数据包接收数据
+ * @dsi: DSI 外设设备
+ * @params: 包含请求参数的缓冲区
+ * @num_params: 请求参数数量
+ * @data: 用于返回接收数据的缓冲区
+ * @size: 接收缓冲区大小
  *
- * This function will automatically choose the right data type depending on
- * the number of parameters passed in.
+ * 通过通用读请求数据包从 DSI 外设读取数据。该函数会根据参数数量
+ * 自动选择合适的数据类型：
+ *   - num_params == 0: 无参数读请求
+ *   - num_params == 1: 1参数读请求
+ *   - num_params == 2: 2参数读请求
+ *   - num_params > 2: 不支持，返回 -EINVAL
  *
- * Return: The number of bytes successfully read or a negative error code on
- * failure.
+ * 返回：成功返回读取的字节数，失败返回负错误码。
  */
 ssize_t mipi_dsi_generic_read(struct mipi_dsi_device *dsi, const void *params,
 			      size_t num_params, void *data, size_t size)
@@ -871,17 +974,20 @@ ssize_t mipi_dsi_generic_read(struct mipi_dsi_device *dsi, const void *params,
 EXPORT_SYMBOL(mipi_dsi_generic_read);
 
 /**
- * drm_mipi_dsi_get_input_bus_fmt() - Get the required MEDIA_BUS_FMT_* based
- *				      input pixel format for a given DSI output
- *				      pixel format
- * @dsi_format: pixel format that a DSI host needs to output
+ * drm_mipi_dsi_get_input_bus_fmt() - 根据 DSI 输出格式获取所需输入总线格式
+ * @dsi_format: DSI 主机需要输出的像素格式
  *
- * Various DSI hosts can use this function during their
- * &drm_bridge_funcs.atomic_get_input_bus_fmts operation to ascertain
- * the MEDIA_BUS_FMT_* pixel format required as input.
+ * 各种 DSI 主机可以在其 &drm_bridge_funcs.atomic_get_input_bus_fmts
+ * 操作中使用此函数来确定所需的输入 MEDIA_BUS_FMT_* 像素格式。
  *
- * RETURNS:
- * a 32-bit MEDIA_BUS_FMT_* value on success or 0 in case of failure.
+ * 支持的格式映射：
+ *   - MIPI_DSI_FMT_RGB888  -> MEDIA_BUS_FMT_RGB888_1X24
+ *   - MIPI_DSI_FMT_RGB666  -> MEDIA_BUS_FMT_RGB666_1X24_CPADHI
+ *   - MIPI_DSI_FMT_RGB666_PACKED -> MEDIA_BUS_FMT_RGB666_1X18
+ *   - MIPI_DSI_FMT_RGB565  -> MEDIA_BUS_FMT_RGB565_1X16
+ *
+ * 返回：
+ * 成功返回 32 位 MEDIA_BUS_FMT_* 值，失败返回 0。
  */
 u32 drm_mipi_dsi_get_input_bus_fmt(enum mipi_dsi_pixel_format dsi_format)
 {
@@ -906,16 +1012,20 @@ u32 drm_mipi_dsi_get_input_bus_fmt(enum mipi_dsi_pixel_format dsi_format)
 EXPORT_SYMBOL(drm_mipi_dsi_get_input_bus_fmt);
 
 /**
- * mipi_dsi_dcs_write_buffer() - transmit a DCS command with payload
- * @dsi: DSI peripheral device
- * @data: buffer containing data to be transmitted
- * @len: size of transmission buffer
+ * mipi_dsi_dcs_write_buffer() - 传输包含负载的 DCS 命令
+ * @dsi: DSI 外设设备
+ * @data: 包含要传输数据的缓冲区（第一个字节为 DCS 命令码）
+ * @len: 传输缓冲区大小
  *
- * This function will automatically choose the right data type depending on
- * the command payload length.
+ * 传输包含负载的 DCS（Display Command Set）命令。该函数会根据
+ * 数据长度自动选择合适的数据类型：
+ *   - len == 1: DCS 短写（仅命令码）
+ *   - len == 2: DCS 短写带参数（命令码 + 1字节参数）
+ *   - len >= 3: DCS 长写
  *
- * Return: The number of bytes successfully transmitted or a negative error
- * code on failure.
+ * 注意：len 不能为 0，否则返回 -EINVAL。
+ *
+ * 返回：成功返回传输的字节数，失败返回负错误码。
  */
 ssize_t mipi_dsi_dcs_write_buffer(struct mipi_dsi_device *dsi,
 				  const void *data, size_t len)
@@ -1028,17 +1138,18 @@ void mipi_dsi_dual_dcs_write_buffer_multi(struct mipi_dsi_multi_context *ctx,
 EXPORT_SYMBOL(mipi_dsi_dual_dcs_write_buffer_multi);
 
 /**
- * mipi_dsi_dcs_write() - send DCS write command
- * @dsi: DSI peripheral device
- * @cmd: DCS command
- * @data: buffer containing the command payload
- * @len: command payload length
+ * mipi_dsi_dcs_write() - 发送 DCS 写命令
+ * @dsi: DSI 外设设备
+ * @cmd: DCS 命令码
+ * @data: 包含命令负载的缓冲区
+ * @len: 命令负载长度
  *
- * This function will automatically choose the right data type depending on
- * the command payload length.
+ * 发送 DCS 写命令，自动将命令码和负载合并到一个缓冲区中传输。
+ * 该函数会根据总长度（1字节命令码 + len字节负载）自动选择
+ * 合适的数据类型。对于小负载（总长度 <= 8），使用栈上缓冲区
+ * 避免堆内存分配。
  *
- * Return: The number of bytes successfully transmitted or a negative error
- * code on failure.
+ * 返回：成功返回传输的字节数，失败返回负错误码。
  */
 ssize_t mipi_dsi_dcs_write(struct mipi_dsi_device *dsi, u8 cmd,
 			   const void *data, size_t len)
@@ -1072,13 +1183,16 @@ ssize_t mipi_dsi_dcs_write(struct mipi_dsi_device *dsi, u8 cmd,
 EXPORT_SYMBOL(mipi_dsi_dcs_write);
 
 /**
- * mipi_dsi_dcs_read() - send DCS read request command
- * @dsi: DSI peripheral device
- * @cmd: DCS command
- * @data: buffer in which to receive data
- * @len: size of receive buffer
+ * mipi_dsi_dcs_read() - 发送 DCS 读请求命令
+ * @dsi: DSI 外设设备
+ * @cmd: DCS 命令码
+ * @data: 用于接收数据的缓冲区
+ * @len: 接收缓冲区大小
  *
- * Return: The number of bytes read or a negative error code on failure.
+ * 发送 DCS 读请求命令，从外设读取指定寄存器或状态的值。
+ * 该函数使用 MIPI_DSI_DCS_READ 数据类型发送读请求。
+ *
+ * 返回：成功返回读取的字节数，失败返回负错误码。
  */
 ssize_t mipi_dsi_dcs_read(struct mipi_dsi_device *dsi, u8 cmd, void *data,
 			  size_t len)
@@ -1134,12 +1248,15 @@ void mipi_dsi_dcs_read_multi(struct mipi_dsi_multi_context *ctx, u8 cmd,
 EXPORT_SYMBOL(mipi_dsi_dcs_read_multi);
 
 /**
- * mipi_dsi_dcs_nop() - send DCS nop packet
- * @dsi: DSI peripheral device
+ * mipi_dsi_dcs_nop() - 发送 DCS NOP（空操作）数据包
+ * @dsi: DSI 外设设备
  *
- * This function is deprecated. Use mipi_dsi_dcs_nop_multi() instead.
+ * 发送 DCS NOP（No Operation）命令。该命令不执行任何操作，
+ * 通常用于保持通信链路的活跃状态或作为填充命令。
  *
- * Return: 0 on success or a negative error code on failure.
+ * 此函数已被弃用，请使用 mipi_dsi_dcs_nop_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_nop(struct mipi_dsi_device *dsi)
 {
@@ -1154,12 +1271,16 @@ int mipi_dsi_dcs_nop(struct mipi_dsi_device *dsi)
 EXPORT_SYMBOL(mipi_dsi_dcs_nop);
 
 /**
- * mipi_dsi_dcs_soft_reset() - perform a software reset of the display module
- * @dsi: DSI peripheral device
+ * mipi_dsi_dcs_soft_reset() - 执行显示模块的软件复位
+ * @dsi: DSI 外设设备
  *
- * This function is deprecated. Use mipi_dsi_dcs_soft_reset_multi() instead.
+ * 发送 DCS 软件复位命令，将显示模块恢复到上电初始状态。
+ * 软件复位通常比硬件复位轻量，会重置内部状态机但不会
+ * 影响电源状态。
  *
- * Return: 0 on success or a negative error code on failure.
+ * 此函数已被弃用，请使用 mipi_dsi_dcs_soft_reset_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_soft_reset(struct mipi_dsi_device *dsi)
 {
@@ -1174,12 +1295,14 @@ int mipi_dsi_dcs_soft_reset(struct mipi_dsi_device *dsi)
 EXPORT_SYMBOL(mipi_dsi_dcs_soft_reset);
 
 /**
- * mipi_dsi_dcs_get_power_mode() - query the display module's current power
- *    mode
- * @dsi: DSI peripheral device
- * @mode: return location for the current power mode
+ * mipi_dsi_dcs_get_power_mode() - 查询显示模块当前的电源模式
+ * @dsi: DSI 外设设备
+ * @mode: 返回当前电源模式的位置
  *
- * Return: 0 on success or a negative error code on failure.
+ * 读取 DCS 电源模式寄存器（0x0A），获取显示模块当前的电源状态，
+ * 包括睡眠模式、显示开启/关闭、部分模式等状态位。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_get_power_mode(struct mipi_dsi_device *dsi, u8 *mode)
 {
@@ -1199,12 +1322,14 @@ int mipi_dsi_dcs_get_power_mode(struct mipi_dsi_device *dsi, u8 *mode)
 EXPORT_SYMBOL(mipi_dsi_dcs_get_power_mode);
 
 /**
- * mipi_dsi_dcs_get_pixel_format() - gets the pixel format for the RGB image
- *    data used by the interface
- * @dsi: DSI peripheral device
- * @format: return location for the pixel format
+ * mipi_dsi_dcs_get_pixel_format() - 获取接口使用的 RGB 图像像素格式
+ * @dsi: DSI 外设设备
+ * @format: 返回像素格式的位置
  *
- * Return: 0 on success or a negative error code on failure.
+ * 读取 DCS 像素格式寄存器（0x0C），获取显示模块当前使用的
+ * RGB 像素格式（如 RGB565、RGB666、RGB888 等）。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_get_pixel_format(struct mipi_dsi_device *dsi, u8 *format)
 {
@@ -1224,13 +1349,16 @@ int mipi_dsi_dcs_get_pixel_format(struct mipi_dsi_device *dsi, u8 *format)
 EXPORT_SYMBOL(mipi_dsi_dcs_get_pixel_format);
 
 /**
- * mipi_dsi_dcs_enter_sleep_mode() - disable all unnecessary blocks inside the
- *    display module except interface communication
- * @dsi: DSI peripheral device
+ * mipi_dsi_dcs_enter_sleep_mode() - 让显示模块进入睡眠模式
+ * @dsi: DSI 外设设备
  *
- * This function is deprecated. Use mipi_dsi_dcs_enter_sleep_mode_multi() instead.
+ * 发送 DCS 进入睡眠模式命令（0x10）。在睡眠模式下，显示模块关闭
+ * 除接口通信外的所有不必要的内部功能模块，以降低功耗。
+ * 从睡眠模式恢复到正常工作需要一定延迟（通常为 120ms 以上）。
  *
- * Return: 0 on success or a negative error code on failure.
+ * 此函数已被弃用，请使用 mipi_dsi_dcs_enter_sleep_mode_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_enter_sleep_mode(struct mipi_dsi_device *dsi)
 {
@@ -1245,13 +1373,15 @@ int mipi_dsi_dcs_enter_sleep_mode(struct mipi_dsi_device *dsi)
 EXPORT_SYMBOL(mipi_dsi_dcs_enter_sleep_mode);
 
 /**
- * mipi_dsi_dcs_exit_sleep_mode() - enable all blocks inside the display
- *    module
- * @dsi: DSI peripheral device
+ * mipi_dsi_dcs_exit_sleep_mode() - 让显示模块退出睡眠模式
+ * @dsi: DSI 外设设备
  *
- * This function is deprecated. Use mipi_dsi_dcs_exit_sleep_mode_multi() instead.
+ * 发送 DCS 退出睡眠模式命令（0x11），启用显示模块内部的所有功能
+ * 模块，使显示模块恢复到正常工作状态。
  *
- * Return: 0 on success or a negative error code on failure.
+ * 此函数已被弃用，请使用 mipi_dsi_dcs_exit_sleep_mode_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_exit_sleep_mode(struct mipi_dsi_device *dsi)
 {
@@ -1266,13 +1396,15 @@ int mipi_dsi_dcs_exit_sleep_mode(struct mipi_dsi_device *dsi)
 EXPORT_SYMBOL(mipi_dsi_dcs_exit_sleep_mode);
 
 /**
- * mipi_dsi_dcs_set_display_off() - stop displaying the image data on the
- *    display device
- * @dsi: DSI peripheral device
+ * mipi_dsi_dcs_set_display_off() - 关闭显示设备的图像数据显示
+ * @dsi: DSI 外设设备
  *
- * This function is deprecated. Use mipi_dsi_dcs_set_display_off_multi() instead.
+ * 发送 DCS 关闭显示命令（0x28），停止在显示设备上显示图像数据。
+ * 显示模块进入空白状态，但帧内存中的数据得以保留。
  *
- * Return: 0 on success or a negative error code on failure.
+ * 此函数已被弃用，请使用 mipi_dsi_dcs_set_display_off_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_set_display_off(struct mipi_dsi_device *dsi)
 {
@@ -1287,13 +1419,15 @@ int mipi_dsi_dcs_set_display_off(struct mipi_dsi_device *dsi)
 EXPORT_SYMBOL(mipi_dsi_dcs_set_display_off);
 
 /**
- * mipi_dsi_dcs_set_display_on() - start displaying the image data on the
- *    display device
- * @dsi: DSI peripheral device
+ * mipi_dsi_dcs_set_display_on() - 开始显示设备的图像数据
+ * @dsi: DSI 外设设备
  *
- * This function is deprecated. Use mipi_dsi_dcs_set_display_on_multi() instead.
+ * 发送 DCS 开启显示命令（0x29），开始在显示设备上显示图像数据。
+ * 该命令通常在完成所有显示参数设置后调用，使显示内容可见。
  *
- * Return: 0 on success or a negative error code on failure
+ * 此函数已被弃用，请使用 mipi_dsi_dcs_set_display_on_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_set_display_on(struct mipi_dsi_device *dsi)
 {
@@ -1308,16 +1442,21 @@ int mipi_dsi_dcs_set_display_on(struct mipi_dsi_device *dsi)
 EXPORT_SYMBOL(mipi_dsi_dcs_set_display_on);
 
 /**
- * mipi_dsi_dcs_set_column_address() - define the column extent of the frame
- *    memory accessed by the host processor
- * @dsi: DSI peripheral device
- * @start: first column of frame memory
- * @end: last column of frame memory
+ * mipi_dsi_dcs_set_column_address() - 定义主机处理器访问的帧内存列范围
+ * @dsi: DSI 外设设备
+ * @start: 帧内存的起始列
+ * @end: 帧内存的结束列
  *
- * This function is deprecated. Use mipi_dsi_dcs_set_column_address_multi()
- * instead.
+ * 发送 DCS 设置列地址命令（0x2A），定义主机处理器可以访问的帧内存
+ * 的水平范围。配合设置页地址命令，可以指定一个矩形区域用于后续的
+ * 内存写入/读取操作。
  *
- * Return: 0 on success or a negative error code on failure.
+ * 列地址以大端字节序编码为 4 个字节（起始列高8位、起始列低8位、
+ * 结束列高8位、结束列低8位）。
+ *
+ * 此函数已被弃用，请使用 mipi_dsi_dcs_set_column_address_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_set_column_address(struct mipi_dsi_device *dsi, u16 start,
 				    u16 end)
@@ -1335,16 +1474,21 @@ int mipi_dsi_dcs_set_column_address(struct mipi_dsi_device *dsi, u16 start,
 EXPORT_SYMBOL(mipi_dsi_dcs_set_column_address);
 
 /**
- * mipi_dsi_dcs_set_page_address() - define the page extent of the frame
- *    memory accessed by the host processor
- * @dsi: DSI peripheral device
- * @start: first page of frame memory
- * @end: last page of frame memory
+ * mipi_dsi_dcs_set_page_address() - 定义主机处理器访问的帧内存页范围
+ * @dsi: DSI 外设设备
+ * @start: 帧内存的起始页
+ * @end: 帧内存的结束页
  *
- * This function is deprecated. Use mipi_dsi_dcs_set_page_address_multi()
- * instead.
+ * 发送 DCS 设置页地址命令（0x2B），定义主机处理器可以访问的帧内存
+ * 的垂直范围。与设置列地址命令结合使用，可以定位到帧内存中的
+ * 任意矩形区域。
  *
- * Return: 0 on success or a negative error code on failure.
+ * 页地址以大端字节序编码为 4 个字节（起始页高8位、起始页低8位、
+ * 结束页高8位、结束页低8位）。
+ *
+ * 此函数已被弃用，请使用 mipi_dsi_dcs_set_page_address_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_set_page_address(struct mipi_dsi_device *dsi, u16 start,
 				  u16 end)
@@ -1362,14 +1506,21 @@ int mipi_dsi_dcs_set_page_address(struct mipi_dsi_device *dsi, u16 start,
 EXPORT_SYMBOL(mipi_dsi_dcs_set_page_address);
 
 /**
- * mipi_dsi_dcs_set_tear_on() - turn on the display module's Tearing Effect
- *    output signal on the TE signal line.
- * @dsi: DSI peripheral device
- * @mode: the Tearing Effect Output Line mode
+ * mipi_dsi_dcs_set_tear_on() - 开启显示模块的 TE（撕裂效应）输出信号
+ * @dsi: DSI 外设设备
+ * @mode: TE 输出线模式
  *
- * This function is deprecated. Use mipi_dsi_dcs_set_tear_on_multi() instead.
+ * 发送 DCS 开启撕裂效应命令（0x35），使能显示模块在 TE 信号线上
+ * 输出撕裂效应信号。TE 信号用于指示显示模块的刷新状态，帮助主机
+ * 同步帧缓冲区更新，避免出现画面撕裂。
  *
- * Return: 0 on success or a negative error code on failure
+ * TE 模式有两种：
+ *   - 模式 0：每帧在垂直空白期输出单个脉冲
+ *   - 模式 1：每帧在指定的扫描线位置输出信号
+ *
+ * 此函数已被弃用，请使用 mipi_dsi_dcs_set_tear_on_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_set_tear_on(struct mipi_dsi_device *dsi,
 			     enum mipi_dsi_dcs_tear_mode mode)
@@ -1387,15 +1538,17 @@ int mipi_dsi_dcs_set_tear_on(struct mipi_dsi_device *dsi,
 EXPORT_SYMBOL(mipi_dsi_dcs_set_tear_on);
 
 /**
- * mipi_dsi_dcs_set_pixel_format() - sets the pixel format for the RGB image
- *    data used by the interface
- * @dsi: DSI peripheral device
- * @format: pixel format
+ * mipi_dsi_dcs_set_pixel_format() - 设置接口使用的 RGB 图像像素格式
+ * @dsi: DSI 外设设备
+ * @format: 像素格式值
  *
- * This function is deprecated. Use mipi_dsi_dcs_set_pixel_format_multi()
- * instead.
+ * 发送 DCS 设置像素格式命令（0x3A），配置显示模块使用的 RGB
+ * 像素格式，如 RGB565（16位）、RGB666（18位）、RGB888（24位）等。
+ * 格式值定义在 MIPI DCS 标准规范中。
  *
- * Return: 0 on success or a negative error code on failure.
+ * 此函数已被弃用，请使用 mipi_dsi_dcs_set_pixel_format_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_set_pixel_format(struct mipi_dsi_device *dsi, u8 format)
 {
@@ -1411,15 +1564,17 @@ int mipi_dsi_dcs_set_pixel_format(struct mipi_dsi_device *dsi, u8 format)
 EXPORT_SYMBOL(mipi_dsi_dcs_set_pixel_format);
 
 /**
- * mipi_dsi_dcs_set_tear_scanline() - set the scanline to use as trigger for
- *    the Tearing Effect output signal of the display module
- * @dsi: DSI peripheral device
- * @scanline: scanline to use as trigger
+ * mipi_dsi_dcs_set_tear_scanline() - 设置 TE 信号的触发扫描线
+ * @dsi: DSI 外设设备
+ * @scanline: 用作触发信号的扫描线
  *
- * This function is deprecated. Use mipi_dsi_dcs_set_tear_scanline_multi()
- * instead.
+ * 发送 DCS 设置撕裂效应扫描线命令（0x44），当 TE 模式设置为模式1时，
+ * 此命令指定在哪个扫描线位置触发 TE 信号。扫描线值以大端字节序
+ * 编码。
  *
- * Return: 0 on success or a negative error code on failure
+ * 此函数已被弃用，请使用 mipi_dsi_dcs_set_tear_scanline_multi() 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_set_tear_scanline(struct mipi_dsi_device *dsi, u16 scanline)
 {
@@ -1436,15 +1591,17 @@ int mipi_dsi_dcs_set_tear_scanline(struct mipi_dsi_device *dsi, u16 scanline)
 EXPORT_SYMBOL(mipi_dsi_dcs_set_tear_scanline);
 
 /**
- * mipi_dsi_dcs_set_display_brightness() - sets the brightness value of the
- *    display
- * @dsi: DSI peripheral device
- * @brightness: brightness value
+ * mipi_dsi_dcs_set_display_brightness() - 设置显示器的亮度值
+ * @dsi: DSI 外设设备
+ * @brightness: 亮度值
  *
- * This function is deprecated. Use mipi_dsi_dcs_set_display_brightness_multi()
- * instead.
+ * 发送 DCS 设置显示亮度命令（0x51），配置显示模块的背光亮度。
+ * 亮度值以小端字节序编码（低字节在前，高字节在后）。
  *
- * Return: 0 on success or a negative error code on failure.
+ * 此函数已被弃用，请使用 mipi_dsi_dcs_set_display_brightness_multi()
+ * 替代。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_set_display_brightness(struct mipi_dsi_device *dsi,
 					u16 brightness)
@@ -1462,12 +1619,13 @@ int mipi_dsi_dcs_set_display_brightness(struct mipi_dsi_device *dsi,
 EXPORT_SYMBOL(mipi_dsi_dcs_set_display_brightness);
 
 /**
- * mipi_dsi_dcs_get_display_brightness() - gets the current brightness value
- *    of the display
- * @dsi: DSI peripheral device
- * @brightness: brightness value
+ * mipi_dsi_dcs_get_display_brightness() - 获取显示器的当前亮度值
+ * @dsi: DSI 外设设备
+ * @brightness: 返回亮度值的位置
  *
- * Return: 0 on success or a negative error code on failure.
+ * 读取 DCS 显示亮度寄存器（0x52），获取显示器当前的背光亮度值。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_get_display_brightness(struct mipi_dsi_device *dsi,
 					u16 *brightness)
@@ -1488,12 +1646,15 @@ int mipi_dsi_dcs_get_display_brightness(struct mipi_dsi_device *dsi,
 EXPORT_SYMBOL(mipi_dsi_dcs_get_display_brightness);
 
 /**
- * mipi_dsi_dcs_set_display_brightness_large() - sets the 16-bit brightness value
- *    of the display
- * @dsi: DSI peripheral device
- * @brightness: brightness value
+ * mipi_dsi_dcs_set_display_brightness_large() - 设置显示器的 16 位亮度值
+ * @dsi: DSI 外设设备
+ * @brightness: 亮度值（大端字节序）
  *
- * Return: 0 on success or a negative error code on failure.
+ * 发送 DCS 设置显示亮度命令（0x51），以大端字节序（高字节在前，
+ * 低字节在后）配置 16 位显示亮度值。与 mipi_dsi_dcs_set_display_brightness()
+ * 的区别在于字节序不同。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_set_display_brightness_large(struct mipi_dsi_device *dsi,
 					     u16 brightness)
@@ -1511,12 +1672,15 @@ int mipi_dsi_dcs_set_display_brightness_large(struct mipi_dsi_device *dsi,
 EXPORT_SYMBOL(mipi_dsi_dcs_set_display_brightness_large);
 
 /**
- * mipi_dsi_dcs_get_display_brightness_large() - gets the current 16-bit
- *    brightness value of the display
- * @dsi: DSI peripheral device
- * @brightness: brightness value
+ * mipi_dsi_dcs_get_display_brightness_large() - 获取显示器的当前 16 位亮度值
+ * @dsi: DSI 外设设备
+ * @brightness: 返回亮度值的位置
  *
- * Return: 0 on success or a negative error code on failure.
+ * 读取 DCS 显示亮度寄存器（0x52），以大端字节序解析并返回 16 位
+ * 显示亮度值。与 mipi_dsi_dcs_get_display_brightness() 的区别在于
+ * 字节序处理方式不同。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_dcs_get_display_brightness_large(struct mipi_dsi_device *dsi,
 					     u16 *brightness)
@@ -2007,11 +2171,14 @@ static void mipi_dsi_drv_shutdown(struct device *dev)
 }
 
 /**
- * mipi_dsi_driver_register_full() - register a driver for DSI devices
- * @drv: DSI driver structure
- * @owner: owner module
+ * mipi_dsi_driver_register_full() - 注册 DSI 设备的驱动程序
+ * @drv: DSI 驱动结构体
+ * @owner: 所属模块
  *
- * Return: 0 on success or a negative error code on failure.
+ * 注册一个 MIPI DSI 设备驱动程序。该函数会将驱动绑定到 DSI 总线
+ * 类型，并设置 probe、remove 和 shutdown 回调函数（如果提供）。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 int mipi_dsi_driver_register_full(struct mipi_dsi_driver *drv,
 				  struct module *owner)
@@ -2031,10 +2198,12 @@ int mipi_dsi_driver_register_full(struct mipi_dsi_driver *drv,
 EXPORT_SYMBOL(mipi_dsi_driver_register_full);
 
 /**
- * mipi_dsi_driver_unregister() - unregister a driver for DSI devices
- * @drv: DSI driver structure
+ * mipi_dsi_driver_unregister() - 注销 DSI 设备的驱动程序
+ * @drv: DSI 驱动结构体
  *
- * Return: 0 on success or a negative error code on failure.
+ * 注销一个之前注册的 MIPI DSI 设备驱动程序。
+ *
+ * 返回：成功返回 0，失败返回负错误码。
  */
 void mipi_dsi_driver_unregister(struct mipi_dsi_driver *drv)
 {

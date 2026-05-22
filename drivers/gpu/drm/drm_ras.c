@@ -3,6 +3,28 @@
  * Copyright © 2026 Intel Corporation
  */
 
+/*
+ * 文件名: drm_ras.c
+ *
+ * 中文描述: DRM RAS（可靠性、可用性、可服务性）节点管理
+ *
+ * RAS（Reliability, Availability, Serviceability）是计算系统用于增强
+ * 可靠性、提高可用性和简化维护的一组特性集合。在 DRM 子系统中，RAS 框架
+ * 用于管理和报告显卡硬件组件的错误计数和可靠性指标。
+ *
+ * 本文件实现了 RAS 节点的注册和管理基础设施：
+ *   1. RAS 节点注册/注销 - 驱动程序可动态注册一个或多个 RAS 节点
+ *   2. 节点通过全局 xarray (drm_ras_xa) 进行管理，支持按 ID 高效查找
+ *   3. 支持 Generic Netlink 接口与用户空间通信
+ *
+ * Netlink 操作：
+ *   1. LIST_NODES - 列出所有已注册的 RAS 节点
+ *   2. GET_ERROR_COUNTER - 获取指定节点的错误计数器值
+ *
+ * 目前仅支持 ERROR_COUNTER 类型的节点，驱动程序需实现
+ * query_error_counter() 回调函数来提供错误计数器和名称。
+ */
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/netdevice.h>
@@ -79,19 +101,17 @@ struct drm_ras_ctx {
 };
 
 /**
- * drm_ras_nl_list_nodes_dumpit() - Dump all registered RAS nodes
- * @skb: Netlink message buffer
- * @cb: Callback context for multi-part dumps
+ * drm_ras_nl_list_nodes_dumpit() - 转储所有已注册的 RAS 节点
+ * @skb: Netlink 消息缓冲区
+ * @cb: 多部分转储的回调上下文
  *
- * Iterates over all registered RAS nodes in the global xarray and appends
- * their attributes (ID, name, type) to the given netlink message buffer.
- * Uses @cb->ctx to track progress in case the message buffer fills up, allowing
- * multi-part dump support. On buffer overflow, updates the context to resume
- * from the last node on the next invocation.
+ * 遍历全局 xarray 中所有已注册的 RAS 节点，将其属性（ID、设备名称、
+ * 节点名称、类型）附加到给定的 netlink 消息缓冲区。
  *
- * Return: 0 if all nodes fit in @skb, number of bytes added to @skb if
- *          the buffer filled up (requires multi-part continuation), or
- *          a negative error code on failure.
+ * 使用 @cb->ctx 跟踪进度以支持多部分（multi-part）转储：当消息缓冲区
+ * 填满时，记录当前位置，下次调用时从中断处继续。
+ *
+ * 返回：0 所有节点已写入，-EMSGSIZE 缓冲区不足（需要继续），其他负错误码
  */
 int drm_ras_nl_list_nodes_dumpit(struct sk_buff *skb,
 				 struct netlink_callback *cb)
@@ -217,19 +237,18 @@ static int doit_reply_value(struct genl_info *info, u32 node_id,
 }
 
 /**
- * drm_ras_nl_get_error_counter_dumpit() - Dump all Error Counters
- * @skb: Netlink message buffer
- * @cb: Callback context for multi-part dumps
+ * drm_ras_nl_get_error_counter_dumpit() - 转储指定节点的所有错误计数器
+ * @skb: Netlink 消息缓冲区
+ * @cb: 多部分转储的回调上下文
  *
- * Iterates over all error counters in a given Node and appends
- * their attributes (ID, name, value) to the given netlink message buffer.
- * Uses @cb->ctx to track progress in case the message buffer fills up, allowing
- * multi-part dump support. On buffer overflow, updates the context to resume
- * from the last node on the next invocation.
+ * 遍历指定 RAS 节点中的所有错误计数器，将其属性（ID、名称、值）
+ * 附加到 netlink 消息缓冲区。支持非连续的错误 ID 范围：
+ * 如果驱动程序的 query_error_counter 回调返回 -ENOENT，
+ * 则跳过该 ID 继续遍历。
  *
- * Return: 0 if all errors fit in @skb, number of bytes added to @skb if
- *          the buffer filled up (requires multi-part continuation), or
- *          a negative error code on failure.
+ * 支持多部分转储：缓冲区满时记录当前位置以便后续继续。
+ *
+ * 返回：0 所有计数器已写入，-EMSGSIZE 缓冲区不足，负错误码失败
  */
 int drm_ras_nl_get_error_counter_dumpit(struct sk_buff *skb,
 					struct netlink_callback *cb)
@@ -288,15 +307,16 @@ int drm_ras_nl_get_error_counter_dumpit(struct sk_buff *skb,
 }
 
 /**
- * drm_ras_nl_get_error_counter_doit() - Query an error counter of an node
- * @skb: Netlink message buffer
- * @info: Generic Netlink info containing attributes of the request
+ * drm_ras_nl_get_error_counter_doit() - 查询指定节点的某个错误计数器
+ * @skb: Netlink 消息缓冲区
+ * @info: 包含请求属性的 Generic Netlink 信息
  *
- * Extracts the node ID and error ID from the netlink attributes and
- * retrieves the current value of the corresponding error counter. Sends the
- * result back to the requesting user via the standard Genl reply.
+ * 从 netlink 属性中提取节点 ID 和错误 ID，查询对应的错误计数器当前值，
+ * 并通过标准 Generic Netlink 回复机制将结果返回给请求的用户空间程序。
  *
- * Return: 0 on success, or negative errno on failure.
+ * 用户空间必须同时提供节点 ID 和错误 ID。
+ *
+ * 返回：0 成功，负错误码失败
  */
 int drm_ras_nl_get_error_counter_doit(struct sk_buff *skb,
 				      struct genl_info *info)
@@ -315,13 +335,18 @@ int drm_ras_nl_get_error_counter_doit(struct sk_buff *skb,
 }
 
 /**
- * drm_ras_node_register() - Register a new RAS node
- * @node: Node structure to register
+ * drm_ras_node_register() - 注册一个新的 RAS 节点
+ * @node: 要注册的节点结构体
  *
- * Adds the given RAS node to the global node xarray and assigns it
- * a unique ID. Both @node->name and @node->type must be valid.
+ * 将给定的 RAS 节点添加到全局节点 xarray 中，并为其分配唯一 ID。
+ * 节点必须提供 device_name 和 node_name。目前仅支持
+ * DRM_RAS_NODE_TYPE_ERROR_COUNTER 类型的节点。
  *
- * Return: 0 on success, or negative errno on failure:
+ * 对于错误计数器类型的节点，还必须提供：
+ *   - error_counter_range.last: 最后一个有效的错误 ID
+ *   - query_error_counter 回调: 用于查询错误计数器的名称和值
+ *
+ * 返回：0 成功，-EINVAL 参数无效，其他负错误码失败
  */
 int drm_ras_node_register(struct drm_ras_node *node)
 {
@@ -342,10 +367,11 @@ int drm_ras_node_register(struct drm_ras_node *node)
 EXPORT_SYMBOL(drm_ras_node_register);
 
 /**
- * drm_ras_node_unregister() - Unregister a previously registered node
- * @node: Node structure to unregister
+ * drm_ras_node_unregister() - 注销一个已注册的 RAS 节点
+ * @node: 要注销的节点结构体
  *
- * Removes the given node from the global node xarray using its ID.
+ * 使用节点的 ID 从全局节点 xarray 中移除该 RAS 节点。
+ * 执行后节点不再对用户空间可见。
  */
 void drm_ras_node_unregister(struct drm_ras_node *node)
 {

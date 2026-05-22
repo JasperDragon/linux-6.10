@@ -26,6 +26,26 @@
  *
  */
 
+/*
+ * DRM CRC 调试接口 - 提供帧 CRC（循环冗余校验）信息的采集和用户空间访问
+ *
+ * 本文件实现了 DRM 的 CRC 调试功能，通过 debugfs 文件系统暴露帧 CRC
+ * 校验信息的采集和控制接口。CRC 数据在帧到达特定硬件组件（CRC 采样源）
+ * 时生成，可用于验证显示输出的完整性、比较帧内容等调试场景。
+ *
+ * 用户空间接口（通过 debugfs）：
+ *   control 文件（dri/0/crtc-N/crc/control）：
+ *     写入 CRC 源名称启用采集，写入 "auto" 使用驱动默认源，
+ *     空字符串禁用采集。
+ *   data 文件（dri/0/crtc-N/crc/data）：
+ *     读取 CRC 数据，每行包含帧号（或 XXXXXXXX）和 CRC 值。
+ *
+ * 驱动侧实现要求：
+ *   实现 &drm_crtc_funcs.set_crc_source 和 &drm_crtc_funcs.verify_crc_source
+ *   回调函数。CRC 采样通过 drm_crtc_add_crc_entry() 提交。
+ *   CRC 结果必须在非全模式设置的原子提交中保持可靠。
+ */
+
 #include <linux/circ_buf.h>
 #include <linux/ctype.h>
 #include <linux/debugfs.h>
@@ -381,6 +401,19 @@ void drm_debugfs_crtc_crc_add(struct drm_crtc *crtc)
 			    &drm_crtc_crc_data_fops);
 }
 
+/*
+ * drm_crtc_add_crc_entry - 添加帧的 CRC 信息条目到调试缓冲区
+ * @crtc: 帧所属的 CRTC
+ * @has_frame: 此条目是否包含帧号
+ * @frame: CRC 对应的帧序号
+ * @crcs: CRC 值数组，长度匹配 drm_crtc_crc.values_cnt
+ *
+ * 驱动程序在每帧处理完成后调用此函数，将从 CRC 采样源获取的数据
+ * 添加到环形缓冲区中，供用户空间通过 debugfs 的 data 文件读取。
+ * 如果缓冲区已满（用户空间读取过慢），会记录溢出错误并返回 -ENOBUFS。
+ *
+ * 返回：0 表示成功，-EINVAL 表示缓冲区未初始化，-ENOBUFS 表示溢出。
+ */
 /**
  * drm_crtc_add_crc_entry - Add entry with CRC information for a frame
  * @crtc: CRTC to which the frame belongs

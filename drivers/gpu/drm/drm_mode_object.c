@@ -20,6 +20,24 @@
  * OF THIS SOFTWARE.
  */
 
+/*
+ * DRM 模式对象基础 - 中文注释补充
+ *
+ * 本文件实现了 DRM 模式对象（mode object）的核心管理机制。
+ * 模式对象是 DRM 展示子系统中所有可标识实体的基类，每个对象
+ * 通过 ID 分配器（IDR）获得一个全局唯一的 32 位标识符。
+ *
+ * 主要功能：
+ *   1. 模式对象的注册与注销（ID 分配和回收）
+ *   2. 对象的引用计数管理（用于需要共享生命周期的对象）
+ *   3. 通过 ID 查找模式对象（支持租约 lease 检查）
+ *   4. 属性（property）的挂载、取值和赋值
+ *   5. 用户空间 IOCTL 接口（get/set properties）
+ *
+ * 模式对象类型包括：CRTC、Connector、Plane、Property、Blob、ColorOP 等。
+ * 原子驱动通过本模块的机制维护对象-属性的映射关系。
+ */
+
 #include <linux/export.h>
 #include <linux/uaccess.h>
 
@@ -76,6 +94,11 @@ int __drm_mode_object_add(struct drm_device *dev, struct drm_mode_object *obj,
  *
  * Returns:
  * Zero on success, error code on failure.
+ */
+/*
+ * 中文说明：向设备的 ID 分配器（IDR）注册一个新的模式对象，
+ * 分配一个全局唯一的 32 位 ID。对象可通过此 ID 被用户空间引用。
+ * 用于管理 CRTC、Connector、Plane 等模式对象。
  */
 int drm_mode_object_add(struct drm_device *dev,
 			struct drm_mode_object *obj, uint32_t obj_type)
@@ -174,6 +197,12 @@ struct drm_mode_object *__drm_mode_object_find(struct drm_device *dev,
  * reference for reference counted objects. This reference must be dropped again
  * by callind drm_mode_object_put().
  */
+/*
+ * 中文说明：通过 ID 和类型查找模式对象。
+ * 自动检查租约（lease）权限，确保调用者有权访问该对象。
+ * 对引用计数对象，自动增加引用计数，调用者必须配对调用 put()。
+ * type 可设为 DRM_MODE_OBJECT_ANY 以匹配任意类型。
+ */
 struct drm_mode_object *drm_mode_object_find(struct drm_device *dev,
 		struct drm_file *file_priv,
 		uint32_t id, uint32_t type)
@@ -193,6 +222,11 @@ EXPORT_SYMBOL(drm_mode_object_find);
  * object. It is a no-op on any other object. This is used to drop references
  * acquired with drm_mode_object_get().
  */
+/*
+ * 中文说明：释放模式对象的引用计数。仅对引用计数对象
+ * （设置了 free_cb 的对象，如 framebuffer、blob 等）有效。
+ * 引用计数归零时自动调用 free_cb 进行资源清理。
+ */
 void drm_mode_object_put(struct drm_mode_object *obj)
 {
 	if (obj->free_cb) {
@@ -209,6 +243,10 @@ EXPORT_SYMBOL(drm_mode_object_put);
  * This function increments the object's refcount if it is a refcounted modeset
  * object. It is a no-op on any other object. References should be dropped again
  * by calling drm_mode_object_put().
+ */
+/*
+ * 中文说明：增加模式对象的引用计数。用于确保对象在使用期间
+ * 不会被释放。与 drm_mode_object_put() 配对使用。
  */
 void drm_mode_object_get(struct drm_mode_object *obj)
 {
@@ -231,6 +269,12 @@ EXPORT_SYMBOL(drm_mode_object_get);
  *
  * Note that all properties must be attached before the object itself is
  * registered and accessible from userspace.
+ */
+/*
+ * 中文说明：将属性挂载到模式对象上，并设置初始值。
+ * 所有属性必须在对象注册到用户空间之前挂载完成。
+ * 驱动在初始化 CRTC/Connector/Plane 时调用此函数注册标准属性。
+ * 属性数组为静态大小（DRM_OBJECT_MAX_PROPERTY），超出会触发 WARN。
  */
 void drm_object_attach_property(struct drm_mode_object *obj,
 				struct drm_property *property,
@@ -281,6 +325,12 @@ EXPORT_SYMBOL(drm_object_attach_property);
  *
  * Returns:
  * Zero on success, error code on failure.
+ */
+/*
+ * 中文说明：设置模式对象上某个属性当前值（软件状态）。
+ * 仅更新内存中的值，不调用驱动的硬件编程回调。
+ * 原子驱动不应直接调用此函数（不可变属性除外），
+ * 应通过 atomic 状态机设置属性。
  */
 int drm_object_property_set_value(struct drm_mode_object *obj,
 				  struct drm_property *property, uint64_t val)
@@ -350,6 +400,12 @@ static int __drm_object_property_get_value(struct drm_mode_object *obj,
  * Returns:
  * Zero on success, error code on failure.
  */
+/*
+ * 中文说明：获取模式对象上某个属性的当前值。
+ * 对原子驱动返回的是软件状态（可能已过时），
+ * 因此原子驱动不应直接调用此函数，而应通过
+ * atomic_get_property 回调获取。
+ */
 int drm_object_property_get_value(struct drm_mode_object *obj,
 				  struct drm_property *property, uint64_t *val)
 {
@@ -375,6 +431,11 @@ EXPORT_SYMBOL(drm_object_property_get_value);
  * Returns:
  * Zero on success, error code on failure.
  */
+/*
+ * 中文说明：获取属性在挂载时设置的默认值。
+ * 仅对使用 atomic 模式设置的驱动有效。
+ * 驱动在 colorop 状态重置时使用此函数获取默认值。
+ */
 int drm_object_property_get_default_value(struct drm_mode_object *obj,
 					  struct drm_property *property,
 					  uint64_t *val)
@@ -398,6 +459,11 @@ EXPORT_SYMBOL(drm_object_property_get_default_value);
  *
  * Returns:
  * Zero on success, error code on failure.
+ */
+/*
+ * 中文说明：获取不可变（IMMUTABLE）属性的值。
+ * 不可变属性在对象的整个生命周期中值不会改变，
+ * 原子驱动和非原子驱动均可使用此函数安全读取。
  */
 int drm_object_immutable_property_get_value(struct drm_mode_object *obj,
 					    struct drm_property *property,

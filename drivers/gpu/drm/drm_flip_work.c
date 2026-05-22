@@ -13,12 +13,33 @@
  * Software.
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * IMPLIED, BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
+ */
+
+/*
+ * 中文注释: DRM 页面翻转工作队列 (Page Flip Work Queue)
+ *
+ * 本文件实现了页面翻转工作队列 (flip-work) 机制, 用于在 DRM 驱动中
+ * 延迟执行页面翻转相关操作。典型应用场景是在 vblank 中断上下文中
+ * 提交工作, 然后在工作队列中实际执行。
+ *
+ * 工作流程:
+ *   1. drm_flip_work_queue(): 在任何上下文 (包括 vblank 中断) 中
+ *      将工作项加入队列。如果无法分配内存, 则立即执行回调函数。
+ *   2. drm_flip_work_commit(): 在 vblank 中断中提交所有排队的工作,
+ *      将任务转移到工作队列执行。
+ *   3. flip_worker: 工作线程, 遍历 commited 列表并调用回调函数。
+ *
+ * 设计特点:
+ *   - 使用两个列表 (queued 和 commited) 实现生产-消费模式
+ *   - 生产者 (任意上下文) 添加到 queued 列表
+ *   - 消费者 (工作线程) 从 commited 列表取出执行
+ *   - commit 操作用 list_splice_tail 原子性地转移整个列表
  */
 
 #include <linux/export.h>
@@ -54,6 +75,12 @@ static void drm_flip_work_queue_task(struct drm_flip_work *work, struct drm_flip
 }
 
 /**
+ * 中文注释: 将工作项加入队列
+ * 将 @val 加入翻转工作队列。如果内存分配失败 (无法创建 task),
+ * 则立即在当前上下文中同步执行回调函数 (fallback)。
+ * 可在任何上下文中调用, 包括 vblank 中断处理函数。
+ * 在可睡眠的上下文中使用 GFP_KERNEL, 否则使用 GFP_ATOMIC。
+ *
  * drm_flip_work_queue - queue work
  * @work: the flip-work
  * @val: the value to queue
@@ -77,6 +104,13 @@ void drm_flip_work_queue(struct drm_flip_work *work, void *val)
 EXPORT_SYMBOL(drm_flip_work_queue);
 
 /**
+ * 中文注释: 提交已排队的工作
+ * 将 queued 列表中的所有工作项原子性地转移到 commited 列表,
+ * 并通过 queue_work() 调度工作线程执行。典型用法:
+ *   1. 在 vblank 中断或之前任意时刻通过 drm_flip_work_queue() 排队
+ *   2. 在 vblank 中断中调用此函数提交所有排队的工作
+ *   3. 工作线程在进程上下文中执行实际的回调函数
+ *
  * drm_flip_work_commit - commit queued work
  * @work: the flip-work
  * @wq: the work-queue to run the queued work on
@@ -125,6 +159,10 @@ static void flip_worker(struct work_struct *w)
 }
 
 /**
+ * 中文注释: 初始化翻转工作队列
+ * 初始化 drm_flip_work 结构, 包括 queued/commited 链表、自旋锁
+ * 和工作线程。@name 用于调试标识, @func 是处理工作项的回调函数。
+ *
  * drm_flip_work_init - initialize flip-work
  * @work: the flip-work to initialize
  * @name: debug name
@@ -146,6 +184,10 @@ void drm_flip_work_init(struct drm_flip_work *work,
 EXPORT_SYMBOL(drm_flip_work_init);
 
 /**
+ * 中文注释: 清理翻转工作队列
+ * 销毁翻转工作队列的资源。如果在清理时仍有未处理的工作项
+ * (queued 或 commited 列表非空), 发出警告。
+ *
  * drm_flip_work_cleanup - cleans up flip-work
  * @work: the flip-work to cleanup
  *

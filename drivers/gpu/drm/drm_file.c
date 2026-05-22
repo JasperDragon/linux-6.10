@@ -31,6 +31,37 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+/*
+ * DRM 文件操作管理 - 实现 DRM 设备文件的打开、关闭、读写和事件管理
+ *
+ * 本文件实现了 DRM 框架的文件操作层，是用户空间与 DRM 内核驱动之间
+ * 的主要接口。驱动程序必须在其 &file_operations 结构中注册此文件提供
+ * 的函数，作为 DRM 用户空间 API 的入口点。
+ *
+ * 核心功能：
+ *
+ *   文件生命周期：
+ *     - drm_file_alloc() / drm_file_free() - DRM 文件上下文的分配和释放
+ *     - drm_open() - 打开 DRM 设备节点，创建文件上下文并初始化资源
+ *     - drm_release() / drm_release_noglobal() - 关闭文件，释放资源
+ *
+ *   事件管理：
+ *     - drm_event_reserve_init() - 预留事件空间并初始化事件
+ *     - drm_event_cancel_free() - 取消并释放未投递的事件
+ *     - drm_send_event() / drm_send_event_locked() - 发送事件到用户空间
+ *     - drm_read() - 从事件队列读取 DRM 事件
+ *     - drm_poll() - 轮询事件队列状态
+ *
+ *   fdinfo 支持：
+ *     - drm_show_fdinfo() - 显示文件描述符信息（驱动、客户端 ID、内存统计）
+ *     - drm_print_memory_stats() - 打印 GEM 对象内存统计
+ *     - drm_show_memory_stats() - 收集并显示内存使用统计
+ *
+ *   其他：
+ *     - mock_drm_getfile() - 创建虚拟 DRM 文件（用于测试）
+ *     - drm_file_update_pid() - 更新文件关联的进程 ID
+ */
+
 #include <linux/anon_inodes.h>
 #include <linux/dma-fence.h>
 #include <linux/export.h>
@@ -118,6 +149,21 @@ bool drm_dev_needs_global_mutex(struct drm_device *dev)
  * :ref:`IOCTL support in the userland interfaces chapter<drm_driver_ioctl>`.
  */
 
+/*
+ * drm_file_alloc - 分配 DRM 文件上下文
+ * @minor: 要关联的 DRM minor
+ *
+ * 创建并初始化一个新的 DRM 文件上下文，包括：
+ *   - 分配唯一的客户端 ID（用于 fdinfo）
+ *   - 初始化事件列表、帧缓冲列表、blob 列表
+ *   - 初始化 GEM、syncobj、prime 等子系统相关的文件私有数据
+ *   - 调用驱动注册的 open 回调
+ *
+ * 该上下文不会自动链接到任何链表，调用者需要负责后续的链接操作。
+ * 注意：上下文持有 @minor 的指针，必须在 @minor 释放之前释放此上下文。
+ *
+ * 返回：指向新分配的文件上下文的指针，失败时返回 ERR_PTR。
+ */
 /**
  * drm_file_alloc - allocate file context
  * @minor: minor to allocate on
@@ -220,6 +266,17 @@ static void drm_events_release(struct drm_file *file_priv)
 	spin_unlock_irqrestore(&dev->event_lock, flags);
 }
 
+/*
+ * drm_file_free - 释放 DRM 文件上下文
+ * @file: 要释放的文件上下文（允许为 NULL）
+ *
+ * 销毁由 drm_file_alloc() 分配的 DRM 文件上下文。在调用此函数前，
+ * 调用者必须确保已将其从任何上下文中取消链接。
+ * 释放过程包括：关闭 GEM 句柄、释放 syncobj、释放事件队列、
+ * 释放 prime 文件私有数据、调用驱动的 postclose 回调等。
+ *
+ * 如果传入 NULL，此函数无操作。
+ */
 /**
  * drm_file_free - free file context
  * @file: context to free, or NULL
@@ -354,6 +411,20 @@ int drm_open_helper(struct file *filp, struct drm_minor *minor)
 	return 0;
 }
 
+/*
+ * drm_open - DRM 设备文件的打开方法
+ * @inode: 设备 inode
+ * @filp: 文件指针
+ *
+ * 驱动程序必须将此函数用作其 file_operations.open 方法。它负责：
+ *   1. 通过 inode 中的次设备号查找对应的 DRM minor 设备
+ *   2. 分配 drm_file 文件上下文并初始化所有每文件资源
+ *   3. 如果是主设备节点，处理主控权分配
+ *   4. 调用驱动的 open 回调
+ *   5. 将文件上下文添加到设备的文件列表中
+ *
+ * 返回：0 表示成功，负错误码表示失败。
+ */
 /**
  * drm_open - open method for DRM file
  * @inode: device inode
@@ -411,6 +482,20 @@ static void drm_lastclose(struct drm_device *dev)
 		vga_switcheroo_process_delayed_switch();
 }
 
+/*
+ * drm_release - DRM 设备文件的释放方法
+ * @inode: 设备 inode
+ * @filp: 文件指针
+ *
+ * 驱动程序必须将此函数用作其 file_operations.release 方法。
+ * 释放所有与打开文件关联的资源。如果这是该 DRM 设备的最后一个
+ * 打开文件，还会恢复活跃的内核 DRM 客户端并触发延迟的显卡切换。
+ *
+ * 此版本会获取 drm_global_mutex，适用于需要全局锁的驱动。
+ * 对于不需要全局锁的驱动，应使用 drm_release_noglobal()。
+ *
+ * 返回：总是成功并返回 0。
+ */
 /**
  * drm_release - release method for DRM file
  * @inode: device inode
@@ -482,17 +567,20 @@ void drm_file_update_pid(struct drm_file *filp)
 }
 
 /**
- * drm_release_noglobal - release method for DRM file
- * @inode: device inode
- * @filp: file pointer.
+ * drm_release_noglobal - DRM 文件释放函数（无全局锁版本）
+ * @inode: 设备 inode
+ * @filp: 文件指针
  *
- * This function may be used by drivers as their &file_operations.release
- * method. It frees any resources associated with the open file prior to taking
- * the drm_global_mutex. If this is the last open file for the DRM device, it
- * then restores the active in-kernel DRM client.
+ * 驱动程序可以使用此函数作为其 &file_operations.release 方法。
+ * 它在获取 drm_global_mutex 之前释放与打开文件关联的所有资源。
+ * 如果这是 DRM 设备的最后一个打开文件，则会恢复到活跃的内核态
+ * DRM 客户端。
  *
- * RETURNS:
- * Always succeeds and returns 0.
+ * 与 drm_release() 的区别在于此函数不获取 drm_global_mutex，
+ * 适用于不需要全局锁的驱动程序。
+ *
+ * 返回：
+ * 始终成功并返回 0。
  */
 int drm_release_noglobal(struct inode *inode, struct file *filp)
 {
@@ -513,6 +601,24 @@ int drm_release_noglobal(struct inode *inode, struct file *filp)
 }
 EXPORT_SYMBOL(drm_release_noglobal);
 
+/*
+ * drm_read - DRM 文件的读取方法（事件读取）
+ * @filp: 文件指针
+ * @buffer: 用户空间的目标缓冲区
+ * @count: 要读取的字节数
+ * @offset: 读取偏移量（被忽略，DRM 事件以管道方式读取）
+ *
+ * 驱动程序必须将此函数用作其 file_operations.read 方法（如果它们使用
+ * DRM 事件进行异步通知）。由于 KMS API 使用事件进行 vblank 和页面翻转
+ * 完成通知，所有现代显示驱动都必须使用此函数。
+ *
+ * 此函数只会读取完整的事件。用户空间必须提供足够大的缓冲区来容纳
+ * 任何事件以确保向前推进。由于最大事件空间目前为 4K，建议安全地使用
+ * 此大小。轮询支持由 drm_poll() 提供。
+ *
+ * 返回：读取的字节数（总是对齐到完整事件，可能为 0），
+ *       或负错误码。
+ */
 /**
  * drm_read - read method for DRM file
  * @filp: file pointer
@@ -606,6 +712,19 @@ put_back_event:
 }
 EXPORT_SYMBOL(drm_read);
 
+/*
+ * drm_poll - DRM 文件的轮询方法
+ * @filp: 文件指针
+ * @wait: 轮询等待表
+ *
+ * 如果驱动使用 DRM 事件进行异步通知，则必须将次函数用作
+ * file_operations.poll 方法。它允许用户空间通过 poll/select/epoll
+ * 机制等待 DRM 事件（如 vblank、页面翻转完成）的到来。
+ *
+ * 另请参阅 drm_read()。
+ *
+ * 返回：表示文件当前状态的 POLL 标志掩码。
+ */
 /**
  * drm_poll - poll method for DRM file
  * @filp: file pointer
@@ -635,6 +754,25 @@ __poll_t drm_poll(struct file *filp, struct poll_table_struct *wait)
 }
 EXPORT_SYMBOL(drm_poll);
 
+/*
+ * drm_event_reserve_init_locked - 初始化 DRM 事件并预留空间（已加锁版本）
+ * @dev: DRM 设备
+ * @file_priv: DRM 文件私有数据
+ * @p: 待处理事件的跟踪结构
+ * @e: 要投递给用户空间的实际事件数据
+ *
+ * 准备传递的事件并预留事件缓冲区空间。如果事件最终未投递（例如 IOCTL
+ * 后续步骤失败），必须使用 drm_event_cancel_free() 取消并释放。
+ * 成功初始化的事件应通过 drm_send_event() 或 drm_send_event_locked()
+ * 在异步操作完成时发送给用户空间。
+ *
+ * 如果调用者将 @p 嵌入到更大的结构中，该结构必须通过 kmalloc 分配，
+ * 且 @p 必须是第一个成员元素。
+ *
+ * 此版本适用于已持有 drm_device.event_lock 的调用者。
+ *
+ * 返回：0 表示成功，-ENOMEM 表示事件空间不足。
+ */
 /**
  * drm_event_reserve_init_locked - init a DRM event and reserve space for it
  * @dev: DRM device
@@ -676,6 +814,19 @@ int drm_event_reserve_init_locked(struct drm_device *dev,
 }
 EXPORT_SYMBOL(drm_event_reserve_init_locked);
 
+/*
+ * drm_event_reserve_init - 初始化 DRM 事件并预留空间（自动加锁版本）
+ * @dev: DRM 设备
+ * @file_priv: DRM 文件私有数据
+ * @p: 待处理事件的跟踪结构
+ * @e: 要投递给用户空间的实际事件数据
+ *
+ * 与 drm_event_reserve_init_locked() 功能相同，但此函数会自动获取
+ * drm_device.event_lock。适用于尚未持有 event_lock 的调用者。
+ * 已持有 event_lock 的调用者应使用 drm_event_reserve_init_locked()。
+ *
+ * 返回：0 表示成功，-ENOMEM 表示事件空间不足。
+ */
 /**
  * drm_event_reserve_init - init a DRM event and reserve space for it
  * @dev: DRM device
@@ -715,6 +866,15 @@ int drm_event_reserve_init(struct drm_device *dev,
 }
 EXPORT_SYMBOL(drm_event_reserve_init);
 
+/*
+ * drm_event_cancel_free - 取消并释放 DRM 事件及其预留空间
+ * @dev: DRM 设备
+ * @p: 待处理事件的跟踪结构
+ *
+ * 释放通过 drm_event_reserve_init() 初始化的事件，并归还其预留的
+ * 事件缓冲区空间。用于在非阻塞操作无法提交需要中止时取消事件。
+ * 此函数会处理 fence 引用的释放。
+ */
 /**
  * drm_event_cancel_free - free a DRM event and release its space
  * @dev: DRM device
@@ -774,6 +934,18 @@ static void drm_send_event_helper(struct drm_device *dev,
 		EPOLLIN | EPOLLRDNORM);
 }
 
+/*
+ * drm_send_event_timestamp_locked - 发送带时间戳的 DRM 事件（已加锁版本）
+ * @dev: DRM 设备
+ * @e: 要投递的 DRM 事件
+ * @timestamp: fence 事件的时间戳（CLOCK_MONOTONIC 时间域）
+ *
+ * 将通过 drm_event_reserve_init() 初始化的事件 @e 发送到关联的
+ * DRM 文件描述符。调用者必须已持有 drm_device.event_lock。
+ *
+ * 核心会在对应的 DRM 文件关闭时自动取消链接和解除事件。驱动无需担心
+ * 此事件的 DRM 文件是否仍然存在，可以在异步工作完成时无条件调用。
+ */
 /**
  * drm_send_event_timestamp_locked - send DRM event to file descriptor
  * @dev: DRM device
@@ -797,6 +969,17 @@ void drm_send_event_timestamp_locked(struct drm_device *dev,
 }
 EXPORT_SYMBOL(drm_send_event_timestamp_locked);
 
+/*
+ * drm_send_event_locked - 发送 DRM 事件到文件描述符（已加锁版本）
+ * @dev: DRM 设备
+ * @e: 要投递的 DRM 事件
+ *
+ * 将通过 drm_event_reserve_init() 初始化的事件发送到关联的 DRM 文件
+ * 描述符。调用者必须已持有 drm_device.event_lock。
+ * 参见 drm_send_event() 获取未加锁版本。
+ *
+ * 核心会在对应的 DRM 文件关闭时自动处理事件的取消链接和解除。
+ */
 /**
  * drm_send_event_locked - send DRM event to file descriptor
  * @dev: DRM device
@@ -817,6 +1000,17 @@ void drm_send_event_locked(struct drm_device *dev, struct drm_pending_event *e)
 }
 EXPORT_SYMBOL(drm_send_event_locked);
 
+/*
+ * drm_send_event - 发送 DRM 事件到文件描述符（自动加锁版本）
+ * @dev: DRM 设备
+ * @e: 要投递的 DRM 事件
+ *
+ * 将通过 drm_event_reserve_init() 初始化的事件发送到关联的 DRM 文件
+ * 描述符。此函数会自动获取 drm_device.event_lock。
+ * 已持有 event_lock 的调用者应使用 drm_send_event_locked()。
+ *
+ * 核心会在对应的 DRM 文件关闭时自动处理事件的取消链接和解除。
+ */
 /**
  * drm_send_event - send DRM event to file descriptor
  * @dev: DRM device
@@ -842,6 +1036,18 @@ void drm_send_event(struct drm_device *dev, struct drm_pending_event *e)
 }
 EXPORT_SYMBOL(drm_send_event);
 
+/**
+ * drm_fdinfo_print_size - 格式化并打印 DRM fdinfo 内存大小信息
+ * @p: DRM 打印机
+ * @prefix: 前缀字符串（如 "drm-memory"）
+ * @stat: 统计类型（如 "total", "shared", "active"）
+ * @region: 内存区域名称（如 "gem"）
+ * @sz: 大小值（字节）
+ *
+ * 以可读的格式打印 DRM 文件描述符信息中的内存使用统计。
+ * 根据大小自动选择合适的单位（字节、KiB、MiB），
+ * 便于用户空间工具（如 gputop）解析 GPU 内存使用情况。
+ */
 void drm_fdinfo_print_size(struct drm_printer *p,
 			   const char *prefix,
 			   const char *stat,
@@ -872,6 +1078,16 @@ int drm_memory_stats_is_zero(const struct drm_memory_stats *stats)
 }
 EXPORT_SYMBOL(drm_memory_stats_is_zero);
 
+/*
+ * drm_print_memory_stats - 打印内存统计信息的辅助函数
+ * @p: 输出打印机
+ * @stats: 已收集的内存统计信息
+ * @supported_status: 可用的可选统计信息位掩码
+ * @region: 内存区域名称
+ *
+ * 输出包括 total（总大小）、shared（共享大小）以及可选的
+ * active（活跃）、resident（驻留）和 purgeable（可回收）统计。
+ */
 /**
  * drm_print_memory_stats - A helper to print memory stats
  * @p: The printer to print output to
@@ -904,6 +1120,15 @@ void drm_print_memory_stats(struct drm_printer *p,
 }
 EXPORT_SYMBOL(drm_print_memory_stats);
 
+/*
+ * drm_show_memory_stats - 收集并显示标准 fdinfo 内存统计信息的辅助函数
+ * @p: 输出打印机
+ * @file: DRM 文件
+ *
+ * 遍历指定文件中已分配句柄的所有 GEM 对象，收集其内存使用统计
+ * （包括共用、私有、活跃、驻留、可回收大小），并使用
+ * drm_print_memory_stats() 输出。
+ */
 /**
  * drm_show_memory_stats - Helper to collect and show standard fdinfo memory stats
  * @p: the printer to print output to
@@ -961,6 +1186,18 @@ void drm_show_memory_stats(struct drm_printer *p, struct drm_file *file)
 }
 EXPORT_SYMBOL(drm_show_memory_stats);
 
+/*
+ * drm_show_fdinfo - DRM 文件 fdinfo 的辅助函数
+ * @m: 输出流（seq_file）
+ * @f: 设备文件实例
+ *
+ * 实现 fdinfo 接口，供用户空间查询进程使用 GPU 的统计信息。
+ * 输出内容包括驱动名称、客户端 ID、PCI 设备地址、客户端名称
+ * 以及驱动特定信息（通过 show_fdinfo 回调）。
+ *
+ * 输出格式说明请参见 Documentation/gpu/drm-usage-stats.rst
+ * 另请参阅 &drm_driver.show_fdinfo。
+ */
 /**
  * drm_show_fdinfo - helper for drm file fops
  * @m: output stream
@@ -1005,12 +1242,13 @@ void drm_show_fdinfo(struct seq_file *m, struct file *f)
 EXPORT_SYMBOL(drm_show_fdinfo);
 
 /**
- * drm_file_err - log process name, pid and client_name associated with a drm_file
- * @file_priv: context of interest for process name and pid
- * @fmt: printf() like format string
+ * drm_file_err - 记录与 drm_file 关联的进程名、PID 和客户端名称的错误信息
+ * @file_priv: 关联的 DRM 文件上下文
+ * @fmt: printf() 风格的格式化字符串
  *
- * Helper function for clients which needs to log process details such
- * as name and pid etc along with user logs.
+ * 辅助函数，用于在记录错误时同时输出与 DRM 文件关联的进程
+ * 详细信息，包括进程名、PID 和客户端名称。有助于在调试时
+ * 快速定位哪个用户空间进程导致了错误。
  */
 void drm_file_err(struct drm_file *file_priv, const char *fmt, ...)
 {
@@ -1040,6 +1278,20 @@ void drm_file_err(struct drm_file *file_priv, const char *fmt, ...)
 }
 EXPORT_SYMBOL(drm_file_err);
 
+/*
+ * mock_drm_getfile - 为 DRM 设备创建新的 struct file（用于测试）
+ * @minor: 要包装的 DRM minor（如 drm_device.primary）
+ * @flags: 文件创建模式（O_RDWR 等）
+ *
+ * 创建一个包装了 DRM 文件上下文的 struct file，模拟用户空间打开
+ * /dev/dri/card0 的行为，但不涉及实际用户空间。可以使用其 f_op
+ * （drm_device.driver.fops）操作该 struct file 来模拟用户空间操作，
+* 或将其作为内部/匿名客户端提供给面向用户空间的函数。
+ *
+ * 此函数仅应用于测试目的，通过 EXPORT_SYMBOL_FOR_TESTS_ONLY 导出。
+ *
+ * 返回：指向新创建的 struct file 的指针，失败时返回 ERR_PTR。
+ */
 /**
  * mock_drm_getfile - Create a new struct file for the drm device
  * @minor: drm minor to wrap (e.g. #drm_device.primary)

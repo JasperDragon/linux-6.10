@@ -1,5 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0
 
+/*
+ * 面板背光特殊处理（quirks）模块
+ *
+ * 本文件提供面板背光相关的特殊处理机制。在某些硬件平台上，由于
+ * 固件或硬件的设计缺陷/差异，背光亮度值无法通过标准方式正确探测。
+ * 本模块通过 DMI（桌面管理接口）系统信息来匹配特定硬件平台，
+ * 并为其提供正确的背光参数覆盖。
+ *
+ * 主要功能：
+ *   1. 最小背光亮度值修正：某些面板将背光关闭（亮度0）误解为
+ *      最大亮度，需要强制设置最小亮度为1来避免此问题。
+ *   2. 亮度值掩码修正：某些 OLED 面板在亮度值的最后几位为 0/1
+ *      时会出现显示异常，需要通过掩码来修正。
+ *
+ * 通过维护一个 DMI 匹配表，本模块能够为已知有问题的硬件平台
+ * 提供正确的背光参数，而无需修改各个显示驱动本身。
+ */
+
 #include <linux/array_size.h>
 #include <linux/dmi.h>
 #include <linux/export.h>
@@ -118,16 +136,21 @@ static bool drm_panel_min_backlight_quirk_matches(
 }
 
 /**
- * drm_get_panel_backlight_quirk - Get backlight quirks for a panel
- * @edid: EDID of the panel to check
+ * drm_get_panel_backlight_quirk - 获取面板背光特殊处理参数
+ * @edid: 要检查的面板的 EDID 数据
  *
- * This function checks for platform specific (e.g. DMI based) quirks
- * providing info on the minimum backlight brightness for systems where this
- * cannot be probed correctly from the hard-/firm-ware and other sources.
+ * 该函数检查平台特定（如基于 DMI 的）特殊处理配置，提供无法从
+ * 硬件/固件或其他来源正确探测的面板最小背光亮度等信息。
  *
- * Returns:
- * a drm_panel_backlight_quirk struct if a quirk was found, otherwise an
- * error pointer.
+ * 背光问题有两种常见情况：
+ *   1. 最小亮度问题：某些面板在亮度设为0时会异常显示（如全黑或全亮），
+ *      需要将最小值设为1来解决。
+ *   2. 亮度掩码问题：某些 OLED 面板在亮度值的最后几位为特定值时会出现
+ *      显示异常，需要通过掩码来修正这些值。
+ *
+ * 返回：
+ * 找到匹配的特殊处理配置时返回 drm_panel_backlight_quirk 结构体指针，
+ * 否则返回错误指针。
  */
 const struct drm_panel_backlight_quirk *
 drm_get_panel_backlight_quirk(const struct drm_edid *edid)

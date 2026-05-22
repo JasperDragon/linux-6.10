@@ -1,4 +1,24 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/*
+ * 文件名: drm_of.c
+ *
+ * 中文描述: DRM Device Tree（设备树）辅助函数
+ *
+ * 本文件提供了一组辅助函数，帮助 DRM 驱动程序解析标准设备树（DT）属性。
+ * 设备树是嵌入式系统和 ARM 平台上描述硬件拓扑结构的标准方式，DRM 驱动通过
+ * DT 节点来发现和连接显示管线的各个组件。
+ *
+ * 核心功能包括：
+ *   1. CRTC 端口查询 (drm_of_crtc_port_mask) - 通过端口 DT 节点查找对应 CRTC 的掩码
+ *   2. 可能的 CRTC 查找 (drm_of_find_possible_crtcs) - 扫描编码器端口的所有端点，生成可连接的 CRTC 掩码
+ *   3. 组件驱动探针 (drm_of_component_probe) - 基于 DT 解析结果自动探测和绑定组件
+ *   4. 面板/桥接器查找 (drm_of_find_panel_or_bridge) - 通过 DT 端口和端点号查找连接的 panel 或 bridge
+ *   5. LVDS 双链路支持 (drm_of_lvds_get_dual_link_pixel_order) - 获取双链路 LVDS 的像素传输顺序
+ *   6. LVDS 数据映射 (drm_of_lvds_get_data_mapping) - 将 DT "data-mapping" 属性转换为媒体总线格式
+ *   7. 数据通道计数 (drm_of_get_data_lanes_count) - 获取 DSI/(e)DP 数据通道数量
+ *   8. DSI 总线查找 (drm_of_get_dsi_bus) - 通过 DT 查找 DSI 总线主机
+ */
+
 #include <linux/component.h>
 #include <linux/export.h>
 #include <linux/list.h>
@@ -22,12 +42,16 @@
  */
 
 /**
- * drm_of_crtc_port_mask - find the mask of a registered CRTC by port OF node
- * @dev: DRM device
- * @port: port OF node
+ * drm_of_crtc_port_mask - 通过端口 DT 节点查找已注册 CRTC 的掩码
+ * @dev: DRM 设备
+ * @port: 端口 OF 节点
  *
- * Given a port OF node, return the possible mask of the corresponding
- * CRTC within a device's list of CRTCs.  Returns zero if not found.
+ * 给定一个端口 OF 节点，遍历设备的所有 CRTC，查找端口匹配的 CRTC。
+ * 返回该 CRTC 在 possible_crtc 掩码中的对应位（1 << index）。
+ * 如果未找到则返回 0。
+ *
+ * 此掩码用于设置编码器（encoder）的 possible_crtcs 字段，
+ * 表示该编码器可以连接到哪些 CRTC。
  */
 uint32_t drm_of_crtc_port_mask(struct drm_device *dev,
 			    struct device_node *port)
@@ -47,13 +71,15 @@ uint32_t drm_of_crtc_port_mask(struct drm_device *dev,
 EXPORT_SYMBOL(drm_of_crtc_port_mask);
 
 /**
- * drm_of_find_possible_crtcs - find the possible CRTCs for an encoder port
- * @dev: DRM device
- * @port: encoder port to scan for endpoints
+ * drm_of_find_possible_crtcs - 为编码器端口查找可能的 CRTC
+ * @dev: DRM 设备
+ * @port: 要扫描端点的编码器端口
  *
- * Scan all endpoints attached to a port, locate their attached CRTCs,
- * and generate the DRM mask of CRTCs which may be attached to this
- * encoder.
+ * 扫描附加到指定端口的所有端点，找到每个端点连接的远程端口，
+ * 确定对应的 CRTC，并生成该编码器可连接的 CRTC 掩码。
+ *
+ * 这是 DRM 驱动 probe 流程中的关键步骤，确保编码器能够正确
+ * 关联到其支持的 CRTC。
  *
  * See https://github.com/devicetree-org/dt-schema/blob/main/dtschema/schemas/graph.yaml
  * for the bindings.
@@ -81,11 +107,15 @@ uint32_t drm_of_find_possible_crtcs(struct drm_device *dev,
 EXPORT_SYMBOL(drm_of_find_possible_crtcs);
 
 /**
- * drm_of_component_match_add - Add a component helper OF node match rule
- * @master: master device
- * @matchptr: component match pointer
- * @compare: compare function used for matching component
- * @node: of_node
+ * drm_of_component_match_add - 添加组件 helper 的 OF 节点匹配规则
+ * @master: master 设备
+ * @matchptr: 组件匹配指针
+ * @compare: 用于匹配组件的比较函数
+ * @node: OF 节点
+ *
+ * 将设备树节点添加到组件匹配列表中。获取节点引用并调用
+ * component_match_add_release() 注册匹配规则，释放时
+ * 使用 component_release_of 自动释放 OF 节点引用。
  */
 void drm_of_component_match_add(struct device *master,
 				struct component_match **matchptr,
@@ -99,7 +129,7 @@ void drm_of_component_match_add(struct device *master,
 EXPORT_SYMBOL_GPL(drm_of_component_match_add);
 
 /**
- * drm_of_component_probe - Generic probe function for a component based master
+ * drm_of_component_probe - 基于组件驱动模型的通用 probe 函数
  * @dev: master device containing the OF node
  * @compare_of: compare function used for matching components
  * @m_ops: component master ops to be used
@@ -187,12 +217,14 @@ int drm_of_component_probe(struct device *dev,
 EXPORT_SYMBOL(drm_of_component_probe);
 
 /*
- * drm_of_encoder_active_endpoint - return the active encoder endpoint
- * @node: device tree node containing encoder input ports
- * @encoder: drm_encoder
+ * drm_of_encoder_active_endpoint - 获取激活的编码器端点
+ * @node: 包含编码器输入端口的设备树节点
+ * @encoder: DRM 编码器
  *
- * Given an encoder device node and a drm_encoder with a connected crtc,
- * parse the encoder endpoint connecting to the crtc port.
+ * 给定编码器设备节点和一个已连接 CRTC 的 drm_encoder，
+ * 解析连接到该 CRTC 端口的编码器端点信息。
+ *
+ * 返回：0 成功，-EINVAL 参数无效
  */
 int drm_of_encoder_active_endpoint(struct device_node *node,
 				   struct drm_encoder *encoder,
@@ -221,7 +253,9 @@ int drm_of_encoder_active_endpoint(struct device_node *node,
 EXPORT_SYMBOL_GPL(drm_of_encoder_active_endpoint);
 
 /**
- * drm_of_find_panel_or_bridge - return connected panel or bridge device
+ * drm_of_find_panel_or_bridge - 返回连接的 panel 或 bridge 设备
+ *
+ * 注意：此函数已废弃，新驱动应使用 devm_drm_of_get_bridge()。
  * @np: device tree node containing encoder output ports
  * @port: port in the device tree node
  * @endpoint: endpoint in the device tree node
@@ -360,7 +394,14 @@ static int __drm_of_lvds_get_dual_link_pixel_order(int p1_pt, int p2_pt)
 }
 
 /**
- * drm_of_lvds_get_dual_link_pixel_order - Get LVDS dual-link source pixel order
+ * drm_of_lvds_get_dual_link_pixel_order - 获取 LVDS 双链路源的像素传输顺序
+ *
+ * LVDS 双链路连接由两条链路组成，偶数像素在一链路上传输，
+ * 奇数像素在另一链路上。此函数根据连接 sink 的需求，返回
+ * LVDS 双链路源的两个端口分别传输偶数和奇数像素的顺序。
+ *
+ * 像素顺序由 sink 的 DT 端口节点中的 dual-lvds-even-pixels 和
+ * dual-lvds-odd-pixels 属性决定。
  * @port1: First DT port node of the Dual-link LVDS source
  * @port2: Second DT port node of the Dual-link LVDS source
  *
@@ -410,7 +451,10 @@ int drm_of_lvds_get_dual_link_pixel_order(const struct device_node *port1,
 EXPORT_SYMBOL_GPL(drm_of_lvds_get_dual_link_pixel_order);
 
 /**
- * drm_of_lvds_get_dual_link_pixel_order_sink - Get LVDS dual-link sink pixel order
+ * drm_of_lvds_get_dual_link_pixel_order_sink - 获取 LVDS 双链路 sink 的像素顺序
+ *
+ * 与 drm_of_lvds_get_dual_link_pixel_order 类似，但直接从 sink 侧
+ * 的端口属性确定像素顺序，不通过远程端点间接获取。
  * @port1: First DT port node of the Dual-link LVDS sink
  * @port2: Second DT port node of the Dual-link LVDS sink
  *
@@ -459,10 +503,16 @@ int drm_of_lvds_get_dual_link_pixel_order_sink(struct device_node *port1,
 EXPORT_SYMBOL_GPL(drm_of_lvds_get_dual_link_pixel_order_sink);
 
 /**
- * drm_of_lvds_get_data_mapping - Get LVDS data mapping
- * @port: DT port node of the LVDS source or sink
+ * drm_of_lvds_get_data_mapping - 获取 LVDS 数据映射格式
+ * @port: LVDS 源或 sink 的 DT 端口节点
  *
- * Convert DT "data-mapping" property string value into media bus format value.
+ * 将设备树中 "data-mapping" 属性的字符串值转换为媒体总线格式值。
+ * 支持的映射关系：
+ *   "jeida-18" -> MEDIA_BUS_FMT_RGB666_1X7X3_SPWG
+ *   "jeida-24" -> MEDIA_BUS_FMT_RGB888_1X7X4_JEIDA
+ *   "jeida-30" -> MEDIA_BUS_FMT_RGB101010_1X7X5_JEIDA
+ *   "vesa-24"  -> MEDIA_BUS_FMT_RGB888_1X7X4_SPWG
+ *   "vesa-30"  -> MEDIA_BUS_FMT_RGB101010_1X7X5_SPWG
  *
  * Return:
  * * MEDIA_BUS_FMT_RGB666_1X7X3_SPWG - data-mapping is "jeida-18"
@@ -498,12 +548,13 @@ int drm_of_lvds_get_data_mapping(const struct device_node *port)
 EXPORT_SYMBOL_GPL(drm_of_lvds_get_data_mapping);
 
 /**
- * drm_of_get_data_lanes_count - Get DSI/(e)DP data lane count
- * @endpoint: DT endpoint node of the DSI/(e)DP source or sink
- * @min: minimum supported number of data lanes
- * @max: maximum supported number of data lanes
+ * drm_of_get_data_lanes_count - 获取 DSI/(e)DP 数据通道数
+ * @endpoint: DSI/(e)DP 源或 sink 的 DT 端点节点
+ * @min: 支持的最少数据通道数
+ * @max: 支持的最多数据通道数
  *
- * Count DT "data-lanes" property elements and check for validity.
+ * 统计 DT 中 "data-lanes" 属性的元素数量，并检查是否在有效范围内。
+ * 用于 DSI（显示串行接口）或 eDP（嵌入式 DisplayPort）的数据通道配置。
  *
  * Return:
  * * min..max - positive integer count of "data-lanes" elements
@@ -527,15 +578,15 @@ int drm_of_get_data_lanes_count(const struct device_node *endpoint,
 EXPORT_SYMBOL_GPL(drm_of_get_data_lanes_count);
 
 /**
- * drm_of_get_data_lanes_count_ep - Get DSI/(e)DP data lane count by endpoint
- * @port: DT port node of the DSI/(e)DP source or sink
- * @port_reg: identifier (value of reg property) of the parent port node
- * @reg: identifier (value of reg property) of the endpoint node
- * @min: minimum supported number of data lanes
- * @max: maximum supported number of data lanes
+ * drm_of_get_data_lanes_count_ep - 通过端点规格获取数据通道数
+ * @port: DSI/(e)DP 源或 sink 的 DT 端口节点
+ * @port_reg: 父端口节点的 reg 属性值
+ * @reg: 端点节点的 reg 属性值
+ * @min: 支持的最少数据通道数
+ * @max: 支持的最多数据通道数
  *
- * Count DT "data-lanes" property elements and check for validity.
- * This variant uses endpoint specifier.
+ * 与 drm_of_get_data_lanes_count 功能相同，但使用端口和端点
+ * 寄存器值来定位端点，适用于需要精确指定端点的场景。
  *
  * Return:
  * * min..max - positive integer count of "data-lanes" elements
@@ -561,17 +612,17 @@ EXPORT_SYMBOL_GPL(drm_of_get_data_lanes_count_ep);
 #if IS_ENABLED(CONFIG_DRM_MIPI_DSI)
 
 /**
- * drm_of_get_dsi_bus - find the DSI bus for a given device
- * @dev: parent device of display (SPI, I2C)
+ * drm_of_get_dsi_bus - 查找给定设备的 DSI 总线
+ * @dev: 显示设备（SPI、I2C 等）的父设备
  *
- * Gets parent DSI bus for a DSI device controlled through a bus other
- * than MIPI-DCS (SPI, I2C, etc.) using the Device Tree.
+ * 为通过非 MIPI-DCS 总线（如 SPI、I2C 等）控制的 DSI 设备
+ * 查找其父 DSI 总线。此函数假设设备的 port@0 是 DSI 输入。
  *
- * This function assumes that the device's port@0 is the DSI input.
+ * 通过遍历设备树图，从设备端点跟踪到远程端口，找到 DSI 主机节点
+ * 并返回对应的 mipi_dsi_host 实例。
  *
- * Returns pointer to mipi_dsi_host if successful, -EINVAL if the
- * request is unsupported, -EPROBE_DEFER if the DSI host is found but
- * not available, or -ENODEV otherwise.
+ * 返回：成功时返回 mipi_dsi_host 指针，-EPROBE_DEFER 表示 DSI 主机
+ * 已找到但尚未可用，-ENODEV 表示未找到，-EINVAL 表示请求不支持。
  */
 struct mipi_dsi_host *drm_of_get_dsi_bus(struct device *dev)
 {

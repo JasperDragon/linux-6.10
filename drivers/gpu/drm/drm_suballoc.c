@@ -25,7 +25,40 @@
  * of the Software.
  *
  */
-/* Algorithm:
+
+/*
+ * 中文注释: DRM 子分配器 (Sub-Allocator)
+ *
+ * 本文件实现了一个范围子分配器 (range suballocator), 用于从预先分配
+ * 的大块内存中进行子分配。子分配器的主要应用场景是 GPU 命令缓冲区
+ * (command buffer) 的管理。
+ *
+ * 核心算法:
+ *   子分配器跟踪最近一次分配的位置 (称为 "hole")。分配时优先从
+ *   hole 之后的位置进行分配。原理是: 在线性 GPU 环 (ring) 中,
+ *   最新分配对象之后的是最早分配的对象, 因此应该是 GPU 最早完成
+ *   使用的对象。
+ *
+ *   如果当前 hole 之后的空间不足, 分配器会跳过正在使用的缓冲区,
+ *   寻找最近完成的缓冲区。如果需要等待, 分配器会等待所有引擎中
+ *   最老的 fence 信号完成。
+ *
+ * 主要特性:
+ *   - 支持多个 fence 队列 (DRM_SUBALLOC_MAX_QUEUES), 对应不同的
+ *     GPU 引擎或 ring
+ *   - 分配可中断等待 (interruptible) 或不可中断等待
+ *   - 支持对齐分配
+ *   - 支持调试信息输出 (通过 debugfs)
+ *
+ * 数据结构:
+ *   - struct drm_suballoc_manager: 子分配管理器
+ *   - struct drm_suballoc: 单个子分配节点
+ *   - olist: 有序链表, 按偏移量排列所有子分配
+ *   - flist[]: fence 队列数组, 按 fence context 哈希分桶
+ */
+
+/*
+ * 算法说明 (原始):
  *
  * We store the last allocated bo in "hole", we always try to allocate
  * after the last allocated bo. Principle is that in a linear GPU ring
@@ -53,6 +86,11 @@ static void drm_suballoc_remove_locked(struct drm_suballoc *sa);
 static void drm_suballoc_try_free(struct drm_suballoc_manager *sa_manager);
 
 /**
+ * 中文注释: 初始化子分配管理器
+ * 设置子分配管理器的基本参数: 总大小和对齐要求。对齐必须是 2 的幂,
+ * 如果传入 0 则使用 1 (无对齐), 如果传入非 2 的幂则向上舍入。
+ * 初始化等待队列和所有 fence 队列链表。
+ *
  * drm_suballoc_manager_init() - Initialise the drm_suballoc_manager
  * @sa_manager: pointer to the sa_manager
  * @size: number of bytes we want to suballocate
@@ -85,6 +123,11 @@ void drm_suballoc_manager_init(struct drm_suballoc_manager *sa_manager,
 EXPORT_SYMBOL(drm_suballoc_manager_init);
 
 /**
+ * 中文注释: 销毁子分配管理器
+ * 清理子分配管理器。尝试释放所有未完成的子分配 (通过检查 fence
+ * 信号状态), 然后强制移除所有剩余的子分配并释放内存。
+ * 如果管理器中有未 signaled 的 fence, 将打印错误信息但仍继续清理。
+ *
  * drm_suballoc_manager_fini() - Destroy the drm_suballoc_manager
  * @sa_manager: pointer to the sa_manager
  *
@@ -293,6 +336,14 @@ static bool drm_suballoc_next_hole(struct drm_suballoc_manager *sa_manager,
 }
 
 /**
+ * 中文注释: 分配未初始化的子分配对象
+ * 预先分配 struct drm_suballoc 内存。这种分离分配 (先分配后初始化)
+ * 的目的是: 允许在禁止内存回收 (reclaim) 的上下文中先分配内存,
+ * 然后在后续的回收上下文中初始化。这避免了在持有锁或处于原子上下文
+ * 时执行可能导致睡眠的内存分配。
+ *
+ * 如果返回的对象处于未初始化状态, 应使用 drm_suballoc_free() 释放。
+ *
  * drm_suballoc_alloc() - Allocate uninitialized suballoc object.
  * @gfp: gfp flags used for memory allocation.
  *
@@ -320,6 +371,16 @@ struct drm_suballoc *drm_suballoc_alloc(gfp_t gfp)
 EXPORT_SYMBOL(drm_suballoc_alloc);
 
 /**
+ * 中文注释: 初始化子分配并插入空洞
+ * 在预先分配的子分配对象上执行实际的子分配操作。核心分配循环:
+ *   1. 尝试从当前 hole 位置分配 (drm_suballoc_try_alloc)
+ *   2. 如果失败, 尝试跳过正在使用的缓冲区到最近完成的缓冲区
+ *      (drm_suballoc_next_hole)
+ *   3. 如果找不到合适的跳过目标, 等待 fence 信号或等待事件
+ *   4. 重试直到分配成功或出错
+ *
+ * @align 不能超过管理器的默认对齐。如果为 0, 使用管理器对齐。
+ *
  * drm_suballoc_insert() - Initialize a suballocation and insert a hole.
  * @sa_manager: pointer to the sa_manager
  * @sa: The struct drm_suballoc.
@@ -412,6 +473,12 @@ int drm_suballoc_insert(struct drm_suballoc_manager *sa_manager,
 EXPORT_SYMBOL(drm_suballoc_insert);
 
 /**
+ * 中文注释: 执行子分配 (一站式接口)
+ * 分配并初始化子分配对象。这是 drm_suballoc_alloc() 和
+ * drm_suballoc_insert() 的组合封装, 适用于大多数场景。
+ * 内部先分配子分配对象, 然后执行插入操作。如果插入失败,
+ * 自动释放已分配的对象并返回错误。
+ *
  * drm_suballoc_new() - Make a suballocation.
  * @sa_manager: pointer to the sa_manager
  * @size: number of bytes we want to suballocate.
@@ -452,6 +519,12 @@ drm_suballoc_new(struct drm_suballoc_manager *sa_manager, size_t size,
 EXPORT_SYMBOL(drm_suballoc_new);
 
 /**
+ * 中文注释: 释放子分配
+ * 释放子分配。如果提供了 fence 且 fence 尚未 signal, 则将子分配
+ * 添加到 fence 队列中, 待 fence signal 后才会真正释放 (供重用)。
+ * 如果未提供 fence 或 fence 已 signal, 则立即释放。
+ * 对于未初始化的子分配对象 (manager 为 NULL), 直接 kfree。
+ *
  * drm_suballoc_free - Free a suballocation
  * @suballoc: pointer to the suballocation
  * @fence: fence that signals when suballocation is idle
@@ -489,6 +562,15 @@ void drm_suballoc_free(struct drm_suballoc *suballoc,
 EXPORT_SYMBOL(drm_suballoc_free);
 
 #ifdef CONFIG_DEBUG_FS
+/**
+ * 中文注释: 输出子分配器调试信息
+ * 打印子分配管理器中所有子分配的详细信息, 包括:
+ *   - 子分配的起始和结束偏移 (相对于 suballoc_base)
+ *   - 子分配的大小
+ *   - ">" 标记指示当前 hole 位置
+ *   - 如果子分配受 fence 保护, 打印 fence 的 seqno 和 context
+ * 适用于 debugfs 实现。
+ */
 void drm_suballoc_dump_debug_info(struct drm_suballoc_manager *sa_manager,
 				  struct drm_printer *p,
 				  unsigned long long suballoc_base)
