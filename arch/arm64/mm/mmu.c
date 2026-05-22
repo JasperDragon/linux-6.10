@@ -105,6 +105,13 @@ pgprot_t phys_mem_access_prot(struct file *file, unsigned long pfn,
 }
 EXPORT_SYMBOL(phys_mem_access_prot);
 
+/*
+ * 早期启动阶段的页表页分配器。
+ *
+ * 直接从 memblock 中分配一页物理内存用作新的页表页。
+ * 只有在 buddy allocator 可用之后，页表分配才会切换到
+ * pgd_pgtable_alloc() 使用伙伴系统。
+ */
 static phys_addr_t __init early_pgtable_alloc(enum pgtable_level pgtable_level)
 {
 	phys_addr_t phys;
@@ -222,7 +229,11 @@ static int alloc_init_cont_pte(pmd_t *pmdp, unsigned long addr,
 
 		next = pte_cont_addr_end(addr, end);
 
-		/* use a contiguous mapping if the range is suitably aligned */
+		/*
+		 * 若虚拟地址、物理地址和区间长度都满足 contiguous PTE 的对齐约束，
+		 * 就优先把这一小段合并成 contiguous 映射，减少 TLB 项数量。
+		 * 一旦上层显式要求 NO_CONT_MAPPINGS，则退回普通逐页映射。
+		 */
 		if ((((addr | next | phys) & ~CONT_PTE_MASK) == 0) &&
 		    (flags & NO_CONT_MAPPINGS) == 0)
 			__prot = __pgprot(pgprot_val(prot) | PTE_CONT);
@@ -254,7 +265,10 @@ static int init_pmd(pmd_t *pmdp, unsigned long addr, unsigned long end,
 
 		next = pmd_addr_end(addr, end);
 
-		/* try section mapping first */
+		/*
+		 * PMD 层优先尝试 block(section) 映射。只有在地址/长度不对齐，或者上层
+		 * 禁用了 block mapping 时，才继续向下拆到 PTE 层。
+		 */
 		if (((addr | next | phys) & ~PMD_MASK) == 0 &&
 		    (flags & NO_BLOCK_MAPPINGS) == 0) {
 			pmd_set_huge(pmdp, phys, prot);
@@ -282,6 +296,13 @@ static int init_pmd(pmd_t *pmdp, unsigned long addr, unsigned long end,
 	return 0;
 }
 
+/*
+ * alloc_init_cont_pmd() 是 ARM64 页表建立流程中起关键衔接作用的一层：
+ * - 尝试用 contiguous PMD 把一组相邻映射合并起来
+ * - 对每一对 addr/phys，调用 init_pmd() 决定是放 2MB block 还是继续拆到 PTE
+ *
+ * contiguous 位是 ARM64 自己扩展的 hint 位：连续映射项让硬件更有效地利用 TLB。
+ */
 static int alloc_init_cont_pmd(pud_t *pudp, unsigned long addr,
 			       unsigned long end, phys_addr_t phys,
 			       pgprot_t prot,
@@ -321,7 +342,10 @@ static int alloc_init_cont_pmd(pud_t *pudp, unsigned long addr,
 
 		next = pmd_cont_addr_end(addr, end);
 
-		/* use a contiguous mapping if the range is suitably aligned */
+		/*
+		 * 与 contiguous PTE 类似，PMD 层也会尽量用 contiguous 位把一组
+		 * 相邻 block/页表项合并起来，前提是对齐关系满足。
+		 */
 		if ((((addr | next | phys) & ~CONT_PMD_MASK) == 0) &&
 		    (flags & NO_CONT_MAPPINGS) == 0)
 			__prot = __pgprot(pgprot_val(prot) | PTE_CONT);
@@ -340,6 +364,12 @@ out:
 	return ret;
 }
 
+/*
+ * 在 PUD 层尽量用 1GB block，实在不行再下沉到 PMD/PTE 拆细。
+ * 这是 ARM64 4K granule 下页表层级决策的关键一步：
+ * - 1GB block 命中：少两级页表，TLB 效率更高
+ * - 1GB 对不齐：交给 alloc_init_cont_pmd() 再尝试 2MB block
+ */
 static int alloc_init_pud(p4d_t *p4dp, unsigned long addr, unsigned long end,
 			  phys_addr_t phys, pgprot_t prot,
 			  phys_addr_t (*pgtable_alloc)(enum pgtable_level),
@@ -375,7 +405,8 @@ static int alloc_init_pud(p4d_t *p4dp, unsigned long addr, unsigned long end,
 		next = pud_addr_end(addr, end);
 
 		/*
-		 * For 4K granule only, attempt to put down a 1GB block
+		 * 4K granule 时，PUD 层还可能直接放下 1GB block。能在更高层完成映射，
+		 * 就尽量不要继续拆到 PMD/PTE。
 		 */
 		if (pud_sect_supported() &&
 		   ((addr | next | phys) & ~PUD_MASK) == 0 &&
@@ -406,6 +437,11 @@ out:
 	return ret;
 }
 
+/*
+ * P4D 层是页表遍历的倒数第二层（仅比 PGD 低一层）。大多数 ARM64 配置下
+ * P4D 只是 PGD 的简单透传（CONFIG_PGTABLE_LEVELS < 5 时折叠为 0 层），
+ * 仅在 52-bit VA 等特殊场景下才真正参与地址转换。
+ */
 static int alloc_init_p4d(pgd_t *pgdp, unsigned long addr, unsigned long end,
 			  phys_addr_t phys, pgprot_t prot,
 			  phys_addr_t (*pgtable_alloc)(enum pgtable_level),
@@ -457,6 +493,16 @@ out:
 	return ret;
 }
 
+/*
+ * ARM64 页表建立的最上层入口。
+ *
+ * 调用方指定 pgdir（通常为 swapper_pg_dir 或 idmap_pg_dir），
+ * 页表 walk 顺序为：PGD → P4D → PUD → PMD → PTE。
+ * 每一层都会尝试在该层直接建立 block/section 映射，仅在无法对齐时
+ * 才分配下一级页表继续细化。
+ *
+ * 该函数加锁后调用 __create_pgd_mapping_locked()，支持 fixmap 并发。
+ */
 static int __create_pgd_mapping_locked(pgd_t *pgdir, phys_addr_t phys,
 				       unsigned long virt, phys_addr_t size,
 				       pgprot_t prot,
@@ -506,6 +552,13 @@ static int __create_pgd_mapping(pgd_t *pgdir, phys_addr_t phys,
 	return ret;
 }
 
+/*
+ * 早期启动阶段建立页表的封装。
+ *
+ * 与常规 __create_pgd_mapping() 的区别在于：
+ * - 页表页通过传入的 pgtable_alloc (通常为 early_pgtable_alloc) 从 memblock 分配
+ * - 后续页表建立则使用伙伴分配器提供的 page 作为新表页
+ */
 static void early_create_pgd_mapping(pgd_t *pgdir, phys_addr_t phys,
 				     unsigned long virt, phys_addr_t size,
 				     pgprot_t prot,
@@ -520,6 +573,18 @@ static void early_create_pgd_mapping(pgd_t *pgdir, phys_addr_t phys,
 		panic("Failed to create page tables\n");
 }
 
+/*
+ * 伙伴分配器时代的页表页分配器。
+ *
+ * 与 early_pgtable_alloc()（基于 memblock）不同，这套函数在 buddy allocator
+ * 可用后使用 pagetable_alloc() 分配页表页，并通过构造函数（ctor）建立各级
+ * 页表的引用计数或锁。
+ *
+ * 三个变体：
+ * - pgd_pgtable_alloc_init_mm: 用于 init_mm（常规内核映射建立）
+ * - pgd_pgtable_alloc_init_mm_gfp: 同上但允许指定 gfp 标志
+ * - pgd_pgtable_alloc_special_mm: 用于无关联 mm 的特殊映射（如 fixmap）
+ */
 static phys_addr_t __pgd_pgtable_alloc(struct mm_struct *mm, gfp_t gfp,
 				       enum pgtable_level pgtable_level)
 {
@@ -988,9 +1053,10 @@ void __init linear_map_maybe_split_to_ptes(void)
 }
 
 /*
- * This function can only be used to modify existing table entries,
- * without allocating new levels of table. Note that this permits the
- * creation of new section or page entries.
+ * 不分配新页表页的映射创建。
+ *
+ * 用于 fixmap FDT 重映射、KPTI trampoline 等"中间级页表已经建好，只需在
+ * 叶子级填入 block/PTE"的场景。若传入范围需要新的中间页表，会直接 BUG。
  */
 void __init create_mapping_noalloc(phys_addr_t phys, unsigned long virt,
 				   phys_addr_t size, pgprot_t prot)
@@ -1004,6 +1070,12 @@ void __init create_mapping_noalloc(phys_addr_t phys, unsigned long virt,
 				 NO_CONT_MAPPINGS);
 }
 
+/*
+ * 为非 init_mm 地址空间建立 PGD 级映射（如模块地址空间、ioremap 页表）。
+ *
+ * 注意它不能用于 init_mm——init_mm 的映射修改应通过 create_mapping_noalloc
+ * 或 update_mapping_prot 进行，因为 init_mm 的顶层页表在启动时已经固定。
+ */
 void __init create_pgd_mapping(struct mm_struct *mm, phys_addr_t phys,
 			       unsigned long virt, phys_addr_t size,
 			       pgprot_t prot, bool page_mappings_only)
@@ -1019,6 +1091,11 @@ void __init create_pgd_mapping(struct mm_struct *mm, phys_addr_t phys,
 				 pgd_pgtable_alloc_special_mm, flags);
 }
 
+/*
+ * 在运行时修改一段已有内核映射的保护属性（如 RW→RO）。
+ * 禁止 contiguous mappings 是为了把粒度控制在独立 PTE/PMD 级别，
+ * 避免一次 contiguous 拆解影响到相邻映射。
+ */
 static void update_mapping_prot(phys_addr_t phys, unsigned long virt,
 				phys_addr_t size, pgprot_t prot)
 {
@@ -1042,11 +1119,18 @@ static void __init __map_memblock(pgd_t *pgdp, phys_addr_t start,
 				 prot, early_pgtable_alloc, flags);
 }
 
+/*
+ * 去掉内核 .text/.rodata 线性别名的写权限。
+ *
+ * ARM64 内核有两套视角访问自己的代码：
+ * 1. 高地址（PAGE_OFFSET 之上的线性映射别名）——用于数据访问和替代补丁
+ * 2. KIMAGE_VADDR 处的内核镜像映射——用于代码执行（可能是只读的）
+ *
+ * 本函数在 alternatives patching 全部完成后，把线性别名也收紧为只读，
+ * 防止后续利用可写别名修改内核代码。
+ */
 void __init mark_linear_text_alias_ro(void)
 {
-	/*
-	 * Remove the write permissions from the linear alias of .text/.rodata
-	 */
 	update_mapping_prot(__pa_symbol(_text), (unsigned long)lm_alias(_text),
 			    (unsigned long)__init_begin - (unsigned long)_text,
 			    PAGE_KERNEL_RO);
@@ -1144,55 +1228,56 @@ static void __init map_mem(pgd_t *pgdp)
 	u64 i;
 
 	/*
-	 * Setting hierarchical PXNTable attributes on table entries covering
-	 * the linear region is only possible if it is guaranteed that no table
-	 * entries at any level are being shared between the linear region and
-	 * the vmalloc region. Check whether this is true for the PGD level, in
-	 * which case it is guaranteed to be true for all other levels as well.
-	 * (Unless we are running with support for LPA2, in which case the
-	 * entire reduced VA space is covered by a single pgd_t which will have
-	 * been populated without the PXNTable attribute by the time we get here.)
+	 * map_mem() 负责建立“内核线性映射”本体，即 PAGE_OFFSET 那条把大部分
+	 * 物理内存直接映射成内核 VA 的主通道。
+	 *
+	 * 线性映射与 vmalloc 区若在某一级页表共享同一个上级表项，就无法安全地在
+	 * 该层统一打 PXNTable 等层级属性。这里先验证 PGD 级别是否天然分离；若
+	 * PGD 已分离，则更低层也必然分离。
+	 *
+	 * LPA2 是例外：缩减后的 VA 空间可能被单个 PGD 覆盖，此时不能依赖这里的
+	 * 层级属性假设。
 	 */
 	BUILD_BUG_ON(pgd_index(direct_map_end - 1) == pgd_index(direct_map_end) &&
 		     pgd_index(_PAGE_OFFSET(VA_BITS_MIN)) != PTRS_PER_PGD - 1);
 
 	early_kfence_pool = arm64_kfence_alloc_pool();
 
+	/*
+	 * BBM L2 splitting 能力允许后续把 block mapping 安全拆细；若平台支持，
+	 * 就可以先大胆建立更粗粒度的线性映射，后面按需细化。
+	 */
 	linear_map_requires_bbml2 = !force_pte_mapping() && can_set_direct_map();
 
+	/* 某些调试/特性场景要求线性映射从一开始就细化到 PTE 级。 */
 	if (force_pte_mapping())
 		flags |= NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS;
 
 	/*
-	 * Take care not to create a writable alias for the
-	 * read-only text and rodata sections of the kernel image.
-	 * So temporarily mark them as NOMAP to skip mappings in
-	 * the following for-loop
+	 * 为了避免在线性映射里给内核 text/rodata 再制造一个可写别名，先把这段
+	 * 物理区临时标成 NOMAP，从后面的“遍历全部 DRAM 建映射”流程中跳过去。
+	 * 稍后再用更严格的属性单独补上映射。
 	 */
 	memblock_mark_nomap(kernel_start, kernel_end - kernel_start);
 
-	/* map all the memory banks */
+	/* 其余普通 DRAM 按统一属性批量挂到线性映射。 */
 	for_each_mem_range(i, &start, &end) {
 		if (start >= end)
 			break;
 		/*
-		 * The linear map must allow allocation tags reading/writing
-		 * if MTE is present. Otherwise, it has the same attributes as
-		 * PAGE_KERNEL.
+		 * 若启用 MTE，线性映射必须允许 tag 读写；否则就是普通 PAGE_KERNEL。
 		 */
 		__map_memblock(pgdp, start, end, pgprot_tagged(PAGE_KERNEL),
 			       flags);
 	}
 
 	/*
-	 * Map the linear alias of the [_text, __init_begin) interval
-	 * as non-executable now, and remove the write permission in
-	 * mark_linear_text_alias_ro() below (which will be called after
-	 * alternative patching has completed). This makes the contents
-	 * of the region accessible to subsystems such as hibernate,
-	 * but protects it from inadvertent modification or execution.
-	 * Note that contiguous mappings cannot be remapped in this way,
-	 * so we should avoid them here.
+	 * 内核镜像线性别名稍后要经历 alternatives patching、只读收紧等步骤，
+	 * 所以这里先给它建立“可读写但不可执行”的保守映射。等补丁替换结束后，
+	 * 再在 mark_linear_text_alias_ro() 里收成只读。
+	 *
+	 * 这里明确禁用 contiguous mapping，因为后续要按更细粒度改权限，粗粒度
+	 * contiguous 映射不便于这样二次调整。
 	 */
 	__map_memblock(pgdp, kernel_start, kernel_end,
 		       PAGE_KERNEL, NO_CONT_MAPPINGS);
@@ -1200,6 +1285,13 @@ static void __init map_mem(pgd_t *pgdp)
 	arm64_kfence_map_pool(early_kfence_pool, pgdp);
 }
 
+/*
+ * 把内核 rodata 段（以及 _text 到 _stext 的头部 gap）的线性别名改为只读。
+ *
+ * 调用时机：kernel_init() 释放完 __init 段之后，紧接在 mark_readonly() 里。
+ * 此时 alternatives patching 已完成，后续不应再有代码修改 rodata 的动机。
+ * 覆盖范围是 __start_rodata 到 __init_begin（包含 NOTES 和 EXCEPTION_TABLE）。
+ */
 void mark_rodata_ro(void)
 {
 	unsigned long section_size;
@@ -1313,9 +1405,16 @@ static int __init __kpti_install_ng_mappings(void *__unused)
 	return 0;
 }
 
+/*
+ * KPTI 收尾：把内核页表中所有 global 映射标记换成 non-global (PTE_NG)。
+ *
+ * KPTI（Kernel Page Table Isolation）要求用户态不能访问内核映射。
+ * 当 KASLR 关闭时，paging_init 最初建立的映射是 global 的——这里通过
+ * stop_machine 在所有 CPU 上同步把它们全部翻成 nG。
+ * KASLR 打开时映射一开始就是 nG，所以可以直接跳过。
+ */
 void __init kpti_install_ng_mappings(void)
 {
-	/* Check whether KPTI is going to be used */
 	if (!arm64_kernel_unmapped_at_el0())
 		return;
 
@@ -1336,6 +1435,11 @@ static pgprot_t __init kernel_exec_prot(void)
 	return rodata_enabled ? PAGE_KERNEL_ROX : PAGE_KERNEL_EXEC;
 }
 
+/*
+ * core_initcall: 为 KPTI 建立异常入口 trampoline 的映射。
+ * trampoline 是一小段在用户态和内核态之间切换时执行的代码，
+ * 在 EL0 无法访问内核 VA 时必须映射到独立的 trampoline 页表中。
+ */
 static int __init map_entry_trampoline(void)
 {
 	int i;
@@ -1370,7 +1474,8 @@ core_initcall(map_entry_trampoline);
 #endif
 
 /*
- * Declare the VMA areas for the kernel
+ * 在 vmalloc 元数据里提前登记 vmlinux 的各段范围。这样后续像模块、调试、
+ * 内核内存遍历器等通用代码，就能把这些静态映射区域也当成 VMA 对象来理解。
  */
 static void __init declare_kernel_vmas(void)
 {
@@ -1396,6 +1501,14 @@ static void __init create_idmap(void)
 	phys_addr_t end   = __pa_symbol(__idmap_text_end);
 	phys_addr_t ptep  = __pa_symbol(idmap_ptes);
 
+	/*
+	 * ID map 只负责“物理地址 == 虚拟地址”那一小段最关键代码，主要用于：
+	 * - CPU 切换/重装 TTBR 时的过渡执行
+	 * - 次级 CPU bring-up
+	 * - KPTI/页表拆分等必须在身份映射下完成的操作
+	 *
+	 * 因此这里只映射 __idmap_text，而不是把整条线性映射再复制一遍。
+	 */
 	__pi_map_range(&ptep, start, end, start, PAGE_KERNEL_ROX,
 		       IDMAP_ROOT_LEVEL, (pte_t *)idmap_pg_dir, false,
 		       __phys_to_virt(ptep) - ptep);
@@ -1405,10 +1518,8 @@ static void __init create_idmap(void)
 		phys_addr_t pa = __pa_symbol(&idmap_kpti_bbml2_flag);
 
 		/*
-		 * The KPTI G-to-nG conversion code needs a read-write mapping
-		 * of its synchronization flag in the ID map. This is also used
-		 * when splitting the linear map to ptes if a secondary CPU
-		 * doesn't support bbml2.
+		 * KPTI 的 G->nG 转换，以及某些 block->pte 拆分路径，需要在 ID map
+		 * 下访问一个同步标志，因此额外给这个标志补一段可写身份映射。
 		 */
 		ptep = __pa_symbol(kpti_bbml2_ptes);
 		__pi_map_range(&ptep, pa, pa + sizeof(u32), pa, PAGE_KERNEL,
@@ -1419,8 +1530,18 @@ static void __init create_idmap(void)
 
 void __init paging_init(void)
 {
+	/*
+	 * paging_init() 是 ARM64 早期页表建立的收口点：
+	 * 1. 建立正式线性映射(swapper_pg_dir)
+	 * 2. 允许 memblock 在后续分配页表/资源时动态扩展自身元数据
+	 * 3. 建立后续切换/次级 CPU 依赖的 ID map
+	 * 4. 把 vmlinux 各段登记进内核 VMA 元数据
+	 *
+	 * 做完这一步，setup_arch() 后半段使用的就是完整得多的正式内核页表环境。
+	 */
 	map_mem(swapper_pg_dir);
 
+	/* 页表和资源登记过程中，memblock 之后仍可能需要扩容内部数组。 */
 	memblock_allow_resize();
 
 	create_idmap();

@@ -198,6 +198,12 @@ static const char *argv_init[MAX_INIT_ARGS+2] = { "init", NULL, };
 const char *envp_init[MAX_INIT_ENVS+2] = { "HOME=/", "TERM=linux", NULL, };
 static const char *panic_later, *panic_param;
 
+/*
+ * 遍历 __setup_start..__setup_end，尝试用已注册的废弃/常规参数处理器匹配命令行。
+ *
+ * 返回 true 表示已匹配（即使是已废弃的参数）；返回 false 表示未匹配，调用方应继续
+ * 尝试其他处理路径（如 unknown_bootoption 转交 init）。
+ */
 static bool __init obsolete_checksetup(char *line)
 {
 	const struct obs_kernel_param *p;
@@ -269,6 +275,13 @@ static int __init loglevel(char *str)
 early_param("loglevel", loglevel);
 
 #ifdef CONFIG_BLK_DEV_INITRD
+/*
+ * 从 initrd 尾部提取 bootconfig 数据块。
+ *
+ * bootconfig 数据以 "#BOOTCONFIG\n" 魔数开头，紧接 4 字节 size + 4 字节 checksum，
+ * 放在 initrd 的最后。提取成功后把 initrd_end 前移，使这块元数据不会在后续
+ * initramfs 解包时被当成 CPIO 条目的一部分。
+ */
 static void * __init get_boot_config_from_initrd(size_t *_size)
 {
 	u32 size, csum;
@@ -416,6 +429,12 @@ static int __init warn_bootconfig(char *str)
 	return 0;
 }
 
+/*
+ * 解析 bootconfig——一种在 initramfs 末尾或内核镜像嵌入区中附加的键值配置。
+ *
+ * 它是对内核命令行的增强：bootconfig 中的 "kernel.*" 键会合入 extra_command_line，
+ * "init.*" 键会合入 extra_init_args，在主命令行解析前被 prepend。
+ */
 static void __init setup_boot_config(void)
 {
 	static char tmp_cmdline[COMMAND_LINE_SIZE] __initdata;
@@ -424,9 +443,8 @@ static void __init setup_boot_config(void)
 	size_t size;
 	char *err;
 
-	/* Cut out the bootconfig data even if we have no bootconfig option */
+	/* 先从 initrd 尾部切出 bootconfig 数据；若无，再尝试内嵌 bootconfig。 */
 	data = get_boot_config_from_initrd(&size);
-	/* If there is no bootconfig in initrd, try embedded one. */
 	if (!data)
 		data = xbc_get_embedded_bootconfig(&size);
 
@@ -519,7 +537,10 @@ static void __init repair_env_string(char *param, char *val)
 	}
 }
 
-/* Anything after -- gets handed straight to init. */
+/*
+ * "--" 分隔符之后的所有参数都无条件进入 argv_init[]，不经过内核解析。
+ * 这允许用户安全地向 init 传递可能与内核参数同名的选项而不会产生歧义。
+ */
 static int __init set_init_arg(char *param, char *val,
 			       const char *unused, void *arg)
 {
@@ -542,8 +563,16 @@ static int __init set_init_arg(char *param, char *val,
 }
 
 /*
- * Unknown boot options get handed to init, unless they look like
- * unused parameters (modprobe will find them in /proc/cmdline).
+ * 处理内核无法识别的命令行参数。
+ *
+ * 核心策略：不认识的参数不报错，而是按规则判断后转交给用户态 init。
+ * - sysctl 别名 → 内核内部消化
+ * - bootloader 标识符 (BOOT_IMAGE=, kexec) → 静默忽略
+ * - 含 '.' 的参数 → 视为未匹配的内核模块参数，忽略
+ * - 带 '=' 的参数 → 加入 envp_init[] 作为环境变量传给 init
+ * - 不带 '=' 的参数 → 加入 argv_init[] 作为命令行参数传给 init
+ *
+ * 大量参数超限时设置 panic_later，在 console_init() 之后再统一 panic。
  */
 static int __init unknown_bootoption(char *param, char *val,
 				     const char *unused, void *arg)
@@ -580,7 +609,7 @@ static int __init unknown_bootoption(char *param, char *val,
 		return 0;
 
 	if (val) {
-		/* Environment option */
+		/* Environment option → 传给 init 的环境变量 */
 		unsigned int i;
 		for (i = 0; envp_init[i]; i++) {
 			if (i == MAX_INIT_ENVS) {
@@ -592,7 +621,7 @@ static int __init unknown_bootoption(char *param, char *val,
 		}
 		envp_init[i] = param;
 	} else {
-		/* Command line option */
+		/* Command line option → 传给 init 的命令行参数 */
 		unsigned int i;
 		for (i = 0; argv_init[i]; i++) {
 			if (i == MAX_INIT_ARGS) {
@@ -605,6 +634,11 @@ static int __init unknown_bootoption(char *param, char *val,
 	return 0;
 }
 
+/*
+ * init= 参数处理。用户显式指定最终 init 程式的路径。
+ * 与 rdinit= 的区别：init= 的优先级低于 rdinit=，但如果 init= 指定的
+ * 程序执行失败会直接 panic，不再尝试其他候选。
+ */
 static int __init init_setup(char *str)
 {
 	unsigned int i;
@@ -622,6 +656,11 @@ static int __init init_setup(char *str)
 }
 __setup("init=", init_setup);
 
+/*
+ * rdinit= 参数处理。指定 initramfs 中 early userspace 的入口程序。
+ * 这是优先级最高的 init 入口：如果 rdinit= 指定的程序可执行，
+ * 后续 block rootfs 上的 /sbin/init 等都不会被尝试。
+ */
 static int __init rdinit_setup(char *str)
 {
 	unsigned int i;
@@ -641,10 +680,13 @@ static inline void smp_prepare_cpus(unsigned int maxcpus) { }
 #endif
 
 /*
- * We need to store the untouched command line for future reference.
- * We also need to store the touched command line since the parameter
- * parsing is performed in place, and we should allow a component to
- * store reference of name/value for future reference.
+ * 保存两份命令行副本：
+ * - saved_command_line: 原始未改动的命令行，供 /proc/cmdline 和后续参考
+ * - static_command_line: setup_arch() 可能就地修改过的命令行，供参数解析使用
+ *
+ * 同时把 extra_command_line（来自 bootconfig 的 kernel.* 键）和
+ * extra_init_args（来自 bootconfig 的 init.* 键/独立的 -- init 参数）
+ * 也拼接到合适位置。
  */
 static void __init setup_command_line(char *command_line)
 {
@@ -703,12 +745,12 @@ static void __init setup_command_line(char *command_line)
 }
 
 /*
- * We need to finalize in a non-__init function or else race conditions
- * between the root thread and the init thread may cause start_kernel to
- * be reaped by free_initmem before the root thread has proceeded to
- * cpu_idle.
+ * 这里必须在一个非 __init 函数里完成启动主线的最后收尾。
+ * 否则一旦 root thread 和 init thread 之间出现竞争，
+ * start_kernel() 所在的 __init 代码段可能会在 boot idle 线程真正进入
+ * cpu_idle() 之前，就被 free_initmem() 提前回收。
  *
- * gcc-3.4 accidentally inlines this function, so use noinline.
+ * 另外，老版本 gcc 可能错误地把这个函数内联，因此显式加 noinline。
  */
 
 static __initdata DECLARE_COMPLETION(kthreadd_done);
@@ -718,17 +760,21 @@ static noinline void __ref __noreturn rest_init(void)
 	struct task_struct *tsk;
 	int pid;
 
+	/* 到这里为止，早期单线程初始化主线已经完成。
+	 * 接下来开始把系统切入“正常调度 + 内核线程 + idle 线程”三者并存的运行态。
+	 */
 	rcu_scheduler_starting();
 	/*
-	 * We need to spawn init first so that it obtains pid 1, however
-	 * the init task will end up wanting to create kthreads, which, if
-	 * we schedule it before we create kthreadd, will OOPS.
+	 * 必须先创建 init，使其拿到 pid 1。
+	 * 但 init 后面又会依赖 kthreadd 来创建更多内核线程，
+	 * 所以顺序必须是：先 fork 出 init，再尽快把 kthreadd 建起来，
+	 * 否则如果过早调度 init，就可能在它创建 kthread 时出错。
 	 */
 	pid = user_mode_thread(kernel_init, NULL, CLONE_FS);
 	/*
-	 * Pin init on the boot CPU. Task migration is not properly working
-	 * until sched_init_smp() has been run. It will set the allowed
-	 * CPUs for init to the non isolated CPUs.
+	 * 在 sched_init_smp() 之前，任务迁移语义还不完整。
+	 * 因此先把 init 固定在 boot CPU 上，等 SMP 调度拓扑完全建立后，
+	 * 再由 sched_init_smp() 重新调整它允许运行的 CPU 集。
 	 */
 	rcu_read_lock();
 	tsk = find_task_by_pid_ns(pid, &init_pid_ns);
@@ -743,19 +789,17 @@ static noinline void __ref __noreturn rest_init(void)
 	rcu_read_unlock();
 
 	/*
-	 * Enable might_sleep() and smp_processor_id() checks.
-	 * They cannot be enabled earlier because with CONFIG_PREEMPTION=y
-	 * kernel_thread() would trigger might_sleep() splats. With
-	 * CONFIG_PREEMPT_VOLUNTARY=y the init task might have scheduled
-	 * already, but it's stuck on the kthreadd_done completion.
+	 * 到这一步才允许打开 might_sleep() 和 smp_processor_id() 的严格检查。
+	 * 再早一些的话，kernel_thread() 自身就可能触发误报；
+	 * 对 voluntary preempt 场景，init 即使已经被调度，也仍卡在 kthreadd_done 上。
 	 */
 	system_state = SYSTEM_SCHEDULING;
 
 	complete(&kthreadd_done);
 
 	/*
-	 * The boot idle thread must execute schedule()
-	 * at least once to get things moving:
+	 * boot idle 线程必须至少真正 schedule() 一次，
+	 * 否则系统虽然把核心线程都建好了，但调度器还没完全“转起来”。
 	 */
 	schedule_preempt_disabled();
 	/* Call into cpu_idle with preempt disabled */
@@ -785,6 +829,13 @@ void __init parse_early_options(char *cmdline)
 }
 
 /* Arch code calls this early on, or if not, just before other parsing. */
+/*
+ * 解析 early param——需要在内核启动最早阶段就生效的参数。
+ *
+ * 与普通内核参数不同，early param 的消费者必须在 parse_early_param() 之前就通过
+ * early_param() 宏注册好（而非 __setup()）。典型例子包括 earlyprintk、mem=、
+ * earlycon 等必须在大量子系统初始化前就确定行为的选项。
+ */
 void __init parse_early_param(void)
 {
 	static int done __initdata;
@@ -862,6 +913,10 @@ static int __init early_randomize_kstack_offset(char *buf)
 early_param("randomize_kstack_offset", early_randomize_kstack_offset);
 #endif
 
+/*
+ * 把未被内核识别的、将转交给 init 的参数汇集打印出来。
+ * 只在有未知参数且不会立即 panic 时才输出，避免无关噪声。
+ */
 static void __init print_unknown_bootoptions(void)
 {
 	char *unknown_options;
@@ -905,6 +960,11 @@ static void __init print_unknown_bootoptions(void)
 	memblock_free(unknown_options, len);
 }
 
+/*
+ * 把 early_cpu_to_node() 的映射结果刷入每个 possible CPU 的 per-CPU numa_node。
+ * 此时 SRAT/DT 的 NUMA 拓扑信息已经可用，但很多 per-CPU 结构还没完全落地，
+ * 所以必须尽早把节点分配固化下来。
+ */
 static void __init early_numa_node_init(void)
 {
 #ifdef CONFIG_USE_PERCPU_NUMA_NODE_ID
@@ -1019,6 +1079,10 @@ void start_kernel(void)
 	char *command_line;
 	char *after_dashes;
 
+	/* 下面这段是整个内核启动最核心的通用主线：
+	 * 从“架构刚跳进 C 代码的早期引导态”，逐步推进到“能进入 rest_init()”
+	 * 的完整内核态。
+	 */
 	set_task_stack_end_magic(&init_task);
 	smp_setup_processor_id();
 	debug_objects_early_init();
@@ -1026,19 +1090,20 @@ void start_kernel(void)
 
 	cgroup_init_early();
 
+	/* 在 IRQ、时钟、调度器都还没完全建立前，必须维持本地中断关闭。 */
 	local_irq_disable();
 	early_boot_irqs_disabled = true;
 
 	/*
-	 * Interrupts are still disabled. Do necessary setups, then
-	 * enable them.
+	 * 现在仍处于“强制关中断”的早期阶段。
+	 * 先完成架构、内存、命令行和调度等必要初始化，稍后再打开中断。
 	 */
 	boot_cpu_init();
 	page_address_init();
 	pr_notice("%s", linux_banner);
 	setup_arch(&command_line);
 	mm_core_init_early();
-	/* Static keys and static calls are needed by LSMs */
+	/* LSM 和不少早期框架会依赖 static key/static call。 */
 	jump_label_init();
 	static_call_init();
 	early_security_init();
@@ -1051,7 +1116,7 @@ void start_kernel(void)
 	boot_cpu_hotplug_init();
 
 	print_kernel_cmdline(saved_command_line);
-	/* parameters may set static keys */
+	/* 启动参数本身可能影响 static key，必须尽早解析。 */
 	parse_early_param();
 	after_dashes = parse_args("Booting kernel",
 				  static_command_line, __start___param,
@@ -1065,12 +1130,12 @@ void start_kernel(void)
 		parse_args("Setting extra init args", extra_init_args,
 			   NULL, 0, -1, -1, NULL, set_init_arg);
 
-	/* Architectural and non-timekeeping rng init, before allocator init */
+	/* 先做与体系结构相关、且尚不依赖完整 timekeeping 的随机源初始化。 */
 	random_init_early(command_line);
 
 	/*
-	 * These use large bootmem allocations and must precede
-	 * initalization of page allocator
+	 * 这些步骤会消耗较大的早期 bootmem/memblock 分配，
+	 * 必须发生在正式页分配器完全接管之前。
 	 */
 	setup_log_buf(0);
 	vfs_caches_init_early();
@@ -1081,13 +1146,12 @@ void start_kernel(void)
 	poking_init();
 	ftrace_init();
 
-	/* trace_printk can be enabled here */
+	/* 从这里开始 trace_printk 已经具备基础可用条件。 */
 	early_trace_init();
 
 	/*
-	 * Set up the scheduler prior starting any interrupts (such as the
-	 * timer interrupt). Full topology setup happens at smp_init()
-	 * time - but meanwhile we still have a functioning scheduler.
+	 * 在打开任何中断（尤其是时钟中断）之前，必须先把调度器建好。
+	 * 完整 SMP 拓扑会在 smp_init() 后补齐，但此时已经需要一个可工作的调度器。
 	 */
 	sched_init();
 
@@ -1097,29 +1161,28 @@ void start_kernel(void)
 	radix_tree_init();
 
 	/*
-	 * Set up housekeeping before setting up workqueues to allow the unbound
-	 * workqueue to take non-housekeeping into account.
+	 * 先建立 housekeeping CPU 语义，再初始化 workqueue，
+	 * 这样 unbound workqueue 才能从一开始就避开不适合的 CPU。
 	 */
 	housekeeping_init();
 
 	/*
-	 * Allow workqueue creation and work item queueing/cancelling
-	 * early.  Work item execution depends on kthreads and starts after
-	 * workqueue_init().
+	 * 允许早期代码先创建 workqueue、排队或取消 work item。
+	 * 但真正执行 work 仍依赖后面 kthreadd/workqueue_init() 之后的线程环境。
 	 */
 	workqueue_init_early();
 
 	rcu_init();
 	kvfree_rcu_init();
 
-	/* Trace events are available after this */
+	/* 走到这里后，trace event 框架已经可用。 */
 	trace_init();
 
 	if (initcall_debug)
 		initcall_debug_enable();
 
 	context_tracking_init();
-	/* init some links before init_ISA_irqs() */
+	/* 在正式 IRQ 初始化前，先把部分早期中断结构链起来。 */
 	early_irq_init();
 	init_IRQ();
 	tick_init();
@@ -1132,10 +1195,10 @@ void start_kernel(void)
 	timekeeping_init();
 	time_init();
 
-	/* This must be after timekeeping is initialized */
+	/* 完整随机数初始化依赖 timekeeping，因此必须放在其后。 */
 	random_init();
 
-	/* These make use of the fully initialized rng */
+	/* 这些机制会使用已经完整建立的随机源。 */
 	kfence_init();
 	boot_init_stack_canary();
 
@@ -1147,12 +1210,13 @@ void start_kernel(void)
 	early_boot_irqs_disabled = false;
 	local_irq_enable();
 
+	/* 真正开中断后，系统才进入常规“运行态初始化”的后半程。 */
 	kmem_cache_init_late();
 
 	/*
-	 * HACK ALERT! This is early. We're enabling the console before
-	 * we've done PCI setups etc, and console_init() must be aware of
-	 * this. But we do want output early, in case something goes wrong.
+	 * 这里把控制台拉起来的时机偏早：
+	 * 此时不少总线和设备初始化还没完成，但为了尽早看到错误输出，只能这么做。
+	 * 因此 console_init() 必须自己知道当前仍处于“早控制台”阶段。
 	 */
 	console_init();
 	if (panic_later)
@@ -1162,13 +1226,15 @@ void start_kernel(void)
 	lockdep_init();
 
 	/*
-	 * Need to run this when irqs are enabled, because it wants
-	 * to self-test [hard/soft]-irqs on/off lock inversion bugs
-	 * too:
+	 * locking_selftest() 必须在 IRQ 已开启后运行，
+	 * 因为它还要自测 hardirq/softirq 开关场景下的锁反转问题。
 	 */
 	locking_selftest();
 
 #ifdef CONFIG_BLK_DEV_INITRD
+	/* 检查 initrd 是否被早期的内核分配意外覆盖。
+	 * 如果 initrd 落在 buddy allocator 已经接管的范围 (below min_low_pfn)，
+	 * 说明它所在的内存可能已经被复用，继续解包会导致数据损坏。 */
 	if (initrd_start && !initrd_below_start_ok &&
 	    page_to_pfn(virt_to_page((void *)initrd_start)) < min_low_pfn) {
 		pr_crit("initrd overwritten (0x%08lx < 0x%08lx) - disabling it.\n",
@@ -1177,6 +1243,10 @@ void start_kernel(void)
 		initrd_start = 0;
 	}
 #endif
+	/*
+	 * 中断开启后，继续补全"完整多核操作系统"所需的基础设施。
+	 * 下面这几个仍属于 NUMA/时间/延迟等偏底层初始化。
+	 */
 	setup_per_cpu_pageset();
 	numa_policy_init();
 	acpi_early_init();
@@ -1185,19 +1255,30 @@ void start_kernel(void)
 	sched_clock_init();
 	calibrate_delay();
 
+	/* 架构最后的 CPU 收尾：包括 speculative 漏洞缓解的最终 enable 等。 */
 	arch_cpu_finalize_init();
 
+	/*
+	 * 进程管理基础设施：pid、匿名 vma、线程栈缓存、cred、fork 和进程级缓存
+	 * 必须在创建任何内核线程之前全部就绪。
+	 */
 	pid_idr_init();
 	anon_vma_init();
 	thread_stack_cache_init();
 	cred_init();
 	fork_init();
 	proc_caches_init();
+	/* 命名空间：UTS / time namespace。 */
 	uts_ns_init();
 	time_ns_init();
+	/* 安全框架、key retention 和 debug lock 晚期初始化。 */
 	key_init();
 	security_init();
 	dbg_late_init();
+	/*
+	 * 网络命名空间 + VFS caches + pagecache。
+	 * VFS 初始化完成后，/proc、nsfs、pidfs 这些伪文件系统才能挂载。
+	 */
 	net_ns_init();
 	vfs_caches_init();
 	pagecache_init();
@@ -1206,17 +1287,25 @@ void start_kernel(void)
 	proc_root_init();
 	nsfs_init();
 	pidfs_init();
+	/*
+	 * cgroup 体系：cpuset → memory cgroup → 通用 cgroup。
+	 * 此时进程管理已经可用，所以 cgroup 能正常创建控制组并施加限制。
+	 */
 	cpuset_init();
 	mem_cgroup_init();
 	cgroup_init();
+	/* 进程统计和延迟记账。 */
 	taskstats_init_early();
 	delayacct_init();
 
+	/* ACPI 子系统最终上线 + 架构补充钩子 + KCSAN 数据竞争检测器。 */
 	acpi_subsystem_init();
 	arch_post_acpi_subsys_init();
 	kcsan_init();
 
-	/* Do the rest non-__init'ed, we're now alive */
+	/* 到这里，系统已经“真正活过来”。
+	 * 后续切到非 __init 上下文，开始进入常规线程与用户态过渡阶段。
+	 */
 	rest_init();
 
 	/*
@@ -1228,7 +1317,11 @@ void start_kernel(void)
 #endif
 }
 
-/* Call all constructor functions linked into the kernel. */
+/*
+ * 执行所有编译进内核的 C++ 风格构造函数（.ctors 段）。
+ * 某些内核子系统用 __attribute__((constructor)) 注册早期回调，需要在这里统一调用。
+ * UML 用户模式在普通 ELF 加载时已经跑过构造函数，跳过即可。
+ */
 static void __init do_ctors(void)
 {
 /*
@@ -1379,6 +1472,15 @@ static inline void do_trace_initcall_level(const char *level)
 }
 #endif /* !TRACEPOINTS_ENABLED */
 
+/*
+ * 执行单个 initcall 并做运行后状态检查。
+ *
+ * initcall 最重要的两条纪律：
+ * - 返回后必须恢复调用前的 preempt count，不得永久改变抢占状态
+ * - 返回后必须开中断，不得把中断关死留给后续代码
+ *
+ * 任何违反都会在 dmesg 中打出 WARN 并自动修复。
+ */
 int __init_or_module do_one_initcall(initcall_t fn)
 {
 	int count = preempt_count();
@@ -1439,6 +1541,13 @@ static int __init ignore_unknown_bootoption(char *param, char *val,
 	return 0;
 }
 
+/*
+ * 执行某一级的所有 initcall。
+ *
+ * 在执行该级 initcall 之前，先用该级专属的 level 参数重新解析一遍命令行，
+ * 这样编译期通过 __setup() 注册的参数可以按 initcall 级别选择性生效。
+ * level < 0 的参数在此级不可见，level > 当前级则留到后续。
+ */
 static void __init do_initcall_level(int level, char *command_line)
 {
 	initcall_entry_t *fn;
@@ -1460,12 +1569,13 @@ static void __init do_initcalls(void)
 	size_t len = saved_command_line_len + 1;
 	char *command_line;
 
+	/* initcall 解析器会改写传入的命令行缓冲区，因此每一层都得用一份可修改副本。 */
 	command_line = kzalloc(len, GFP_KERNEL);
 	if (!command_line)
 		panic("%s: Failed to allocate %zu bytes\n", __func__, len);
 
 	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++) {
-		/* Parser modifies command_line, restore it each time */
+		/* 每一层 initcall 都重新喂一遍原始命令行，避免上一层解析结果污染下一层。 */
 		strcpy(command_line, saved_command_line);
 		do_initcall_level(level, command_line);
 	}
@@ -1474,11 +1584,9 @@ static void __init do_initcalls(void)
 }
 
 /*
- * Ok, the machine is now initialized. None of the devices
- * have been touched yet, but the CPU subsystem is up and
- * running, and memory and process management works.
- *
- * Now we can finally start doing some real work..
+ * 走到 do_basic_setup() 时，CPU、内存、调度和进程管理都已经可用，
+ * 但绝大多数设备和驱动还没真正初始化。
+ * 这里才开始进入“设备模型、driver core、构造函数和 initcall”这些实质性工作。
  */
 static void __init do_basic_setup(void)
 {
@@ -1494,6 +1602,9 @@ static void __init do_pre_smp_initcalls(void)
 {
 	initcall_entry_t *fn;
 
+	/* 这些是比 pure_initcall 还更早的一批 initcall，
+	 * 需要在 SMP 完整起来之前执行。
+	 */
 	do_trace_initcall_level("early");
 	for (fn = __initcall_start; fn < __initcall0_start; fn++)
 		do_one_initcall(initcall_from_entry(fn));
@@ -1503,6 +1614,11 @@ static int run_init_process(const char *init_filename)
 {
 	const char *const *p;
 
+	/*
+	 * init 进程并不是“fork 一个现成用户态程序”，而是当前这个内核线程直接
+	 * exec 成用户态 1 号进程。也就是说，一旦 kernel_execve() 成功返回到
+	 * 用户态，这条内核启动主线就到此结束，不会再继续执行下面的 C 代码。
+	 */
 	argv_init[0] = init_filename;
 	pr_info("Run %s as init process\n", init_filename);
 	pr_debug("  with arguments:\n");
@@ -1518,6 +1634,11 @@ static int try_to_run_init_process(const char *init_filename)
 {
 	int ret;
 
+	/*
+	 * 对候选 init 路径做“尽力而为”的尝试：
+	 * - ENOENT: 文件不存在，静默继续尝试下一个候选
+	 * - 其他错误: 文件在，但无法执行，打印明确报错
+	 */
 	ret = run_init_process(init_filename);
 
 	if (ret && ret != -ENOENT) {
@@ -1553,6 +1674,10 @@ static int __init set_debug_rodata(char *str)
 early_param("rodata", set_debug_rodata);
 #endif
 
+/*
+ * 内核内存保护收口：在释放完 __init 段后，把 rodata 和内核文本的线性别名设成只读，
+ * 并做 W+X 页面检查。这是 kernel_init() 释放 init 内存后紧接着执行的加固步骤。
+ */
 static void mark_readonly(void)
 {
 	if (IS_ENABLED(CONFIG_STRICT_KERNEL_RWX) && rodata_enabled) {
@@ -1586,12 +1711,13 @@ static int __ref kernel_init(void *unused)
 	int ret;
 
 	/*
-	 * Wait until kthreadd is all set-up.
+	 * init 线程虽然已经创建，但在这里先卡住，
+	 * 等 kthreadd 真正就绪后再继续往下执行。
 	 */
 	wait_for_completion(&kthreadd_done);
 
 	kernel_init_freeable();
-	/* need to finish all async __init code before freeing the memory */
+	/* 在释放 __init 段之前，必须确保所有异步 __init 工作都已经跑完。 */
 	async_synchronize_full();
 
 	system_state = SYSTEM_FREEING_INITMEM;
@@ -1603,19 +1729,23 @@ static int __ref kernel_init(void *unused)
 	mark_readonly();
 
 	/*
-	 * Kernel mappings are now finalized - update the userspace page-table
-	 * to finalize PTI.
+	 * 到这里内核映射已经定型，再去同步用户态页表侧的 PTI 最终状态。
 	 */
 	pti_finalize();
 
 	system_state = SYSTEM_RUNNING;
 	numa_default_policy();
 
+	/* 到这里才切换到常规运行态，允许用户通过内核参数进一步修改 sysctl。 */
 	rcu_end_inkernel_boot();
 
 	do_sysctl_args();
 
 	if (ramdisk_execute_command) {
+		/*
+		 * rdinit= 是“早期用户空间接管”入口，优先级最高。它通常用于 initramfs
+		 * 里的 /init，成功后不会再走真实根文件系统上的 /sbin/init 链路。
+		 */
 		ret = run_init_process(ramdisk_execute_command);
 		if (!ret)
 			return 0;
@@ -1624,12 +1754,11 @@ static int __ref kernel_init(void *unused)
 	}
 
 	/*
-	 * We try each of these until one succeeds.
-	 *
-	 * The Bourne shell can be used instead of init if we are
-	 * trying to recover a really broken machine.
+	 * 后面这串 init 入口按顺序逐个尝试，直到某一个成功。
+	 * 最后的 /bin/sh 是为“系统已经严重损坏但仍想抢救”这种场景保底。
 	 */
 	if (execute_command) {
+		/* init= 是用户显式指定的最终 init，若失败则直接 panic，不再猜测。 */
 		ret = run_init_process(execute_command);
 		if (!ret)
 			return 0;
@@ -1638,6 +1767,7 @@ static int __ref kernel_init(void *unused)
 	}
 
 	if (CONFIG_DEFAULT_INIT[0] != '\0') {
+		/* Kconfig 默认 init 是发行版/裁剪系统给出的静态兜底值。 */
 		ret = run_init_process(CONFIG_DEFAULT_INIT);
 		if (ret)
 			pr_err("Default init %s failed (error %d)\n",
@@ -1656,7 +1786,9 @@ static int __ref kernel_init(void *unused)
 	      "See Linux Documentation/admin-guide/init.rst for guidance.");
 }
 
-/* Open /dev/console, for stdin/stdout/stderr, this should never fail */
+/* 打开 /dev/console，作为最初的 stdin/stdout/stderr。
+ * 这里理论上不应失败，但若失败只能发告警继续往前走。
+ */
 void __init console_on_rootfs(void)
 {
 	struct file *file = filp_open("/dev/console", O_RDWR, 0);
@@ -1673,16 +1805,20 @@ void __init console_on_rootfs(void)
 
 static noinline void __init kernel_init_freeable(void)
 {
-	/* Now the scheduler is fully set up and can do blocking allocations */
+	/* 走到这里，调度器已经完整可用，因此可以放心做会阻塞的内存分配。 */
 	gfp_allowed_mask = __GFP_BITS_MASK;
 
 	/*
-	 * init can allocate pages on any node
+	 * init 线程此时可以从任意内存节点分配页，
+	 * 不再受早期启动阶段那种严格绑定约束。
 	 */
 	set_mems_allowed(node_states[N_MEMORY]);
 
 	cad_pid = get_pid(task_pid(current));
 
+	/* 这一段是从“boot CPU 单线程主线”切到“完整 SMP + 完整 workqueue + 驱动初始化”
+	 * 的关键桥接阶段。
+	 */
 	smp_prepare_cpus(setup_max_cpus);
 
 	workqueue_init();
@@ -1704,12 +1840,17 @@ static noinline void __init kernel_init_freeable(void)
 
 	kunit_run_all_tests();
 
+	/*
+	 * 等待内建 initramfs 解包结束。只有等这里完成，rdinit=/init 之类 early
+	 * userspace 入口才真正有机会在 rootfs 上出现。
+	 */
 	wait_for_initramfs();
 	console_on_rootfs();
 
 	/*
-	 * check if there is an early userspace init.  If yes, let it do all
-	 * the work
+	 * 检查是否存在 early userspace 的 rdinit= 入口。
+	 * 如果能用，就让它接管后续根文件系统和用户态初始化工作；
+	 * 否则回落到 prepare_namespace() 走常规 rootfs 准备流程。
 	 */
 	int ramdisk_command_access;
 	ramdisk_command_access = init_eaccess(ramdisk_execute_command);
@@ -1718,16 +1859,16 @@ static noinline void __init kernel_init_freeable(void)
 			pr_warn("check access for rdinit=%s failed: %i, ignoring\n",
 				ramdisk_execute_command, ramdisk_command_access);
 		ramdisk_execute_command = NULL;
+		/*
+		 * 没有可执行的 rdinit= 时，才进入传统“准备真实根设备并切根”的路径。
+		 * 这也是块设备 rootfs、NFS root、旧式 initrd 等方案的汇合点。
+		 */
 		prepare_namespace();
 	}
 
 	/*
-	 * Ok, we have completed the initial bootup, and
-	 * we're essentially up and running. Get rid of the
-	 * initmem segments and start the user-mode stuff..
-	 *
-	 * rootfs is available now, try loading the public keys
-	 * and default modules
+	 * 到这里，初始引导基本完成，rootfs 也已经可用。
+	 * 后面就只剩最后的安全/模块相关收尾，以及把控制权交给用户态。
 	 */
 
 	integrity_load_keys();

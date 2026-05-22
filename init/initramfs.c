@@ -180,8 +180,15 @@ static void __init dir_utime(void) {}
 
 static __initdata time64_t mtime;
 
-/* cpio header parsing */
-
+/*
+ * CPIO newc 格式 header 解析。
+ *
+ * newc header 是 110 字节的 ASCII 十六进制字段：
+ *   magic(6) ino(8) mode(8) uid(8) gid(8) nlink(8) mtime(8)
+ *   filesize(8) devmajor(8) devminor(8) rdevmajor(8) rdevminor(8)
+ *   namesize(8) check(8)
+ * 后跟 namesize 字节的文件名（4 字节对齐填充）和 filesize 字节的文件体。
+ */
 static __initdata unsigned long ino, major, minor, nlink;
 static __initdata umode_t mode;
 static __initdata unsigned long body_len, name_len;
@@ -212,17 +219,27 @@ static void __init parse_header(char *s)
 	hdr_csum = parsed[12];
 }
 
-/* Finite-state machine */
-
+/*
+ * initramfs CPIO 解包状态机。
+ *
+ * 状态流转（正常文件）：
+ *   Start → GotHeader → SkipIt → GotName → CopyFile → Reset → Start...
+ *
+ * 状态流转（符号链接）：
+ *   Start → GotHeader → Collect → GotSymlink → Reset → Start...
+ *
+ * 每个状态对应一个 do_xxx() 处理函数，在 write_buffer() 的循环中被驱动。
+ * 状态机一次只处理一段连续输入，当输入不够时返回让调用方补充更多数据。
+ */
 static __initdata enum state {
-	Start,
-	Collect,
-	GotHeader,
-	SkipIt,
-	GotName,
-	CopyFile,
-	GotSymlink,
-	Reset
+	Start,		/* 等待/跳过 CPIO 条目间填充，读取下一个 header */
+	Collect,	/* 收集分散到达的数据到连续缓冲区 */
+	GotHeader,	/* 解析 cpio header (magic + 字段) */
+	SkipIt,		/* 跳过当前条目的未读部分（如非 REG 文件的 body） */
+	GotName,	/* 根据文件名和 mode 创建文件/目录/设备节点 */
+	CopyFile,	/* 把 body 内容写入已创建的文件 */
+	GotSymlink,	/* 创建符号链接 */
+	Reset		/* 跳过条目间 padding，返回 Start */
 } state, next_state;
 
 static __initdata char *victim;
@@ -276,6 +293,12 @@ static int __init do_collect(void)
 	return 0;
 }
 
+/*
+ * 状态：GotHeader — 解析 CPIO header，决定下一步走向。
+ * - 符号链接：收集 name+symlink target 后转 GotSymlink
+ * - 普通文件或无 body：读入文件名后转 GotName
+ * - 其他（设备节点等）：先跳至 SkipIt 再自动进入 GotName
+ */
 static int __init do_header(void)
 {
 	if (!memcmp(collected, "070701", 6)) {
@@ -309,6 +332,9 @@ static int __init do_header(void)
 	return 0;
 }
 
+/*
+ * 状态：SkipIt — 跳过当前条目的未读字节，直到到达 next_header 边界。
+ */
 static int __init do_skip(void)
 {
 	if (this_header + byte_count < next_header) {
@@ -321,6 +347,10 @@ static int __init do_skip(void)
 	}
 }
 
+/*
+ * 状态：Reset — 消耗条目间的 '\0' 填充字节（4 字节对齐 padding），
+ * 然后回到 Start 等待下一个 header。
+ */
 static int __init do_reset(void)
 {
 	while (byte_count && *victim == '\0')
@@ -358,6 +388,13 @@ static int __init maybe_link(void)
 static __initdata struct file *wfile;
 static __initdata loff_t wfile_pos;
 
+/*
+ * 状态：GotName — 根据文件名和 mode 在 rootfs 上创建对应的文件系统对象。
+ * - REG: 打开文件准备写入内容 → CopyFile
+ * - DIR: mkdir + chown + chmod
+ * - BLK/CHR/FIFO/SOCK: mknod + chown + chmod
+ * - TRAILER!!!: CPIO 归档结束标记，释放硬链接缓存
+ */
 static int __init do_name(void)
 {
 	state = SkipIt;
@@ -411,6 +448,10 @@ static int __init do_name(void)
 	return 0;
 }
 
+/*
+ * 状态：CopyFile — 把 body 内容写入由 do_name() 打开的文件。
+ * 支持跨多次回调的分段写入（输入缓冲区可能装不下整个 body）。
+ */
 static int __init do_copy(void)
 {
 	if (byte_count >= body_len) {
@@ -433,6 +474,9 @@ static int __init do_copy(void)
 	}
 }
 
+/*
+ * 状态：GotSymlink — 创建符号链接。
+ */
 static int __init do_symlink(void)
 {
 	if (collected[name_len - 1] != '\0') {
@@ -462,6 +506,11 @@ static __initdata int (*actions[])(void) = {
 	[Reset]		= do_reset,
 };
 
+/*
+ * 向状态机喂入一段输入数据，然后驱动状态循环直到数据耗尽或回到等待态。
+ *
+ * 返回值：实际消费的字节数。若返回值 < len，则状态机需要更多数据才能继续。
+ */
 static long __init write_buffer(char *buf, unsigned long len)
 {
 	byte_count = len;
@@ -472,6 +521,9 @@ static long __init write_buffer(char *buf, unsigned long len)
 	return len - byte_count;
 }
 
+/*
+ * 解压回调：解压库每产生一块输出就回调这里，把解压后数据喂入 CPIO 状态机。
+ */
 static long __init flush_buffer(void *bufv, unsigned long len)
 {
 	char *buf = bufv;
@@ -500,13 +552,18 @@ static unsigned long my_inptr __initdata; /* index of next byte to be processed 
 #include <linux/decompress/generic.h>
 
 /**
- * unpack_to_rootfs - decompress and extract an initramfs archive
- * @buf: input initramfs archive to extract
- * @len: length of initramfs data to process
+ * unpack_to_rootfs - 解压并提取 initramfs 归档到 rootfs。
+ * @buf: initramfs 归档数据起始地址
+ * @len: 数据长度
  *
- * Returns: NULL for success or an error message string
+ * 该函数支持两种输入格式：
+ * 1. 纯 CPIO 归档（无压缩）：'0707...' header 直接在 buf 开头
+ * 2. 压缩 CPIO 归档：先用 decompress_method() 检测压缩格式，解压后再喂入状态机
  *
- * This symbol shouldn't be used externally. It's available for unit tests.
+ * 内部是一个由 write_buffer() 驱动的有限状态机，逐个解析 cpio 条目
+ * 并在 rootfs 上创建对应的文件、目录、设备节点和符号链接。
+ *
+ * Returns: NULL 表示成功，非 NULL 为错误消息字符串。
  */
 char * __init unpack_to_rootfs(char *buf, unsigned long len)
 {
@@ -605,12 +662,19 @@ extern unsigned long __initramfs_size;
 
 static BIN_ATTR(initrd, 0440, sysfs_bin_attr_simple_read, NULL, 0);
 
+/*
+ * 在 memblock 中预留外部 initrd 的物理内存区域。
+ *
+ * 调用时机：在 arm64_memblock_init() 已计算出线性映射基址之后，
+ * 由 bootmem_init() → early_init_fdt_scan_reserved_mem() 间接触发。
+ * 预留后算出 initrd 的虚拟地址（initrd_start/end），供后续解包使用。
+ */
 void __init reserve_initrd_mem(void)
 {
 	phys_addr_t start;
 	unsigned long size;
 
-	/* Ignore the virtul address computed during device tree parsing */
+	/* Ignore the virtual address computed during device tree parsing */
 	initrd_start = initrd_end = 0;
 
 	if (!phys_initrd_size)
@@ -708,12 +772,22 @@ static void __init populate_initrd_image(char *err)
 }
 #endif /* CONFIG_BLK_DEV_RAM */
 
+/*
+ * initramfs/initrd 解包的主入口（异步执行）。
+ *
+ * 执行顺序：
+ * 1. 先解包编译期内嵌的 __initramfs_start..__initramfs_size（内建 initramfs）
+ * 2. 如果存在外部 initrd（bootloader 传入），再解包它
+ * 3. 如果外部 initrd 不是 CPIO 归档而是文件系统镜像（如 ext2），则把它作为
+ *    /initrd.image 保留，供后续旧式 initrd 路径使用
+ * 4. 做完后释放 initrd 占用的物理内存，或根据 retain_initrd 保留在 sysfs
+ */
 static void __init do_populate_rootfs(void *unused, async_cookie_t cookie)
 {
-	/* Load the built in initramfs */
+	/* 第一步：解包编译期内嵌的 initramfs。若失败则直接 panic。 */
 	char *err = unpack_to_rootfs(__initramfs_start, __initramfs_size);
 	if (err)
-		panic_show_mem("%s", err); /* Failed to decompress INTERNAL initramfs */
+		panic_show_mem("%s", err);
 
 	if (!initrd_start || IS_ENABLED(CONFIG_INITRAMFS_FORCE))
 		goto done;
@@ -723,9 +797,12 @@ static void __init do_populate_rootfs(void *unused, async_cookie_t cookie)
 	else
 		printk(KERN_INFO "Unpacking initramfs...\n");
 
+	/* 第二步：尝试把外部 initrd 当作 initramfs 解包。 */
 	err = unpack_to_rootfs((char *)initrd_start, initrd_end - initrd_start);
 	if (err) {
 #ifdef CONFIG_BLK_DEV_RAM
+		/* 解包失败时，外部镜像可能是旧式 ramdisk 文件系统镜像。
+		 * 把它保存到 /initrd.image，后面的 rd_load_image() 会来处理。 */
 		populate_initrd_image(err);
 #else
 		printk(KERN_EMERG "Initramfs unpacking failed: %s\n", err);
@@ -756,6 +833,12 @@ done:
 static ASYNC_DOMAIN_EXCLUSIVE(initramfs_domain);
 static async_cookie_t initramfs_cookie;
 
+/*
+ * 等待 initramfs 解包完成。
+ *
+ * 由 kernel_init_freeable() 调用，确保在执行 rdinit= 或 prepare_namespace()
+ * 之前 rootfs 上已经有完整的 early userspace 内容。
+ */
 void wait_for_initramfs(void)
 {
 	if (!initramfs_cookie) {
@@ -772,6 +855,13 @@ void wait_for_initramfs(void)
 }
 EXPORT_SYMBOL_GPL(wait_for_initramfs);
 
+/*
+ * rootfs_initcall 入口：异步启动 initramfs 解包。
+ *
+ * 选择异步执行的目的是让内核初始化主线不阻塞在解包上。
+ * 若 initramfs_async=0，则同步等待解包完成。
+ * 解包完成后，usermodehelper 才真正可用（某些 initramfs 内容可能依赖它）。
+ */
 static int __init populate_rootfs(void)
 {
 	initramfs_cookie = async_schedule_domain(do_populate_rootfs, NULL,

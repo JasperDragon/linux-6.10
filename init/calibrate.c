@@ -275,6 +275,19 @@ void __attribute__((weak)) calibration_delay_done(void)
 {
 }
 
+/*
+ * 校准 loops_per_jiffy——内核延迟循环的基准值（BogoMIPS）。
+ *
+ * 校准值有多种来源，按优先级排列：
+ * 1. 从其他 CPU 继承（SMP 次级 CPU 复用 boot CPU 的校准值）
+ * 2. lpj= 内核参数显式指定
+ * 3. lpj_fine（基于定时器频率快速计算）
+ * 4. 架构提供的 calibrate_delay_is_known()
+ * 5. calibrate_delay_direct()（硬件定时器直接测量）
+ * 6. calibrate_delay_converge()（纯软件逼近，二分收敛到 1 jiffy）
+ *
+ * 在 start_kernel() 中为 boot CPU 调用一次，后续 SMP bringup 时再为每个次级 CPU 调用。
+ */
 void calibrate_delay(void)
 {
 	unsigned long lpj;

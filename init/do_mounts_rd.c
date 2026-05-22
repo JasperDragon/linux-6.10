@@ -30,23 +30,14 @@ __setup("ramdisk_start=", ramdisk_start_setup);
 static int __init crd_load(decompress_fn deco);
 
 /*
- * This routine tries to find a RAM disk image to load, and returns the
- * number of blocks to read for a non-compressed image, 0 if the image
- * is a compressed image, and -1 if an image with the right magic
- * numbers could not be found.
+ * 识别 /initrd.image 里的镜像类型。
  *
- * We currently check for the following magic numbers:
- *	minix
- *	ext2
- *	romfs
- *	cramfs
- *	squashfs
- *	gzip
- *	bzip2
- *	lzma
- *	xz
- *	lzo
- *	lz4
+ * 返回值语义：
+ * - >0: 非压缩文件系统镜像，返回需要拷贝到 ramdisk 的 KiB 数
+ * -  0: 压缩镜像，需要走解压路径
+ * - -1: 没识别出合法 RAM disk 镜像
+ *
+ * 这里按若干已知 magic number/压缩头去猜测镜像格式，而不是依赖外部元数据。
  */
 static int __init
 identify_ramdisk_image(struct file *file, loff_t pos,
@@ -73,9 +64,7 @@ identify_ramdisk_image(struct file *file, loff_t pos,
 	squashfsb = (struct squashfs_super_block *) buf;
 	memset(buf, 0xe5, size);
 
-	/*
-	 * Read block 0 to test for compressed kernel
-	 */
+	/* 先看 block 0：压缩格式、romfs、cramfs、squashfs 都可能直接从这里起。 */
 	pos = start_block * BLOCK_SIZE;
 	kernel_read(file, buf, size, &pos);
 
@@ -91,7 +80,7 @@ identify_ramdisk_image(struct file *file, loff_t pos,
 		goto done;
 	}
 
-	/* romfs is at block zero too */
+	/* romfs 也可能直接从 block 0 开始。 */
 	if (romfsb->word0 == ROMSB_WORD0 &&
 	    romfsb->word1 == ROMSB_WORD1) {
 		printk(KERN_NOTICE
@@ -109,7 +98,7 @@ identify_ramdisk_image(struct file *file, loff_t pos,
 		goto done;
 	}
 
-	/* squashfs is at block zero too */
+	/* squashfs 同样可能直接落在 block 0。 */
 	if (le32_to_cpu(squashfsb->s_magic) == SQUASHFS_MAGIC) {
 		printk(KERN_NOTICE
 		       "RAMDISK: squashfs filesystem found at block %d\n",
@@ -119,9 +108,7 @@ identify_ramdisk_image(struct file *file, loff_t pos,
 		goto done;
 	}
 
-	/*
-	 * Read 512 bytes further to check if cramfs is padded
-	 */
+	/* 有些 cramfs 镜像前面会补 512B 头，这里再向后探一次。 */
 	pos = start_block * BLOCK_SIZE + 0x200;
 	kernel_read(file, buf, size, &pos);
 
@@ -133,9 +120,7 @@ identify_ramdisk_image(struct file *file, loff_t pos,
 		goto done;
 	}
 
-	/*
-	 * Read block 1 to test for minix and ext2 superblock
-	 */
+	/* minix/ext2 的 superblock 不在 block 0，而在更靠后的位置。 */
 	pos = (start_block + 1) * BLOCK_SIZE;
 	kernel_read(file, buf, size, &pos);
 
@@ -177,6 +162,15 @@ static unsigned long nr_blocks(struct file *file)
 	return i_size_read(inode) >> 10;
 }
 
+/*
+ * 旧式 initrd 的核心加载函数。
+ *
+ * 路径分为两条：
+ * 1. 压缩镜像 (nblocks==0): 交给 crd_load() 边读边解压到 /dev/ram
+ * 2. 非压缩文件系统镜像 (nblocks>0): 直接从 /initrd.image 逐块复制到 /dev/ram
+ *
+ * 返回值：1 表示加载成功，0 表示失败。
+ */
 int __init rd_load_image(void)
 {
 	int res = 0;
@@ -187,19 +181,23 @@ int __init rd_load_image(void)
 	decompress_fn decompressor = NULL;
 	char rotator[4] = { '|' , '/' , '-' , '\\' };
 
+	/* 打开 /dev/ram 作为输出目标，即 ramdisk 设备。 */
 	out_file = filp_open("/dev/ram", O_RDWR, 0);
 	if (IS_ERR(out_file))
 		goto out;
 
+	/* 打开 /initrd.image 作为输入源（由 initrd_load() 预先创建）。 */
 	in_file = filp_open("/initrd.image", O_RDONLY, 0);
 	if (IS_ERR(in_file))
 		goto noclose_input;
 
+	/* 先识别镜像类型：压缩/文件系统/unrecognized。 */
 	in_pos = rd_image_start * BLOCK_SIZE;
 	nblocks = identify_ramdisk_image(in_file, in_pos, &decompressor);
 	if (nblocks < 0)
 		goto done;
 
+	/* nblocks==0 表示压缩镜像，走解压路径。 */
 	if (nblocks == 0) {
 		if (crd_load(decompressor) == 0)
 			goto successful_load;
@@ -207,8 +205,7 @@ int __init rd_load_image(void)
 	}
 
 	/*
-	 * NOTE NOTE: nblocks is not actually blocks but
-	 * the number of kibibytes of data to load into a ramdisk.
+	 * 历史包袱：这里的 nblocks 实际上不是块数，而是需要装入 ramdisk 的 KiB 数。
 	 */
 	rd_blocks = nr_blocks(out_file);
 	if (nblocks > rd_blocks) {
@@ -218,7 +215,9 @@ int __init rd_load_image(void)
 	}
 
 	/*
-	 * OK, time to copy in the data
+	 * 非压缩镜像路径：直接把镜像逐块复制到 /dev/ram。
+	 * 注意它可能是多卷格式——第一块拷贝完后立即结束（旧式 ext2 disk 1），
+	 * 不会继续读取 input。
 	 */
 	devblocks = nblocks;
 
@@ -267,6 +266,14 @@ out:
 static int exit_code;
 static int decompress_error;
 
+/*
+ * 压缩解压适配层：compr_fill / compr_flush / error 三个回调。
+ *
+ * 它们是解压库（gzip/lz4/xz 等）与内核文件 IO 之间的桥接：
+ * - compr_fill: 从 /initrd.image 读取压缩数据
+ * - compr_flush: 把解压后数据写入 /dev/ram
+ * - error: 记录错误并终止解压
+ */
 static long __init compr_fill(void *buf, unsigned long len)
 {
 	long r = kernel_read(in_file, buf, len, &in_pos);
@@ -298,6 +305,13 @@ static void __init error(char *x)
 	decompress_error = 1;
 }
 
+/*
+ * 压缩 ramdisk 解压主函数。
+ *
+ * 调用方已通过 identify_ramdisk_image() 确定了正确的解压器。
+ * 这里把解压器、输入回调 (compr_fill) 和输出回调 (compr_flush) 串起来，
+ * 实现"边读边解压边写 /dev/ram"的流式解压。
+ */
 static int __init crd_load(decompress_fn deco)
 {
 	int result;

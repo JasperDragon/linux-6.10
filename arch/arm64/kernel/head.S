@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Low-level CPU initialisation
- * Based on arch/arm/kernel/head.S
+ * ARM64 最底层 CPU 初始化入口
+ * 基于 arch/arm/kernel/head.S 演化而来
  *
  * Copyright (C) 1994-2002 Russell King
  * Copyright (C) 2003-2012 ARM Ltd.
@@ -82,16 +82,17 @@
  */
 
 /*
- * Kernel startup entry point.
- * ---------------------------
+ * Kernel 启动入口约束
+ * -------------------
  *
- * The requirements are:
- *   MMU = off, D-cache = off, I-cache = on or off,
- *   x0 = physical address to the FDT blob.
+ * 入口要求：
+ *   - MMU = off
+ *   - D-cache = off
+ *   - I-cache = on 或 off 均可
+ *   - x0 = FDT blob 的物理地址
  *
- * Note that the callee-saved registers are used for storing variables
- * that are useful before the MMU is enabled. The allocations are described
- * in the entry routines.
+ * 另外要注意，若干被调用方保存寄存器会在 MMU 开启前承担“启动期变量寄存器”的角色。
+ * 它们的具体分配和生命周期，在各入口例程的注释里说明。
  */
 	__HEAD
 	/*
@@ -122,22 +123,22 @@
 	__EFI_PE_HEADER
 
 	/*
-	 * .idmap.text 段: 恒等映射文本段
+	 * .idmap.text 段：恒等映射文本段
 	 *
-	 * 此段中的代码在 MMU 开启前后的虚拟地址空间变化中都能正确执行，
-	 * 因为 __create_init_idmap 为此段创建了恒等映射 (VA==PA)。
-	 * 所有在 MMU 开启瞬间及前后执行的代码必须放在此段中。
+	 * 这里的代码必须能同时跨越“MMU 关闭”和“MMU 刚开启”两个阶段执行，
+	 * 因为此时 PC 不能因为地址空间切换而失效。
+	 * 内核通过初始 idmap 保证这段代码满足 VA == PA，
+	 * 所有 MMU 切换前后紧邻执行的代码都必须放在这里。
 	 */
 	.section ".idmap.text","a"
 
 	/*
-	 * The following callee saved general purpose registers are used on the
-	 * primary lowlevel boot path:
+	 * 主核低级启动路径里会占用以下被调用方保存通用寄存器：
 	 *
-	 *  Register   Scope                      Purpose
-	 *  x19        primary_entry() .. start_kernel()        whether we entered with the MMU on
-	 *  x20        primary_entry() .. __primary_switch()    CPU boot mode
-	 *  x21        primary_entry() .. start_kernel()        FDT pointer passed at boot in x0
+	 *  寄存器   生命周期范围                         用途
+	 *  x19      primary_entry() .. start_kernel()   记录进入时 MMU 是否已开启
+	 *  x20      primary_entry() .. __primary_switch() 记录 CPU 启动模式
+	 *  x21      primary_entry() .. start_kernel()   保存 bootloader 传入的 FDT 指针
 	 */
 SYM_CODE_START(primary_entry)
 	/*
@@ -518,13 +519,13 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 	and	x0, x0, #HCR_E2H
 	cbz	x0, 2f
 
-	/* VHE 路径: 使用 _EL12 访问器设置 SCTLR_EL1 */
+	/* VHE 路径：通过 _EL12 访问器间接编程“来宾视角”的 SCTLR_EL1。 */
 	msr_s	SYS_SCTLR_EL12, x1
 	mov	x2, #BOOT_CPU_FLAG_E2H		// 标记: 支持 VHE
 	b	3f
 
 2:
-	/* 非 VHE 路径: 直接写 SCTLR_EL1 */
+	/* 非 VHE 路径：直接由 EL2 写入真正的 SCTLR_EL1。 */
 	msr	sctlr_el1, x1
 	mov	x2, xzr				// 无 E2H 标志
 3:
@@ -533,17 +534,21 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 
 	mov	w0, #BOOT_CPU_MODE_EL2		// 返回 BOOT_CPU_MODE_EL2
 	orr	x0, x0, x2			// 合并 E2H 标志
-	eret					// ★ ERET: 降级到 EL1，开始执行 EL1 代码
+	eret					// ★ 通过 ERET 降到 EL1，继续执行内核常规 EL1 路径
 SYM_FUNC_END(init_kernel_el)
 
 	/*
-	 * secondary_holding_pen: 从核"等候区"
+	 * secondary_holding_pen：从核“等候区”
 	 *
-	 * 平台可以在此持有所有从核，直到主核准备好。
-	 * 原理: 每个从核轮询检查 secondary_holding_pen_release 全局变量，
-	 * 当该值等于自己的 MPIDR 时，跳转到 secondary_startup。
+	 * 很多平台会先把所有从核停在这里，等主核完成页表、内存和 SMP 基础设施后，
+	 * 再逐个放行。
 	 *
-	 * 主核通过 smp_prepare_cpus() → 写 secondary_holding_pen_release 释放从核。
+	 * 机制很简单：
+	 *   - 每个从核读出自己的 MPIDR 硬件 ID
+	 *   - 轮询 secondary_holding_pen_release
+	 *   - 当全局值等于自己的 MPIDR 时，转入 secondary_startup
+	 *
+	 * 主核通常在 smp_prepare_cpus()/__cpu_up() 相关路径里写这个全局变量来放行从核。
 	 */
 SYM_FUNC_START(secondary_holding_pen)
 	mov	x0, xzr				// MMU=off 调用 init_kernel_el
@@ -555,15 +560,16 @@ SYM_FUNC_START(secondary_holding_pen)
 pen:	ldr	x4, [x3]			// 读取释放信号
 	cmp	x4, x2				// 是释放我吗?
 	b.eq	secondary_startup		// 是 → 启动
-	wfe					// Wait For Event: 等待中断唤醒
+	wfe					// Wait For Event：低功耗等待事件
 	b	pen				// 继续轮询
 SYM_FUNC_END(secondary_holding_pen)
 
 	/*
-	 * secondary_entry: 从核直接入口
+	 * secondary_entry：从核直接入口
 	 *
-	 * 仅适用于内核动态上线 CPU 的场景 (如 hotplug)。
-	 * 无需轮询等待，直接初始化并启动。
+	 * 主要用于 CPU hotplug 这类动态上线场景。
+	 * 与 secondary_holding_pen 不同，它不需要先在“等候区”轮询，
+	 * 而是直接走从核启动主线。
 	 */
 SYM_FUNC_START(secondary_entry)
 	mov	x0, xzr				// MMU=off
@@ -572,23 +578,25 @@ SYM_FUNC_START(secondary_entry)
 SYM_FUNC_END(secondary_entry)
 
 	/*
-	 * secondary_startup: 从核通用启动路径
+	 * secondary_startup：从核通用启动路径
 	 *
-	 * 输入: x0 = cpu_boot_mode
+	 * 输入：
+	 *   x0 = cpu_boot_mode
 	 *
-	 * 流程:
-	 * 1. [可选] 检查 52 位 VA 支持
-	 * 2. __cpu_setup: CPU 特定初始化 (TCR/MAIR 等)
-	 * 3. __enable_mmu: 开启 MMU (使用主核准备好的 swapper_pg_dir)
-	 * 4. 跳转到 __secondary_switched (虚拟地址)
+	 * 这是所有“真正被放行的从核”都会走的统一主线。
+	 * 重点不在于建立新页表，而在于：
+	 *   - 复用主核已经准备好的内核页表
+	 *   - 做每个 CPU 自己必须做的体系结构初始化
+	 *   - 安全地切进虚拟地址空间
 	 */
 SYM_FUNC_START_LOCAL(secondary_startup)
 	mov	x20, x0				// preserve boot mode
 
 #ifdef CONFIG_ARM64_VA_BITS_52
 	/*
-	 * 52位 VA 支持检查
-	 * 如果主核支持 52位 VA 但从核不支持，则卡住该从核。
+	 * 52 位 VA 检查：
+	 * 如果整个系统最终选择了 52 位虚拟地址，但这个从核本身不支持，
+	 * 就不能让它继续加入系统，只能把它标成 stuck 并停住。
 	 */
 alternative_if ARM64_HAS_VA52
 	bl	__cpu_secondary_check52bitva
@@ -598,9 +606,9 @@ alternative_else_nop_endif
 	bl	__cpu_setup			// initialise processor
 
 	/*
-	 * 从核使用主核已建立好的页表:
-	 * x1 = swapper_pg_dir (内核全局页表, 用于 TTBR1)
-	 * x2 = idmap_pg_dir   (恒等映射页表, 用于 TTBR0)
+	 * 从核不重新造页表，而是直接复用主核已经建立好的两份关键页表：
+	 *   x1 = swapper_pg_dir  → TTBR1，提供高地址内核映射
+	 *   x2 = idmap_pg_dir    → TTBR0，提供切换阶段的恒等映射
 	 */
 	adrp	x1, swapper_pg_dir
 	adrp	x2, idmap_pg_dir
@@ -611,9 +619,12 @@ SYM_FUNC_END(secondary_startup)
 
 	.text
 /*
- * __secondary_switched: 从核 MMU 开启后
+ * __secondary_switched：从核开启 MMU 后落到的第一个虚拟地址
  *
- * 此时运行在虚拟地址空间，使用主核的 swapper_pg_dir。
+ * 从这里开始：
+ *   - 从核已经进入虚拟地址空间
+ *   - 页表与主核一致
+ *   - 可以开始装载每 CPU 上下文、异常向量和 secondary task
  */
 SYM_FUNC_START_LOCAL(__secondary_switched)
 	mov	x0, x20
@@ -628,8 +639,8 @@ SYM_FUNC_START_LOCAL(__secondary_switched)
 	isb
 
 	/*
-	 * 加载从核任务
-	 * secondary_data.task 由主核在 __cpu_up() 中设置
+	 * 取出主核预先为该从核准备好的 task_struct。
+	 * secondary_data.task 通常由 __cpu_up() 之类的主核路径提前填好。
 	 */
 	adr_l	x0, secondary_data
 	ldr	x2, [x0, #CPU_BOOT_TASK]	// x2 = secondary_data.task
@@ -656,17 +667,16 @@ SYM_FUNC_START_LOCAL(__secondary_too_slow)
 SYM_FUNC_END(__secondary_too_slow)
 
 /*
- * set_cpu_boot_mode_flag: 设置 __boot_cpu_mode 标志
+ * set_cpu_boot_mode_flag：记录 CPU 的实际启动模式
  *
- * 输入: w0 = BOOT_CPU_MODE_EL1 或 BOOT_CPU_MODE_EL2
+ * 输入：
+ *   w0 = BOOT_CPU_MODE_EL1 或 BOOT_CPU_MODE_EL2
  *
- * __boot_cpu_mode 是一个 64 位值，分为两个 32 位:
- * [31:0]  = 当前 CPU 的启动模式
- * [63:32] = 如果多个 CPU 启动模式不一致时的冲突值
+ * __boot_cpu_mode 是个 64 位槽位，拆成两个 32 位使用：
+ *   [31:0]  保存一种启动模式
+ *   [63:32] 在不同 CPU 启动模式不一致时可保存另一种模式，用于冲突检测
  *
- * 由于 CPU 不支持非对齐原子访问，所以在不同偏移写入:
- * BOOT_CPU_MODE_EL2 → [x1+4] (高32位)
- * BOOT_CPU_MODE_EL1 → [x1]   (低32位)
+ * 之所以分开写，是因为这里不依赖非对齐原子访问语义。
  */
 SYM_FUNC_START_LOCAL(set_cpu_boot_mode_flag)
 	adr_l	x1, __boot_cpu_mode
@@ -678,14 +688,14 @@ SYM_FUNC_START_LOCAL(set_cpu_boot_mode_flag)
 SYM_FUNC_END(set_cpu_boot_mode_flag)
 
 /*
- * update_early_cpu_boot_status: 更新 early_cpu_boot_status 并确保写入内存
+ * update_early_cpu_boot_status：更新从核早期启动状态并强制对外可见
  *
- * 宏参数:
+ * 宏参数：
  *   status: 要写入的状态值
  *   tmp1, tmp2: 临时寄存器
  *
- * 使用 DMB + DC IVAC 确保即使在 MMU 关闭时，
- * 写入也能被其他 CPU 看到。
+ * 这里使用 DMB + DC IVAC，确保即便当前还在 MMU 关闭或缓存状态不稳定的阶段，
+ * 主核或其他观察者之后也能可靠看到这个状态。
  */
 	.macro	update_early_cpu_boot_status status, tmp1, tmp2
 	mov	\tmp2, #\status
@@ -696,19 +706,21 @@ SYM_FUNC_END(set_cpu_boot_mode_flag)
 	.endm
 
 /*
- * __enable_mmu: 开启 MMU
+ * __enable_mmu：真正执行“打开 MMU”这件事
  *
- * 输入:
- *   x0 = SCTLR_EL1 的值 (用于开启 MMU)
- *   x1 = TTBR1_EL1 的值 (swapper_pg_dir 页表基址)
- *   x2 = ID map 根页表地址 → TTBR0_EL1
+ * 输入：
+ *   x0 = 目标 SCTLR_EL1 值
+ *   x1 = TTBR1_EL1 对应页表（通常是 swapper_pg_dir）
+ *   x2 = TTBR0_EL1 对应页表（通常是 idmap 根页表）
  *
- * 返回: 通过 x30/lr 返回
- * 要求: 调用者必须在 .idmap.text 段中 (由恒等映射覆盖)
+ * 前置要求：
+ *   - 调用者必须位于 .idmap.text 中
+ *   - 这样在 SCTLR_EL1.M 由 0 切 1 的瞬间，PC 依然能被恒等映射命中
  *
- * 在执行 MMU 开启前，校验 CPU 是否支持当前选择的内存颗粒大小:
- *   - 支持: 加载 TTBR0/TTBR1，写 SCTLR_EL1 开启 MMU
- *   - 不支持: 跳转到 __no_granule_support (卡住 CPU)
+ * 该函数只做几件极关键的事：
+ *   1. 检查当前 CPU 是否支持内核所选内存颗粒大小
+ *   2. 装载 TTBR0/TTBR1
+ *   3. 写 SCTLR_EL1，真正把 MMU 打开
  */
 	.section ".idmap.text","a"
 SYM_FUNC_START(__enable_mmu)
@@ -736,14 +748,14 @@ SYM_FUNC_START(__enable_mmu)
 	load_ttbr1 x1, x1, x3
 
 	/*
-	 * ★ 写 SCTLR_EL1 — MMU 在此刻开启!
+	 * ★ 写 SCTLR_EL1：MMU 就在这一刻真正打开
 	 *
-	 * set_sctlr_el1 宏处理了 errata 规避 (如 nGnRE 强制写入)
-	 * 此指令执行后:
-	 *   - MMU 开启，虚拟地址空间生效
-	 *   - TTBR0 用于低地址 (idmap_pg_dir)
-	 *   - TTBR1 用于高地址 (swapper_pg_dir)
-	 *   - 当前 PC 仍在 idmap 恒等映射区域，因此不会断裂
+	 * set_sctlr_el1 会顺带处理相关 errata 规避。
+	 * 指令提交后：
+	 *   - 地址翻译正式生效
+	 *   - 低地址仍由 TTBR0 的 idmap 承接
+	 *   - 高地址内核映射由 TTBR1 承接
+	 *   - 当前 PC 不会丢，因为仍处在被恒等映射覆盖的 .idmap.text 中
 	 */
 	set_sctlr_el1	x0
 
@@ -798,34 +810,31 @@ SYM_FUNC_START_LOCAL(__no_granule_support)
 SYM_FUNC_END(__no_granule_support)
 
 /*
- * __primary_switch: 主核 MMU 开启 + 内核映射 + 重定位
+ * __primary_switch：主核从“物理地址世界”切进“内核虚拟地址世界”的桥
  *
- * 此函数在 .idmap.text 段中，由恒等映射覆盖。
+ * 这个函数仍运行在 .idmap.text 中，因此它自己不会因 MMU 切换而失联。
  *
- * 流程:
- * 1. __enable_mmu:
- *      x1 = reserved_pg_dir → TTBR1 (暂时指向保留页表)
- *      x2 = __pi_init_idmap_pg_dir → TTBR0 (恒等映射)
- *      开启 MMU
+ * 主核路径与从核路径最大的不同在于：
+ *   - 主核不仅要打开 MMU
+ *   - 还要完成内核镜像、FDT、BSS、临时页表到最终页表的过渡
  *
- * 2. __pi_early_map_kernel (PI = position independent):
- *      映射 FDT、清除 BSS、映射内核各段 (text/rodata/init/data)
- *      将 TTBR1 切换为 init_pg_dir
- *      将最终的 swapper_pg_dir 准备好
- *
- * 3. 跳转到 __primary_switched (虚拟地址)
+ * 可以把它理解成：
+ *   1. 先用最小可运行页表把 MMU 打开
+ *   2. 再把正式内核地址空间真正搭好
+ *   3. 最后跳到 __primary_switched，进入稳定虚拟地址阶段
  */
 SYM_FUNC_START_LOCAL(__primary_switch)
 	/*
-	 * 暂时将 TTBR1 指向 reserved_pg_dir (空页表)
-	 * TTBR0 指向初始 ID map 页表
+	 * 先让 TTBR1 指向 reserved_pg_dir，而不是一上来就用最终页表。
+	 * 这样做是为了在“MMU 刚打开但正式映射还没铺好”时，保持过渡阶段可控。
 	 */
 	adrp	x1, reserved_pg_dir
 	adrp	x2, __pi_init_idmap_pg_dir
 	bl	__enable_mmu			// ★ 开启 MMU
 
 	/*
-	 * MMU 已开启，重新设置栈 (使用虚拟地址)
+	 * MMU 已开启后，重新以虚拟地址方式设置 early_init_stack。
+	 * 从这里开始，后续栈访问已经处于内核虚拟地址语义下。
 	 */
 	adrp	x1, early_init_stack
 	mov	sp, x1
@@ -834,17 +843,16 @@ SYM_FUNC_START_LOCAL(__primary_switch)
 	mov	x0, x20				// pass the full boot status
 	mov	x1, x21				// pass the FDT (物理地址)
 	/*
-	 * ★ 映射内核到虚拟地址空间
-	 * __pi_early_map_kernel 完成:
-	 *   - map_fdt():       映射 FDT 到虚拟地址
-	 *   - 清除 BSS 和初始页表区域
-	 *   - 处理 KASLR 随机化种子
-	 *   - map_kernel():    映射内核各段 (text/rodata/inittext/initdata/data)
-	 *                     使用 init_pg_dir 作为临时页表
-	 *   - 将 TTBR1 切换到 init_pg_dir
-	 *   - 可选: 使用连续描述符重映射 text 段 (性能优化)
-	 *   - 拷贝根页表到 swapper_pg_dir (最终页表)
-	 *   - [LPA2] 重建 ID map 以支持 LPA2 描述符
+	 * ★ 真正把内核地址空间搭起来
+	 * __pi_early_map_kernel 负责完成：
+	 *   - FDT 映射
+	 *   - BSS 清零
+	 *   - KASLR 相关早期处理
+	 *   - 内核各段映射
+	 *   - 从临时 init_pg_dir 过渡到最终 swapper_pg_dir
+	 *   - 必要时重建更适合最终运行态的映射形式
+	 *
+	 * 这一步做完后，系统才算真正拥有“稳定的内核虚拟地址空间”。
 	 */
 	bl	__pi_early_map_kernel		// Map and relocate the kernel
 

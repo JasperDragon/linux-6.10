@@ -96,6 +96,17 @@ static void __init early_fixmap_init_pud(p4d_t *p4dp, unsigned long addr,
 }
 
 /*
+ * 在 setup_arch() 的最早阶段初始化 fixmap 页表。
+ *
+ * fixmap 是内核启动早期就需要的固定虚拟映射窗口，用于：
+ * - 临时映射设备树 blob（FDT）
+ * - 映射 UEFI 运行时服务
+ * - 早期 ioremap / early console
+ * - KPTI trampoline 等特殊用途
+ *
+ * 因为这时 memblock 还没完全设立、伙伴分配器未就绪，fixmap 页表不能
+ * 动态分配，必须使用 bm_pud/bm_pmd/bm_pte 这些编译期预留的静态页表。
+ *
  * The p*d_populate functions call virt_to_phys implicitly so they can't be used
  * directly on kernel symbols (bm_p*d). This function is called too early to use
  * lm_alias so __p*d_populate functions must be used to populate with the
@@ -134,6 +145,13 @@ void __set_fixmap(enum fixed_addresses idx,
 	}
 }
 
+/*
+ * 把 bootloader 传入的设备树物理地址映射到 fixmap 虚拟窗口。
+ *
+ * FDT 头部不一定按 PAGE_SIZE 对齐，所以会先对齐到页边界，再按首个 PAGE_SIZE
+ * 映射读取 fdt_header，最后按实际 totalsize 扩充映射范围。
+ * 返回值为 FDT 在 fixmap 中的虚拟地址，后续 setup_machine_fdt() 直接使用它。
+ */
 void *__init fixmap_remap_fdt(phys_addr_t dt_phys, int *size, pgprot_t prot)
 {
 	const u64 dt_virt_base = __fix_to_virt(FIX_FDT);
