@@ -1,73 +1,39 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * linux/ipc/sem.c
+ * linux/ipc/sem.c — System V 信号量实现
  * Copyright (C) 1992 Krishna Balasubramanian
  * Copyright (C) 1995 Eric Schenk, Bruno Haible
  *
- * /proc/sysvipc/sem support (c) 1999 Dragos Acostachioaie <dragos@iname.com>
+ * ============================================================================
+ * 架构概览
+ * ============================================================================
  *
- * SMP-threaded, sysctl's added
- * (c) 1999 Manfred Spraul <manfred@colorfullife.com>
- * Enforced range limit on SEM_UNDO
- * (c) 2001 Red Hat Inc
- * Lockless wakeup
- * (c) 2003 Manfred Spraul <manfred@colorfullife.com>
- * (c) 2016 Davidlohr Bueso <dave@stgolabs.net>
- * Further wakeup optimizations, documentation
- * (c) 2010 Manfred Spraul <manfred@colorfullife.com>
+ * 核心数据结构:
+ *   sem_array  — 一个信号量集合 (对应一个 IPC ID)
+ *     └─ sem[] — 每个集合可包含多个信号量 (最多 SEMMSL 个)
+ *   sem_queue  — 挂起的 semop 操作队列 (按 FIFO 排列)
+ *   sem_undo   — 进程退出时的 UNDO 调整值 (每个进程-每个数组一组)
  *
- * support for audit of ipc object properties and permission changes
- * Dustin Kirkland <dustin.kirkland@us.ibm.com>
+ * 关键算法:
+ *   - FIFO 唤醒: 完成 semop 的进程主动扫描等待队列, 把能满足的操作一并完成
+ *     (update_queue()), 而不是让被唤醒者自己去抢
+ *   - 复杂的快速路径 (sem_lock):
+ *     信号量是唯一绕开 kern_ipc_perm.lock 的 IPC 类型,
+ *     使用 per-array 的 complex_mode + sem_perm.lock 替代
+ *   - per-sem 等待队列:
+ *     每个信号量维护独立的 pending 链表, 避免扫描无关等待者
+ *   - RCU + spinlock: semop 和 semctl(RMID) 通过 RCU 同步
  *
- * namespaces support
- * OpenVZ, SWsoft Inc.
- * Pavel Emelianov <xemul@openvz.org>
+ * 系统调用入口:
+ *   sys_semget()     — 创建/获取信号量集合
+ *   sys_semctl()     — 控制操作 (SETVAL/GETVAL/GETALL/SETALL/RMID/STAT...)
+ *   sys_semop()      — P/V 操作 (增加/减少信号量值)
+ *   sys_semtimedop() — 带超时的 P/V 操作
  *
- * Implementation notes: (May 2010)
- * This file implements System V semaphores.
- *
- * User space visible behavior:
- * - FIFO ordering for semop() operations (just FIFO, not starvation
- *   protection)
- * - multiple semaphore operations that alter the same semaphore in
- *   one semop() are handled.
- * - sem_ctime (time of last semctl()) is updated in the IPC_SET, SETVAL and
- *   SETALL calls.
- * - two Linux specific semctl() commands: SEM_STAT, SEM_INFO.
- * - undo adjustments at process exit are limited to 0..SEMVMX.
- * - namespace are supported.
- * - SEMMSL, SEMMNS, SEMOPM and SEMMNI can be configured at runtime by writing
- *   to /proc/sys/kernel/sem.
- * - statistics about the usage are reported in /proc/sysvipc/sem.
- *
- * Internals:
- * - scalability:
- *   - all global variables are read-mostly.
- *   - semop() calls and semctl(RMID) are synchronized by RCU.
- *   - most operations do write operations (actually: spin_lock calls) to
- *     the per-semaphore array structure.
- *   Thus: Perfect SMP scaling between independent semaphore arrays.
- *         If multiple semaphores in one array are used, then cache line
- *         trashing on the semaphore array spinlock will limit the scaling.
- * - semncnt and semzcnt are calculated on demand in count_semcnt()
- * - the task that performs a successful semop() scans the list of all
- *   sleeping tasks and completes any pending operations that can be fulfilled.
- *   Semaphores are actively given to waiting tasks (necessary for FIFO).
- *   (see update_queue())
- * - To improve the scalability, the actual wake-up calls are performed after
- *   dropping all locks. (see wake_up_sem_queue_prepare())
- * - All work is done by the waker, the woken up task does not have to do
- *   anything - not even acquiring a lock or dropping a refcount.
- * - A woken up task may not even touch the semaphore array anymore, it may
- *   have been destroyed already by a semctl(RMID).
- * - UNDO values are stored in an array (one per process and per
- *   semaphore array, lazily allocated). For backwards compatibility, multiple
- *   modes for the UNDO variables are supported (per process, per thread)
- *   (see copy_semundo, CLONE_SYSVSEM)
- * - There are two lists of the pending operations: a per-array list
- *   and per-semaphore list (stored in the array). This allows to achieve FIFO
- *   ordering without always scanning all pending operations.
- *   The worst-case behavior is nevertheless O(N^2) for N wakeups.
+ * UNDO 机制:
+ *   进程可以在 semop 时设置 SEM_UNDO 标志, 内核记录本次操作的反向值。
+ *   当进程退出时, 自动把 UNDO 值反向施加到信号量上, 避免死锁。
+ *   这对"获取信号量后崩溃"的场景尤其重要。
  */
 
 #include <linux/compat.h>
@@ -380,11 +346,35 @@ static void complexmode_tryleave(struct sem_array *sma)
 
 #define SEM_GLOBAL_LOCK	(-1)
 /*
- * If the request contains only one semaphore operation, and there are
- * no complex transactions pending, lock only the semaphore involved.
- * Otherwise, lock the entire semaphore array, since we either have
- * multiple semaphores in our own semops, or we need to look at
- * semaphores from other pending complex operations.
+ * sem_lock — 信号量专用的自适应锁机制。
+ *
+ * 这是 SysV 信号量实现中最重要的性能优化。与 msg/shm 总是获取
+ * kern_ipc_perm.lock (全局锁) 不同, 信号量支持两种锁定模式:
+ *
+ * 1) 简单模式 (per-sem lock):
+ *    - 仅操作单个信号量 (nsops == 1) 且没有复杂事务在进行时可用
+ *    - 直接获取该信号量的 sem->lock (spinlock)
+ *    - 完美 SMP 扩展性: 同一数组的不同信号量可完全并行操作
+ *
+ * 2) 复杂模式 (global lock / SEM_GLOBAL_LOCK):
+ *    - nsops > 1 (一次操作多个信号量, 需要原子性)
+ *    - 或已经有复杂事务在队列中 (需要全局视图来扫描)
+ *    - 获取整个 sem_array 的 sem_perm.lock
+ *    - 通过 complexmode_enter() 阻止新的简单操作进入
+ *
+ * 模式切换 (use_global_lock 状态机):
+ *   0:          简单模式 (默认)
+ *   >0:         复杂模式, 值作为 hysteresis 计数器递减
+ *               在降至 0 之前允许等待中的简单操作继续以简单模式执行
+ *   SEM_GLOBAL_LOCK (-1): 强制全局锁
+ *
+ * 快速路径 (fast path):
+ *   1) READ_ONCE(use_global_lock) == 0? → 大概率命中
+ *   2) spin_lock(sem->lock)
+ *   3) smp_load_acquire 再确认 use_global_lock 未变
+ *   4) 成功! 返回 sem_num 作为 locknum
+ *
+ * 返回: 锁编号 (>=0 = per-sem lock, SEM_GLOBAL_LOCK = 全局锁)
  */
 static inline int sem_lock(struct sem_array *sma, struct sembuf *sops,
 			      int nsops)
@@ -522,11 +512,25 @@ static struct sem_array *sem_alloc(size_t nsems)
 }
 
 /**
- * newary - Create a new semaphore set
- * @ns: namespace
- * @params: ptr to the structure that contains key, semflg and nsems
+ * newary — 创建一个新的 System V 信号量集合。
+ * @ns:     IPC namespace
+ * @params: key + semflg + nsems (集合中的信号量数量)
  *
- * Called with sem_ids.rwsem held (as a writer)
+ * 调用条件: 持有 sem_ids.rwsem 写锁
+ *
+ * 初始化流程:
+ *   1) 检查 nsems 合法性 + namespace 的 semmns 配额
+ *   2) kvzalloc_flex 分配 sem_array + sem[nsems] 数组 (灵活数组成员)
+ *   3) 为每个信号量初始化 per-sem 等待队列 (pending_alter/pending_const)
+ *      - pending_alter: 等待修改该信号量的操作
+ *      - pending_const: 等待该信号量变为特定值的操作 (sem_op==0)
+ *   4) 初始化全局等待队列 (pending_alter/pending_const)
+ *   5) ipc_addid() 分配 ID 并插入 IPC IDR 树 + key 哈希表
+ *   6) seminfo.semmni 计数 +1
+ *
+ * 每个信号量有两个独立等待队列的设计是信号量 FIFO 唤醒的
+ * 关键优化: 当某个信号量值变化时, 只需要扫描其专属队列,
+ * 而不是遍历整个集合的全局队列。
  */
 static int newary(struct ipc_namespace *ns, struct ipc_params *params)
 {
@@ -621,27 +625,35 @@ long ksys_semget(key_t key, int nsems, int semflg)
 	return ipcget(ns, &sem_ids(ns), &sem_ops, &sem_params);
 }
 
+/*
+ * sys_semget — 创建或获取一个 System V 信号量集合。
+ * @key:     IPC key (IPC_PRIVATE=0 时强制创建新集合)
+ * @nsems:   集合中的信号量数量 (仅创建时需要, 范围 [1, SEMMSL])
+ * @semflg:  标志位 (IPC_CREAT | IPC_EXCL | 权限位 0777)
+ *
+ * 底层通过 ipcget() 分发到 newary (创建) 或权限检查路径。
+ */
 SYSCALL_DEFINE3(semget, key_t, key, int, nsems, int, semflg)
 {
 	return ksys_semget(key, nsems, semflg);
 }
 
 /**
- * perform_atomic_semop[_slow] - Attempt to perform semaphore
- *                               operations on a given array.
- * @sma: semaphore array
- * @q: struct sem_queue that describes the operation
+ * perform_atomic_semop[_slow] — 尝试原子地执行一组信号量操作。
+ * @sma: 目标信号量集合
+ * @q:   描述操作内容的 sem_queue 条目
  *
- * Caller blocking are as follows, based the value
- * indicated by the semaphore operation (sem_op):
+ * 对每个 sem_op 的判断规则:
+ *   (1) sem_op > 0:  永不阻塞, 把值加到 semval
+ *   (2) sem_op == 0: 等待零操作——semval 必须为 0 才能继续
+ *   (3) sem_op < 0:  如果操作后 semval < 0 则阻塞
  *
- *  (1) >0 never blocks.
- *  (2)  0 (wait-for-zero operation): semval is non-zero.
- *  (3) <0 attempting to decrement semval to a value smaller than zero.
+ * 算法要点: 两步扫描 (two-pass scan)
+ *   第一遍: 纯检查——确认所有操作都能成功, 不修改任何信号量值
+ *   第二遍: 实际执行——只有在确认可以完整执行后才写回
+ *   这样可以避免"部分执行、部分阻塞"的复杂回滚场景。
  *
- * Returns 0 if the operation was possible.
- * Returns 1 if the operation is impossible, the caller must sleep.
- * Returns <0 for error codes.
+ * 返回值: 0 = 成功, 1 = 需要阻塞等待, <0 = 错误码
  */
 static int perform_atomic_semop_slow(struct sem_array *sma, struct sem_queue *q)
 {
@@ -936,15 +948,19 @@ static int do_smart_wakeup_zero(struct sem_array *sma, struct sembuf *sops,
  * @semnum: semaphore that was modified.
  * @wake_q: lockless wake-queue head.
  *
- * update_queue must be called after a semaphore in a semaphore array
- * was modified. If multiple semaphores were modified, update_queue must
- * be called with semnum = -1, as well as with the number of each modified
- * semaphore.
- * The tasks that must be woken up are added to @wake_q. The return code
- * is stored in q->pid.
- * The function internally checks if const operations can now succeed.
+ * update_queue — FIFO 唤醒扫描 (信号量最核心的算法)。
  *
- * The function return 1 if at least one semop was completed successfully.
+ * 每当某个信号量的值发生变化后, 调用此函数扫描等待队列。
+ * 按照 FIFO 顺序逐个检查每个等待的 semop 是否可以完整执行,
+ * 如果可以则立即完成它, 并将完成的任务加入 @wake_q 等待唤醒。
+ *
+ * 算法性质:
+ *   - FIFO (非 starvation-free, 但公平)
+ *   - 完成者主动执行, 被唤醒者不需要再抢锁
+ *   - semnum >= 0 时只检查该信号量的专用等待队列 (per-sem),
+ *     semnum == -1 时检查整个集合的全局等待队列
+ *
+ * 返回值: 1 = 至少完成了一个 semop, 0 = 没有可完成的
  */
 static int update_queue(struct sem_array *sma, int semnum, struct wake_q_head *wake_q)
 {
@@ -2321,16 +2337,29 @@ int copy_semundo(u64 clone_flags, struct task_struct *tsk)
 }
 
 /*
- * add semadj values to semaphores, free undo structures.
- * undo structures are not freed when semaphore arrays are destroyed
- * so some of them may be out of date.
- * IMPLEMENTATION NOTE: There is some confusion over whether the
- * set of adjustments that needs to be done should be done in an atomic
- * manner or not. That is, if we are attempting to decrement the semval
- * should we queue up and wait until we can do so legally?
- * The original implementation attempted to do this (queue and wait).
- * The current implementation does not do so. The POSIX standard
- * and SVID should be consulted to determine what behavior is mandated.
+ * exit_sem — 进程退出时处理 SEM_UNDO (信号量 UNDO 调整)。
+ * @tsk: 正在退出的任务
+ *
+ * 这是 SEM_UNDO 机制的执行点:
+ *   当进程在 semop() 中设置了 SEM_UNDO 标志时, 内核会记录每次操作的反向值
+ *   (存储在 sem_undo 结构中)。进程退出时, 这些调整值被反向施加到信号量上,
+ *   从而避免"进程持有信号量后崩溃导致死锁"的问题。
+ *
+ * 算法要点:
+ *   - 遍历 ulp->list_proc 链表中的每个 sem_undo 条目
+ *   - 对每个信号量计算总调整值: sum(undo->adj[sem_num]) = -semadj
+ *   - 调用 perform_atomic_semop_slow() 尝试原子地施加调整
+ *   - 如果信号量为 0 且 undo 调整也是 0 (净效果为 0), 跳过不做修改
+ *   - 调整值超出 SEMVMX 范围时截断到 [0, SEMVMX]
+ *
+ * 并发问题:
+ *   - 可能与 ipc_rmid 竞争: 检查 semid==-1 表示集合已销毁, 跳过
+ *   - 引用计数: ulp->refcnt 归零时才真正释放整个 undo_list
+ *     (clone_flags & CLONE_SYSVSEM 时父子进程共享 undo_list)
+ *
+ * 注意: 当前实现不保证调整的原子性——如果部分信号量调整无法立即完成,
+ * 直接强制施加 (不等待)。这可能导致语义上的细微差异,
+ * 但避免了复杂的排队和死锁风险。
  */
 void exit_sem(struct task_struct *tsk)
 {

@@ -17,12 +17,17 @@
 #include <linux/pid.h>
 
 /*
- * The IPC ID contains 2 separate numbers - index and sequence number.
- * By default,
- *   bits  0-14: index (32k, 15 bits)
- *   bits 15-30: sequence number (64k, 16 bits)
+ * IPC 标识符 (ID) 的位域组成。
  *
- * When IPCMNI extension mode is turned on, the composition changes:
+ * 用户态可见的 IPC ID 由两部分拼接而成：
+ *   - index (索引):  在 idr 树中的位置，用于快速查找内核对象
+ *   - seq (序列号):  防止 ABA 问题——对象被删除重建后，旧 ID 不会误指新对象
+ *
+ * 默认模式:
+ *   bits  0-14: index (32K, 15 bits)
+ *   bits 15-30: sequence number (64K, 16 bits)
+ *
+ * IPCMNI 扩展模式 (当 ipc_mni > 32K 时自动启用):
  *   bits  0-23: index (16M, 24 bits)
  *   bits 24-30: sequence number (128, 7 bits)
  */
@@ -80,8 +85,11 @@ static inline void shm_exit_ns(struct ipc_namespace *ns) { }
 #endif
 
 /*
- * Structure that holds the parameters needed by the ipc operations
- * (see after)
+ * IPC 操作参数——封装了 sys_*get() 系统调用的公共入参。
+ *
+ *   key:  用户传入的 IPC key (IPC_PRIVATE 表示强制创建新对象)
+ *   flg:  标志位组合 (IPC_CREAT | IPC_EXCL | 权限位)
+ *   u:    类型相关的附加参数 (shm 的 size 或 sem 的 nsems)
  */
 struct ipc_params {
 	key_t key;
@@ -93,14 +101,11 @@ struct ipc_params {
 };
 
 /*
- * Structure that holds some ipc operations. This structure is used to unify
- * the calls to sys_msgget(), sys_semget(), sys_shmget()
- *      . routine to call to create a new ipc object. Can be one of newque,
- *        newary, newseg
- *      . routine to call to check permissions for a new ipc object.
- *        Can be one of security_msg_associate, security_sem_associate,
- *        security_shm_associate
- *      . routine to call for an extra check if needed
+ * IPC 操作向量——sys_msgget/sys_semget/sys_shmget 共同依赖的抽象接口。
+ *
+ *   getnew:    创建新的 IPC 对象 (msg/queue → newque, sem → newary, shm → newseg)
+ *   associate: 在已有对象上做安全检查 (security_msg/sem/shm_associate)
+ *   more_checks: 类型相关的额外检查 (如 msg queue 数限制)
  */
 struct ipc_ops {
 	int (*getnew)(struct ipc_namespace *, struct ipc_params *);

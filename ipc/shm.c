@@ -1,28 +1,43 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * linux/ipc/shm.c
+ * linux/ipc/shm.c — System V 共享内存实现
  * Copyright (C) 1992, 1993 Krishna Balasubramanian
- *	 Many improvements/fixes by Bruno Haible.
- * Replaced `struct shm_desc' by `struct vm_area_struct', July 1994.
- * Fixed the shm swap deallocation (shm_unuse()), August 1998 Andrea Arcangeli.
  *
- * /proc/sysvipc/shm support (c) 1999 Dragos Acostachioaie <dragos@iname.com>
- * BIGMEM support, Andrea Arcangeli <andrea@suse.de>
- * SMP thread shm, Jean-Luc Boyard <jean-luc.boyard@siemens.fr>
- * HIGHMEM support, Ingo Molnar <mingo@redhat.com>
- * Make shmmax, shmall, shmmni sysctl'able, Christoph Rohland <cr@sap.com>
- * Shared /dev/zero support, Kanoj Sarcar <kanoj@sgi.com>
- * Move the mm functionality over to mm/shmem.c, Christoph Rohland <cr@sap.com>
+ * ============================================================================
+ * 架构概览
+ * ============================================================================
  *
- * support for audit of ipc object properties and permission changes
- * Dustin Kirkland <dustin.kirkland@us.ibm.com>
+ * SysV 共享内存与其他 IPC 类型有一个关键区别:
+ * 它需要与内存管理子系统 (mm/) 深度集成, 因为共享内存段最终要映射到
+ * 进程的虚拟地址空间中。
  *
- * namespaces support
- * OpenVZ, SWsoft Inc.
- * Pavel Emelianov <xemul@openvz.org>
+ * 核心数据结构:
+ *   shmid_kernel  — 一个共享内存段 (对应一个 IPC ID)
+ *     └─ shm_file — 基于 shmem (tmpfs) 的 file 对象
+ *        这个 file 承载了真正的物理页面, 通过页缓存 (page cache) 管理
+ *        页面换入换出。用户态调用 shmat() 时, 内核把这个 file 映射到
+ *        调用进程的 VMA 中。
  *
- * Better ipc lock (kern_ipc_perm.lock) handling
- * Davidlohr Bueso <davidlohr.bueso@hp.com>, June 2013.
+ *   struct shmem_inode_info — shm_file 的 inode 私有数据
+ *     包含 i_size、flags (huge page 支持) 等
+ *
+ * 关键设计点:
+ *   - 页面通过 shmem (mm/shmem.c) 管理, 而非直接分配
+ *     shmem 提供了 swap、huge page、memcg 记账等完整基础设施
+ *   - shmctl(SHM_LOCK/SHM_UNLOCK): 锁定/解锁共享内存页面,
+ *     阻止它们被换出
+ *   - Huge page 支持: 通过 shmctl(SHM_HUGETLB) flags,
+ *     共享内存段可以映射为大页
+ *   - RMID 与 VMA 生命周期:
+ *     当 shmctl(IPC_RMID) 被调用时, 段的 ID 被标记为删除,
+ *     但物理页面和 VMA 映射仍然保留, 直到所有附加进程都 detach
+ *     且最后一个引用计数归零后才真正释放
+ *
+ * 系统调用入口:
+ *   sys_shmget()  — 创建/获取共享内存段
+ *   sys_shmat()   — 将共享内存段附加 (attach) 到进程地址空间
+ *   sys_shmdt()   — 分离 (detach) 共享内存段
+ *   sys_shmctl()  — 控制操作 (IPC_STAT/SET/RMID, SHM_LOCK/UNLOCK...)
  */
 
 #include <linux/slab.h>
@@ -320,13 +335,21 @@ static void shm_open(struct vm_area_struct *vma)
 }
 
 /*
- * shm_destroy - free the struct shmid_kernel
+ * shm_destroy — 真正销毁共享内存段, 释放所有资源。
  *
- * @ns: namespace
- * @shp: struct to free
+ * 调用条件: 持有 shp->shm_perm.lock + shm_ids.rwsem 写锁
+ * 返回时:   shp 已被解锁且通过 RCU 排入延迟释放队列
  *
- * It has to be called with shp and shm_ids.rwsem (writer) locked,
- * but returns with shp unlocked and freed.
+ * 释放链:
+ *   1) 分离 shm_file, 减去 shm_tot 配额
+ *   2) shm_rmid() 从 IPC IDR 树和 key 哈希表中移除
+ *   3) 如果启用了 SHM_LOCK, 通过 shmem_lock 解锁所有页面
+ *   4) fput(shm_file) — 递减 file 引用计数 (最后一减时 shmem 页被释放)
+ *   5) ipc_rcu_putref() — 通过 call_rcu 延迟释放 shmid_kernel 内存
+ *
+ * 注意: fput 和 RCU free 是异步的——真正的物理页面释放在
+ * file 引用计数归零 + RCU grace period 之后才发生。
+ * 这意味着在销毁被触发后, 已经 attach 的进程仍可短暂访问页面。
  */
 static void shm_destroy(struct ipc_namespace *ns, struct shmid_kernel *shp)
 {
@@ -346,14 +369,16 @@ static void shm_destroy(struct ipc_namespace *ns, struct shmid_kernel *shp)
 }
 
 /*
- * shm_may_destroy - identifies whether shm segment should be destroyed now
+ * shm_may_destroy — 判断现在是否可以销毁段。
  *
- * Returns true if and only if there are no active users of the segment and
- * one of the following is true:
+ * 必须同时满足两个条件:
+ *   1) shm_nattch == 0: 没有任何进程还在 attach
+ *   2) SHM_DEST 标志已置位 (即 shmctl(IPC_RMID) 已调用)
+ *      或 sysctl kernel.shm_rmid_forced == 1 (强制销毁)
  *
- * 1) shmctl(id, IPC_RMID, NULL) was called for this shp
- *
- * 2) sysctl kernel.shm_rmid_forced is set to 1.
+ * 这个"延迟销毁"语义是 SysV shm 的一个重要特性:
+ * IPC_RMID 只是标记段为"待销毁", 实际的清理推迟到最后一个
+ * 进程 detach 时。这保证了使用中的映射不会突然消失。
  */
 static bool shm_may_destroy(struct shmid_kernel *shp)
 {
@@ -363,10 +388,10 @@ static bool shm_may_destroy(struct shmid_kernel *shp)
 }
 
 /*
- * remove the attach descriptor vma.
- * free memory for segment if it is marked destroyed.
- * The descriptor has already been removed from the current->mm->mmap list
- * and will later be kfree()d.
+ * __shm_close — 处理进程 detach (shmdt) 的核心逻辑。
+ *
+ * 递减 shm_nattch 计数, 如果归零且 SHM_DEST 已置位,
+ * 则触发 shm_destroy() 真正释放段。
  */
 static void __shm_close(struct shm_file_data *sfd)
 {
@@ -699,6 +724,29 @@ static const struct vm_operations_struct shm_vm_ops = {
  *
  * Called with shm_ids.rwsem held as a writer.
  */
+/*
+ * newseg — 创建一个新的 System V 共享内存段。
+ * @ns:     IPC namespace
+ * @params: key + size + shmflg
+ *
+ * 这是 sys_shmget(IPC_CREAT) 的核心实现。
+ *
+ * 共享内存与其他 IPC 类型的关键区别:
+ *   创建时并不直接分配物理页面, 而是创建一个 shmem file。
+ *   该 file 是 tmpfs (shmem) 的一部分, 物理页在第一次实际访问时
+ *   才通过缺页异常按需分配。这样:
+ *     - 大段不用的共享内存不会浪费物理内存
+ *     - swap 机制透明地处理内存压力下的页面换出
+ *     - hugetlb 通过 hugetlb_file_setup 走独立的大页路径
+ *
+ * 流程:
+ *   1) 参数校验: size 必须在 [SHMMIN, shm_ctlmax] 范围内
+ *   2) 配额检查: shm_tot + numpages 不能超过 shm_ctlall
+ *   3) 创建 shmem/hugetlb file (shmem_kernel_file_setup)
+ *   4) 分配 shmid_kernel, 关联 shm_file
+ *   5) ipc_addid() 分配 ID 并插入 namespace
+ *   6) shm_tot 计数 +numpages
+ */
 static int newseg(struct ipc_namespace *ns, struct ipc_params *params)
 {
 	key_t key = params->key;
@@ -844,6 +892,15 @@ long ksys_shmget(key_t key, size_t size, int shmflg)
 	return ipcget(ns, &shm_ids(ns), &shm_ops, &shm_params);
 }
 
+/*
+ * sys_shmget — 创建或获取一个 System V 共享内存段。
+ * @key:    IPC key
+ * @size:   段大小 (向上取整到 PAGE_SIZE 的整数倍)
+ * @shmflg: 标志位 (IPC_CREAT | IPC_EXCL | SHM_HUGETLB | SHM_HUGE_2MB... | 权限)
+ *
+ * 底层通过 ipcget() + newseg() 创建。注意新创建的段只是分配了 shmem file，
+ * 尚未建立任何 VMA 映射——映射在 shmat() 时才真正发生。
+ */
 SYSCALL_DEFINE3(shmget, key_t, key, size_t, size, int, shmflg)
 {
 	return ksys_shmget(key, size, shmflg);
@@ -1515,6 +1572,24 @@ COMPAT_SYSCALL_DEFINE3(old_shmctl, int, shmid, int, cmd, void __user *, uptr)
  * NOTE! Despite the name, this is NOT a direct system call entrypoint. The
  * "raddr" thing points to kernel space, and there has to be a wrapper around
  * this.
+ */
+/*
+ * do_shmat — 将共享内存段附加到当前进程的地址空间中。
+ * @shmid:   共享内存段 ID
+ * @shmaddr: 用户请求的附加地址 (NULL=内核自动选择, 非NULL=固定地址)
+ * @shmflg:  标志 (SHM_RDONLY, SHM_REMAP, SHM_RND, SHM_EXEC)
+ * @raddr:   输出参数, 返回实际映射的虚拟地址
+ * @shmlba:  SHMLBA 对齐值 (体系结构相关, 约束 attach 地址对齐)
+ *
+ * 核心流程:
+ *   1) shm_obtain_object_check() — 通过 ID 找到 shmid_kernel
+ *   2) 权限/能力检查
+ *   3) 通过 shm_file (shmem file) 调用 do_mmap()
+ *      - MAP_SHARED 映射确保多个进程看到同一片物理页
+ *      - 地址选择: NULL → 自动选, 非NULL → 按 SHM_RND/SHM_REMAP 处理
+ *   4) VMA 被标记为 VM_SHARED, vm_ops 指向 shm_vm_ops
+ *
+ * 返回值: 映射成功的虚拟地址 (通过 raddr 返回)
  */
 long do_shmat(int shmid, char __user *shmaddr, int shmflg,
 	      ulong *raddr, unsigned long shmlba)

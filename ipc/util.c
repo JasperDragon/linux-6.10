@@ -1,47 +1,49 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * linux/ipc/util.c
+ * linux/ipc/util.c — System V IPC 基础设施
  * Copyright (C) 1992 Krishna Balasubramanian
  *
- * Sep 1997 - Call suser() last after "normal" permission checks so we
- *            get BSD style process accounting right.
- *            Occurs in several places in the IPC code.
- *            Chris Evans, <chris@ferret.lmh.ox.ac.uk>
- * Nov 1999 - ipc helper functions, unified SMP locking
- *	      Manfred Spraul <manfred@colorfullife.com>
- * Oct 2002 - One lock per IPC id. RCU ipc_free for lock-free grow_ary().
- *            Mingming Cao <cmm@us.ibm.com>
- * Mar 2006 - support for audit of ipc object properties
- *            Dustin Kirkland <dustin.kirkland@us.ibm.com>
- * Jun 2006 - namespaces ssupport
- *            OpenVZ, SWsoft Inc.
- *            Pavel Emelianov <xemul@openvz.org>
+ * 历史修订:
+ *   Sep 1997 - 将 suser() 权限检查放在普通权限检查之后 (BSD 风格)
+ *   Nov 1999 - IPC 辅助函数, 统一 SMP 锁
+ *   Oct 2002 - 每个 IPC ID 独立 spinlock + RCU free
+ *   Mar 2006 - IPC 对象审计 (audit) 支持
+ *   Jun 2006 - IPC namespace 支持 (OpenVZ)
  *
- * General sysv ipc locking scheme:
- *	rcu_read_lock()
- *          obtain the ipc object (kern_ipc_perm) by looking up the id in an idr
- *	    tree.
- *	    - perform initial checks (capabilities, auditing and permission,
- *	      etc).
- *	    - perform read-only operations, such as INFO command, that
- *	      do not demand atomicity
- *	      acquire the ipc lock (kern_ipc_perm.lock) through
- *	      ipc_lock_object()
- *		- perform read-only operations that demand atomicity,
- *		  such as STAT command.
- *		- perform data updates, such as SET, RMID commands and
- *		  mechanism-specific operations (semop/semtimedop,
- *		  msgsnd/msgrcv, shmat/shmdt).
- *	    drop the ipc lock, through ipc_unlock_object().
- *	rcu_read_unlock()
+ * ============================================================================
+ * SysV IPC 通用锁协议
+ * ============================================================================
  *
- *  The ids->rwsem must be taken when:
- *	- creating, removing and iterating the existing entries in ipc
- *	  identifier sets.
- *	- iterating through files under /proc/sysvipc/
+ * 内核中有两级 IPC 锁，按粒度从粗到细：
  *
- *  Note that sems have a special fast path that avoids kern_ipc_perm.lock -
- *  see sem_lock().
+ *   1) ipc_ids.rwsem (读写信号量)
+ *      - 保护 IPC ID 集合 (ids) 中条目的创建、删除和遍历
+ *      - 保护 /proc/sysvipc/ 下的遍历
+ *      - 写锁用于增删条目，读锁用于遍历
+ *
+ *   2) kern_ipc_perm.lock (每对象 spinlock)
+ *      - 保护单个 IPC 对象的数据字段
+ *      - 保护需要原子性的读操作 (如 STAT 命令)
+ *      - 保护所有数据更新操作 (SET, RMID, semop, msgsnd 等)
+ *
+ * 典型操作流程:
+ *   rcu_read_lock()                        ← RCU 读临界区开始
+ *     ipc_obtain_object_check()            ← 通过 ID 找到 IPC 对象 (无锁)
+ *       ├─ 快速检查 (能力、审计、权限等)    ← 不持对象锁, 不用原子性
+ *       │
+ *       └─ ipc_lock_object()              ← 获取对象 spinlock
+ *            ├─ 需要原子性的读操作 (STAT)
+ *            ├─ 数据更新 (SET, RMID)
+ *            └─ 类型特有操作 (semop, msgsnd, shmat 等)
+ *          ipc_unlock_object()            ← 释放对象 spinlock
+ *   rcu_read_unlock()                      ← RCU 读临界区结束
+ *
+ * 特别注意:
+ *   - 信号量有特殊的快速路径 (sem_lock)，可绕过 kern_ipc_perm.lock
+ *     详见 sem.c 的注释
+ *   - RCU 保证了 IDR 查找的无锁安全: 对象释放走 call_rcu() 延迟回收
+ *   - refcount 机制: 每个对象从 refcount=1 开始，getref 加, putref 减到 0 时
+ *     触发 RCU 延迟销毁
  */
 
 #include <linux/mm.h>
@@ -106,11 +108,13 @@ static const struct rhashtable_params ipc_kht_params = {
 };
 
 /**
- * ipc_init_ids	- initialise ipc identifiers
- * @ids: ipc identifier set
+ * ipc_init_ids - 初始化 IPC 标识符集合。
+ * @ids: 待初始化的 IPC ID 集合
  *
- * Set up the sequence range to use for the ipc identifier range (limited
- * below ipc_mni) then initialise the keys hashtable and ids idr.
+ * 完成三项初始化:
+ * 1. 初始化 rwsem (保护 ID 集合的创建/删除/遍历)
+ * 2. 初始化 key_ht (key → IPC 对象的哈希表, 用于 IPC_PRIVATE 以外的 key 查找)
+ * 3. 初始化 ipcs_idr (ID → IPC 对象的 IDR 映射树)
  */
 void ipc_init_ids(struct ipc_ids *ids)
 {
@@ -261,19 +265,22 @@ static inline int ipc_idr_alloc(struct ipc_ids *ids, struct kern_ipc_perm *new)
 }
 
 /**
- * ipc_addid - add an ipc identifier
- * @ids: ipc identifier set
- * @new: new ipc permission set
- * @limit: limit for the number of used ids
+ * ipc_addid - 向 IPC 集合中添加一个新对象，分配 ID。
+ * @ids:    IPC 标识符集合
+ * @new:    新 IPC 对象 (kern_ipc_perm 基类)
+ * @limit:  in_use 的上限 (sem/shm/msg 各自的最大对象数)
  *
- * Add an entry 'new' to the ipc ids idr. The permissions object is
- * initialised and the first free entry is set up and the index assigned
- * is returned. The 'new' entry is returned in a locked state on success.
+ * 核心流程:
+ * 1. 初始化 refcount=1, spinlock
+ * 2. 设置创建者的 uid/gid (cuid/cgid = euid/egid)
+ * 3. 通过 ipc_idr_alloc() 在 IDR 中分配 index, 计算 seq 并组装 ID
+ *    - seq 空间保存: 只有新 index <= last_idx 时才递增 seq
+ *    - 确保 ID 在对象生命周期内唯一 (ABA 保护)
+ * 4. 若 key != IPC_PRIVATE, 注册到 key 哈希表
+ * 5. 更新 in_use 计数和 max_idx 缓存
  *
- * On failure the entry is not locked and a negative err-code is returned.
- * The caller must use ipc_rcu_putref() to free the identifier.
- *
- * Called with writer ipc_ids.rwsem held.
+ * 调用条件: 持有 ids->rwsem 写锁
+ * 返回: 成功时返回锁定的对象 (spinlock 已持有), 失败返回负 errno
  */
 int ipc_addid(struct ipc_ids *ids, struct kern_ipc_perm *new, int limit)
 {
@@ -525,11 +532,31 @@ void ipc_set_key_private(struct ipc_ids *ids, struct kern_ipc_perm *ipcp)
 	ipcp->key = IPC_PRIVATE;
 }
 
+/*
+ * ipc_rcu_getref — 尝试增加 IPC 对象的引用计数。
+ *
+ * 返回 true: 成功, refcount > 0, 对象仍然存活
+ * 返回 false: 失败, refcount 已经为 0 (对象正在被销毁)
+ *
+ * 这是 RCU + refcount 组合模式的关键:
+ * - RCU 保护对象指针的可见性
+ * - refcount 保护对象的内存生命周期
+ * - 两者配合允许无锁地访问正在被并发删除的 IPC 对象
+ */
 bool ipc_rcu_getref(struct kern_ipc_perm *ptr)
 {
 	return refcount_inc_not_zero(&ptr->refcount);
 }
 
+/*
+ * ipc_rcu_putref — 减少引用计数, 归零时通过 call_rcu 调度延迟销毁。
+ *
+ * refcount 从 1 → 0 时调用 call_rcu(), 保证在所有的 RCU 读者都退出
+ * 临界区之后才执行 func 真正释放内存。
+ *
+ * "ipc_addid 初始化 refcount=1" + "putref 归零时 RCU free"
+ * 构成了 IPC 对象的完整生命周期管理。
+ */
 void ipc_rcu_putref(struct kern_ipc_perm *ptr,
 			void (*func)(struct rcu_head *head))
 {
@@ -615,13 +642,15 @@ void ipc64_perm_to_ipc_perm(struct ipc64_perm *in, struct ipc_perm *out)
 }
 
 /**
- * ipc_obtain_object_idr - Look for an id in the ipc ids idr and
- *   return associated ipc object.
- * @ids: ipc identifier set
- * @id: ipc id to look for
+ * ipc_obtain_object_idr — 通过 ID 在 IDR 树中查找 IPC 对象 (无锁)。
+ * @ids: IPC 标识符集合
+ * @id:  用户态传入的 IPC ID (包含 index + seq 的合成值)
  *
- * Call inside the RCU critical section.
- * The ipc object is *not* locked on exit.
+ * 此函数仅做 index 查找, 不验证 sequence number。
+ * 调用方必须处于 RCU 读临界区中, 且返回的对象 *未加锁*。
+ *
+ * RCU 保证: 即使对象正在被 ipc_rmid() 删除, idr_find 返回的指针仍然有效,
+ * 因为真正的内存释放通过 call_rcu() 延迟到所有 CPU 的 RCU grace period 之后。
  */
 struct kern_ipc_perm *ipc_obtain_object_idr(struct ipc_ids *ids, int id)
 {
@@ -636,13 +665,13 @@ struct kern_ipc_perm *ipc_obtain_object_idr(struct ipc_ids *ids, int id)
 }
 
 /**
- * ipc_obtain_object_check - Similar to ipc_obtain_object_idr() but
- *   also checks the ipc object sequence number.
- * @ids: ipc identifier set
- * @id: ipc id to look for
+ * ipc_obtain_object_check — 查找并验证 IPC 对象 (无锁, 带 seq 校验)。
+ * @ids: IPC 标识符集合
+ * @id:  用户态传入的 IPC ID
  *
- * Call inside the RCU critical section.
- * The ipc object is *not* locked on exit.
+ * 在 ipc_obtain_object_idr() 的基础上增加 sequence number 校验,
+ * 防止 ABA 问题: 如果旧 ID 恰好在对象被删除重建后复用同一个 index,
+ * seq 的不同可以检测出"这不是你要的那个对象"。
  */
 struct kern_ipc_perm *ipc_obtain_object_check(struct ipc_ids *ids, int id)
 {
@@ -658,14 +687,20 @@ out:
 }
 
 /**
- * ipcget - Common sys_*get() code
- * @ns: namespace
- * @ids: ipc identifier set
- * @ops: operations to be called on ipc object creation, permission checks
- *       and further checks
- * @params: the parameters needed by the previous operations.
+ * ipcget - SysV IPC 获取/创建的公共分发函数。
+ * @ns:     IPC namespace
+ * @ids:    IPC 标识符集合
+ * @ops:    IPC 类型相关的操作向量 (getnew/associate/more_checks)
+ * @params: key + flag + 类型特定参数
  *
- * Common routine called by sys_msgget(), sys_semget() and sys_shmget().
+ * 被 sys_msgget() / sys_semget() / sys_shmget() 共同调用。
+ *
+ * 根据 key 分两条路径:
+ *   - IPC_PRIVATE (key=0): → ipcget_new()  无条件创建新对象
+ *   - 其他 key:            → ipcget_public() key 查找 → 已有则检查权限
+ *                                                  → 无 + IPC_CREAT → 创建
+ *                                                  → 无 + 无IPC_CREAT → -ENOENT
+ *                                                  → 有 + IPC_EXCL → -EEXIST
  */
 int ipcget(struct ipc_namespace *ns, struct ipc_ids *ids,
 			const struct ipc_ops *ops, struct ipc_params *params)

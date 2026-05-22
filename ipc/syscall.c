@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * sys_ipc() is the old de-multiplexer for the SysV IPC calls.
+ * sys_ipc() — 旧的 SysV IPC 多路复用系统调用。
  *
- * This is really horribly ugly, and new architectures should just wire up
- * the individual syscalls instead.
+ * 新架构不应使用此多路复用器，而应直接注册独立的 syscall:
+ *   sys_semget/sys_semctl/sys_semop/sys_semtimedop
+ *   sys_msgget/sys_msgctl/sys_msgsnd/sys_msgrcv
+ *   sys_shmget/sys_shmctl/sys_shmat/sys_shmdt
+ *
+ * 此文件仅为旧的 __ARCH_WANT_SYS_IPC 架构 (如 x86 32-bit) 保留。
  */
 #include <linux/unistd.h>
 #include <linux/syscalls.h>
@@ -17,6 +21,14 @@
 #include <linux/shm.h>
 #include <linux/uaccess.h>
 
+/*
+ * ksys_ipc — 旧的 IPC 多路复用分发器。
+ *
+ * 根据 call 参数分发到对应的 SysV IPC 操作:
+ *   SEMOP → sys_semtimedop, SEMGET → sys_semget, SEMCTL → sys_semctl
+ *   MSGSND → sys_msgsnd, MSGRCV → sys_msgrcv, MSGGET → sys_msgget, MSGCTL → sys_msgctl
+ *   SHMAT → sys_shmat, SHMDT → sys_shmdt, SHMGET → sys_shmget, SHMCTL → sys_shmctl
+ */
 int ksys_ipc(unsigned int call, int first, unsigned long second,
 	unsigned long third, void __user * ptr, long fifth)
 {

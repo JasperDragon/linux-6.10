@@ -1,15 +1,49 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * POSIX message queues filesystem for Linux.
+ * POSIX 消息队列 (mqueue) — 基于文件系统的实现。
  *
- * Copyright (C) 2003,2004  Krzysztof Benedyczak    (golbi@mat.uni.torun.pl)
- *                          Michal Wronski          (michal.wronski@gmail.com)
+ * Copyright (C) 2003,2004  Krzysztof Benedyczak, Michal Wronski
  *
- * Spinlocks:               Mohamed Abbas           (abbas.mohamed@intel.com)
- * Lockless receive & send, fd based notify:
- *			    Manfred Spraul	    (manfred@colorfullife.com)
+ * ============================================================================
+ * 架构概览
+ * ============================================================================
  *
- * Audit:                   George Wilson           (ltcgcw@us.ibm.com)
+ * 与 SysV 消息队列不同, POSIX mqueue 有自己独立的文件系统 (mqueue_fs_type),
+ * 挂载点通常为 /dev/mqueue。每个消息队列在文件系统中表现为一个文件,
+ * 用户态通过文件描述符操作队列 (mq_open → fd, mq_send/mq_receive)。
+ *
+ * 核心数据结构:
+ *   mqueue_inode_info — 嵌入在 inode 中的队列元数据
+ *     ├─ pi_waiters 链表 — 阻塞等待消息的进程 (按优先级排队)
+ *     ├─ messages 树 — 按优先级排序的消息红黑树
+ *     ├─ attr — 队列属性 (maxmsg, msgsize, curmsgs)
+ *     └─ notify — 注册的通知 (mq_notify)
+ *
+ *   ext_wait_queue — 等待队列条目
+ *     ├─ task / prio — 等待进程及优先级
+ *     └─ msg 指针 — 流水线接收时直接指向目标消息
+ *
+ * 关键特性:
+ *   - 优先级消息: 每条消息有优先级 (0..MQ_PRIO_MAX-1),
+ *     接收时总是取优先级最高的消息
+ *   - 流水线接收 (pipelined receive):
+ *     mq_timedsend 时, 如果有匹配的接收者在等待, 直接把消息数据
+ *     拷贝给接收者, 跳过"入队→唤醒→出队"的过程
+ *   - 异步通知 (mq_notify):
+ *     进程可以注册一个 SIGEV_SIGNAL 或 SIGEV_THREAD 通知,
+ *     当空队列收到新消息时触发
+ *   - 文件描述符语义:
+ *     mq_open 返回 fd, 支持 poll/select/epoll 监听
+ *     mq_getattr/mq_setattr 操作队列属性
+ *     close(fd) 不影响队列本身 (队列生命周期独立于 fd)
+ *
+ * 系统调用入口:
+ *   sys_mq_open()    — 创建/打开消息队列 (返回 fd)
+ *   sys_mq_unlink()  — 删除消息队列名
+ *   sys_mq_timedsend() — 发送消息 (带超时)
+ *   sys_mq_timedreceive() — 接收消息 (带超时)
+ *   sys_mq_notify()  — 注册/取消异步通知
+ *   sys_mq_getsetattr() — 获取/设置队列属性
  */
 
 #include <linux/capability.h>

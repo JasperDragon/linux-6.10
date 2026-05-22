@@ -1,7 +1,31 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * linux/ipc/namespace.c
+ * linux/ipc/namespace.c — IPC 命名空间管理
  * Copyright (C) 2006 Pavel Emelyanov <xemul@openvz.org> OpenVZ, SWsoft Inc.
+ *
+ * ============================================================================
+ * 架构概览
+ * ============================================================================
+ *
+ * IPC 命名空间使得不同容器可以拥有独立的 SysV IPC 资源视图:
+ *   同一个 IPC key 在不同的 namespace 中指向不同的对象。
+ *
+ * 核心数据结构:
+ *   ipc_namespace — 每个 IPC 命名空间的私有数据
+ *     ├─ ids[3]       — sem/msg/shm 各自的 IPC ID 集合 (struct ipc_ids)
+ *     ├─ mq_mnt       — POSIX mqueue 文件系统挂载点 (每个 ns 独立)
+ *     └─ sem_ctls[]   — 信号量 sysctl 参数 (semmni, semmsl 等)
+ *
+ * 关键操作:
+ *   copy_ipcs()      — clone/fork 时复制 IPC namespace
+ *   free_ipcs()      — namespace 退出时销毁所有 IPC 对象
+ *   get_ipc_ns_export() — 通过 fd 获取 namespace 引用 (用于 CRIU 迁移)
+ *
+ * SysV IPC 对象 (sem/msg/shm) 在 namespace 销毁时必须全部清理:
+ *   - 信号量: 唤醒所有等待者 (带 -EIDRM 错误)
+ *   - 消息队列: 唤醒所有发送/接收者 (带 -EIDRM)
+ *   - 共享内存: 标记为 deleted, 等待自然 detach
+ *   POSIX mqueue 的命名空间隔离通过独立的文件系统挂载实例实现。
  */
 
 #include <linux/ipc.h>

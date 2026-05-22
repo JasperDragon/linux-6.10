@@ -1,26 +1,39 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * linux/ipc/msg.c
+ * linux/ipc/msg.c — System V 消息队列实现
  * Copyright (C) 1992 Krishna Balasubramanian
  *
- * Removed all the remaining kerneld mess
- * Catch the -EFAULT stuff properly
- * Use GFP_KERNEL for messages as in 1.2
- * Fixed up the unchecked user space derefs
- * Copyright (C) 1998 Alan Cox & Andi Kleen
+ * ============================================================================
+ * 架构概览
+ * ============================================================================
  *
- * /proc/sysvipc/msg support (c) 1999 Dragos Acostachioaie <dragos@iname.com>
+ * 核心数据结构:
+ *   msg_queue  — 一个消息队列 (对应一个 IPC ID)
+ *     ├─ q_messages 链表 — 按类型 (mtype) 有序的消息链表
+ *     ├─ q_receiver / q_senders — 阻塞等待的接收/发送者链表
+ *     └─ q_qbytes 等 — 队列属性 (最大字节数, 消息数等)
  *
- * mostly rewritten, threaded and wake-one semantics added
- * MSGMAX limit removed, sysctl's added
- * (c) 1999 Manfred Spraul <manfred@colorfullife.com>
+ *   msg_msg    — 单条消息
+ *     ├─ m_list — 链入队列的链表节点
+ *     ├─ m_type — 消息类型 (正 long, 用于 msgrcv 的类型筛选)
+ *     └─ 消息体紧随其后 (可能跨多个物理页分配)
  *
- * support for audit of ipc object properties and permission changes
- * Dustin Kirkland <dustin.kirkland@us.ibm.com>
+ *   msg_receiver / msg_sender — 阻塞等待上下文
  *
- * namespaces support
- * OpenVZ, SWsoft Inc.
- * Pavel Emelianov <xemul@openvz.org>
+ * 关键算法:
+ *   - 流水线唤醒 (pipelined send):
+ *     msgsnd 时, 如果有匹配的接收者正在等待, 直接把消息数据拷贝到
+ *     接收者提供的用户缓冲区, 跳过"放入队列 → 唤醒 → 再取出"的过程,
+ *     减少一次内存拷贝和上下文切换
+ *   - 消息分页存储:
+ *     大于一页的消息会被分配在连续虚拟地址的多页上 (load_msg),
+ *     并通过 msg_msg 链表的 next 指针串联 (copy_msg)
+ *
+ * 系统调用入口:
+ *   sys_msgget() — 创建/获取消息队列
+ *   sys_msgctl() — 控制操作 (IPC_STAT/IPC_SET/IPC_RMID...)
+ *   sys_msgsnd() — 发送消息
+ *   sys_msgrcv() — 接收消息 (支持按类型筛选: =0 任意, >0 精确, <0 最低 <= |type|)
  */
 
 #include <linux/capability.h>
@@ -813,6 +826,17 @@ static int testmsg(struct msg_msg *msg, long type, int mode)
 	return 0;
 }
 
+/*
+ * pipelined_send — 流水线发送: 如果队列上有正在等待的接收者,
+ * 直接把消息交给它, 跳过"入队→唤醒→出队"的中间步骤。
+ *
+ * 这是 SysV 消息队列性能优化的关键:
+ * - 避免了一次内存拷贝 (不需要 copy_msg 到队列, 再 store_msg 到用户)
+ * - 避免了一次调度切换 (发送者直接唤醒接收者, 接收者被唤醒时消息已就绪)
+ *
+ * 通过 smp_store_release 把消息指针放入 msr->r_msg,
+ * 接收者 (do_msgrcv) 可以无锁地读取它。
+ */
 static inline int pipelined_send(struct msg_queue *msq, struct msg_msg *msg,
 				 struct wake_q_head *wake_q)
 {
