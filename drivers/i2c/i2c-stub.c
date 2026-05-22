@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
-    i2c-stub.c - I2C/SMBus chip emulator
-
-    Copyright (c) 2004 Mark M. Hoffman <mhoffman@lightlink.com>
-    Copyright (C) 2007-2014 Jean Delvare <jdelvare@suse.de>
-
-*/
+ * i2c-stub.c - I2C/SMBus 芯片模拟器
+ *
+ * Copyright (c) 2004 Mark M. Hoffman <mhoffman@lightlink.com>
+ * Copyright (C) 2007-2014 Jean Delvare <jdelvare@suse.de>
+ */
 
 #define pr_fmt(fmt) "i2c-stub: " fmt
 
@@ -20,9 +19,8 @@
 #define MAX_CHIPS 10
 
 /*
- * Support for I2C_FUNC_SMBUS_BLOCK_DATA is disabled by default and must
- * be enabled explicitly by setting the I2C_FUNC_SMBUS_BLOCK_DATA bits
- * in the 'functionality' module parameter.
+ * 默认不启用 I2C_FUNC_SMBUS_BLOCK_DATA。
+ * 如果测试需要这项能力，必须显式在模块参数 functionality 里打开对应位。
  */
 #define STUB_FUNC_DEFAULT \
 		(I2C_FUNC_SMBUS_QUICK | I2C_FUNC_SMBUS_BYTE | \
@@ -41,7 +39,7 @@ static unsigned long functionality = STUB_FUNC_DEFAULT;
 module_param(functionality, ulong, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(functionality, "Override functionality bitfield");
 
-/* Some chips have banked register ranges */
+/* 有些模拟芯片带 banked register 区间。 */
 
 static u8 bank_reg[MAX_CHIPS];
 module_param_array(bank_reg, byte, NULL, S_IRUGO);
@@ -68,24 +66,26 @@ struct smbus_block_data {
 
 struct stub_chip {
 	u8 pointer;
-	u16 words[256];		/* Byte operations use the LSB as per SMBus
-				   specification */
+	u16 words[256];		/* 按 SMBus 规范，字节访问使用低 8 位 */
 	struct list_head smbus_blocks;
 
-	/* For chips with banks, extra registers are allocated dynamically */
+	/* 对带 bank 的芯片，额外寄存器空间按需动态分配。 */
 	u8 bank_reg;
 	u8 bank_shift;
 	u8 bank_mask;
-	u8 bank_sel;		/* Currently selected bank */
+	u8 bank_sel;		/* 当前选中的 bank 编号 */
 	u8 bank_start;
 	u8 bank_end;
 	u16 bank_size;
-	u16 *bank_words;	/* Room for bank_mask * bank_size registers */
+	u16 *bank_words;	/* 为 bank_mask * bank_size 个寄存器预留空间 */
 };
 
 static struct stub_chip *stub_chips;
 static int stub_chips_nr;
 
+/* 按 command 查找对应的 SMBus block 缓冲区。
+ * 只有在显式允许 create 时，才为首次访问的 block 命令动态分配存储。
+ */
 static struct smbus_block_data *stub_find_block(struct device *dev,
 						struct stub_chip *chip,
 						u8 command, bool create)
@@ -108,6 +108,10 @@ static struct smbus_block_data *stub_find_block(struct device *dev,
 	return rb;
 }
 
+/* 统一根据 bank 选择状态返回目标“寄存器字”的存储位置。
+ * 如果当前命令落在 banked window 内，并且 bank_sel 非 0，
+ * 就切到 bank_words；否则退回主 words[] 数组。
+ */
 static u16 *stub_get_wordp(struct stub_chip *chip, u8 offset)
 {
 	if (chip->bank_sel &&
@@ -119,7 +123,7 @@ static u16 *stub_get_wordp(struct stub_chip *chip, u8 offset)
 		return chip->words + offset;
 }
 
-/* Return negative errno on error. */
+/* 出错返回负 errno。 */
 static s32 stub_xfer(struct i2c_adapter *adap, u16 addr, unsigned short flags,
 	char read_write, u8 command, int size, union i2c_smbus_data *data)
 {
@@ -129,7 +133,7 @@ static s32 stub_xfer(struct i2c_adapter *adap, u16 addr, unsigned short flags,
 	struct smbus_block_data *b;
 	u16 *wordp;
 
-	/* Search for the right chip */
+	/* 先按地址找到要模拟的那颗芯片。 */
 	for (i = 0; i < stub_chips_nr; i++) {
 		if (addr == chip_addr[i]) {
 			chip = stub_chips + i;
@@ -172,7 +176,7 @@ static s32 stub_xfer(struct i2c_adapter *adap, u16 addr, unsigned short flags,
 				"smbus byte data - addr 0x%02x, wrote 0x%02x at 0x%02x.\n",
 				addr, data->byte, command);
 
-			/* Set the bank as needed */
+			/* 如果写的是 bank 选择寄存器，就同步切换当前 bank。 */
 			if (chip->bank_words && command == chip->bank_reg) {
 				chip->bank_sel =
 					(data->byte >> chip->bank_shift)
@@ -211,15 +215,15 @@ static s32 stub_xfer(struct i2c_adapter *adap, u16 addr, unsigned short flags,
 
 	case I2C_SMBUS_I2C_BLOCK_DATA:
 		/*
-		 * We ignore banks here, because banked chips don't use I2C
-		 * block transfers
+		 * 这里忽略 bank 机制，因为带 bank 的芯片通常不会再同时提供
+		 * I2C block transfer 语义。
 		 */
 		if (data->block[0] == 0 ||
 		    data->block[0] > I2C_SMBUS_BLOCK_MAX) {
 			ret = -EINVAL;
 			break;
 		}
-		if (data->block[0] > 256 - command)	/* Avoid overrun */
+		if (data->block[0] > 256 - command)	/* 避免越界覆盖 */
 			data->block[0] = 256 - command;
 		len = data->block[0];
 		if (read_write == I2C_SMBUS_WRITE) {
@@ -245,8 +249,8 @@ static s32 stub_xfer(struct i2c_adapter *adap, u16 addr, unsigned short flags,
 
 	case I2C_SMBUS_BLOCK_DATA:
 		/*
-		 * We ignore banks here, because chips typically don't use both
-		 * banks and SMBus block transfers
+		 * 同样忽略 bank 机制，因为真实芯片通常不会同时组合
+		 * “寄存器 bank” 和 “SMBus block transfer” 这两套语义。
 		 */
 		b = stub_find_block(&adap->dev, chip, command, false);
 		if (read_write == I2C_SMBUS_WRITE) {
@@ -263,12 +267,12 @@ static s32 stub_xfer(struct i2c_adapter *adap, u16 addr, unsigned short flags,
 					break;
 				}
 			}
-			/* Largest write sets read block length */
+			/* 按模拟器语义，历史上最大一次写入长度会成为后续读长度。 */
 			if (len > b->len)
 				b->len = len;
 			for (i = 0; i < len; i++)
 				b->block[i] = data->block[i + 1];
-			/* update for byte and word commands */
+			/* 同步维护 byte/word 命令视角下的镜像寄存器值。 */
 			chip->words[command] = (b->block[0] << 8) | b->len;
 			dev_dbg(&adap->dev,
 				"smbus block data - addr 0x%02x, wrote %d bytes at 0x%02x.\n",
@@ -327,7 +331,7 @@ static int __init i2c_stub_allocate_banks(int i)
 	chip->bank_end = bank_end[i];
 	chip->bank_size = bank_end[i] - bank_start[i] + 1;
 
-	/* We assume that all bits in the mask are contiguous */
+	/* 假定 bank mask 的有效位是连续分布的，这样才能通过右移得到 bank 编号。 */
 	chip->bank_mask = bank_mask[i];
 	while (!(chip->bank_mask & 1)) {
 		chip->bank_shift++;
@@ -347,6 +351,7 @@ static int __init i2c_stub_allocate_banks(int i)
 	return 0;
 }
 
+/* 释放所有虚拟芯片以及各自扩展出来的 bank 寄存器空间。 */
 static void i2c_stub_free(void)
 {
 	int i;
@@ -375,7 +380,7 @@ static int __init i2c_stub_init(void)
 		pr_info("Virtual chip at 0x%02x\n", chip_addr[i]);
 	}
 
-	/* Allocate memory for all chips at once */
+	/* 一次性为所有虚拟芯片分配主体结构，便于统一清理。 */
 	stub_chips_nr = i;
 	stub_chips = kzalloc_objs(struct stub_chip, stub_chips_nr);
 	if (!stub_chips)
@@ -384,7 +389,7 @@ static int __init i2c_stub_init(void)
 	for (i = 0; i < stub_chips_nr; i++) {
 		INIT_LIST_HEAD(&stub_chips[i].smbus_blocks);
 
-		/* Allocate extra memory for banked register ranges */
+		/* 对带 bank 的寄存器窗口，再补一块额外存储空间。 */
 		if (bank_mask[i]) {
 			ret = i2c_stub_allocate_banks(i);
 			if (ret)

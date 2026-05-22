@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * I2C slave mode testunit
+ * I2C target/slave 模式测试单元
  *
  * Copyright (C) 2020 by Wolfram Sang, Sang Engineering <wsa@sang-engineering.com>
  * Copyright (C) 2020 by Renesas Electronics Corporation
@@ -20,7 +20,7 @@
 #define TU_VERSION_MAX_LENGTH 128
 
 enum testunit_cmds {
-	TU_CMD_READ_BYTES = 1,	/* save 0 for ABORT, RESET or similar */
+	TU_CMD_READ_BYTES = 1,	/* 保留 0 给 ABORT、RESET 之类的扩展命令 */
 	TU_CMD_SMBUS_HOST_NOTIFY,
 	TU_CMD_SMBUS_BLOCK_PROC_CALL,
 	TU_CMD_GET_VERSION_WITH_REP_START,
@@ -44,12 +44,12 @@ enum testunit_flags {
 struct testunit_data {
 	unsigned long flags;
 	u8 regs[TU_NUM_REGS];
-	u8 reg_idx;
-	u8 read_idx;
+	u8 reg_idx;		/* 当前写入到了哪一个命令寄存器 */
+	u8 read_idx;		/* 重复起始读版本字符串时的读取偏移 */
 	struct i2c_client *client;
 	struct delayed_work worker;
-	struct gpio_desc *gpio;
-	struct completion alert_done;
+	struct gpio_desc *gpio;	/* SMBus Alert 测试场景使用的告警 GPIO */
+	struct completion alert_done;	/* 等待 alert 主机侧应答完成 */
 };
 
 static char tu_version_info[] = "v" UTS_RELEASE "\n\0";
@@ -83,14 +83,23 @@ static int i2c_slave_testunit_slave_cb(struct i2c_client *client,
 				     enum i2c_slave_event event, u8 *val)
 {
 	struct testunit_data *tu = i2c_get_clientdata(client);
+	/* SMBus Block Process Call:
+	 * 主机先写入命令和参数，再在重复起始后的读阶段取回结果长度。
+	 */
 	bool is_proc_call = tu->reg_idx == 3 && tu->regs[TU_REG_DATAL] == 1 &&
 			    tu->regs[TU_REG_CMD] == TU_CMD_SMBUS_BLOCK_PROC_CALL;
+	/* GET_VERSION_WITH_REP_START:
+	 * 主机通过重复起始连续读出内核版本字符串，直到遇到 NUL 结尾。
+	 */
 	bool is_get_version = tu->reg_idx == 3 &&
 			      tu->regs[TU_REG_CMD] == TU_CMD_GET_VERSION_WITH_REP_START;
 	int ret = 0;
 
 	switch (event) {
 	case I2C_SLAVE_WRITE_REQUESTED:
+		/* 一旦已有后台命令在执行，或之前的传输已出错进入 NACK 状态，
+		 * 整个后续写阶段都统一拒绝，直到看到 STOP 为止。
+		 */
 		if (test_bit(TU_FLAG_IN_PROCESS | TU_FLAG_NACK, &tu->flags)) {
 			ret = -EBUSY;
 			break;
@@ -115,13 +124,14 @@ static int i2c_slave_testunit_slave_cb(struct i2c_client *client,
 		if (tu->reg_idx <= TU_NUM_REGS)
 			tu->reg_idx++;
 
-		/* TU_REG_CMD always written at this point */
+		/* 走到这里时，TU_REG_CMD 一定位于第一个字节，已经写入完成。 */
 		if (tu->regs[TU_REG_CMD] >= TU_NUM_CMDS)
 			ret = -EINVAL;
 
 		break;
 
 	case I2C_SLAVE_STOP:
+		/* 只有完整收到 4 个寄存器字节，才把命令交给后台工作队列执行。 */
 		if (tu->reg_idx == TU_NUM_REGS) {
 			set_bit(TU_FLAG_IN_PROCESS, &tu->flags);
 			queue_delayed_work(system_dfl_long_wq, &tu->worker,
@@ -129,9 +139,8 @@ static int i2c_slave_testunit_slave_cb(struct i2c_client *client,
 		}
 
 		/*
-		 * Reset reg_idx to avoid that work gets queued again in case of
-		 * STOP after a following read message. But do not clear TU regs
-		 * here because we still need them in the workqueue!
+		 * 把 reg_idx 清零，避免后续读消息结束时再次看到 STOP 又重复排队。
+		 * 但这里不能清空寄存器镜像，因为后台工作队列仍要读取这些参数。
 		 */
 		tu->reg_idx = 0;
 
@@ -139,10 +148,11 @@ static int i2c_slave_testunit_slave_cb(struct i2c_client *client,
 		break;
 
 	case I2C_SLAVE_READ_PROCESSED:
-		/* Advance until we reach the NUL character */
+		/* 版本字符串场景下逐字推进，直到读到结尾 NUL。 */
 		if (is_get_version && tu_version_info[tu->read_idx] != 0)
 			tu->read_idx++;
 		else if (is_proc_call && tu->regs[TU_REG_DATAH])
+			/* Proc call 场景借用 DATAH 作为剩余返回长度计数器。 */
 			tu->regs[TU_REG_DATAH]--;
 
 		fallthrough;
@@ -158,7 +168,7 @@ static int i2c_slave_testunit_slave_cb(struct i2c_client *client,
 		break;
 	}
 
-	/* If an error occurred somewhen, we NACK everything until next STOP */
+	/* 一旦本轮事务任何阶段出错，就持续 NACK 到下一个 STOP 为止。 */
 	if (ret)
 		set_bit(TU_FLAG_NACK, &tu->flags);
 
@@ -174,6 +184,7 @@ static void i2c_slave_testunit_work(struct work_struct *work)
 	u16 orig_addr;
 	int ret = 0;
 
+	/* 默认视为“本次命令不需要发起主模式传输”，后续按命令类型覆盖。 */
 	msg.addr = I2C_CLIENT_END;
 	msg.buf = msgbuf;
 
@@ -198,6 +209,9 @@ static void i2c_slave_testunit_work(struct work_struct *work)
 			ret = -ENOENT;
 			break;
 		}
+		/* Alert 协议固定使用地址 0x0c。这里临时把当前 client 切换到该地址，
+		 * 完成从机侧应答后再恢复原地址并重新注册普通 slave 回调。
+		 */
 		i2c_slave_unregister(tu->client);
 		orig_addr = tu->client->addr;
 		tu->client->addr = 0x0c;
@@ -223,7 +237,7 @@ out_smbalert:
 
 	if (msg.addr != I2C_CLIENT_END) {
 		ret = i2c_transfer(tu->client->adapter, &msg, 1);
-		/* convert '0 msgs transferred' to errno */
+		/* 把“成功返回但未实际传输任何消息”折算成 errno，便于测试判错。 */
 		ret = (ret == 0) ? -EIO : ret;
 	}
 
@@ -259,7 +273,7 @@ static int i2c_slave_testunit_probe(struct i2c_client *client)
 		tu_version_info[TU_VERSION_MAX_LENGTH - 1] = 0;
 
 	return i2c_slave_register(client, i2c_slave_testunit_slave_cb);
-};
+}
 
 static void i2c_slave_testunit_remove(struct i2c_client *client)
 {

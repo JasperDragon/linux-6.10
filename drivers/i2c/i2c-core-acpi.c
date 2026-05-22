@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Linux I2C core ACPI support code
+ * Linux I2C core 的 ACPI 支持代码
+ *
+ * 这一层负责把 ACPI 描述的 I2C 资源转换成 i2c_client，
+ * 同时解析 IRQ、总线速度和 adapter 绑定关系。
  *
  * Copyright (C) 2014 Intel Corp, Author: Lan Tianyu <tianyu.lan@intel.com>
  */
@@ -43,14 +46,14 @@ struct i2c_acpi_lookup {
 };
 
 /**
- * i2c_acpi_get_i2c_resource - Gets I2cSerialBus resource if type matches
- * @ares:	ACPI resource
- * @i2c:	Pointer to I2cSerialBus resource will be returned here
+ * i2c_acpi_get_i2c_resource - 从 ACPI 资源中提取 I2cSerialBus 项
+ * @ares: ACPI 资源项
+ * @i2c:  若匹配成功，则在这里返回 I2cSerialBus 资源指针
  *
- * Checks if the given ACPI resource is of type I2cSerialBus.
- * In this case, returns a pointer to it to the caller.
+ * 判断给定 ACPI 资源是否为 I2cSerialBus。
+ * 如果是，就把该资源返回给调用者。
  *
- * Returns true if resource type is of I2cSerialBus, otherwise false.
+ * 返回 true 表示资源类型匹配，否则返回 false。
  */
 bool i2c_acpi_get_i2c_resource(struct acpi_resource *ares,
 			       struct acpi_resource_i2c_serialbus **i2c)
@@ -81,11 +84,14 @@ static int i2c_acpi_resource_count(struct acpi_resource *ares, void *data)
 }
 
 /**
- * i2c_acpi_client_count - Count the number of I2cSerialBus resources
- * @adev:	ACPI device
+ * i2c_acpi_client_count - 统计 ACPI 设备里有多少个 I2cSerialBus 资源
+ * @adev: ACPI 设备
  *
- * Returns the number of I2cSerialBus resources in the ACPI-device's
- * resource-list; or a negative error code.
+ * 一个 ACPI device 可能声明多个 I2cSerialBus() 资源，分别指向不同地址
+ * 甚至不同 adapter。这个 helper 只负责计数，供上层决定是否要为第 N 个
+ * 资源额外创建 i2c_client。
+ *
+ * Return: I2cSerialBus 资源个数，或负 errno
  */
 int i2c_acpi_client_count(struct acpi_device *adev)
 {
@@ -130,8 +136,8 @@ static int i2c_acpi_fill_info(struct acpi_resource *ares, void *data)
 
 static const struct acpi_device_id i2c_acpi_ignored_device_ids[] = {
 	/*
-	 * ACPI video acpi_devices, which are handled by the acpi-video driver
-	 * sometimes contain a SERIAL_TYPE_I2C ACPI resource, ignore these.
+	 * ACPI video 设备有时会携带 I2C 资源，但它们由 acpi-video 驱动接管，
+	 * 不应该被 I2C core 再次实例化。
 	 */
 	{ ACPI_VIDEO_HID, 0 },
 	{}
@@ -161,7 +167,12 @@ static int i2c_acpi_do_lookup(struct acpi_device *adev,
 	memset(info, 0, sizeof(*info));
 	lookup->device_handle = acpi_device_handle(adev);
 
-	/* Look up for I2cSerialBus resource */
+	/*
+	 * 这是 ACPI -> i2c_board_info 的第一步。
+	 *
+	 * 它会从资源表里找出 I2cSerialBus()，提取 slave_address、
+	 * 10-bit 标志、connection_speed，以及资源里引用的 adapter handle。
+	 */
 	INIT_LIST_HEAD(&resource_list);
 	ret = acpi_dev_get_resources(adev, &resource_list,
 				     i2c_acpi_fill_info, lookup);
@@ -187,17 +198,17 @@ static int i2c_acpi_add_irq_resource(struct acpi_resource *ares, void *data)
 	irq_ctx->irq = i2c_dev_irq_from_resources(&r, 1);
 	irq_ctx->wake_capable = r.flags & IORESOURCE_IRQ_WAKECAPABLE;
 
-	return 1; /* No need to add resource to the list */
+	return 1; /* 不需要把这个资源再挂进资源链表。 */
 }
 
 /**
- * i2c_acpi_get_irq - get device IRQ number from ACPI
- * @client: Pointer to the I2C client device
- * @wake_capable: Set to true if the IRQ is wake capable
+ * i2c_acpi_get_irq - 从 ACPI 中获取设备 IRQ
+ * @client:        目标 I2C client
+ * @wake_capable:  若 IRQ 具备唤醒能力，则在这里返回 true
  *
- * Find the IRQ number used by a specific client device.
+ * 查找指定 client 使用的 IRQ 编号。
  *
- * Return: The IRQ number or an error code.
+ * Return: IRQ 号或错误码。
  */
 int i2c_acpi_get_irq(struct i2c_client *client, bool *wake_capable)
 {
@@ -249,13 +260,13 @@ static int i2c_acpi_get_info(struct acpi_device *adev,
 		return ret;
 
 	if (adapter) {
-		/* The adapter must match the one in I2cSerialBus() connector */
+		/* 传进来的 adapter 必须和 I2cSerialBus() 里声明的上游控制器一致。 */
 		if (!device_match_acpi_handle(&adapter->dev, lookup.adapter_handle))
 			return -ENODEV;
 	} else {
 		struct acpi_device *adapter_adev;
 
-		/* The adapter must be present */
+		/* 如果调用方没给 adapter，至少要保证资源里引用的 adapter 真实存在。 */
 		adapter_adev = acpi_fetch_acpi_dev(lookup.adapter_handle);
 		if (!adapter_adev)
 			return -ENODEV;
@@ -274,6 +285,12 @@ static int i2c_acpi_get_info(struct acpi_device *adev,
 	return 0;
 }
 
+/*
+ * 把一个 ACPI 设备真正注册成 i2c_client。
+ *
+ * 这一步会把 ACPI companion 标记为“已枚举”，避免后续重复实例化。
+ * 如果 i2c_new_client_device() 失败，还要把这个状态回滚掉。
+ */
 static void i2c_acpi_register_device(struct i2c_adapter *adapter,
 				     struct acpi_device *adev,
 				     struct i2c_board_info *info)
@@ -310,12 +327,13 @@ static acpi_status i2c_acpi_add_device(acpi_handle handle, u32 level,
 #define I2C_ACPI_MAX_SCAN_DEPTH 32
 
 /**
- * i2c_acpi_register_devices - enumerate I2C slave devices behind adapter
- * @adap: pointer to adapter
+ * i2c_acpi_register_devices - 枚举挂在某个 adapter 后面的 ACPI I2C 设备
+ * @adap: 目标 adapter
  *
- * Enumerate all I2C slave devices behind this adapter by walking the ACPI
- * namespace. When a device is found it will be added to the Linux device
- * model and bound to the corresponding ACPI handle.
+ * 这里会遍历 ACPI 命名空间，找出资源里引用当前 adapter 的所有
+ * I2cSerialBus() 设备，并把它们注册到 Linux device model。
+ *
+ * Return: 无
  */
 void i2c_acpi_register_devices(struct i2c_adapter *adap)
 {
@@ -401,13 +419,16 @@ static acpi_status i2c_acpi_lookup_speed(acpi_handle handle, u32 level,
 }
 
 /**
- * i2c_acpi_find_bus_speed - find I2C bus speed from ACPI
- * @dev: The device owning the bus
+ * i2c_acpi_find_bus_speed - 从 ACPI 中推导 I2C 总线速度
+ * @dev: 拥有这条总线的设备
  *
- * Find the I2C bus speed by walking the ACPI namespace for all I2C slaves
- * devices connected to this bus and use the speed of slowest device.
+ * 遍历 ACPI 命名空间里挂在这条总线上的所有 I2C 从设备，
+ * 取其中最慢的速度作为总线速度。
  *
- * Returns the speed in Hz or zero
+ * 某些已知有问题的设备还会触发强制修正逻辑，例如强制 100 kHz 或
+ * 强制 400 kHz，这些都属于基于 DMI/ACPI 经验积累的兼容性兜底。
+ *
+ * Return: 总线速度（Hz），若无法推导则返回 0
  */
 u32 i2c_acpi_find_bus_speed(struct device *dev)
 {
@@ -447,6 +468,12 @@ u32 i2c_acpi_find_bus_speed(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(i2c_acpi_find_bus_speed);
 
+/*
+ * 通过 ACPI handle 反查 i2c_adapter。
+ *
+ * 这和 OF 场景按 node 查 adapter 的思路类似，只不过 ACPI 这边用的是
+ * companion handle 作为关联键。
+ */
 struct i2c_adapter *i2c_acpi_find_adapter_by_handle(acpi_handle handle)
 {
 	struct i2c_adapter *adapter;
@@ -485,6 +512,7 @@ static int i2c_acpi_notify(struct notifier_block *nb, unsigned long value,
 
 	switch (value) {
 	case ACPI_RECONFIG_DEVICE_ADD:
+		/* 设备热插入或运行时补枚举：重新走一遍 ACPI -> client 实例化。 */
 		if (i2c_acpi_get_info(adev, &info, NULL, &adapter_handle))
 			break;
 
@@ -496,6 +524,7 @@ static int i2c_acpi_notify(struct notifier_block *nb, unsigned long value,
 		put_device(&adapter->dev);
 		break;
 	case ACPI_RECONFIG_DEVICE_REMOVE:
+		/* 热移除时，先删 client，再清理可能绑定到 companion 的 adapter。 */
 		if (!acpi_device_enumerated(adev))
 			break;
 
@@ -522,22 +551,21 @@ struct notifier_block i2c_acpi_notifier = {
 };
 
 /**
- * i2c_acpi_new_device_by_fwnode - Create i2c-client for the Nth I2cSerialBus resource
- * @fwnode:  fwnode with the ACPI resources to get the client from
- * @index:   Index of ACPI resource to get
- * @info:    describes the I2C device; note this is modified (addr gets set)
+ * i2c_acpi_new_device_by_fwnode - 为第 N 个 I2cSerialBus 资源创建 i2c_client
+ * @fwnode:  含有目标 ACPI 资源的 fwnode
+ * @index:   要提取的 ACPI 资源索引
+ * @info:    设备描述模板；函数内部会回填地址等字段
  * Context: can sleep
  *
- * By default the i2c subsys creates an i2c-client for the first I2cSerialBus
- * resource of an acpi_device, but some acpi_devices have multiple I2cSerialBus
- * resources, in that case this function can be used to create an i2c-client
- * for other I2cSerialBus resources in the Current Resource Settings table.
+ * 默认情况下，I2C 子系统只会为 acpi_device 的第一个 I2cSerialBus
+ * 资源创建 i2c-client；但有些 acpi_device 有多个 I2cSerialBus 资源，
+ * 此时就可以用这个函数来为当前资源表（Current Resource Settings）中的其他资源
+ * 创建对应的 i2c-client。
  *
- * Also see i2c_new_client_device, which this function calls to create the
- * i2c-client.
+ * 该函数内部会调用 i2c_new_client_device。
  *
- * Returns a pointer to the new i2c-client, or error pointer in case of failure.
- * Specifically, -EPROBE_DEFER is returned if the adapter is not found.
+ * Return: 成功返回新的 i2c-client；失败时返回 ERR_PTR()。
+ * 如果暂时还找不到对应 adapter，则返回 -EPROBE_DEFER。
  */
 struct i2c_client *i2c_acpi_new_device_by_fwnode(struct fwnode_handle *fwnode,
 						 int index,
@@ -576,6 +604,12 @@ struct i2c_client *i2c_acpi_new_device_by_fwnode(struct fwnode_handle *fwnode,
 }
 EXPORT_SYMBOL_GPL(i2c_acpi_new_device_by_fwnode);
 
+/*
+ * 判断这个 ACPI I2C 设备在 probe 前是否可以跳过强制 D0 上电。
+ *
+ * 某些平台的 ACPI 电源时序比较脆弱，驱动会显式声明“不要为了 probe
+ * 把设备切到 D0”。这里就是 I2C core 侧的统一判断入口。
+ */
 bool i2c_acpi_waive_d0_probe(struct device *dev)
 {
 	struct i2c_driver *driver = to_i2c_driver(dev->driver);

@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * BCM2835 I2C controller driver
+ * BCM2835 I2C 控制器驱动
+ *
+ * 这份驱动负责 Raspberry Pi BCM2835/BCM2711 系列 SoC 的 I2C 控制器：
+ * - 计算并配置总线时钟
+ * - 通过 FIFO 发送/接收数据
+ * - 处理中断和重复起始条件
  */
 
 #include <linux/clk.h>
@@ -24,9 +29,8 @@
 #define BCM2835_I2C_DIV		0x14
 #define BCM2835_I2C_DEL		0x18
 /*
- * 16-bit field for the number of SCL cycles to wait after rising SCL
- * before deciding the target is not responding. 0 disables the
- * timeout detection.
+ * 16 位字段：SCL 上升后等待多少个周期再判定目标设备无响应。
+ * 写 0 会关闭超时检测。
  */
 #define BCM2835_I2C_CLKT	0x1c
 
@@ -93,9 +97,8 @@ static int clk_bcm2835_i2c_calc_divider(unsigned long rate,
 	u32 divider = DIV_ROUND_UP(parent_rate, rate);
 
 	/*
-	 * Per the datasheet, the register is always interpreted as an even
-	 * number, by rounding down. In other words, the LSB is ignored. So,
-	 * if the LSB is set, increment the divider to avoid any issue.
+	 * 根据手册，这个寄存器会按偶数解释并向下取整，也就是忽略最低位。
+	 * 因此如果最低位为 1，就把 divider 加一，避免配置出错。
 	 */
 	if (divider & 1)
 		divider++;
@@ -119,16 +122,12 @@ static int clk_bcm2835_i2c_set_rate(struct clk_hw *hw, unsigned long rate,
 	bcm2835_i2c_writel(div->i2c_dev, BCM2835_I2C_DIV, divider);
 
 	/*
-	 * Number of core clocks to wait after falling edge before
-	 * outputting the next data bit.  Note that both FEDL and REDL
-	 * can't be greater than CDIV/2.
+	 * SCL 下降沿后等待多少个 core clock 再输出下一位数据。
+	 * 注意 FEDL 和 REDL 都不能大于 CDIV/2。
 	 */
 	fedl = max(divider / 16, 1u);
 
-	/*
-	 * Number of core clocks to wait after rising edge before
-	 * sampling the next incoming data bit.
-	 */
+	/* SCL 上升沿后等待多少个 core clock 再采样下一位输入数据。 */
 	redl = max(divider / 4, 1u);
 
 	bcm2835_i2c_writel(div->i2c_dev, BCM2835_I2C_DEL,
@@ -223,16 +222,12 @@ static void bcm2835_drain_rxfifo(struct bcm2835_i2c_dev *i2c_dev)
 }
 
 /*
- * Repeated Start Condition (Sr)
- * The BCM2835 ARM Peripherals datasheet mentions a way to trigger a Sr when it
- * talks about reading from a target with 10 bit address. This is achieved by
- * issuing a write, poll the I2CS.TA flag and wait for it to be set, and then
- * issue a read.
- * A comment in https://github.com/raspberrypi/linux/issues/254 shows how the
- * firmware actually does it using polling and says that it's a workaround for
- * a problem in the state machine.
- * It turns out that it is possible to use the TXW interrupt to know when the
- * transfer is active, provided the FIFO has not been prefilled.
+ * Repeated Start（重复起始）。
+ *
+ * BCM2835 手册里提到了一种处理 10 位地址读操作的方式：
+ * 先发写请求，轮询 I2CS.TA 等到其置位，再发读请求。
+ * 这里使用 TXW 中断判断传输是否已经进入活动状态，
+ * 前提是 FIFO 还没有被提前填满。
  */
 
 static void bcm2835_i2c_start_transfer(struct bcm2835_i2c_dev *i2c_dev)
@@ -271,12 +266,13 @@ static void bcm2835_i2c_finish_transfer(struct bcm2835_i2c_dev *i2c_dev)
 }
 
 /*
- * Note about I2C_C_CLEAR on error:
- * The I2C_C_CLEAR on errors will take some time to resolve -- if you were in
- * non-idle state and I2C_C_READ, it sets an abort_rx flag and runs through
- * the state machine to send a NACK and a STOP. Since we're setting CLEAR
- * without I2CEN, that NACK will be hanging around queued up for next time
- * we start the engine.
+ * 关于错误路径里的 I2C_C_CLEAR：
+ *
+ * 出错时写 CLEAR 不会立刻结束当前状态机。如果当时处于非 idle 且
+ * 读模式，它会先走完状态机去发 NACK 和 STOP。
+ *
+ * 这里是在没有 I2CEN 的情况下写 CLEAR，所以那个 NACK 可能会残留在
+ * 队列里，等下次启动控制器时再被处理。
  */
 
 static irqreturn_t bcm2835_i2c_isr(int this_irq, void *data)
@@ -284,6 +280,12 @@ static irqreturn_t bcm2835_i2c_isr(int this_irq, void *data)
 	struct bcm2835_i2c_dev *i2c_dev = data;
 	u32 val, err;
 
+	/*
+	 * 中断处理路径：
+	 * - 检查超时和总线错误
+	 * - 处理传输完成
+	 * - 按 FIFO 水位继续补发/回收数据
+	 */
 	val = bcm2835_i2c_readl(i2c_dev, BCM2835_I2C_S);
 
 	err = val & (BCM2835_I2C_S_CLKT | BCM2835_I2C_S_ERR);
@@ -351,6 +353,7 @@ static int bcm2835_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
 	unsigned long time_left;
 	int i;
 
+	/* BCM2835 这里不支持多段读交错，只允许最后一个消息是读操作。 */
 	for (i = 0; i < (num - 1); i++)
 		if (msgs[i].flags & I2C_M_RD) {
 			dev_warn_once(i2c_dev->dev,
@@ -397,7 +400,7 @@ static const struct i2c_algorithm bcm2835_i2c_algo = {
 };
 
 /*
- * The BCM2835 was reported to have problems with clock stretching:
+ * BCM2835 早期被报告存在 clock stretching 相关问题：
  * https://www.advamation.com/knowhow/raspberrypi/rpi-i2c-bug.html
  * https://www.raspberrypi.org/forums/viewtopic.php?p=146272
  */
@@ -413,6 +416,14 @@ static int bcm2835_i2c_probe(struct platform_device *pdev)
 	struct clk *mclk;
 	u32 bus_clk_rate;
 
+	/*
+	 * probe 阶段负责：
+	 * - 分配私有数据
+	 * - 映射寄存器
+	 * - 获取并配置时钟
+	 * - 申请 IRQ
+	 * - 注册 I2C adapter
+	 */
 	i2c_dev = devm_kzalloc(&pdev->dev, sizeof(*i2c_dev), GFP_KERNEL);
 	if (!i2c_dev)
 		return -ENOMEM;
@@ -479,9 +490,9 @@ static int bcm2835_i2c_probe(struct platform_device *pdev)
 	adap->quirks = of_device_get_match_data(&pdev->dev);
 
 	/*
-	 * Disable the hardware clock stretching timeout. SMBUS
-	 * specifies a limit for how long the device can stretch the
-	 * clock, but core I2C doesn't.
+	 * 关闭硬件 clock stretching 超时。
+	 *
+	 * SMBus 对从设备拉伸时钟的时间有上限要求，但核心 I2C 并没有这个约束。
 	 */
 	bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_CLKT, 0);
 	bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_C, 0);
@@ -506,6 +517,7 @@ static void bcm2835_i2c_remove(struct platform_device *pdev)
 {
 	struct bcm2835_i2c_dev *i2c_dev = platform_get_drvdata(pdev);
 
+	/* 反注册时把时钟、IRQ 和 adapter 按相反顺序收尾。 */
 	clk_rate_exclusive_put(i2c_dev->bus_clk);
 	clk_disable_unprepare(i2c_dev->bus_clk);
 

@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * I2C Address Translator
+ * I2C 地址翻译器（Address Translator）公共接口
  *
  * Copyright (c) 2019,2022 Luca Ceresoli <luca@lucaceresoli.net>
  * Copyright (c) 2022,2023 Tomi Valkeinen <tomi.valkeinen@ideasonboard.com>
  *
- * Based on i2c-mux.h
+ * 最初基于 i2c-mux.h
  */
 
 #ifndef _LINUX_I2C_ATR_H
@@ -19,14 +19,16 @@ struct fwnode_handle;
 struct i2c_atr;
 
 /**
- * enum i2c_atr_flags - Flags for an I2C ATR driver
+ * enum i2c_atr_flags - ATR 驱动的工作模式标志
  *
- * @I2C_ATR_F_STATIC: ATR does not support dynamic mapping, use static mapping.
- *                    Mappings will only be added or removed as a result of
- *                    devices being added or removed from a child bus.
- *                    The ATR pool will have to be big enough to accomodate all
- *                    devices expected to be added to the child buses.
- * @I2C_ATR_F_PASSTHROUGH: Allow unmapped incoming addresses to pass through
+ * @I2C_ATR_F_STATIC:
+ *	ATR 不支持运行时动态映射，只能使用静态映射。
+ *	映射项只会随着子总线上设备的创建/删除而增减，不会在一次普通
+ *	传输中因为地址未命中而临时建立新映射。
+ *	这要求 alias 池足够大，能够容纳所有预期会出现在子总线上的设备。
+ * @I2C_ATR_F_PASSTHROUGH:
+ *	允许未映射地址直接透传到父总线。
+ *	这通常用于“不是每个地址都必须经过 ATR 改写”的硬件实现。
  */
 enum i2c_atr_flags {
 	I2C_ATR_F_STATIC = BIT(0),
@@ -34,15 +36,17 @@ enum i2c_atr_flags {
 };
 
 /**
- * struct i2c_atr_ops - Callbacks from ATR to the device driver.
- * @attach_addr: Notify the driver of a new device connected on a child
- *               bus, with the alias assigned to it. The driver must
- *               configure the hardware to use the alias.
- * @detach_addr: Notify the driver of a device getting disconnected. The
- *               driver must configure the hardware to stop using the
- *               alias.
+ * struct i2c_atr_ops - ATR 核心回调到底层硬件驱动的接口
+ * @attach_addr:
+ *	当某个子总线地址需要建立映射时调用。
+ *	核心层已经为这个地址选好了 alias，底层驱动要把
+ *	`(chan_id, addr) -> alias` 的关系编程到硬件 ATR 中。
+ * @detach_addr:
+ *	当某个地址不再需要映射时调用。
+ *	底层驱动要撤掉该地址对应的硬件映射，避免旧 alias 继续生效。
  *
- * All these functions return 0 on success, a negative error code otherwise.
+ * attach_addr() 成功返回 0，失败返回负的 errno。detach_addr() 没有返回值，
+ * 调用方默认底层驱动能同步完成清理，因此实现时要保证它是可完成的。
  */
 struct i2c_atr_ops {
 	int (*attach_addr)(struct i2c_atr *atr, u32 chan_id,
@@ -52,19 +56,25 @@ struct i2c_atr_ops {
 };
 
 /**
- * struct i2c_atr_adap_desc - An ATR downstream bus descriptor
- * @chan_id:        Index of the new adapter (0 .. max_adapters-1).  This value is
- *                  passed to the callbacks in `struct i2c_atr_ops`.
- * @parent:         The device used as the parent of the new i2c adapter, or NULL
- *                  to use the i2c-atr device as the parent.
- * @bus_handle:     The fwnode handle that points to the adapter's i2c
- *                  peripherals, or NULL.
- * @num_aliases:    The number of aliases in this adapter's private alias pool. Set
- *                  to zero if this adapter uses the ATR's global alias pool.
- * @aliases:        An optional array of private aliases used by the adapter
- *                  instead of the ATR's global pool of aliases. Must contain
- *                  exactly num_aliases entries if num_aliases > 0, is ignored
- *                  otherwise.
+ * struct i2c_atr_adap_desc - ATR 下游子总线描述符
+ * @chan_id:
+ *	要创建的子适配器编号，范围是 `0 .. max_adapters - 1`。
+ *	这个值会原样传给 struct i2c_atr_ops 回调，底层驱动通常用它来
+ *	选择具体的硬件通道或端口。
+ * @parent:
+ *	新 i2c_adapter 在设备模型中的父设备。
+ *	若为 NULL，则默认使用 i2c-atr 自身的设备对象作为父节点。
+ * @bus_handle:
+ *	指向这个子总线下游外设集合的固件节点。
+ *	若为 NULL，核心层会回退到 `i2c-atr` 子节点中，按 `reg = chan_id`
+ *	去自动匹配一个固件子节点。
+ * @num_aliases:
+ *	该子总线私有 alias 池中的地址数量。
+ *	若为 0，则表示这个子适配器复用 ATR 的全局共享 alias 池。
+ * @aliases:
+ *	可选的私有 alias 数组。
+ *	仅当 @num_aliases 大于 0 时才会使用，且必须准确提供
+ *	`num_aliases` 个地址。
  */
 struct i2c_atr_adap_desc {
 	u32 chan_id;
@@ -75,74 +85,73 @@ struct i2c_atr_adap_desc {
 };
 
 /**
- * i2c_atr_new() - Allocate and initialize an I2C ATR helper.
- * @parent:       The parent (upstream) adapter
- * @dev:          The device acting as an ATR
- * @ops:          Driver-specific callbacks
- * @max_adapters: Maximum number of child adapters
- * @flags:        Flags for ATR
+ * i2c_atr_new() - 创建并初始化一个 ATR 帮助对象
+ * @parent: 上游父适配器
+ * @dev:    实现 ATR 功能的设备对象
+ * @ops:    底层驱动回调
+ * @max_adapters: 最多允许创建多少个子适配器
+ * @flags:  ATR 工作模式标志
  *
- * The new ATR helper is connected to the parent adapter but has no child
- * adapters. Call i2c_atr_add_adapter() to add some.
+ * 这个函数只建立 ATR 框架本身：记录父总线、准备公共锁、解析共享
+ * alias 池、注册总线 notifier。新建的 ATR 此时还没有任何子适配器，
+ * 后续必须通过 i2c_atr_add_adapter() 逐个添加。
  *
- * Call i2c_atr_delete() to remove.
+ * 与之对应的销毁接口是 i2c_atr_delete()。
  *
- * Return: pointer to the new ATR helper object, or ERR_PTR
+ * Return: 成功时返回 ATR 对象指针，失败时返回 ERR_PTR()
  */
 struct i2c_atr *i2c_atr_new(struct i2c_adapter *parent, struct device *dev,
 			    const struct i2c_atr_ops *ops, int max_adapters,
 			    u32 flags);
 
 /**
- * i2c_atr_delete - Delete an I2C ATR helper.
- * @atr: I2C ATR helper to be deleted.
+ * i2c_atr_delete - 销毁一个 ATR 帮助对象
+ * @atr: 要销毁的 ATR 对象
  *
- * Precondition: all the adapters added with i2c_atr_add_adapter() must be
- * removed by calling i2c_atr_del_adapter().
+ * 前提条件：所有通过 i2c_atr_add_adapter() 创建的子适配器都必须先
+ * 用 i2c_atr_del_adapter() 删除干净。
  */
 void i2c_atr_delete(struct i2c_atr *atr);
 
 /**
- * i2c_atr_add_adapter - Create a child ("downstream") I2C bus.
- * @atr:        The I2C ATR
- * @desc:       An ATR adapter descriptor
+ * i2c_atr_add_adapter - 创建一个下游子 I2C 总线
+ * @atr:  ATR 对象
+ * @desc: 子适配器描述符
  *
- * After calling this function a new i2c bus will appear. Adding and removing
- * devices on the downstream bus will result in calls to the
- * &i2c_atr_ops->attach_client and &i2c_atr_ops->detach_client callbacks for the
- * driver to assign an alias to the device.
+ * 调用后，系统里会出现一个新的 i2c_adapter。该子总线上设备的创建与
+ * 删除，会经由 I2C bus notifier 转换成对底层驱动 attach/detach
+ * 回调的调用，从而在硬件 ATR 中建立或撤销 alias 映射。
  *
- * The adapter's fwnode is set to @bus_handle, or if @bus_handle is NULL the
- * function looks for a child node whose 'reg' property matches the chan_id
- * under the i2c-atr device's 'i2c-atr' node.
+ * 适配器的 fwnode 取自 @bus_handle；若 @bus_handle 为 NULL，则会在
+ * `i2c-atr` 设备的 `i2c-atr` 子节点下，寻找 `reg == chan_id` 的节点。
  *
- * Call i2c_atr_del_adapter() to remove the adapter.
+ * 对应的删除接口是 i2c_atr_del_adapter()。
  *
- * Return: 0 on success, a negative error code otherwise.
+ * Return: 成功返回 0，失败返回负的 errno
  */
 int i2c_atr_add_adapter(struct i2c_atr *atr, struct i2c_atr_adap_desc *desc);
 
 /**
- * i2c_atr_del_adapter - Remove a child ("downstream") I2C bus added by
- *                       i2c_atr_add_adapter(). If no I2C bus has been added
- *                       this function is a no-op.
- * @atr:     The I2C ATR
- * @chan_id: Index of the adapter to be removed (0 .. max_adapters-1)
+ * i2c_atr_del_adapter - 删除一个先前创建的下游子总线
+ * @atr:     ATR 对象
+ * @chan_id: 要删除的子适配器编号，范围是 `0 .. max_adapters - 1`
+ *
+ * 如果对应通道并不存在，这个函数什么也不做。
  */
 void i2c_atr_del_adapter(struct i2c_atr *atr, u32 chan_id);
 
 /**
- * i2c_atr_set_driver_data - Set private driver data to the i2c-atr instance.
- * @atr:  The I2C ATR
- * @data: Pointer to the data to store
+ * i2c_atr_set_driver_data - 给 ATR 对象保存底层驱动私有数据
+ * @atr:  ATR 对象
+ * @data: 要保存的私有指针
  */
 void i2c_atr_set_driver_data(struct i2c_atr *atr, void *data);
 
 /**
- * i2c_atr_get_driver_data - Get the stored drive data.
- * @atr:     The I2C ATR
+ * i2c_atr_get_driver_data - 取回先前保存的驱动私有数据
+ * @atr: ATR 对象
  *
- * Return: Pointer to the stored data
+ * Return: 之前通过 i2c_atr_set_driver_data() 保存的指针
  */
 void *i2c_atr_get_driver_data(struct i2c_atr *atr);
 

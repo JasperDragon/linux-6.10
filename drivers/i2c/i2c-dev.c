@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
-    i2c-dev.c - i2c-bus driver, char device interface
+ * i2c-dev.c - I2C 总线驱动的字符设备接口
+ *
+ * Copyright (C) 1995-97 Simon G. Vogl
+ * Copyright (C) 1998-99 Frodo Looijaard <frodol@dds.nl>
+ * Copyright (C) 2003 Greg Kroah-Hartman <greg@kroah.com>
+ */
 
-    Copyright (C) 1995-97 Simon G. Vogl
-    Copyright (C) 1998-99 Frodo Looijaard <frodol@dds.nl>
-    Copyright (C) 2003 Greg Kroah-Hartman <greg@kroah.com>
+/*
+ * 注意：这个文件是对 Simon Vogl 的 i2c-dev 模块的完整重写。
+ * 不过这里沿用了他原始代码和设计中的大量内容，所以仍应把
+ * 他视为共同作者。
+ */
 
-*/
-
-/* Note that this is a complete rewrite of Simon Vogl's i2c-dev module.
-   But I have used so much of his original code and ideas that it seems
-   only fair to recognize him as co-author -- Frodo */
-
-/* The I2C_RDWR ioctl code is written by Kolja Waschk <waschk@telos.de> */
+/* I2C_RDWR ioctl 代码由 Kolja Waschk <waschk@telos.de> 编写。 */
 
 #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
 
@@ -32,12 +33,12 @@
 #include <linux/uaccess.h>
 
 /*
- * An i2c_dev represents an i2c_adapter ... an I2C or SMBus master, not a
- * slave (i2c_client) with which messages will be exchanged.  It's coupled
- * with a character special file which is accessed by user mode drivers.
+ * 一个 i2c_dev 对应一个 i2c_adapter，也就是 I2C/SMBus 主机，
+ * 而不是与之交换消息的从设备（i2c_client）。
+ * 它绑定到一个字符设备节点，供用户态驱动访问。
  *
- * The list of i2c_dev structures is parallel to the i2c_adapter lists
- * maintained by the driver model, and is updated using bus notifications.
+ * i2c_dev 列表与驱动模型维护的 i2c_adapter 列表保持同步，
+ * 通过总线通知机制更新。
  */
 struct i2c_dev {
 	struct list_head list;
@@ -115,20 +116,18 @@ ATTRIBUTE_GROUPS(i2c);
 /* ------------------------------------------------------------------------- */
 
 /*
- * After opening an instance of this character special file, a file
- * descriptor starts out associated only with an i2c_adapter (and bus).
+ * 打开这个字符设备后，文件描述符最初只和一个 i2c_adapter（总线）
+ * 关联。
  *
- * Using the I2C_RDWR ioctl(), you can then *immediately* issue i2c_msg
- * traffic to any devices on the bus used by that adapter.  That's because
- * the i2c_msg vectors embed all the addressing information they need, and
- * are submitted directly to an i2c_adapter.  However, SMBus-only adapters
- * don't support that interface.
+ * 如果使用 I2C_RDWR ioctl，就可以立即向该适配器所在总线上的任意
+ * 设备发送 i2c_msg，因为 i2c_msg 本身就包含了所需的地址信息，
+ * 并且是直接提交给 i2c_adapter 的。不过，只支持 SMBus 的控制器
+ * 不支持这个接口。
  *
- * To use read()/write() system calls on that file descriptor, or to use
- * SMBus interfaces (and work with SMBus-only hosts!), you must first issue
- * an I2C_SLAVE (or I2C_SLAVE_FORCE) ioctl.  That configures an anonymous
- * (never registered) i2c_client so it holds the addressing information
- * needed by those system calls and by this SMBus interface.
+ * 如果想用 read()/write() 系统调用，或者想使用 SMBus 接口（并
+ * 同时兼容只支持 SMBus 的主机），则必须先执行 I2C_SLAVE 或
+ * I2C_SLAVE_FORCE ioctl。这样会配置一个匿名的、从未注册过的
+ * i2c_client，用来保存这些系统调用和 SMBus 接口所需的地址信息。
  */
 
 static ssize_t i2cdev_read(struct file *file, char __user *buf, size_t count,
@@ -139,7 +138,7 @@ static ssize_t i2cdev_read(struct file *file, char __user *buf, size_t count,
 
 	struct i2c_client *client = file->private_data;
 
-	/* Adapter must support I2C transfers */
+	/* 适配器必须支持 I2C 传输。 */
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
 		return -EOPNOTSUPP;
 
@@ -167,7 +166,7 @@ static ssize_t i2cdev_write(struct file *file, const char __user *buf,
 	char *tmp;
 	struct i2c_client *client = file->private_data;
 
-	/* Adapter must support I2C transfers */
+	/* 适配器必须支持 I2C 传输。 */
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
 		return -EOPNOTSUPP;
 
@@ -195,7 +194,7 @@ static int i2cdev_check(struct device *dev, void *addrp)
 	return dev->driver ? -EBUSY : 0;
 }
 
-/* walk up mux tree */
+/* 向上遍历 mux 树。 */
 static int i2cdev_check_mux_parents(struct i2c_adapter *adapter, int addr)
 {
 	struct i2c_adapter *parent = i2c_parent_is_i2c_adapter(adapter);
@@ -208,7 +207,7 @@ static int i2cdev_check_mux_parents(struct i2c_adapter *adapter, int addr)
 	return result;
 }
 
-/* recurse down mux tree */
+/* 向下递归遍历 mux 树。 */
 static int i2cdev_check_mux_children(struct device *dev, void *addrp)
 {
 	int result;
@@ -222,9 +221,10 @@ static int i2cdev_check_mux_children(struct device *dev, void *addrp)
 	return result;
 }
 
-/* This address checking function differs from the one in i2c-core
-   in that it considers an address with a registered device, but no
-   driver bound to it, as NOT busy. */
+/*
+ * 这个地址检查函数与 i2c-core 里的实现不同：
+ * 它把“已经注册了设备但还没有绑定驱动”的地址视为未占用。
+ */
 static int i2cdev_check_addr(struct i2c_adapter *adapter, unsigned int addr)
 {
 	struct i2c_adapter *parent = i2c_parent_is_i2c_adapter(adapter);
@@ -246,7 +246,17 @@ static noinline int i2cdev_ioctl_rdwr(struct i2c_client *client,
 	u8 __user **data_ptrs;
 	int i, res;
 
-	/* Adapter must support I2C transfers */
+	/*
+	 * I2C_RDWR 是 i2c-dev 里最接近“原生 I2C 消息”的接口。
+	 *
+	 * 用户态可以一次提交多条 i2c_msg，每条消息自己带地址/方向/长度。
+	 * 内核这里要做的主要是：
+	 * - 把每条用户缓冲区拷进内核
+	 * - 做基本长度和 RECV_LEN 合法性检查
+	 * - 标记为 DMA_SAFE，方便底层控制器直接复用
+	 * - 调 i2c_transfer() 真正下发，再把读结果拷回用户态
+	 */
+	/* 适配器必须支持 I2C 传输。 */
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
 		return -EOPNOTSUPP;
 
@@ -256,7 +266,7 @@ static noinline int i2cdev_ioctl_rdwr(struct i2c_client *client,
 
 	res = 0;
 	for (i = 0; i < nmsgs; i++) {
-		/* Limit the size of the message to a sane amount */
+		/* 把消息长度限制在一个合理范围内。 */
 		if (msgs[i].len > 8192) {
 			res = -EINVAL;
 			break;
@@ -268,19 +278,15 @@ static noinline int i2cdev_ioctl_rdwr(struct i2c_client *client,
 			res = PTR_ERR(msgs[i].buf);
 			break;
 		}
-		/* memdup_user allocates with GFP_KERNEL, so DMA is ok */
+		/* memdup_user 使用 GFP_KERNEL 分配，因此可以作为 DMA 缓冲区。 */
 		msgs[i].flags |= I2C_M_DMA_SAFE;
 
 		/*
-		 * If the message length is received from the slave (similar
-		 * to SMBus block read), we must ensure that the buffer will
-		 * be large enough to cope with a message length of
-		 * I2C_SMBUS_BLOCK_MAX as this is the maximum underlying bus
-		 * drivers allow. The first byte in the buffer must be
-		 * pre-filled with the number of extra bytes, which must be
-		 * at least one to hold the message length, but can be
-		 * greater (for example to account for a checksum byte at
-		 * the end of the message.)
+		 * 如果消息长度需要从从设备返回（类似 SMBus block read），
+		 * 必须确保缓冲区足够大，至少能容纳 I2C_SMBUS_BLOCK_MAX
+		 * 字节，因为底层总线驱动允许的最大块长度就是这个值。
+		 * 缓冲区第一个字节必须预先填入额外字节数，它至少要能容纳
+		 * 长度字节本身，但也可以更大（例如给消息尾部校验字节留空间）。
 		 */
 		if (msgs[i].flags & I2C_M_RECV_LEN) {
 			if (!(msgs[i].flags & I2C_M_RD) ||
@@ -323,6 +329,14 @@ static noinline int i2cdev_ioctl_smbus(struct i2c_client *client,
 	union i2c_smbus_data temp = {};
 	int datasize, res;
 
+	/*
+	 * 这是 i2c-dev 对 I2C_SMBUS ioctl 的解析层。
+	 *
+	 * 相比 I2C_RDWR，这里用户态提交的是“协议语义”而不是消息数组。
+	 * 因此内核先校验协议类型和参数，再把用户缓冲区折叠成
+	 * union i2c_smbus_data，最后统一交给 i2c_smbus_xfer()。
+	 */
+
 	if ((size != I2C_SMBUS_BYTE) &&
 	    (size != I2C_SMBUS_QUICK) &&
 	    (size != I2C_SMBUS_BYTE_DATA) &&
@@ -337,8 +351,10 @@ static noinline int i2cdev_ioctl_smbus(struct i2c_client *client,
 			size);
 		return -EINVAL;
 	}
-	/* Note that I2C_SMBUS_READ and I2C_SMBUS_WRITE are 0 and 1,
-	   so the check is valid if size==I2C_SMBUS_QUICK too. */
+	/*
+	 * 注意，I2C_SMBUS_READ 和 I2C_SMBUS_WRITE 分别是 0 和 1，
+	 * 所以即使 size == I2C_SMBUS_QUICK，这个检查也仍然成立。
+	 */
 	if ((read_write != I2C_SMBUS_READ) &&
 	    (read_write != I2C_SMBUS_WRITE)) {
 		dev_dbg(&client->adapter->dev,
@@ -347,12 +363,12 @@ static noinline int i2cdev_ioctl_smbus(struct i2c_client *client,
 		return -EINVAL;
 	}
 
-	/* Note that command values are always valid! */
+	/* 注意 command 值总是有效的。 */
 
 	if ((size == I2C_SMBUS_QUICK) ||
 	    ((size == I2C_SMBUS_BYTE) &&
 	    (read_write == I2C_SMBUS_WRITE)))
-		/* These are special: we do not use data */
+		/* 这些情况比较特殊，不需要 data。 */
 		return i2c_smbus_xfer(client->adapter, client->addr,
 				      client->flags, read_write,
 				      command, size, NULL);
@@ -380,8 +396,7 @@ static noinline int i2cdev_ioctl_smbus(struct i2c_client *client,
 			return -EFAULT;
 	}
 	if (size == I2C_SMBUS_I2C_BLOCK_BROKEN) {
-		/* Convert old I2C block commands to the new
-		   convention. This preserves binary compatibility. */
+			/* 把旧的 I2C block 命令转换成新约定，保持二进制兼容。 */
 		size = I2C_SMBUS_I2C_BLOCK_DATA;
 		if (read_write == I2C_SMBUS_READ)
 			temp.block[0] = I2C_SMBUS_BLOCK_MAX;
@@ -413,7 +428,7 @@ static long i2cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EINVAL;
 		if (cmd == I2C_SLAVE && i2cdev_check_addr(client->adapter, arg))
 			return -EBUSY;
-		/* REVISIT: address could become busy later */
+		/* REVISIT: 这个地址后续可能还会变成 busy。 */
 		client->addr = arg;
 		return 0;
 	case I2C_TENBIT:
@@ -424,11 +439,8 @@ static long i2cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return 0;
 	case I2C_PEC:
 		/*
-		 * Setting the PEC flag here won't affect kernel drivers,
-		 * which will be using the i2c_client node registered with
-		 * the driver model core.  Likewise, when that client has
-		 * the PEC flag already set, the i2c-dev driver won't see
-		 * (or use) this setting.
+		 * 这里改的是“匿名 i2c-dev client”的标志，不会影响内核里
+		 * 已注册、已绑定驱动的真实 i2c_client。
 		 */
 		if (arg)
 			client->flags |= I2C_CLIENT_PEC;
@@ -452,10 +464,7 @@ static long i2cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (!rdwr_arg.msgs || rdwr_arg.nmsgs == 0)
 			return -EINVAL;
 
-		/*
-		 * Put an arbitrary limit on the number of messages that can
-		 * be sent at once
-		 */
+		/* 对一次能发送的消息数量加一个任意上限。 */
 		if (rdwr_arg.nmsgs > I2C_RDWR_IOCTL_MAX_MSGS)
 			return -EINVAL;
 
@@ -487,20 +496,17 @@ static long i2cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		client->adapter->retries = arg;
 		break;
 	case I2C_TIMEOUT:
-		/*
-		 * For historical reasons, user-space sets the timeout value in
-		 * units of 10 ms.
-		 */
+		/* 历史原因：用户态设置的超时单位是 10 ms。 */
 		if (arg > INT_MAX / 10)
 			return -EINVAL;
 
 		client->adapter->timeout = msecs_to_jiffies(arg * 10);
 		break;
 	default:
-		/* NOTE:  returning a fault code here could cause trouble
-		 * in buggy userspace code.  Some old kernel bugs returned
-		 * zero in this case, and userspace code might accidentally
-		 * have depended on that bug.
+		/*
+		 * 注意：这里如果返回故障码，可能会让有缺陷的用户态代码出问题。
+		 * 某些旧内核 bug 在这种情况下返回 0，而用户态代码可能无意中
+		 * 依赖了这个错误行为。
 		 */
 		return -ENOTTY;
 	}
@@ -605,12 +611,15 @@ static int i2cdev_open(struct inode *inode, struct file *file)
 	if (!adap)
 		return -ENODEV;
 
-	/* This creates an anonymous i2c_client, which may later be
-	 * pointed to some address using I2C_SLAVE or I2C_SLAVE_FORCE.
+	/*
+	 * 这里会创建一个匿名 i2c_client，之后可以通过 I2C_SLAVE 或
+	 * I2C_SLAVE_FORCE 把它指向某个具体地址。
 	 *
-	 * This client is ** NEVER REGISTERED ** with the driver model
-	 * or I2C core code!!  It just holds private copies of addressing
-	 * information and maybe a PEC flag.
+	 * 这个 client **绝不会** 注册到 driver model 或 I2C core。
+	 * 它只是一个“每个文件描述符私有的地址上下文”，用于承载：
+	 * - read()/write() 的目标地址
+	 * - I2C_SMBUS ioctl 的目标地址
+	 * - 当前 fd 视角下的 PEC / TENBIT 等标志
 	 */
 	client = kzalloc_obj(*client);
 	if (!client) {
@@ -671,6 +680,11 @@ static int i2cdev_attach_adapter(struct device *dev)
 		return NOTIFY_DONE;
 	adap = to_i2c_adapter(dev);
 
+	/*
+	 * 一个 i2c_adapter 对应一个 /dev/i2c-X 字符设备节点。
+	 * 这里负责把“内核里的 adapter 对象”桥接成“用户态可打开的 cdev”。
+	 */
+
 	i2c_dev = get_free_i2c_dev(adap);
 	if (IS_ERR(i2c_dev))
 		return NOTIFY_DONE;
@@ -724,6 +738,12 @@ static int i2cdev_notifier_call(struct notifier_block *nb, unsigned long action,
 {
 	struct device *dev = data;
 
+	/*
+	 * i2c-dev 不自己维护 adapter 生命周期，而是订阅 I2C bus notifier。
+	 * 这样无论 adapter 是先于 i2c-dev 还是后于 i2c-dev 出现，都能把
+	 * /dev/i2c-X 节点和真实适配器同步起来。
+	 */
+
 	switch (action) {
 	case BUS_NOTIFY_ADD_DEVICE:
 		return i2cdev_attach_adapter(dev);
@@ -753,7 +773,13 @@ static int __exit i2c_dev_detach_adapter(struct device *dev, void *dummy)
 }
 
 /*
- * module load/unload record keeping
+ * 模块加载/卸载时的记录维护。
+ *
+ * 初始化顺序是：
+ * - 先申请字符设备号段
+ * - 再注册 class，准备创建设备节点
+ * - 再挂上 bus notifier，跟踪后续新增/删除的 adapter
+ * - 最后遍历已有 adapter，补齐已有 /dev/i2c-X 节点
  */
 
 static int __init i2c_dev_init(void)
@@ -770,12 +796,12 @@ static int __init i2c_dev_init(void)
 	if (res)
 		goto out_unreg_chrdev;
 
-	/* Keep track of adapters which will be added or removed later */
+	/* 记录之后可能被添加或移除的适配器。 */
 	res = bus_register_notifier(&i2c_bus_type, &i2cdev_notifier);
 	if (res)
 		goto out_unreg_class;
 
-	/* Bind to already existing adapters right away */
+	/* 立即绑定到已经存在的适配器。 */
 	i2c_for_each_dev(NULL, i2c_dev_attach_adapter);
 
 	return 0;

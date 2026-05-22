@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * I2C slave mode EEPROM simulator
+ * I2C target/slave 模式 EEPROM 模拟器
  *
  * Copyright (C) 2014 by Wolfram Sang, Sang Engineering <wsa@sang-engineering.com>
  * Copyright (C) 2014 by Renesas Electronics Corporation
  *
- * Because most slave IP cores can only detect one I2C slave address anyhow,
- * this driver does not support simulating EEPROM types which take more than
- * one address.
+ * 大多数 target/slave 控制器一次只能监听一个从地址，因此这个驱动
+ * 只模拟“单地址 EEPROM”这一类器件，不支持需要多个地址窗口的型号。
  */
 
 /*
- * FIXME: What to do if only 8 bits of a 16 bit address are sent?
- * The ST-M24C64 sends only 0xff then. Needs verification with other
- * EEPROMs, though. We currently use the 8 bit as a valid address.
+ * FIXME:
+ * 对 16 位地址 EEPROM，如果主机只发了低 8 位地址应该怎么处理？
+ * 已知 ST-M24C64 在这种情况下会回 0xff，但是否所有 EEPROM 都如此
+ * 还没有统一结论。目前这里把这 8 位地址当成有效地址使用。
  */
 
 #include <linux/bitfield.h>
@@ -64,7 +64,7 @@ static int i2c_slave_eeprom_slave_cb(struct i2c_client *client,
 		break;
 
 	case I2C_SLAVE_READ_PROCESSED:
-		/* The previous byte made it to the bus, get next one */
+		/* 上一个字节已经真正出现在总线上，现在推进到下一个字节。 */
 		eeprom->buffer_idx++;
 		fallthrough;
 	case I2C_SLAVE_READ_REQUESTED:
@@ -72,9 +72,9 @@ static int i2c_slave_eeprom_slave_cb(struct i2c_client *client,
 		*val = eeprom->buffer[eeprom->buffer_idx & eeprom->address_mask];
 		spin_unlock(&eeprom->buffer_lock);
 		/*
-		 * Do not increment buffer_idx here, because we don't know if
-		 * this byte will be actually used. Read Linux I2C slave docs
-		 * for details.
+		 * 这里不能提前递增 buffer_idx，因为还不知道主机是否真的会
+		 * 接收这个字节。target/slave 模式下，READ_REQUESTED 只表示
+		 * “控制器准备好提供一个字节”，并不等价于“该字节一定被消费”。
 		 */
 		break;
 
@@ -134,7 +134,7 @@ static int i2c_slave_init_eeprom_data(struct eeprom_data *eeprom, struct i2c_cli
 			return ret;
 		release_firmware(fw);
 	} else {
-		/* An empty eeprom typically has all bits set to 1 */
+		/* 空 EEPROM 通常默认擦成全 1。 */
 		memset(eeprom->buffer, 0xff, size);
 	}
 	return 0;

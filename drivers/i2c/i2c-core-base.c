@@ -57,8 +57,10 @@
 #define I2C_ADDR_DEVICE_ID	0x7c
 
 /*
- * core_lock protects i2c_adapter_idr, and guarantees that device detection,
- * deletion of detected devices are serialized
+ * core_lock 保护 i2c_adapter_idr，并保证以下操作串行化：
+ * - 适配器编号分配与回收
+ * - 设备探测
+ * - 通过 detect 创建的设备删除
  */
 static DEFINE_MUTEX(core_lock);
 static DEFINE_IDR(i2c_adapter_idr);
@@ -141,18 +143,20 @@ static int i2c_device_match(struct device *dev, const struct device_driver *drv)
 	struct i2c_client	*client = i2c_verify_client(dev);
 	const struct i2c_driver	*driver;
 
-
-	/* Attempt an OF style match */
+	/*
+	 * 匹配顺序：
+	 * 1. 设备树
+	 * 2. ACPI
+	 * 3. I2C id_table
+	 */
 	if (i2c_of_match_device(drv->of_match_table, client))
 		return 1;
 
-	/* Then ACPI style match */
 	if (acpi_driver_match_device(dev, drv))
 		return 1;
 
 	driver = to_i2c_driver(drv);
 
-	/* Finally an I2C match */
 	if (i2c_match_id(driver->id_table, client))
 		return 1;
 
@@ -164,6 +168,7 @@ static int i2c_device_uevent(const struct device *dev, struct kobj_uevent_env *e
 	const struct i2c_client *client = to_i2c_client(dev);
 	int rc;
 
+	/* 先输出 OF/ACPI modalias；都没有时再回退到 I2C 字符串。 */
 	rc = of_device_uevent_modalias(dev, env);
 	if (rc != -ENODEV)
 		return rc;
@@ -175,7 +180,12 @@ static int i2c_device_uevent(const struct device *dev, struct kobj_uevent_env *e
 	return add_uevent_var(env, "MODALIAS=%s%s", I2C_MODULE_PREFIX, client->name);
 }
 
-/* i2c bus recovery routines */
+/*
+ * I2C 总线恢复逻辑。
+ *
+ * 这里负责处理 SDA/SCL 卡死、时钟丢失等场景，尽量通过 GPIO 或 pinctrl
+ * 把总线恢复到可用状态。
+ */
 static int get_scl_gpio_value(struct i2c_adapter *adap)
 {
 	return gpiod_get_value_cansleep(adap->bus_recovery_info->scl_gpiod);
@@ -213,9 +223,8 @@ static int i2c_generic_bus_free(struct i2c_adapter *adap)
 }
 
 /*
- * We are generating clock pulses. ndelay() determines durating of clk pulses.
- * We will generate clock with rate 100 KHz and so duration of both clock levels
- * is: delay in ns = (10^6 / 100) / 2
+ * 这里是在手动生成时钟脉冲，ndelay() 决定每个时钟电平的持续时间。
+ * 我们按 100 KHz 目标来生成时钟，因此两个电平的持续时间都约为 5 us。
  */
 #define RECOVERY_NDELAY		5000
 #define RECOVERY_CLK_CNT	9
@@ -231,11 +240,8 @@ int i2c_generic_scl_recovery(struct i2c_adapter *adap)
 		pinctrl_select_state(bri->pinctrl, bri->pins_gpio);
 
 	/*
-	 * If we can set SDA, we will always create a STOP to ensure additional
-	 * pulses will do no harm. This is achieved by letting SDA follow SCL
-	 * half a cycle later. Check the 'incomplete_write_byte' fault injector
-	 * for details. Note that we must honour tsu:sto, 4us, but lets use 5us
-	 * here for simplicity.
+	 * 如果可以控制 SDA，就主动构造 STOP 条件，避免后续恢复脉冲
+	 * 继续干扰从设备状态。
 	 */
 	bri->set_scl(adap, scl);
 	ndelay(RECOVERY_NDELAY);
@@ -248,7 +254,7 @@ int i2c_generic_scl_recovery(struct i2c_adapter *adap)
 	 */
 	while (i++ < RECOVERY_CLK_CNT * 2) {
 		if (scl) {
-			/* SCL shouldn't be low here */
+				/* 这里 SCL 不应该还是低电平。 */
 			if (!bri->get_scl(adap)) {
 				dev_err(&adap->dev,
 					"SCL is stuck low, exit recovery\n");
@@ -259,7 +265,7 @@ int i2c_generic_scl_recovery(struct i2c_adapter *adap)
 
 		scl = !scl;
 		bri->set_scl(adap, scl);
-		/* Creating STOP again, see above */
+			/* 再次构造 STOP，避免恢复过程破坏设备状态。 */
 		if (scl)  {
 			/* Honour minimum tsu:sto */
 			ndelay(RECOVERY_NDELAY);
@@ -278,7 +284,7 @@ int i2c_generic_scl_recovery(struct i2c_adapter *adap)
 		}
 	}
 
-	/* If we can't check bus status, assume recovery worked */
+	/* 如果无法检查总线状态，就默认恢复成功。 */
 	if (ret == -EOPNOTSUPP)
 		ret = 0;
 
@@ -309,10 +315,7 @@ static void i2c_gpio_init_pinctrl_recovery(struct i2c_adapter *adap)
 
 	bri->pinctrl = p;
 
-	/*
-	 * we can't change states without pinctrl, so remove the states if
-	 * populated
-	 */
+		/* 没有 pinctrl 就无法切换状态，直接清空恢复配置。 */
 	if (!p) {
 		bri->pins_default = NULL;
 		bri->pins_gpio = NULL;
@@ -338,7 +341,7 @@ static void i2c_gpio_init_pinctrl_recovery(struct i2c_adapter *adap)
 		}
 	}
 
-	/* for pinctrl state changes, we need all the information */
+	/* 只有 default/gpio 两个状态都存在，才算完整支持 pinctrl 恢复。 */
 	if (bri->pins_default && bri->pins_gpio) {
 		dev_info(dev, "using pinctrl states for GPIO recovery");
 	} else {
@@ -355,24 +358,15 @@ static int i2c_gpio_init_generic_recovery(struct i2c_adapter *adap)
 	struct gpio_desc *gpiod;
 	int ret = 0;
 
-	/*
-	 * don't touch the recovery information if the driver is not using
-	 * generic SCL recovery
-	 */
+		/* 不是通用 SCL 恢复路径时，不要修改已有恢复信息。 */
 	if (bri->recover_bus && bri->recover_bus != i2c_generic_scl_recovery)
 		return 0;
 
-	/*
-	 * pins might be taken as GPIO, so we should inform pinctrl about
-	 * this and move the state to GPIO
-	 */
+		/* 引脚要改作 GPIO 使用时，先切到 gpio 状态。 */
 	if (bri->pinctrl)
 		pinctrl_select_state(bri->pinctrl, bri->pins_gpio);
 
-	/*
-	 * if there is incomplete or no recovery information, see if generic
-	 * GPIO recovery is available
-	 */
+		/* 恢复信息不完整时，尝试自动获取通用 GPIO 恢复引脚。 */
 	if (!bri->scl_gpiod) {
 		gpiod = devm_gpiod_get(dev, "scl", GPIOD_OUT_HIGH_OPEN_DRAIN);
 		if (PTR_ERR(gpiod) == -EPROBE_DEFER) {
@@ -389,14 +383,14 @@ static int i2c_gpio_init_generic_recovery(struct i2c_adapter *adap)
 	/* SDA GPIOD line is optional, so we care about DEFER only */
 	if (!bri->sda_gpiod) {
 		/*
-		 * We have SCL. Pull SCL low and wait a bit so that SDA glitches
-		 * have no effect.
+		 * 已经拿到 SCL 后先把它拉低，再等一小会儿，避免 SDA 毛刺
+		 * 对后续恢复动作造成影响。
 		 */
 		gpiod_direction_output(bri->scl_gpiod, 0);
 		udelay(10);
 		gpiod = devm_gpiod_get(dev, "sda", GPIOD_IN);
 
-		/* Wait a bit in case of a SDA glitch, and then release SCL. */
+		/* 再等一会儿防止 SDA 突发毛刺，然后释放 SCL。 */
 		udelay(10);
 		gpiod_direction_output(bri->scl_gpiod, 1);
 
@@ -409,7 +403,7 @@ static int i2c_gpio_init_generic_recovery(struct i2c_adapter *adap)
 	}
 
 cleanup_pinctrl_state:
-	/* change the state of the pins back to their default state */
+	/* 最后把引脚状态切回默认状态。 */
 	if (bri->pinctrl)
 		pinctrl_select_state(bri->pinctrl, bri->pins_default);
 
@@ -449,7 +443,7 @@ static int i2c_init_recovery(struct i2c_adapter *adap)
 				bri->set_sda = set_sda_gpio_value;
 		}
 	} else if (bri->recover_bus == i2c_generic_scl_recovery) {
-		/* Generic SCL recovery */
+		/* 通用 SCL 恢复。 */
 		if (!bri->set_scl || !bri->get_scl) {
 			err_str = "no {get|set}_scl() found";
 			goto err;
@@ -505,7 +499,7 @@ static int i2c_device_probe(struct device *dev)
 
 		if (client->flags & I2C_CLIENT_HOST_NOTIFY) {
 			dev_dbg(dev, "Using Host Notify IRQ\n");
-			/* Keep adapter active when Host Notify is required */
+			/* Host Notify 需要适配器保持激活，否则中断域会失效。 */
 			pm_runtime_get_sync(&client->adapter->dev);
 			irq = i2c_smbus_host_notify_to_irq(client);
 		} else if (is_of_node(fwnode)) {
@@ -532,10 +526,7 @@ static int i2c_device_probe(struct device *dev)
 
 	driver = to_i2c_driver(dev->driver);
 
-	/*
-	 * An I2C ID table is not mandatory, if and only if, a suitable OF
-	 * or ACPI ID table is supplied for the probing device.
-	 */
+	/* 设备树或 ACPI 已提供匹配信息时，id_table 不是强制要求。 */
 	if (!driver->id_table &&
 	    !acpi_driver_match_device(dev, dev->driver) &&
 	    !i2c_of_match_device(dev->driver->of_match_table, client)) {
@@ -593,11 +584,9 @@ static int i2c_device_probe(struct device *dev)
 		status = -EINVAL;
 
 	/*
-	 * Note that we are not closing the devres group opened above so
-	 * even resources that were attached to the device after probe is
-	 * run are released when i2c_device_remove() is executed. This is
-	 * needed as some drivers would allocate additional resources,
-	 * for example when updating firmware.
+	 * 这里故意不关闭 devres group。
+	 * 这样 probe 期间和 probe 之后追加的资源都会在 remove 时统一释放，
+	 * 适合固件更新等“先 probe，后补资源”的驱动。
 	 */
 
 	if (status)
@@ -637,7 +626,8 @@ static void i2c_device_remove(struct device *dev)
 	dev_pm_clear_wake_irq(&client->dev);
 	device_init_wakeup(&client->dev, false);
 
-	client->irq = 0;
+		/* 设备卸载后，IRQ 和 Host Notify 相关状态都要清理。 */
+		client->irq = 0;
 	if (client->flags & I2C_CLIENT_HOST_NOTIFY)
 		pm_runtime_put(&client->adapter->dev);
 }
@@ -689,7 +679,7 @@ static DEVICE_ATTR_RO(modalias);
 
 static struct attribute *i2c_dev_attrs[] = {
 	&dev_attr_name.attr,
-	/* modalias helps coldplug:  modprobe $(cat .../modalias) */
+	/* modalias 方便冷插拔：用户空间可以直接据此 modprobe 对应驱动。 */
 	&dev_attr_modalias.attr,
 	NULL
 };
@@ -713,13 +703,11 @@ EXPORT_SYMBOL_GPL(i2c_client_type);
 
 
 /**
- * i2c_verify_client - return parameter as i2c_client, or NULL
+ * i2c_verify_client - 将参数验证为 i2c_client，否则返回 NULL
  * @dev: device, probably from some driver model iterator
  *
- * When traversing the driver model tree, perhaps using driver model
- * iterators like @device_for_each_child(), you can't assume very much
- * about the nodes you find.  Use this function to avoid oopses caused
- * by wrongly treating some non-I2C device as an i2c_client.
+ * 在遍历 driver model 树时，不能假设遇到的节点一定是 I2C 设备。
+ * 这个 helper 用来避免把非 I2C 设备误当成 i2c_client。
  */
 struct i2c_client *i2c_verify_client(struct device *dev)
 {
@@ -730,12 +718,12 @@ struct i2c_client *i2c_verify_client(struct device *dev)
 EXPORT_SYMBOL(i2c_verify_client);
 
 
-/* Return a unique address which takes the flags of the client into account */
+/* 生成一个唯一地址，并把 client 的 flags 也编码进去，避免冲突。 */
 static unsigned short i2c_encode_flags_to_addr(struct i2c_client *client)
 {
 	unsigned short addr = client->addr;
 
-	/* For some client flags, add an arbitrary offset to avoid collisions */
+	/* 某些 client flags 需要额外偏移，以避免地址碰撞。 */
 	if (client->flags & I2C_CLIENT_TEN)
 		addr |= I2C_ADDR_OFFSET_TEN_BIT;
 
@@ -745,37 +733,40 @@ static unsigned short i2c_encode_flags_to_addr(struct i2c_client *client)
 	return addr;
 }
 
-/* This is a permissive address validity check, I2C address map constraints
- * are purposely not enforced, except for the general call address. */
+/*
+ * 这是一个宽松的地址合法性检查。
+ * 除了通用调用地址外，不强制执行完整的 I2C 地址映射约束。
+ */
 static int i2c_check_addr_validity(unsigned int addr, unsigned short flags)
 {
 	if (flags & I2C_CLIENT_TEN) {
-		/* 10-bit address, all values are valid */
+		/* 10 位地址，所有值都视为合法范围内。 */
 		if (addr > 0x3ff)
 			return -EINVAL;
 	} else {
-		/* 7-bit address, reject the general call address */
+		/* 7 位地址，拒绝通用调用地址。 */
 		if (addr == 0x00 || addr > 0x7f)
 			return -EINVAL;
 	}
 	return 0;
 }
 
-/* And this is a strict address validity check, used when probing. If a
- * device uses a reserved address, then it shouldn't be probed. 7-bit
- * addressing is assumed, 10-bit address devices are rare and should be
- * explicitly enumerated. */
+/*
+ * 这是一个严格的地址合法性检查，主要用于 probe。
+ * 如果设备使用保留地址，就不应该被扫描。
+ * 这里默认按 7 位地址处理，10 位地址设备应当显式枚举。
+ */
 int i2c_check_7bit_addr_validity_strict(unsigned short addr)
 {
 	/*
-	 * Reserved addresses per I2C specification:
-	 *  0x00       General call address / START byte
-	 *  0x01       CBUS address
-	 *  0x02       Reserved for different bus format
-	 *  0x03       Reserved for future purposes
-	 *  0x04-0x07  Hs-mode master code
-	 *  0x78-0x7b  10-bit slave addressing
-	 *  0x7c-0x7f  Reserved for future purposes
+	 * I2C 规范里的保留地址：
+	 *  0x00       通用调用地址 / START byte
+	 *  0x01       CBUS 地址
+	 *  0x02       为不同总线格式保留
+	 *  0x03       预留给未来用途
+	 *  0x04-0x07  高速模式 master code
+	 *  0x78-0x7b  10 位从设备地址
+	 *  0x7c-0x7f  预留给未来用途
 	 */
 	if (addr < 0x08 || addr > 0x77)
 		return -EINVAL;
@@ -792,7 +783,7 @@ static int __i2c_check_addr_busy(struct device *dev, void *addrp)
 	return 0;
 }
 
-/* walk up mux tree */
+/* 向上遍历 mux 树。 */
 static int i2c_check_mux_parents(struct i2c_adapter *adapter, int addr)
 {
 	struct i2c_adapter *parent = i2c_parent_is_i2c_adapter(adapter);
@@ -807,7 +798,7 @@ static int i2c_check_mux_parents(struct i2c_adapter *adapter, int addr)
 	return result;
 }
 
-/* recurse down mux tree */
+/* 向下递归遍历 mux 树。 */
 static int i2c_check_mux_children(struct device *dev, void *addrp)
 {
 	int result;
@@ -837,10 +828,10 @@ static int i2c_check_addr_busy(struct i2c_adapter *adapter, int addr)
 }
 
 /**
- * i2c_adapter_lock_bus - Get exclusive access to an I2C bus segment
- * @adapter: Target I2C bus segment
- * @flags: I2C_LOCK_ROOT_ADAPTER locks the root i2c adapter, I2C_LOCK_SEGMENT
- *	locks only this branch in the adapter tree
+ * i2c_adapter_lock_bus - 获取某个 I2C 总线段的独占访问权
+ * @adapter: 目标 I2C 总线段
+ * @flags:   I2C_LOCK_ROOT_ADAPTER 表示锁住根适配器，
+ *	     I2C_LOCK_SEGMENT 表示只锁当前拓扑分支
  */
 static void i2c_adapter_lock_bus(struct i2c_adapter *adapter,
 				 unsigned int flags)
@@ -849,10 +840,10 @@ static void i2c_adapter_lock_bus(struct i2c_adapter *adapter,
 }
 
 /**
- * i2c_adapter_trylock_bus - Try to get exclusive access to an I2C bus segment
- * @adapter: Target I2C bus segment
- * @flags: I2C_LOCK_ROOT_ADAPTER trylocks the root i2c adapter, I2C_LOCK_SEGMENT
- *	trylocks only this branch in the adapter tree
+ * i2c_adapter_trylock_bus - 尝试获取某个 I2C 总线段的独占访问权
+ * @adapter: 目标 I2C 总线段
+ * @flags:   I2C_LOCK_ROOT_ADAPTER 表示尝试锁住根适配器，
+ *	     I2C_LOCK_SEGMENT 表示只尝试锁当前拓扑分支
  */
 static int i2c_adapter_trylock_bus(struct i2c_adapter *adapter,
 				   unsigned int flags)
@@ -861,10 +852,10 @@ static int i2c_adapter_trylock_bus(struct i2c_adapter *adapter,
 }
 
 /**
- * i2c_adapter_unlock_bus - Release exclusive access to an I2C bus segment
- * @adapter: Target I2C bus segment
- * @flags: I2C_LOCK_ROOT_ADAPTER unlocks the root i2c adapter, I2C_LOCK_SEGMENT
- *	unlocks only this branch in the adapter tree
+ * i2c_adapter_unlock_bus - 释放某个 I2C 总线段的独占访问权
+ * @adapter: 目标 I2C 总线段
+ * @flags:   I2C_LOCK_ROOT_ADAPTER 表示解锁根适配器，
+ *	     I2C_LOCK_SEGMENT 表示只解锁当前拓扑分支
  */
 static void i2c_adapter_unlock_bus(struct i2c_adapter *adapter,
 				   unsigned int flags)
@@ -919,8 +910,8 @@ int i2c_dev_irq_from_resources(const struct resource *resources,
 }
 
 /*
- * Serialize device instantiation in case it can be instantiated explicitly
- * and by auto-detection
+ * 设备实例化需要串行化，
+ * 因为同一个地址可能既能被显式创建，也能被自动探测创建。
  */
 static int i2c_lock_addr(struct i2c_adapter *adap, unsigned short addr,
 			 unsigned short flags)
@@ -940,20 +931,31 @@ static void i2c_unlock_addr(struct i2c_adapter *adap, unsigned short addr,
 }
 
 /**
- * i2c_new_client_device - instantiate an i2c device
- * @adap: the adapter managing the device
- * @info: describes one I2C device; bus_num is ignored
+ * i2c_new_client_device - 实例化一个 I2C 设备
+ * @adap: 管理该设备的适配器
+ * @info: 描述一个 I2C 设备；其中 bus_num 会被忽略
  * Context: can sleep
  *
- * Create an i2c device. Binding is handled through driver model
- * probe()/remove() methods.  A driver may be bound to this device when we
- * return from this function, or any later moment (e.g. maybe hotplugging will
- * load the driver module).  This call is not appropriate for use by mainboard
- * initialization logic, which usually runs during an arch_initcall() long
- * before any i2c_adapter could exist.
+ * 这是 I2C core 里最基础的“显式创建设备实例”入口。它负责把
+ * `struct i2c_board_info` 转成真正的 `struct i2c_client` 和
+ * `struct device`，再交给 driver core 去做匹配与 probe。
  *
- * This returns the new i2c client, which may be saved for later use with
- * i2c_unregister_device(); or an ERR_PTR to describe the error.
+ * 设备绑定由 driver model 接管：匹配成功后会进入 probe/remove 生命周期。
+ * 在这个函数返回时，驱动可能已经绑定到设备，也可能稍后才绑定
+ * （例如热插拔会在之后加载驱动模块）。
+ *
+ * 这个接口不适合板级初始化代码使用，因为板级初始化通常发生在
+ * arch_initcall() 阶段，那个时候 I2C 适配器还可能根本不存在。
+ *
+ * 内部关键步骤包括：
+ * - 校验地址是否合法
+ * - 用 addrs_in_instantiation 串行化同地址实例化
+ * - 检查总线上该地址是否已被占用
+ * - 挂接 fwnode / software node / IRQ 等设备描述
+ * - 注册 struct device，让后续匹配进入 driver core
+ *
+ * 返回新的 i2c client，后续可交给 i2c_unregister_device() 释放；
+ * 如果出错，则返回 ERR_PTR。
  */
 struct i2c_client *
 i2c_new_client_device(struct i2c_adapter *adap, struct i2c_board_info const *info)
@@ -991,7 +993,7 @@ i2c_new_client_device(struct i2c_adapter *adap, struct i2c_board_info const *inf
 	if (status)
 		goto out_err_silent;
 
-	/* Check for address business */
+	/* 再检查这条总线上是否已经有别的设备占用了同一地址。 */
 	status = i2c_check_addr_busy(adap, i2c_encode_flags_to_addr(client));
 	if (status)
 		goto out_err;
@@ -1046,9 +1048,13 @@ out_err_silent:
 EXPORT_SYMBOL_GPL(i2c_new_client_device);
 
 /**
- * i2c_unregister_device - reverse effect of i2c_new_*_device()
- * @client: value returned from i2c_new_*_device()
+ * i2c_unregister_device - 撤销 i2c_new_*_device() 创建的设备
+ * @client: 由 i2c_new_*_device() 返回的 client
  * Context: can sleep
+ *
+ * 这个函数负责把一个显式实例化出来的 I2C 设备从 driver model 中移除。
+ * 除了普通的 device_unregister()，它还要顺便清理 OF/ACPI/software node
+ * 侧的“已枚举”状态，否则同一个固件节点后续可能无法再次被实例化。
  */
 void i2c_unregister_device(struct i2c_client *client)
 {
@@ -1064,8 +1070,8 @@ void i2c_unregister_device(struct i2c_client *client)
 		acpi_device_clear_enumerated(to_acpi_device_node(fwnode));
 
 	/*
-	 * If the primary fwnode is a software node it is free-ed by
-	 * device_remove_software_node() below, avoid double-free.
+	 * 如果主 fwnode 本身就是 software node，那么后面的
+	 * device_remove_software_node() 会负责释放它，这里不能再 put 一次。
 	 */
 	if (!is_software_node(fwnode))
 		fwnode_handle_put(fwnode);
@@ -1076,13 +1082,13 @@ void i2c_unregister_device(struct i2c_client *client)
 EXPORT_SYMBOL_GPL(i2c_unregister_device);
 
 /**
- * i2c_find_device_by_fwnode() - find an i2c_client for the fwnode
- * @fwnode: &struct fwnode_handle corresponding to the &struct i2c_client
+ * i2c_find_device_by_fwnode() - 根据 fwnode 查找对应的 i2c_client
+ * @fwnode: 与目标 &struct i2c_client 对应的 &struct fwnode_handle
  *
- * Look up and return the &struct i2c_client corresponding to the @fwnode.
- * If no client can be found, or @fwnode is NULL, this returns NULL.
+ * 查找并返回与 @fwnode 对应的 &struct i2c_client。
+ * 如果找不到 client，或者 @fwnode 为空，则返回 NULL。
  *
- * The user must call put_device(&client->dev) once done with the i2c client.
+ * 使用完后，调用者必须执行 put_device(&client->dev)。
  */
 struct i2c_client *i2c_find_device_by_fwnode(struct fwnode_handle *fwnode)
 {
@@ -1123,22 +1129,20 @@ static struct i2c_driver dummy_driver = {
 };
 
 /**
- * i2c_new_dummy_device - return a new i2c device bound to a dummy driver
- * @adapter: the adapter managing the device
- * @address: seven bit address to be used
+ * i2c_new_dummy_device - 创建一个绑定到 dummy driver 的 I2C 设备
+ * @adapter: 管理该设备的适配器
+ * @address: 要使用的 7 位地址
  * Context: can sleep
  *
- * This returns an I2C client bound to the "dummy" driver, intended for use
- * with devices that consume multiple addresses.  Examples of such chips
- * include various EEPROMS (like 24c04 and 24c08 models).
+ * 这个 dummy client 常用于多地址芯片的“附属地址”访问：
  *
- * These dummy devices have two main uses.  First, most I2C and SMBus calls
- * except i2c_transfer() need a client handle; the dummy will be that handle.
- * And second, this prevents the specified address from being bound to a
- * different driver.
+ * - 给 SMBus/I2C API 提供一个可用的 client 句柄
+ * - 阻止其他驱动抢占这个地址
  *
- * This returns the new i2c client, which should be saved for later use with
- * i2c_unregister_device(); or an ERR_PTR to describe the error.
+ * 它适合 EEPROM、codec 等会占用多个地址的芯片。
+ *
+ * 返回一个绑定到 "dummy" 驱动的 I2C client，后续可交给
+ * i2c_unregister_device() 释放；如果出错，则返回 ERR_PTR。
  */
 struct i2c_client *i2c_new_dummy_device(struct i2c_adapter *adapter, u16 address)
 {
@@ -1156,14 +1160,14 @@ static void devm_i2c_release_dummy(void *client)
 }
 
 /**
- * devm_i2c_new_dummy_device - return a new i2c device bound to a dummy driver
- * @dev: device the managed resource is bound to
- * @adapter: the adapter managing the device
- * @address: seven bit address to be used
+ * devm_i2c_new_dummy_device - i2c_new_dummy_device() 的受管理版本
+ * @dev: 该受管理资源绑定到的设备
+ * @adapter: 管理该设备的适配器
+ * @address: 要使用的 7 位地址
  * Context: can sleep
  *
- * This is the device-managed version of @i2c_new_dummy_device. It returns the
- * new i2c client or an ERR_PTR in case of an error.
+ * 这是 @i2c_new_dummy_device 的设备管理版本。成功时返回新的
+ * i2c client，失败时返回 ERR_PTR。
  */
 struct i2c_client *devm_i2c_new_dummy_device(struct device *dev,
 					     struct i2c_adapter *adapter,
@@ -1185,26 +1189,33 @@ struct i2c_client *devm_i2c_new_dummy_device(struct device *dev,
 EXPORT_SYMBOL_GPL(devm_i2c_new_dummy_device);
 
 /**
- * i2c_new_ancillary_device - Helper to get the instantiated secondary address
- * and create the associated device
- * @client: Handle to the primary client
- * @name: Handle to specify which secondary address to get
- * @default_addr: Used as a fallback if no secondary address was specified
+ * i2c_new_ancillary_device - 根据从属名称创建附属 I2C 设备
+ *
+ * 这个 helper 用来处理“一个物理芯片占用多个 I2C 地址”的场景。
+ * 主驱动通常先绑定主地址，然后再通过名字查找固件里声明的次级地址，
+ * 为这些附属地址创建 dummy client，后续即可借助标准 SMBus/I2C API
+ * 去访问它们。
+ *
+ * 这个 helper 会从固件描述里查找 secondary address，再创建对应的 dummy
+ * client。常见于一个芯片内部拆成多个 I2C slave 的场景。
+ * @client: 主 client
+ * @name: 用来指定要获取哪个 secondary address 的名称
+ * @default_addr: 如果固件里没有指定 secondary address，就使用这个值
  * Context: can sleep
  *
- * I2C clients can be composed of multiple I2C slaves bound together in a single
- * component. The I2C client driver then binds to the master I2C slave and needs
- * to create I2C dummy clients to communicate with all the other slaves.
+ * 一个 I2C client 可能由多个 I2C slave 共同组成一个单元。此时
+ * I2C client 驱动先绑定到主 I2C slave，再创建 I2C dummy client，
+ * 用来和其它 slave 通信。
  *
- * This function creates and returns an I2C dummy client whose I2C address is
- * retrieved from the platform firmware based on the given slave name. If no
- * address is specified by the firmware default_addr is used.
+ * 这个函数会创建并返回一个 I2C dummy client，它的 I2C 地址来源于
+ * 平台固件中与给定 slave 名称匹配的条目；如果固件没有提供地址，
+ * 就使用 default_addr。
  *
- * On DT-based platforms the address is retrieved from the "reg" property entry
- * cell whose "reg-names" value matches the slave name.
+ * 在基于 DT 的平台上，地址会从 "reg" 属性中读取，而对应的
+ * "reg-names" 值必须和 slave 名称匹配。
  *
- * This returns the new i2c client, which should be saved for later use with
- * i2c_unregister_device(); or an ERR_PTR to describe the error.
+ * 返回新的 i2c client，后续可交给 i2c_unregister_device() 释放；
+ * 如果出错，则返回 ERR_PTR。
  */
 struct i2c_client *i2c_new_ancillary_device(struct i2c_client *client,
 						const char *name,
@@ -1225,7 +1236,7 @@ EXPORT_SYMBOL_GPL(i2c_new_ancillary_device);
 
 /* ------------------------------------------------------------------------- */
 
-/* I2C bus adapters -- one roots each I2C or SMBUS segment */
+/* I2C 适配器管理：每个 adapter 对应一段独立的 I2C/SMBus 总线。 */
 
 static void i2c_adapter_dev_release(struct device *dev)
 {
@@ -1250,14 +1261,15 @@ unsigned int i2c_adapter_depth(struct i2c_adapter *adapter)
 EXPORT_SYMBOL_GPL(i2c_adapter_depth);
 
 /*
- * Let users instantiate I2C devices through sysfs. This can be used when
- * platform initialization code doesn't contain the proper data for
- * whatever reason. Also useful for drivers that do device detection and
- * detection fails, either because the device uses an unexpected address,
- * or this is a compatible device with different ID register values.
+ * 允许用户通过 sysfs 手工实例化 I2C 设备。
  *
- * Parameter checking may look overzealous, but we really don't want
- * the user to provide incorrect parameters.
+ * 这种方式适合平台初始化代码没有提供正确设备信息的场景，
+ * 也适合那些依赖探测逻辑、但自动探测失败的驱动。失败原因
+ * 可能是设备地址与预期不一致，也可能是兼容器件使用了不同的
+ * ID 寄存器值。
+ *
+ * 这里的参数检查看起来比较严格，但这是有意为之，避免用户
+ * 传入错误参数导致创建出错误的设备实例。
  */
 static ssize_t
 new_device_store(struct device *dev, struct device_attribute *attr,
@@ -1282,7 +1294,7 @@ new_device_store(struct device *dev, struct device_attribute *attr,
 	}
 	memcpy(info.type, buf, blank - buf);
 
-	/* Parse remaining parameters, reject extra parameters */
+	/* 解析剩余参数，并拒绝多余字段。 */
 	res = sscanf(++blank, "%hi%c", &info.addr, &end);
 	if (res < 1) {
 		dev_err(dev, "%s: Can't parse I2C address\n", "new_device");
@@ -1307,7 +1319,7 @@ new_device_store(struct device *dev, struct device_attribute *attr,
 	if (IS_ERR(client))
 		return PTR_ERR(client);
 
-	/* Keep track of the added device */
+	/* 记录这个通过 sysfs 添加的设备，便于后续删除。 */
 	mutex_lock(&adap->userspace_clients_lock);
 	list_add_tail(&client->detected, &adap->userspace_clients);
 	mutex_unlock(&adap->userspace_clients_lock);
@@ -1319,13 +1331,13 @@ new_device_store(struct device *dev, struct device_attribute *attr,
 static DEVICE_ATTR_WO(new_device);
 
 /*
- * And of course let the users delete the devices they instantiated, if
- * they got it wrong. This interface can only be used to delete devices
- * instantiated by i2c_sysfs_new_device above. This guarantees that we
- * don't delete devices to which some kernel code still has references.
+ * 当然也允许用户删除自己通过 sysfs 创建的设备，防止手工创建
+ * 错误后无法回收。
  *
- * Parameter checking may look overzealous, but we really don't want
- * the user to delete the wrong device.
+ * 这个接口只能删除上面通过 i2c_sysfs_new_device 创建的设备，
+ * 这样可以保证不会误删仍被内核代码引用的设备。
+ *
+ * 这里的参数检查同样比较严格，因为我们不希望用户删错设备。
  */
 static ssize_t
 delete_device_store(struct device *dev, struct device_attribute *attr,
@@ -1337,7 +1349,7 @@ delete_device_store(struct device *dev, struct device_attribute *attr,
 	char end;
 	int res;
 
-	/* Parse parameters, reject extra parameters */
+	/* 解析参数，并拒绝多余字段。 */
 	res = sscanf(buf, "%hi%c", &addr, &end);
 	if (res < 1) {
 		dev_err(dev, "%s: Can't parse I2C address\n", "delete_device");
@@ -1348,7 +1360,7 @@ delete_device_store(struct device *dev, struct device_attribute *attr,
 		return -EINVAL;
 	}
 
-	/* Make sure the device was added through sysfs */
+	/* 确认目标设备确实是通过 sysfs 创建出来的。 */
 	res = -ENOENT;
 	mutex_lock_nested(&adap->userspace_clients_lock,
 			  i2c_adapter_depth(adap));
@@ -1389,13 +1401,12 @@ const struct device_type i2c_adapter_type = {
 EXPORT_SYMBOL_GPL(i2c_adapter_type);
 
 /**
- * i2c_verify_adapter - return parameter as i2c_adapter or NULL
- * @dev: device, probably from some driver model iterator
+ * i2c_verify_adapter - 将参数验证为 i2c_adapter，否则返回 NULL
+ * @dev: 设备对象，通常来自驱动模型迭代器
  *
- * When traversing the driver model tree, perhaps using driver model
- * iterators like @device_for_each_child(), you can't assume very much
- * about the nodes you find.  Use this function to avoid oopses caused
- * by wrongly treating some non-I2C device as an i2c_adapter.
+ * 在遍历驱动模型树时，尤其是使用 @device_for_each_child() 这类
+ * 迭代器时，不能对遇到的节点做太多假设。使用这个辅助函数可以
+ * 避免把非 I2C 设备误当成 i2c_adapter，从而引发崩溃。
  */
 struct i2c_adapter *i2c_verify_adapter(struct device *dev)
 {
@@ -1423,7 +1434,7 @@ static void i2c_scan_static_board_info(struct i2c_adapter *adapter)
 static int i2c_do_add_adapter(struct i2c_driver *driver,
 			      struct i2c_adapter *adap)
 {
-	/* Detect supported devices on that bus, and instantiate them */
+	/* 扫描当前总线上可识别的设备，并实例化对应的 client。 */
 	i2c_detect(adap, driver);
 
 	return 0;
@@ -1487,14 +1498,13 @@ static int i2c_setup_host_notify_irq_domain(struct i2c_adapter *adap)
 }
 
 /**
- * i2c_handle_smbus_host_notify - Forward a Host Notify event to the correct
- * I2C client.
- * @adap: the adapter
- * @addr: the I2C address of the notifying device
+ * i2c_handle_smbus_host_notify - 将 Host Notify 事件转发给正确的 I2C client
+ * @adap: 目标适配器
+ * @addr: 发出通知的设备地址
  * Context: can't sleep
  *
- * Helper function to be called from an I2C bus driver's interrupt
- * handler. It will schedule the Host Notify IRQ.
+ * 这是给 I2C 总线驱动中断处理函数调用的辅助函数，用来安排
+ * 对应的 Host Notify IRQ。
  */
 int i2c_handle_smbus_host_notify(struct i2c_adapter *adap, unsigned short addr)
 {
@@ -1519,13 +1529,13 @@ static int i2c_register_adapter(struct i2c_adapter *adap)
 {
 	int res = -EINVAL;
 
-	/* Can't register until after driver model init */
+	/* 必须等驱动模型初始化完成后才能注册。 */
 	if (WARN_ON(!is_registered)) {
 		res = -EAGAIN;
 		goto out_list;
 	}
 
-	/* Sanity checks */
+	/* 基本有效性检查。 */
 	if (WARN(!adap->name[0], "i2c adapter has no name"))
 		goto out_list;
 
@@ -1543,11 +1553,11 @@ static int i2c_register_adapter(struct i2c_adapter *adap)
 	mutex_init(&adap->userspace_clients_lock);
 	INIT_LIST_HEAD(&adap->userspace_clients);
 
-	/* Set default timeout to 1 second if not already set */
+	/* 如果还没有设置默认超时，就把它设为 1 秒。 */
 	if (adap->timeout == 0)
 		adap->timeout = HZ;
 
-	/* register soft irqs for Host Notify */
+	/* 为 Host Notify 注册软中断映射。 */
 	res = i2c_setup_host_notify_irq_domain(adap);
 	if (res) {
 		pr_err("adapter '%s': can't create Host Notify IRQs (%d)\n",
@@ -1561,8 +1571,8 @@ static int i2c_register_adapter(struct i2c_adapter *adap)
 	device_initialize(&adap->dev);
 
 	/*
-	 * This adapter can be used as a parent immediately after device_add(),
-	 * setup runtime-pm (especially ignore-children) before hand.
+	 * device_add() 之后这个适配器就可能被当作父设备使用，
+	 * 所以必须提前准备好 runtime PM，尤其是 ignore-children。
 	 */
 	device_enable_async_suspend(&adap->dev);
 	pm_runtime_no_callbacks(&adap->dev);
@@ -1588,7 +1598,7 @@ static int i2c_register_adapter(struct i2c_adapter *adap)
 
 	dev_dbg(&adap->dev, "adapter [%s] registered\n", adap->name);
 
-	/* create pre-declared device nodes */
+	/* 创建预先声明好的设备节点。 */
 	of_i2c_register_devices(adap);
 	i2c_acpi_install_space_handler(adap);
 	i2c_acpi_register_devices(adap);
@@ -1596,7 +1606,7 @@ static int i2c_register_adapter(struct i2c_adapter *adap)
 	if (adap->nr < __i2c_first_dynamic_bus_num)
 		i2c_scan_static_board_info(adap);
 
-	/* Notify drivers */
+	/* 通知已经存在的驱动来尝试绑定这个新适配器。 */
 	mutex_lock(&core_lock);
 	bus_for_each_drv(&i2c_bus_type, NULL, adap, __process_new_adapter);
 	mutex_unlock(&core_lock);
@@ -1616,11 +1626,11 @@ out_list:
 }
 
 /**
- * __i2c_add_numbered_adapter - i2c_add_numbered_adapter where nr is never -1
- * @adap: the adapter to register (with adap->nr initialized)
+ * __i2c_add_numbered_adapter - 适用于 bus number 已经固定的注册路径
+ * @adap: 要注册的适配器，调用前已经初始化 adap->nr
  * Context: can sleep
  *
- * See i2c_add_numbered_adapter() for details.
+ * 这是 i2c_add_numbered_adapter() 的内部实现，适配器号不会是 -1。
  */
 static int __i2c_add_numbered_adapter(struct i2c_adapter *adap)
 {
@@ -1636,18 +1646,26 @@ static int __i2c_add_numbered_adapter(struct i2c_adapter *adap)
 }
 
 /**
- * i2c_add_adapter - declare i2c adapter, use dynamic bus number
- * @adapter: the adapter to add
+ * i2c_add_adapter - 注册 I2C 适配器，使用动态总线号
+ * @adapter: 要添加的适配器
  * Context: can sleep
  *
- * This routine is used to declare an I2C adapter when its bus number
- * doesn't matter or when its bus number is specified by an dt alias.
- * Examples of bases when the bus number doesn't matter: I2C adapters
- * dynamically added by USB links or PCI plugin cards.
+ * 这个接口用于总线号不重要，或者总线号由 DT alias 指定的场景。
+ * 例如 USB 转接出来的 I2C 适配器，或者 PCI 插件卡上的 I2C 控制器。
  *
- * When this returns zero, a new bus number was allocated and stored
- * in adap->nr, and the specified adapter became available for clients.
- * Otherwise, a negative errno value is returned.
+ * 核心流程是：
+ * - 若固件给了 `i2cX` alias，就优先复用这个编号
+ * - 否则从动态总线号区间分配一个空闲 nr
+ * - 再调用 i2c_register_adapter() 完成剩余注册动作
+ *
+ * i2c_register_adapter() 内部还会继续做：
+ * - 注册 adapter 的 struct device
+ * - 建立 sysfs/debugfs 节点
+ * - 枚举 OF/ACPI/boardinfo 里预声明的 client
+ * - 让已经注册的 i2c_driver 补做一轮探测
+ *
+ * 返回 0 表示成功，此时会为适配器分配一个新的总线号并写入
+ * adap->nr；否则返回负的 errno。
  */
 int i2c_add_adapter(struct i2c_adapter *adapter)
 {
@@ -1674,27 +1692,23 @@ int i2c_add_adapter(struct i2c_adapter *adapter)
 EXPORT_SYMBOL(i2c_add_adapter);
 
 /**
- * i2c_add_numbered_adapter - declare i2c adapter, use static bus number
- * @adap: the adapter to register (with adap->nr initialized)
+ * i2c_add_numbered_adapter - 注册 I2C 适配器，使用静态总线号
+ * @adap: 要注册的适配器，调用前已经初始化 adap->nr
  * Context: can sleep
  *
- * This routine is used to declare an I2C adapter when its bus number
- * matters.  For example, use it for I2C adapters from system-on-chip CPUs,
- * or otherwise built in to the system's mainboard, and where i2c_board_info
- * is used to properly configure I2C devices.
+ * 这个接口用于总线号很重要的场景。例如 SoC 内部固定的 I2C 控制器，
+ * 或者板级设计中已经明确指定总线号、并通过 i2c_board_info 配置
+ * 设备的场景。
  *
- * If the requested bus number is set to -1, then this function will behave
- * identically to i2c_add_adapter, and will dynamically assign a bus number.
+ * 如果请求的总线号是 -1，那么这个函数会退化成 i2c_add_adapter()，
+ * 转而动态分配一个总线号。
  *
- * If no devices have pre-been declared for this bus, then be sure to
- * register the adapter before any dynamically allocated ones.  Otherwise
- * the required bus ID may not be available.
+ * 如果这条总线上没有提前声明过设备，务必先注册适配器，再注册动态
+ * 创建的设备，否则需要的总线号可能会被占用。
  *
- * When this returns zero, the specified adapter became available for
- * clients using the bus number provided in adap->nr.  Also, the table
- * of I2C devices pre-declared using i2c_register_board_info() is scanned,
- * and the appropriate driver model device nodes are created.  Otherwise, a
- * negative errno value is returned.
+ * 返回 0 表示成功，此时 adap->nr 对应的总线可以被客户端使用，
+ * 同时会扫描 i2c_register_board_info() 预先登记的设备并创建
+ * 相应的驱动模型节点；否则返回负的 errno。
  */
 int i2c_add_numbered_adapter(struct i2c_adapter *adap)
 {
@@ -1710,8 +1724,7 @@ static void i2c_do_del_adapter(struct i2c_driver *driver,
 {
 	struct i2c_client *client, *_n;
 
-	/* Remove the devices we created ourselves as the result of hardware
-	 * probing (using a driver's detect method) */
+	/* 删除之前通过 detect 自动创建的设备。 */
 	list_for_each_entry_safe(client, _n, &driver->clients, detected) {
 		if (client->adapter == adapter) {
 			dev_dbg(&adapter->dev, "Removing %s at 0x%x\n",
@@ -1744,19 +1757,28 @@ static int __process_removed_adapter(struct device_driver *d, void *data)
 }
 
 /**
- * i2c_del_adapter - unregister I2C adapter
- * @adap: the adapter being unregistered
+ * i2c_del_adapter - 注销 I2C 适配器
+ * @adap: 要注销的适配器
  * Context: can sleep
  *
- * This unregisters an I2C adapter which was previously registered
- * by @i2c_add_adapter or @i2c_add_numbered_adapter.
+ * 注销一个之前通过 @i2c_add_adapter 或 @i2c_add_numbered_adapter
+ * 注册成功的 I2C 适配器。
+ *
+ * 删除顺序不能乱：
+ * - 先让所有使用 detect() 自动生成的设备撤掉
+ * - 再清理 userspace 通过 sysfs 创建的 client
+ * - 再分两轮注销真实 client 和 dummy client
+ * - 最后注销 adapter 自身并归还总线号
+ *
+ * 之所以把 dummy client 放到第二轮，是因为一些真实驱动会在 remove()
+ * 期间依赖这些 dummy 句柄去完成寄存器收尾或撤销附属地址状态。
  */
 void i2c_del_adapter(struct i2c_adapter *adap)
 {
 	struct i2c_adapter *found;
 	struct i2c_client *client, *next;
 
-	/* First make sure that this adapter was ever added */
+	/* 先确认这个适配器确实注册过。 */
 	mutex_lock(&core_lock);
 	found = idr_find(&i2c_adapter_idr, adap->nr);
 	mutex_unlock(&core_lock);
@@ -1766,13 +1788,13 @@ void i2c_del_adapter(struct i2c_adapter *adap)
 	}
 
 	i2c_acpi_remove_space_handler(adap);
-	/* Tell drivers about this removal */
+	/* 通知驱动这个适配器正在被移除。 */
 	mutex_lock(&core_lock);
 	bus_for_each_drv(&i2c_bus_type, NULL, adap,
 			       __process_removed_adapter);
 	mutex_unlock(&core_lock);
 
-	/* Remove devices instantiated from sysfs */
+	/* 移除之前通过 sysfs 实例化出来的设备。 */
 	mutex_lock_nested(&adap->userspace_clients_lock,
 			  i2c_adapter_depth(adap));
 	list_for_each_entry_safe(client, next, &adap->userspace_clients,
@@ -1784,15 +1806,16 @@ void i2c_del_adapter(struct i2c_adapter *adap)
 	}
 	mutex_unlock(&adap->userspace_clients_lock);
 
-	/* Detach any active clients. This can't fail, thus we do not
-	 * check the returned value. This is a two-pass process, because
-	 * we can't remove the dummy devices during the first pass: they
-	 * could have been instantiated by real devices wishing to clean
-	 * them up properly, so we give them a chance to do that first. */
+	/*
+	 * 分两轮拆掉当前绑定的客户端。这个过程不会失败，所以不检查
+	 * 返回值。之所以要两轮，是因为 dummy 设备不能在第一轮就删掉：
+	 * 它们可能是由真实设备创建出来、用于后续清理的，所以要先给
+	 * 真实设备一个自行清理 dummy 的机会。
+	 */
 	device_for_each_child(&adap->dev, NULL, __unregister_client);
 	device_for_each_child(&adap->dev, NULL, __unregister_dummy);
 
-	/* device name is gone after device_unregister */
+	/* device_unregister 之后设备名就不再可靠。 */
 	dev_dbg(&adap->dev, "adapter [%s] unregistered\n", adap->name);
 
 	pm_runtime_disable(&adap->dev);
@@ -1801,24 +1824,23 @@ void i2c_del_adapter(struct i2c_adapter *adap)
 
 	debugfs_remove_recursive(adap->debugfs);
 
-	/* wait until all references to the device are gone
+	/*
+	 * 等待所有引用都释放完毕。
 	 *
-	 * FIXME: This is old code and should ideally be replaced by an
-	 * alternative which results in decoupling the lifetime of the struct
-	 * device from the i2c_adapter, like spi or netdev do. Any solution
-	 * should be thoroughly tested with DEBUG_KOBJECT_RELEASE enabled!
+	 * FIXME: 这段老代码理想情况下应该改掉，最好像 SPI 或 netdev
+	 * 那样，把 struct device 的生命周期和 i2c_adapter 解耦。任何
+	 * 替代方案都应该在打开 DEBUG_KOBJECT_RELEASE 后充分测试。
 	 */
 	init_completion(&adap->dev_released);
 	device_unregister(&adap->dev);
 	wait_for_completion(&adap->dev_released);
 
-	/* free bus id */
+	/* 释放总线号。 */
 	mutex_lock(&core_lock);
 	idr_remove(&i2c_adapter_idr, adap->nr);
 	mutex_unlock(&core_lock);
 
-	/* Clear the device structure in case this adapter is ever going to be
-	   added again */
+	/* 清空 device 结构，避免这个适配器将来再次注册时残留旧状态。 */
 	memset(&adap->dev, 0, sizeof(adap->dev));
 }
 EXPORT_SYMBOL(i2c_del_adapter);
@@ -1829,13 +1851,12 @@ static void devm_i2c_del_adapter(void *adapter)
 }
 
 /**
- * devm_i2c_add_adapter - device-managed variant of i2c_add_adapter()
- * @dev: managing device for adding this I2C adapter
- * @adapter: the adapter to add
+ * devm_i2c_add_adapter - i2c_add_adapter() 的受管理版本
+ * @dev: 负责管理这个 I2C 适配器生命周期的设备
+ * @adapter: 要添加的适配器
  * Context: can sleep
  *
- * Add adapter with dynamic bus number, same with i2c_add_adapter()
- * but the adapter will be auto deleted on driver detach.
+ * 行为与 i2c_add_adapter() 相同，只是驱动卸载时会自动删除该适配器。
  */
 int devm_i2c_add_adapter(struct device *dev, struct i2c_adapter *adapter)
 {
@@ -1861,13 +1882,13 @@ static int i2c_dev_or_parent_fwnode_match(struct device *dev, const void *data)
 }
 
 /**
- * i2c_find_adapter_by_fwnode() - find an i2c_adapter for the fwnode
- * @fwnode: &struct fwnode_handle corresponding to the &struct i2c_adapter
+ * i2c_find_adapter_by_fwnode() - 根据 fwnode 查找对应的 i2c_adapter
+ * @fwnode: 与目标 &struct i2c_adapter 对应的 &struct fwnode_handle
  *
- * Look up and return the &struct i2c_adapter corresponding to the @fwnode.
- * If no adapter can be found, or @fwnode is NULL, this returns NULL.
+ * 查找并返回与 @fwnode 对应的 &struct i2c_adapter。
+ * 如果找不到适配器，或者 @fwnode 为空，则返回 NULL。
  *
- * The user must call put_device(&adapter->dev) once done with the i2c adapter.
+ * 使用完后，调用者必须执行 put_device(&adapter->dev)。
  */
 struct i2c_adapter *i2c_find_adapter_by_fwnode(struct fwnode_handle *fwnode)
 {
@@ -1891,15 +1912,15 @@ struct i2c_adapter *i2c_find_adapter_by_fwnode(struct fwnode_handle *fwnode)
 EXPORT_SYMBOL(i2c_find_adapter_by_fwnode);
 
 /**
- * i2c_get_adapter_by_fwnode() - find an i2c_adapter for the fwnode
- * @fwnode: &struct fwnode_handle corresponding to the &struct i2c_adapter
+ * i2c_get_adapter_by_fwnode() - 根据 fwnode 查找并持有对应的 i2c_adapter
+ * @fwnode: 与目标 &struct i2c_adapter 对应的 &struct fwnode_handle
  *
- * Look up and return the &struct i2c_adapter corresponding to the @fwnode,
- * and increment the adapter module's use count. If no adapter can be found,
- * or @fwnode is NULL, this returns NULL.
+ * 查找并返回与 @fwnode 对应的 &struct i2c_adapter，同时增加适配器
+ * 所属模块的引用计数。如果找不到适配器，或者 @fwnode 为空，则
+ * 返回 NULL。
  *
- * The user must call i2c_put_adapter(adapter) once done with the i2c adapter.
- * Note that this is different from i2c_find_adapter_by_node().
+ * 使用完后，调用者必须执行 i2c_put_adapter(adapter)。
+ * 注意这与 i2c_find_adapter_by_node() 不同。
  */
 struct i2c_adapter *i2c_get_adapter_by_fwnode(struct fwnode_handle *fwnode)
 {
@@ -1931,20 +1952,17 @@ static void i2c_parse_timing(struct device *dev, char *prop_name, u32 *cur_val_p
 }
 
 /**
- * i2c_parse_fw_timings - get I2C related timing parameters from firmware
- * @dev: The device to scan for I2C timing properties
- * @t: the i2c_timings struct to be filled with values
- * @use_defaults: bool to use sane defaults derived from the I2C specification
- *		  when properties are not found, otherwise don't update
+ * i2c_parse_fw_timings - 从固件中读取 I2C 相关时序参数
+ * @dev: 要扫描 I2C 时序属性的设备
+ * @t: 用于填充结果的 i2c_timings 结构体
+ * @use_defaults: 当属性缺失时，是否使用 I2C 规范推导出的默认值
  *
- * Scan the device for the generic I2C properties describing timing parameters
- * for the signal and fill the given struct with the results. If a property was
- * not found and use_defaults was true, then maximum timings are assumed which
- * are derived from the I2C specification. If use_defaults is not used, the
- * results will be as before, so drivers can apply their own defaults before
- * calling this helper. The latter is mainly intended for avoiding regressions
- * of existing drivers which want to switch to this function. New drivers
- * almost always should use the defaults.
+ * 从固件属性中读取时序相关参数；如果没有提供，还可以按需要填入
+ * 标准默认值。
+ *
+ * 这些字段并不会直接驱动硬件，它们只是由 I2C 控制器驱动读取后，
+ * 再换算成具体寄存器值。也就是说，这个 helper 负责的是“统一解析
+ * 固件语义”，而不是“统一配置硬件时序”。
  */
 void i2c_parse_fw_timings(struct device *dev, struct i2c_timings *t, bool use_defaults)
 {
@@ -1995,25 +2013,30 @@ static int __process_new_driver(struct device *dev, void *data)
 }
 
 /*
- * An i2c_driver is used with one or more i2c_client (device) nodes to access
- * i2c slave chips, on a bus instance associated with some i2c_adapter.
+ * I2C 驱动注册与解绑。
+ *
+ * 一个 i2c_driver 可以同时匹配多个 i2c_client，真正的绑定/解绑动作
+ * 仍由 driver core 负责。I2C core 在这里补充的工作主要有两类：
+ * - 维护 detect() 自动探测出来的 client 链表
+ * - 在驱动或适配器“后注册”的情况下，补做一次遍历以完成迟到匹配
  */
 
 int i2c_register_driver(struct module *owner, struct i2c_driver *driver)
 {
 	int res;
 
-	/* Can't register until after driver model init */
+	/* 必须等驱动模型初始化完成后才能注册。 */
 	if (WARN_ON(!is_registered))
 		return -EAGAIN;
 
-	/* add the driver to the list of i2c drivers in the driver core */
+	/* 把驱动加入 driver core 里的 I2C 驱动列表。 */
 	driver->driver.owner = owner;
 	driver->driver.bus = &i2c_bus_type;
 	INIT_LIST_HEAD(&driver->clients);
 
-	/* When registration returns, the driver core
-	 * will have called probe() for all matching-but-unbound devices.
+	/*
+	 * driver_register() 返回时，driver core 已经对所有“匹配但尚未
+	 * 绑定”的设备调用过 probe()。
 	 */
 	res = driver_register(&driver->driver);
 	if (res)
@@ -2021,7 +2044,13 @@ int i2c_register_driver(struct module *owner, struct i2c_driver *driver)
 
 	pr_debug("driver [%s] registered\n", driver->driver.name);
 
-	/* Walk the adapters that are already present */
+	/*
+	 * 对已经存在的 adapter 再补做一轮处理。
+	 *
+	 * driver_register() 会让 driver core 去匹配“已存在的 client”，
+	 * 但 detect() 风格驱动还需要在每条 adapter 上主动跑一遍地址扫描，
+	 * 这一步由 i2c_do_add_adapter() 完成。
+	 */
 	i2c_for_each_dev(driver, __process_new_driver);
 
 	return 0;
@@ -2036,8 +2065,8 @@ static int __process_removed_driver(struct device *dev, void *data)
 }
 
 /**
- * i2c_del_driver - unregister I2C driver
- * @driver: the driver being unregistered
+ * i2c_del_driver - 注销 I2C 驱动
+ * @driver: 要注销的驱动
  * Context: can sleep
  */
 void i2c_del_driver(struct i2c_driver *driver)
@@ -2129,18 +2158,19 @@ static void __exit i2c_exit(void)
 	tracepoint_synchronize_unregister();
 }
 
-/* We must initialize early, because some subsystems register i2c drivers
- * in subsys_initcall() code, but are linked (and initialized) before i2c.
+/*
+ * 必须尽早初始化，因为有些子系统会在 subsys_initcall() 里注册
+ * I2C 驱动，而它们的链接和初始化顺序可能早于 i2c core。
  */
 postcore_initcall(i2c_init);
 module_exit(i2c_exit);
 
 /* ----------------------------------------------------
- * the functional interface to the i2c busses.
+ * I2C 总线功能接口
  * ----------------------------------------------------
  */
 
-/* Check if val is exceeding the quirk IFF quirk is non 0 */
+/* 仅在 quirk 非 0 时才检查长度是否超限。 */
 #define i2c_quirk_exceeded(val, quirk) ((quirk) && ((val) > (quirk)))
 
 static int i2c_quirk_error(struct i2c_adapter *adap, struct i2c_msg *msg, char *err_msg)
@@ -2160,7 +2190,7 @@ static int i2c_check_for_quirks(struct i2c_adapter *adap, struct i2c_msg *msgs, 
 	if (q->flags & I2C_AQ_COMB) {
 		max_num = 2;
 
-		/* special checks for combined messages */
+		/* 组合消息需要做额外检查。 */
 		if (num == 2) {
 			if (q->flags & I2C_AQ_COMB_WRITE_FIRST && msgs[0].flags & I2C_M_RD)
 				return i2c_quirk_error(adap, &msgs[0], "1st comb msg must be write");
@@ -2206,16 +2236,22 @@ static int i2c_check_for_quirks(struct i2c_adapter *adap, struct i2c_msg *msgs, 
 }
 
 /**
- * __i2c_transfer - unlocked flavor of i2c_transfer
- * @adap: Handle to I2C bus
- * @msgs: One or more messages to execute before STOP is issued to
- *	terminate the operation; each message begins with a START.
- * @num: Number of messages to be executed.
+ * __i2c_transfer - i2c_transfer() 的无锁版本
+ * @adap: I2C 总线句柄
+ * @msgs: 要执行的一条或多条消息；每条消息都从 START 开始，
+ *	在发送 STOP 结束整个操作之前依次完成。
+ * @num: 要执行的消息数量
  *
- * Returns negative errno, else the number of messages executed.
+ * 这是 I2C 传输的真正核心入口。它假设调用者已经完成总线锁定，因此
+ * 这里专注于“能不能传”和“怎么调算法层”：
+ * - 检查 adapter 是否支持 master_xfer
+ * - 检查 suspend/quirk 约束
+ * - 在 tracepoint 打开时记录消息内容
+ * - 必要时根据 adapter->retries 自动重试
  *
- * Adapter lock must be held when calling this function. No debug logging
- * takes place.
+ * 返回负的 errno，否则返回已执行的消息数量。
+ *
+ * 调用此函数前必须持有适配器锁，这里也不会额外打印调试日志。
  */
 int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 {
@@ -2238,9 +2274,8 @@ int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 		return -EOPNOTSUPP;
 
 	/*
-	 * i2c_trace_msg_key gets enabled when tracepoint i2c_transfer gets
-	 * enabled.  This is an efficient way of keeping the for-loop from
-	 * being executed when not needed.
+	 * 当 tracepoint i2c_transfer 被启用时，i2c_trace_msg_key 也会被
+	 * 打开。这样可以在不需要时避免执行这段 for 循环。
 	 */
 	if (static_branch_unlikely(&i2c_trace_msg_key)) {
 		int i;
@@ -2251,7 +2286,13 @@ int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 				trace_i2c_write(adap, &msgs[i], i);
 	}
 
-	/* Retry automatically on arbitration loss */
+	/*
+	 * 遇到 -EAGAIN 时自动重试。
+	 *
+	 * 对很多控制器实现来说，-EAGAIN 对应仲裁丢失或暂时无法完成传输。
+	 * I2C core 用 retries + timeout 做一层统一兜底，避免每个调用方
+	 * 都重复实现这一层重试逻辑。
+	 */
 	orig_jiffies = jiffies;
 	for (ret = 0, try = 0; try <= adap->retries; try++) {
 		if (i2c_in_atomic_xfer_mode() && adap->algo->master_xfer_atomic)
@@ -2278,36 +2319,38 @@ int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 EXPORT_SYMBOL(__i2c_transfer);
 
 /**
- * i2c_transfer - execute a single or combined I2C message
- * @adap: Handle to I2C bus
- * @msgs: One or more messages to execute before STOP is issued to
- *	terminate the operation; each message begins with a START.
- * @num: Number of messages to be executed.
+ * i2c_transfer - 执行单条或组合 I2C 消息
+ * @adap: I2C 总线句柄
+ * @msgs: 要执行的一条或多条消息；在发送 STOP 结束整个操作之前，
+ *	每条消息都会先从 START 开始。
+ * @num: 要执行的消息数量
  *
- * Returns negative errno, else the number of messages executed.
+ * 这是给上层驱动使用的常规 I2C 组合传输 API。它在 __i2c_transfer()
+ * 外围补上了 adapter 级总线锁，因此调用者不需要自己关心与其它传输
+ * 的并发串行化。
  *
- * Note that there is no requirement that each message be sent to
- * the same slave address, although that is the most common model.
+ * 返回负的 errno，否则返回已执行的消息数量。
+ *
+ * 注意，这里并不要求每条消息都发往同一个从设备地址，虽然这
+ * 是最常见的使用方式。
  */
 int i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 {
 	int ret;
 
-	/* REVISIT the fault reporting model here is weak:
+	/*
+	 * REVISIT: 这里的错误上报模型仍然比较弱：
 	 *
-	 *  - When we get an error after receiving N bytes from a slave,
-	 *    there is no way to report "N".
+	 *  - 如果从从设备读到 N 个字节后发生错误，当前没有办法报告
+	 *    “已经收到了 N 个字节”。
 	 *
-	 *  - When we get a NAK after transmitting N bytes to a slave,
-	 *    there is no way to report "N" ... or to let the master
-	 *    continue executing the rest of this combined message, if
-	 *    that's the appropriate response.
+	 *  - 如果向从设备发送了 N 个字节后收到 NAK，也没有办法报告
+	 *    “已经发了 N 个字节”；如果这是正确的响应，也无法继续执
+	 *    行组合消息后面的剩余部分。
 	 *
-	 *  - When for example "num" is two and we successfully complete
-	 *    the first message but get an error part way through the
-	 *    second, it's unclear whether that should be reported as
-	 *    one (discarding status on the second message) or errno
-	 *    (discarding status on the first one).
+	 *  - 比如 num=2 时，第一个消息成功、第二个消息中途出错，现
+	 *    在也不清楚应该返回 1（丢弃第二条状态）还是 errno（丢
+	 *    弃第一条状态）。
 	 */
 	ret = __i2c_lock_bus_helper(adap);
 	if (ret)
@@ -2321,14 +2364,13 @@ int i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 EXPORT_SYMBOL(i2c_transfer);
 
 /**
- * i2c_transfer_buffer_flags - issue a single I2C message transferring data
- *			       to/from a buffer
- * @client: Handle to slave device
- * @buf: Where the data is stored
- * @count: How many bytes to transfer, must be less than 64k since msg.len is u16
- * @flags: The flags to be used for the message, e.g. I2C_M_RD for reads
+ * i2c_transfer_buffer_flags - 用缓冲区发送/接收单条 I2C 消息
+ * @client: 从设备句柄
+ * @buf: 数据缓冲区
+ * @count: 要传输的字节数，因为 msg.len 是 u16，所以必须小于 64k
+ * @flags: 消息要使用的标志，例如读操作使用 I2C_M_RD
  *
- * Returns negative errno, or else the number of bytes transferred.
+ * 返回负的 errno，否则返回已传输的字节数。
  */
 int i2c_transfer_buffer_flags(const struct i2c_client *client, char *buf,
 			      int count, u16 flags)
@@ -2343,20 +2385,24 @@ int i2c_transfer_buffer_flags(const struct i2c_client *client, char *buf,
 
 	ret = i2c_transfer(client->adapter, &msg, 1);
 
-	/*
-	 * If everything went ok (i.e. 1 msg transferred), return #bytes
-	 * transferred, else error code.
-	 */
+	/* 如果一切正常（即只传输了 1 条消息），返回字节数，否则返回错误码。 */
 	return (ret == 1) ? count : ret;
 }
 EXPORT_SYMBOL(i2c_transfer_buffer_flags);
 
 /**
- * i2c_get_device_id - get manufacturer, part id and die revision of a device
- * @client: The device to query
- * @id: The queried information
+ * i2c_get_device_id - 获取设备的厂商 ID、器件 ID 和版本号
+ * @client: 要查询的设备
+ * @id: 用于返回查询结果的结构体
  *
- * Returns negative errno on error, zero on success.
+ * 这是对 I2C Device ID 规范访问流程的封装。目标地址固定是
+ * `0x7c`，真正的从设备地址则通过 SMBus command 字段编码传入。
+ * 设备若支持这套机制，返回的 3 字节数据会被拆成：
+ * - manufacturer_id
+ * - part_id
+ * - die_revision
+ *
+ * 失败返回负的 errno，成功返回 0。
  */
 int i2c_get_device_id(const struct i2c_client *client,
 		      struct i2c_device_identity *id)
@@ -2383,10 +2429,10 @@ int i2c_get_device_id(const struct i2c_client *client,
 EXPORT_SYMBOL_GPL(i2c_get_device_id);
 
 /**
- * i2c_client_get_device_id - get the driver match table entry of a device
- * @client: the device to query. The device must be bound to a driver
+ * i2c_client_get_device_id - 获取设备当前匹配到的 id_table 项
+ * @client: 要查询的设备，且该设备必须已经绑定到驱动
  *
- * Returns a pointer to the matching entry if found, NULL otherwise.
+ * 如果找到匹配项则返回对应条目的指针，否则返回 NULL。
  */
 const struct i2c_device_id *i2c_client_get_device_id(const struct i2c_client *client)
 {
@@ -2397,22 +2443,18 @@ const struct i2c_device_id *i2c_client_get_device_id(const struct i2c_client *cl
 EXPORT_SYMBOL_GPL(i2c_client_get_device_id);
 
 /* ----------------------------------------------------
- * the i2c address scanning function
- * Will not work for 10-bit addresses!
+ * I2C 地址扫描功能
+ * 注意：这里不支持 10 位地址。
  * ----------------------------------------------------
  */
 
 /*
- * Legacy default probe function, mostly relevant for SMBus. The default
- * probe method is a quick write, but it is known to corrupt the 24RF08
- * EEPROMs due to a state machine bug, and could also irreversibly
- * write-protect some EEPROMs, so for address ranges 0x30-0x37 and 0x50-0x5f,
- * we use a short byte read instead. Also, some bus drivers don't implement
- * quick write, so we fallback to a byte read in that case too.
- * On x86, there is another special case for FSC hardware monitoring chips,
- * which want regular byte reads (address 0x73.) Fortunately, these are the
- * only known chips using this I2C address on PC hardware.
- * Returns 1 if probe succeeded, 0 if not.
+ * 旧式默认探测方式，主要面向 SMBus。
+ *
+ * 默认 probe 使用 quick write，但某些 EEPROM 会被误伤，因此对部分地址段
+ * 会回退到 byte read；如果控制器本身不支持 quick write，也会回退。
+ *
+ * 返回 1 表示探测成功，0 表示失败。
  */
 static int i2c_default_probe(struct i2c_adapter *adap, unsigned short addr)
 {
@@ -2450,7 +2492,7 @@ static int i2c_detect_address(struct i2c_client *temp_client,
 	int addr = temp_client->addr;
 	int err;
 
-	/* Make sure the address is valid */
+	/* 先确认地址本身合法。 */
 	err = i2c_check_7bit_addr_validity_strict(addr);
 	if (err) {
 		dev_warn(&adapter->dev, "Invalid probe address 0x%02x\n",
@@ -2458,25 +2500,24 @@ static int i2c_detect_address(struct i2c_client *temp_client,
 		return err;
 	}
 
-	/* Skip if already in use (7 bit, no need to encode flags) */
+	/* 地址已被占用就跳过。这里是 7 位地址，不需要编码 flags。 */
 	if (i2c_check_addr_busy(adapter, addr))
 		return 0;
 
-	/* Make sure there is something at this address */
+	/* 先用默认 probe 判断这个地址是否真的有设备。 */
 	if (!i2c_default_probe(adapter, addr))
 		return 0;
 
-	/* Finally call the custom detection function */
+	/* 最后交给驱动自定义的 detect() 做精确识别。 */
 	memset(&info, 0, sizeof(struct i2c_board_info));
 	info.addr = addr;
 	err = driver->detect(temp_client, &info);
 	if (err) {
-		/* -ENODEV is returned if the detection fails. We catch it
-		   here as this isn't an error. */
+		/* detect() 返回 -ENODEV 代表“没找到”，这不算真正的错误。 */
 		return err == -ENODEV ? 0 : err;
 	}
 
-	/* Consistency check */
+		/* 一致性检查：detect() 成功后必须填入设备名。 */
 	if (info.type[0] == '\0') {
 		dev_err(&adapter->dev,
 			"%s detection function provided no name for 0x%x\n",
@@ -2484,7 +2525,7 @@ static int i2c_detect_address(struct i2c_client *temp_client,
 	} else {
 		struct i2c_client *client;
 
-		/* Detection succeeded, instantiate the device */
+			/* 探测成功后，实例化设备。 */
 		if (adapter->class & I2C_CLASS_DEPRECATED)
 			dev_warn(&adapter->dev,
 				"This adapter will soon drop class based instantiation of devices. "
@@ -2514,7 +2555,7 @@ static int i2c_detect(struct i2c_adapter *adapter, struct i2c_driver *driver)
 	if (!driver->detect || !address_list)
 		return 0;
 
-	/* Warn that the adapter lost class based instantiation */
+	/* 提示：这个适配器已经不再支持基于 class 的自动实例化。 */
 	if (adapter->class == I2C_CLASS_DEPRECATED) {
 		dev_dbg(&adapter->dev,
 			"This adapter dropped support for I2C classes and won't auto-detect %s devices anymore. "
@@ -2523,11 +2564,11 @@ static int i2c_detect(struct i2c_adapter *adapter, struct i2c_driver *driver)
 		return 0;
 	}
 
-	/* Stop here if the classes do not match */
+	/* 如果 class 不匹配，就直接停止。 */
 	if (!(adapter->class & driver->class))
 		return 0;
 
-	/* Set up a temporary client to help detect callback */
+	/* 创建一个临时 client，供 detect() 回调使用。 */
 	temp_client = kzalloc_obj(*temp_client);
 	if (!temp_client)
 		return -ENOMEM;
@@ -2568,14 +2609,14 @@ i2c_new_scanned_device(struct i2c_adapter *adap,
 		probe = i2c_default_probe;
 
 	for (i = 0; addr_list[i] != I2C_CLIENT_END; i++) {
-		/* Check address validity */
+		/* 检查地址是否合法。 */
 		if (i2c_check_7bit_addr_validity_strict(addr_list[i]) < 0) {
 			dev_warn(&adap->dev, "Invalid 7-bit address 0x%02x\n",
 				 addr_list[i]);
 			continue;
 		}
 
-		/* Check address availability (7 bit, no need to encode flags) */
+		/* 检查地址是否可用。这里是 7 位地址，不需要编码 flags。 */
 		if (i2c_check_addr_busy(adap, addr_list[i])) {
 			dev_dbg(&adap->dev,
 				"Address 0x%02x already in use, not probing\n",
@@ -2583,7 +2624,7 @@ i2c_new_scanned_device(struct i2c_adapter *adap,
 			continue;
 		}
 
-		/* Test address responsiveness */
+		/* 测试这个地址是否有响应。 */
 		if (probe(adap, addr_list[i]))
 			break;
 	}
@@ -2624,26 +2665,25 @@ void i2c_put_adapter(struct i2c_adapter *adap)
 		return;
 
 	module_put(adap->owner);
-	/* Should be last, otherwise we risk use-after-free with 'adap' */
+	/* 这个 put 操作必须放在最后，否则可能引发对 adap 的 use-after-free。 */
 	put_device(&adap->dev);
 }
 EXPORT_SYMBOL(i2c_put_adapter);
 
 /**
- * i2c_get_dma_safe_msg_buf() - get a DMA safe buffer for the given i2c_msg
- * @msg: the message to be checked
- * @threshold: the minimum number of bytes for which using DMA makes sense.
- *	       Should at least be 1.
+ * i2c_get_dma_safe_msg_buf() - 为指定 i2c_msg 获取 DMA 安全缓冲区
+ * @msg: 要检查的消息
+ * @threshold: 启用 DMA 的最小字节数，至少应为 1
  *
- * Return: NULL if a DMA safe buffer was not obtained. Use msg->buf with PIO.
- *	   Or a valid pointer to be used with DMA. After use, release it by
- *	   calling i2c_put_dma_safe_msg_buf().
+ * 如果没有拿到 DMA 安全缓冲区，则返回 NULL，这时继续使用 msg->buf
+ * 进行 PIO 传输即可。否则返回一个可用于 DMA 的有效指针。用完后，
+ * 需要调用 i2c_put_dma_safe_msg_buf() 归还。
  *
- * This function must only be called from process context!
+ * 这个函数只能在进程上下文中调用！
  */
 u8 *i2c_get_dma_safe_msg_buf(struct i2c_msg *msg, unsigned int threshold)
 {
-	/* also skip 0-length msgs for bogus thresholds of 0 */
+	/* threshold 为 0 时也顺带跳过 0 长度消息。 */
 	if (!threshold)
 		pr_debug("DMA buffer for addr=0x%02x with length 0 is bogus\n",
 			 msg->addr);
@@ -2664,10 +2704,10 @@ u8 *i2c_get_dma_safe_msg_buf(struct i2c_msg *msg, unsigned int threshold)
 EXPORT_SYMBOL_GPL(i2c_get_dma_safe_msg_buf);
 
 /**
- * i2c_put_dma_safe_msg_buf - release DMA safe buffer and sync with i2c_msg
- * @buf: the buffer obtained from i2c_get_dma_safe_msg_buf(). May be NULL.
- * @msg: the message which the buffer corresponds to
- * @xferred: bool saying if the message was transferred
+ * i2c_put_dma_safe_msg_buf - 释放 DMA 安全缓冲区并回写到 i2c_msg
+ * @buf: 从 i2c_get_dma_safe_msg_buf() 得到的缓冲区，可能为 NULL
+ * @msg: 该缓冲区对应的消息
+ * @xferred: 该消息是否已经成功传输
  */
 void i2c_put_dma_safe_msg_buf(u8 *buf, struct i2c_msg *msg, bool xferred)
 {

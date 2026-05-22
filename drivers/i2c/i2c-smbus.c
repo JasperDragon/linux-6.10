@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * i2c-smbus.c - SMBus extensions to the I2C protocol
+ * i2c-smbus.c - I2C 协议的 SMBus 扩展
+ *
+ * 这一层补充了 SMBALERT#、Host Notify、SPD 自动实例化等能力，
+ * 用来处理那些“不是纯 I2C 寄存器访问”的兼容接口。
  *
  * Copyright (C) 2008 David Brownell
  * Copyright (C) 2010-2019 Jean Delvare <jdelvare@suse.de>
@@ -29,7 +32,7 @@ struct alert_data {
 	unsigned int		data;
 };
 
-/* If this is the alerting device, notify its driver */
+/* 如果当前设备就是发出告警的那个客户端，就通知它的驱动。 */
 static int smbus_do_alert(struct device *dev, void *addrp)
 {
 	struct i2c_client *client = i2c_verify_client(dev);
@@ -66,8 +69,7 @@ static int smbus_do_alert(struct device *dev, void *addrp)
 	return ret;
 }
 
-/* Same as above, but call back all drivers with alert handler */
-
+/* 和上面类似，但会把所有带 alert() 的驱动都回调一遍。 */
 static int smbus_do_alert_force(struct device *dev, void *addrp)
 {
 	struct i2c_client *client = i2c_verify_client(dev);
@@ -93,8 +95,8 @@ static int smbus_do_alert_force(struct device *dev, void *addrp)
 }
 
 /*
- * The alert IRQ handler needs to hand work off to a task which can issue
- * SMBus calls, because those sleeping calls can't be made in IRQ context.
+ * alert 中断处理函数不能直接做 SMBus 传输，因为这类调用可能睡眠。
+ * 所以它只负责把工作交给 workqueue。
  */
 static irqreturn_t smbus_alert(int irq, void *d)
 {
@@ -162,7 +164,7 @@ static void smbalert_work(struct work_struct *work)
 
 }
 
-/* Setup SMBALERT# infrastructure */
+/* 初始化 SMBALERT# 基础设施。 */
 static int smbalert_probe(struct i2c_client *ara)
 {
 	struct i2c_smbus_alert_setup *setup = dev_get_platdata(&ara->dev);
@@ -211,7 +213,7 @@ static int smbalert_probe(struct i2c_client *ara)
 	return 0;
 }
 
-/* IRQ and memory resources are managed so they are freed automatically */
+/* IRQ 和内存资源都交给 devm 管理，卸载时会自动释放。 */
 static void smbalert_remove(struct i2c_client *ara)
 {
 	struct i2c_smbus_alert *alert = i2c_get_clientdata(ara);
@@ -235,16 +237,14 @@ static struct i2c_driver smbalert_driver = {
 };
 
 /**
- * i2c_handle_smbus_alert - Handle an SMBus alert
+ * i2c_handle_smbus_alert - 处理一次 SMBus 告警
  * @ara: the ARA client on the relevant adapter
  * Context: can't sleep
  *
- * Helper function to be called from an I2C bus driver's interrupt
- * handler. It will schedule the alert work, in turn calling the
- * corresponding I2C device driver's alert function.
+ * 供 I2C 控制器驱动的中断处理函数调用。
+ * 这里只负责调度告警 work，随后由 work 去回调对应 I2C 设备驱动的 alert()。
  *
- * It is assumed that ara is a valid i2c client previously returned by
- * i2c_new_smbus_alert_device().
+ * 这里假定 ara 是之前由 i2c_new_smbus_alert_device() 返回的有效 client。
  */
 int i2c_handle_smbus_alert(struct i2c_client *ara)
 {
@@ -297,17 +297,17 @@ static int i2c_slave_host_notify_cb(struct i2c_client *client,
 }
 
 /**
- * i2c_new_slave_host_notify_device - get a client for SMBus host-notify support
+ * i2c_new_slave_host_notify_device - 创建用于 SMBus Host Notify 的 client
  * @adapter: the target adapter
  * Context: can sleep
  *
- * Setup handling of the SMBus host-notify protocol on a given I2C bus segment.
+ * 在指定 I2C 总线上建立 SMBus host-notify 支持。
  *
- * Handling is done by creating a device and its callback and handling data
- * received via the SMBus host-notify address (0x8)
+ * 这里的实现方式是创建一个 device 和对应回调，用来处理通过
+ * SMBus host-notify 地址（0x8）收到的数据。
  *
- * This returns the client, which should be ultimately freed using
- * i2c_free_slave_host_notify_device(); or an ERRPTR to indicate an error.
+ * 返回创建好的 client，后续应调用 i2c_free_slave_host_notify_device()
+ * 释放；失败时返回 ERR_PTR。
  */
 struct i2c_client *i2c_new_slave_host_notify_device(struct i2c_adapter *adapter)
 {
@@ -343,12 +343,11 @@ struct i2c_client *i2c_new_slave_host_notify_device(struct i2c_adapter *adapter)
 EXPORT_SYMBOL_GPL(i2c_new_slave_host_notify_device);
 
 /**
- * i2c_free_slave_host_notify_device - free the client for SMBus host-notify
- * support
+ * i2c_free_slave_host_notify_device - 释放 SMBus Host Notify client
  * @client: the client to free
  * Context: can sleep
  *
- * Free the i2c_client allocated via i2c_new_slave_host_notify_device
+ * 释放通过 i2c_new_slave_host_notify_device() 分配的 i2c_client。
  */
 void i2c_free_slave_host_notify_device(struct i2c_client *client)
 {
@@ -363,12 +362,12 @@ EXPORT_SYMBOL_GPL(i2c_free_slave_host_notify_device);
 #endif
 
 /*
- * SPD is not part of SMBus but we include it here for convenience as the
- * target systems are the same.
- * Restrictions to automatic SPD instantiation:
- *  - Only works if all filled slots have the same memory type
- *  - Only works for (LP)DDR memory types up to DDR5
- *  - Only works on systems with 1 to 8 memory slots
+ * SPD 不是 SMBus 的一部分，但因为目标系统相同，这里一起处理。
+ *
+ * 自动实例化 SPD 的限制：
+ * - 所有已填插槽必须是同一种内存类型
+ * - 只支持到 DDR5 的 (LP)DDR 类型
+ * - 只适用于 1 到 8 个内存槽位的系统
  */
 #if IS_ENABLED(CONFIG_DMI)
 static void i2c_register_spd(struct i2c_adapter *adap, bool write_disabled)

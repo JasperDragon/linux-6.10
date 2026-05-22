@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Linux I2C core OF component prober code
+ * Linux I2C core 的 OF 组件探测器代码
  *
  * Copyright (C) 2024 Google LLC
  */
@@ -20,37 +20,34 @@
 #include <linux/stddef.h>
 
 /*
- * Some devices, such as Google Hana Chromebooks, are produced by multiple
- * vendors each using their preferred components. Such components are all
- * in the device tree. Instead of having all of them enabled and having each
- * driver separately try and probe its device while fighting over shared
- * resources, they can be marked as "fail-needs-probe" and have a prober
- * figure out which one is actually used beforehand.
+ * 某些设备，例如 Google Hana Chromebook，会由多个厂商分别提供
+ * 各自偏好的器件，而这些器件都被写进了设备树。与其把所有器件
+ * 都启用后再让各自驱动去抢共享资源，不如把它们标记为
+ * "fail-needs-probe"，再由一个探测器预先判断到底实际用了哪一颗。
  *
- * This prober assumes such drop-in parts are on the same I2C bus, have
- * non-conflicting addresses, and can be directly probed by seeing which
- * address responds.
+ * 这个探测器假定这些可替换器件挂在同一条 I2C 总线上，地址互不
+ * 冲突，并且可以通过探测哪个地址有响应来直接确认。
  *
  * TODO:
- * - Support I2C muxes
+ * - 支持 I2C mux
  */
 
 static struct device_node *i2c_of_probe_get_i2c_node(struct device *dev, const char *type)
 {
 	struct device_node *node __free(device_node) = of_find_node_by_name(NULL, type);
 	if (!node) {
-		dev_err(dev, "Could not find %s device node\n", type);
+		dev_err(dev, "找不到 %s 设备节点\n", type);
 		return NULL;
 	}
 
 	struct device_node *i2c_node __free(device_node) = of_get_parent(node);
 	if (!of_node_name_eq(i2c_node, "i2c")) {
-		dev_err(dev, "%s device isn't on I2C bus\n", type);
+		dev_err(dev, "%s 设备不在 I2C 总线上\n", type);
 		return NULL;
 	}
 
 	if (!of_device_is_available(i2c_node)) {
-		dev_err(dev, "I2C controller not available\n");
+		dev_err(dev, "I2C 控制器不可用\n");
 		return NULL;
 	}
 
@@ -61,7 +58,7 @@ static int i2c_of_probe_enable_node(struct device *dev, struct device_node *node
 {
 	int ret;
 
-	dev_dbg(dev, "Enabling %pOF\n", node);
+	dev_dbg(dev, "启用 %pOF\n", node);
 
 	struct of_changeset *ocs __free(kfree) = kzalloc_obj(*ocs);
 	if (!ocs)
@@ -74,12 +71,11 @@ static int i2c_of_probe_enable_node(struct device *dev, struct device_node *node
 
 	ret = of_changeset_apply(ocs);
 	if (ret) {
-		/* ocs needs to be explicitly cleaned up before being freed. */
+		/* 释放前必须显式清理 ocs。 */
 		of_changeset_destroy(ocs);
 	} else {
 		/*
-		 * ocs is intentionally kept around as it needs to
-		 * exist as long as the change is applied.
+		 * 这里刻意保留 ocs，因为只要变更还在生效，它就必须继续存在。
 		 */
 		void *ptr __always_unused = no_free_ptr(ocs);
 	}
@@ -90,39 +86,31 @@ static int i2c_of_probe_enable_node(struct device *dev, struct device_node *node
 static const struct i2c_of_probe_ops i2c_of_probe_dummy_ops;
 
 /**
- * i2c_of_probe_component() - probe for devices of "type" on the same i2c bus
- * @dev: Pointer to the &struct device of the caller, only used for dev_printk() messages.
- * @cfg: Pointer to the &struct i2c_of_probe_cfg containing callbacks and other options
- *       for the prober.
- * @ctx: Context data for callbacks.
+ * i2c_of_probe_component() - 在同一条 I2C 总线上探测某种 type 的设备
+ * @dev: 调用者的 &struct device 指针，仅用于 dev_printk() 日志
+ * @cfg: 指向包含回调和其他探测选项的 &struct i2c_of_probe_cfg
+ * @ctx: 回调使用的上下文数据
  *
- * Probe for possible I2C components of the same "type" (&i2c_of_probe_cfg->type)
- * on the same I2C bus that have their status marked as "fail-needs-probe".
+ * 探测同一条 I2C 总线上、并且 status 标记为 "fail-needs-probe" 的
+ * 同类型 I2C 组件（类型名由 &i2c_of_probe_cfg->type 指定）。
  *
- * Assumes that across the entire device tree the only instances of nodes
- * with "type" prefixed node names (not including the address portion) are
- * the ones that need handling for second source components. In other words,
- * if "type" is "touchscreen", then all device nodes named "touchscreen*"
- * are the ones that need probing. There cannot be another "touchscreen*"
- * node that is already enabled.
+ * 假设整个设备树里，只有那些以 "type" 为前缀的节点名称（不包含
+ * 地址部分）才是需要处理的第二来源组件。换句话说，如果 type 是
+ * "touchscreen"，那么所有名为 "touchscreen*" 的节点都是待探测
+ * 对象，不应该再有其它已经启用的 "touchscreen*" 节点。
  *
- * Assumes that for each "type" of component, only one actually exists. In
- * other words, only one matching and existing device will be enabled.
+ * 还假设每一种 type 的组件最终只会有一个实际存在，也就是只会启用
+ * 一个匹配且存在的设备。
  *
- * Context: Process context only. Does non-atomic I2C transfers.
- *          Should only be used from a driver probe function, as the function
- *          can return -EPROBE_DEFER if the I2C adapter or other resources
- *          are unavailable.
- * Return: 0 on success or no-op, error code otherwise.
- *         A no-op can happen when it seems like the device tree already
- *         has components of the type to be probed already enabled. This
- *         can happen when the device tree had not been updated to mark
- *         the status of the to-be-probed components as "fail-needs-probe".
- *         Or this function was already run with the same parameters and
- *         succeeded in enabling a component. The latter could happen if
- *         the user had multiple types of components to probe, and one of
- *         them down the list caused a deferred probe. This is expected
- *         behavior.
+ * Context: 只能在进程上下文中调用，会进行非原子的 I2C 传输。
+ *          最好只在驱动的 probe 函数里调用，因为当 I2C 适配器或
+ *          其它资源不可用时，它可能返回 -EPROBE_DEFER。
+ * Return: 成功或无操作返回 0，其它情况返回错误码。
+ *         当看起来设备树里已经启用了待探测类型的组件时，可能会
+ *         什么都不做。这可能是因为设备树还没有更新为
+ *         "fail-needs-probe"，也可能是这个函数已经用同样参数运行
+ *         过并成功启用了一个组件。后者常见于：用户有多个组件要探测，
+ *         而列表中较靠后的某个组件触发了 deferred probe。这是预期行为。
  */
 int i2c_of_probe_component(struct device *dev, const struct i2c_of_probe_cfg *cfg, void *ctx)
 {
@@ -139,9 +127,10 @@ int i2c_of_probe_component(struct device *dev, const struct i2c_of_probe_cfg *cf
 		return -ENODEV;
 
 	/*
-	 * If any devices of the given "type" are already enabled then this function is a no-op.
-	 * Either the device tree hasn't been modified to work with this probe function, or the
-	 * function had already run before and enabled some component.
+	 * 如果给定 type 的设备已经有任何一个处于启用状态，那么这个
+	 * 函数就直接无操作返回。
+	 * 这通常表示设备树还没有按这个探测器的要求改造，或者这个
+	 * 函数之前已经运行过并成功启用了某个组件。
 	 */
 	for_each_child_of_node_with_prefix(i2c_node, node, type)
 		if (of_device_is_available(node))
@@ -151,7 +140,7 @@ int i2c_of_probe_component(struct device *dev, const struct i2c_of_probe_cfg *cf
 	if (!i2c)
 		return dev_err_probe(dev, -EPROBE_DEFER, "Couldn't get I2C adapter\n");
 
-	/* Grab and enable resources */
+	/* 申请并启用资源。 */
 	ret = 0;
 	if (ops->enable)
 		ret = ops->enable(dev, i2c_node, ctx);
@@ -167,7 +156,7 @@ int i2c_of_probe_component(struct device *dev, const struct i2c_of_probe_cfg *cf
 		if (i2c_smbus_xfer(i2c, addr, 0, I2C_SMBUS_READ, 0, I2C_SMBUS_BYTE, &data) < 0)
 			continue;
 
-		/* Found a device that is responding */
+		/* 找到了一个会响应的设备。 */
 		if (ops->cleanup_early)
 			ops->cleanup_early(dev, ctx);
 		ret = i2c_of_probe_enable_node(dev, node);
@@ -190,10 +179,9 @@ static int i2c_of_probe_simple_get_supply(struct device *dev, struct device_node
 	struct regulator *supply;
 
 	/*
-	 * It's entirely possible for the component's device node to not have the
-	 * regulator supplies. While it does not make sense from a hardware perspective,
-	 * the supplies could be always on or otherwise not modeled in the device tree,
-	 * but the device would still work.
+	 * 组件的设备节点完全可能没有 regulator 供电描述。
+	 * 从硬件角度看这未必合理，但供电也可能一直开启，或者根本
+	 * 没有在设备树里建模；即便如此，设备仍然可能正常工作。
 	 */
 	supply_name = ctx->opts->supply_name;
 	if (!supply_name)
@@ -253,11 +241,11 @@ static int i2c_of_probe_simple_get_gpiod(struct device *dev, struct device_node 
 	struct gpio_desc *gpiod;
 	const char *con_id;
 
-	/* NULL signals no GPIO needed */
+	/* NULL 表示不需要 GPIO。 */
 	if (!ctx->opts->gpio_name)
 		return 0;
 
-	/* An empty string signals an unnamed GPIO */
+	/* 空字符串表示使用未命名 GPIO。 */
 	if (!ctx->opts->gpio_name[0])
 		con_id = NULL;
 	else
@@ -303,19 +291,19 @@ static void i2c_of_probe_simple_disable_gpio(struct device *dev, struct i2c_of_p
 }
 
 /**
- * i2c_of_probe_simple_enable - Simple helper for I2C OF prober to get and enable resources
- * @dev: Pointer to the &struct device of the caller, only used for dev_printk() messages
- * @bus_node: Pointer to the &struct device_node of the I2C adapter.
- * @data: Pointer to &struct i2c_of_probe_simple_ctx helper context.
+ * i2c_of_probe_simple_enable - I2C OF prober 的简化资源申请/启用助手
+ * @dev: 调用者的 &struct device 指针，仅用于 dev_printk() 日志
+ * @bus_node: I2C 适配器对应的 &struct device_node
+ * @data: 指向 &struct i2c_of_probe_simple_ctx 的上下文
  *
- * If &i2c_of_probe_simple_opts->supply_name is given, request the named regulator supply.
- * If &i2c_of_probe_simple_opts->gpio_name is given, request the named GPIO. Or if it is
- * the empty string, request the unnamed GPIO.
- * If a regulator supply was found, enable that regulator.
- * If a GPIO line was found, configure the GPIO line to output and set value
- * according to given options.
+ * 如果设置了 &i2c_of_probe_simple_opts->supply_name，就申请对应的
+ * regulator 供电。
+ * 如果设置了 &i2c_of_probe_simple_opts->gpio_name，就申请对应的 GPIO；
+ * 如果它是空字符串，则申请未命名 GPIO。
+ * 如果找到了 regulator，就把它打开。
+ * 如果找到了 GPIO，就把这条 GPIO 配置成输出，并按照选项设置电平。
  *
- * Return: %0 on success or no-op, or a negative error number on failure.
+ * Return: 成功或无操作返回 0，失败返回负错误码。
  */
 int i2c_of_probe_simple_enable(struct device *dev, struct device_node *bus_node, void *data)
 {
@@ -369,13 +357,12 @@ out_put_node:
 EXPORT_SYMBOL_NS_GPL(i2c_of_probe_simple_enable, "I2C_OF_PROBER");
 
 /**
- * i2c_of_probe_simple_cleanup_early - \
- *	Simple helper for I2C OF prober to release GPIOs before component is enabled
- * @dev: Pointer to the &struct device of the caller; unused.
- * @data: Pointer to &struct i2c_of_probe_simple_ctx helper context.
+ * i2c_of_probe_simple_cleanup_early - 在组件启用前提前释放 GPIO
+ * @dev: 调用者的 &struct device 指针；未使用
+ * @data: 指向 &struct i2c_of_probe_simple_ctx 的上下文
  *
- * GPIO descriptors are exclusive and have to be released before the
- * actual driver probes so that the latter can acquire them.
+ * GPIO 描述符是独占资源，必须在真实驱动 probe 之前释放，
+ * 这样后者才能重新申请它们。
  */
 void i2c_of_probe_simple_cleanup_early(struct device *dev, void *data)
 {
@@ -386,19 +373,19 @@ void i2c_of_probe_simple_cleanup_early(struct device *dev, void *data)
 EXPORT_SYMBOL_NS_GPL(i2c_of_probe_simple_cleanup_early, "I2C_OF_PROBER");
 
 /**
- * i2c_of_probe_simple_cleanup - Clean up and release resources for I2C OF prober simple helpers
- * @dev: Pointer to the &struct device of the caller, only used for dev_printk() messages
- * @data: Pointer to &struct i2c_of_probe_simple_ctx helper context.
+ * i2c_of_probe_simple_cleanup - 清理并释放 I2C OF prober 简化助手的资源
+ * @dev: 调用者的 &struct device 指针，仅用于 dev_printk() 日志
+ * @data: 指向 &struct i2c_of_probe_simple_ctx 的上下文
  *
- * * If a GPIO line was found and not yet released, set its value to the opposite of that
- *   set in i2c_of_probe_simple_enable() and release it.
- * * If a regulator supply was found, disable that regulator and release it.
+ * * 如果找到了 GPIO 且还没有释放，就把它的值设为
+ *   i2c_of_probe_simple_enable() 中设置值的反相，然后释放它。
+ * * 如果找到了 regulator，就关闭该 regulator 并释放它。
  */
 void i2c_of_probe_simple_cleanup(struct device *dev, void *data)
 {
 	struct i2c_of_probe_simple_ctx *ctx = data;
 
-	/* GPIO operations here are no-ops if i2c_of_probe_simple_cleanup_early was called. */
+	/* 如果已经调用过 i2c_of_probe_simple_cleanup_early，这里的 GPIO 操作就会变成空操作。 */
 	i2c_of_probe_simple_disable_gpio(dev, ctx);
 	i2c_of_probe_simple_put_gpiod(ctx);
 

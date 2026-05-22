@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * i2c-boardinfo.c - collect pre-declarations of I2C devices
+ * i2c-boardinfo.c - 收集预先声明的 I2C 设备
+ *
+ * 这一层保存板级代码提前登记的 i2c_board_info，等对应适配器注册后，
+ * 再由 I2C core 统一实例化成真正的 i2c_client。
  */
 
 #include <linux/export.h>
@@ -13,8 +16,8 @@
 #include "i2c-core.h"
 
 
-/* These symbols are exported ONLY FOR the i2c core.
- * No other users will be supported.
+/*
+ * 这些符号只导出给 I2C core 使用，不支持其他用户直接调用。
  */
 DECLARE_RWSEM(__i2c_board_lock);
 EXPORT_SYMBOL_GPL(__i2c_board_lock);
@@ -27,26 +30,25 @@ EXPORT_SYMBOL_GPL(__i2c_first_dynamic_bus_num);
 
 
 /**
- * i2c_register_board_info - statically declare I2C devices
- * @busnum: identifies the bus to which these devices belong
- * @info: vector of i2c device descriptors
- * @len: how many descriptors in the vector; may be zero to reserve
- *	the specified bus number.
+ * i2c_register_board_info - 静态声明 I2C 设备
+ * @busnum: 这些设备所属的总线编号
+ * @info: i2c 设备描述符数组
+ * @len: 描述符数量；也可以为 0，用来预留指定总线号
  *
- * Systems using the Linux I2C driver stack can declare tables of board info
- * while they initialize.  This should be done in board-specific init code
- * near arch_initcall() time, or equivalent, before any I2C adapter driver is
- * registered.  For example, mainboard init code could define several devices,
- * as could the init code for each daughtercard in a board stack.
+ * 使用 Linux I2C 驱动栈的系统，可以在初始化阶段声明一批板级设备
+ * 信息。通常应当在接近 arch_initcall() 的板级初始化代码里完成，
+ * 并且要早于任何 I2C 适配器驱动的注册。
  *
- * The I2C devices will be created later, after the adapter for the relevant
- * bus has been registered.  After that moment, standard driver model tools
- * are used to bind "new style" I2C drivers to the devices.  The bus number
- * for any device declared using this routine is not available for dynamic
- * allocation.
+ * 例如，主板初始化代码可以声明若干设备；板级堆叠里的子板初始化
+ * 代码也可以各自声明自己的设备。
  *
- * The board info passed can safely be __initdata, but be careful of embedded
- * pointers (for platform_data, functions, etc) since that won't be copied.
+ * 这些 I2C 设备会在对应总线的适配器注册之后再创建。创建完成后，
+ * 标准驱动模型会负责把“新式” I2C 驱动绑定到这些设备上。通过
+ * 这个接口预先声明的总线号不能再被动态分配。
+ *
+ * 传入的 board info 可以安全地放在 __initdata 中，但要小心其中
+ * 可能嵌入的指针（例如 platform_data、函数指针等），因为这些
+ * 内容不会被深拷贝。
  */
 int i2c_register_board_info(int busnum, struct i2c_board_info const *info, unsigned len)
 {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Linux I2C core slave support code
+ * Linux I2C core 的从设备（slave）支持代码
  *
  * Copyright (C) 2014 by Wolfram Sang <wsa@sang-engineering.com>
  */
@@ -26,20 +26,20 @@ int i2c_slave_register(struct i2c_client *client, i2c_slave_cb_t slave_cb)
 		return -EINVAL;
 
 	if (!(client->flags & I2C_CLIENT_SLAVE))
-		dev_warn(&client->dev, "%s: client slave flag not set. You might see address collisions\n",
+		dev_warn(&client->dev, "%s: client slave 标志未设置，可能会出现地址冲突\n",
 			 __func__);
 
 	if (!(client->flags & I2C_CLIENT_TEN)) {
-		/* Enforce stricter address checking */
+		/* 对 7 位地址执行更严格的检查。 */
 		ret = i2c_check_7bit_addr_validity_strict(client->addr);
 		if (ret) {
-			dev_err(&client->dev, "%s: invalid address\n", __func__);
+			dev_err(&client->dev, "%s: 地址无效\n", __func__);
 			return ret;
 		}
 	}
 
 	if (!client->adapter->algo->reg_slave) {
-		dev_err(&client->dev, "%s: not supported by adapter\n", __func__);
+		dev_err(&client->dev, "%s: 该适配器不支持此功能\n", __func__);
 		return -EOPNOTSUPP;
 	}
 
@@ -51,7 +51,7 @@ int i2c_slave_register(struct i2c_client *client, i2c_slave_cb_t slave_cb)
 
 	if (ret) {
 		client->slave_cb = NULL;
-		dev_err(&client->dev, "%s: adapter returned error %d\n", __func__, ret);
+		dev_err(&client->dev, "%s: 适配器返回错误 %d\n", __func__, ret);
 	}
 
 	return ret;
@@ -66,7 +66,7 @@ int i2c_slave_unregister(struct i2c_client *client)
 		return -EINVAL;
 
 	if (!client->adapter->algo->unreg_slave) {
-		dev_err(&client->dev, "%s: not supported by adapter\n", __func__);
+		dev_err(&client->dev, "%s: 该适配器不支持此功能\n", __func__);
 		return -EOPNOTSUPP;
 	}
 
@@ -77,7 +77,7 @@ int i2c_slave_unregister(struct i2c_client *client)
 	if (ret == 0)
 		client->slave_cb = NULL;
 	else
-		dev_err(&client->dev, "%s: adapter returned error %d\n", __func__, ret);
+		dev_err(&client->dev, "%s: 适配器返回错误 %d\n", __func__, ret);
 
 	return ret;
 }
@@ -96,16 +96,14 @@ int i2c_slave_event(struct i2c_client *client,
 EXPORT_SYMBOL_GPL(i2c_slave_event);
 
 /**
- * i2c_detect_slave_mode - detect operation mode
- * @dev: The device owning the bus
+ * i2c_detect_slave_mode - 检测设备是否以从设备模式工作
+ * @dev: 持有该总线的设备
  *
- * This checks the device nodes for an I2C slave by checking the address
- * used in the reg property. If the address match the I2C_OWN_SLAVE_ADDRESS
- * flag this means the device is configured to act as a I2C slave and it will
- * be listening at that address.
+ * 通过检查设备树中 reg 属性所使用的地址，判断是否存在 I2C 从设备。
+ * 如果地址匹配 I2C_OWN_SLAVE_ADDRESS 标志，就说明该设备被配置为
+ * I2C 从设备，并会在该地址上监听。
  *
- * Returns true if an I2C own slave address is detected, otherwise returns
- * false.
+ * 如果检测到 I2C own slave address，则返回 true，否则返回 false。
  */
 bool i2c_detect_slave_mode(struct device *dev)
 {
@@ -120,7 +118,7 @@ bool i2c_detect_slave_mode(struct device *dev)
 				return true;
 		}
 	} else if (is_acpi_device_node(fwnode)) {
-		dev_dbg(dev, "ACPI slave is not supported yet\n");
+		dev_dbg(dev, "ACPI 从设备模式暂不支持\n");
 	}
 	return false;
 }

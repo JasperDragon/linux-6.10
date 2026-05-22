@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Definitions for the Linux I2C OF component prober
+ * Linux I2C OF 组件探测器的公共定义
  *
  * Copyright (C) 2024 Google LLC
  */
@@ -15,52 +15,50 @@ struct device;
 struct device_node;
 
 /**
- * struct i2c_of_probe_ops - I2C OF component prober callbacks
+ * struct i2c_of_probe_ops - I2C OF 组件探测器回调集合
  *
- * A set of callbacks to be used by i2c_of_probe_component().
+ * 这组回调用于 i2c_of_probe_component()。
  *
- * All callbacks are optional. Callbacks are called only once per run, and are
- * used in the order they are defined in this structure.
+ * 所有回调都是可选的。每轮探测中，每个回调最多调用一次，并严格按
+ * 结构体里定义的顺序执行。
  *
- * All callbacks that have return values shall return %0 on success,
- * or a negative error number on failure.
+ * 有返回值的回调在成功时应返回 %0，失败时返回负 errno。
  *
- * The @dev parameter passed to the callbacks is the same as @dev passed to
- * i2c_of_probe_component(). It should only be used for dev_printk() calls
- * and nothing else, especially not managed device resource (devres) APIs.
+ * 传给回调的 @dev 与传给 i2c_of_probe_component() 的 @dev 相同。
+ * 它只应该用于 dev_printk() 这类日志用途，不应拿去做别的事情，
+ * 尤其不要调用受管理资源（devres）接口。
  */
 struct i2c_of_probe_ops {
 	/**
-	 * @enable: Retrieve and enable resources so that the components respond to probes.
+	 * @enable: 获取并使能资源，让组件能对 probe 有响应
 	 *
-	 * It is OK for this callback to return -EPROBE_DEFER since the intended use includes
-	 * retrieving resources and enables them. Resources should be reverted to their initial
-	 * state and released before returning if this fails.
+	 * 这个回调允许返回 -EPROBE_DEFER，因为典型用途就包括“先取资源，
+	 * 再把组件上电/复位释放，使其能够被探测”。如果中途失败，返回前必须
+	 * 把资源恢复到初始状态并释放干净。
 	 */
 	int (*enable)(struct device *dev, struct device_node *bus_node, void *data);
 
 	/**
-	 * @cleanup_early: Release exclusive resources prior to calling probe() on a
-	 *		   detected component.
+	 * @cleanup_early: 在对已发现组件调用 probe() 前，提前释放独占资源
 	 *
-	 * Only called if a matching component is actually found. If none are found,
-	 * resources that would have been released in this callback should be released in
-	 * @free_resourcs_late instead.
+	 * 只有真正找到了匹配组件时才会调用。
+	 * 如果最终没有找到任何组件，那么本应在这里释放的资源，应改由
+	 * @cleanup 收尾。
 	 */
 	void (*cleanup_early)(struct device *dev, void *data);
 
 	/**
-	 * @cleanup: Opposite of @enable to balance refcounts and free resources after probing.
+	 * @cleanup: 与 @enable 相对的收尾操作，用于平衡引用计数并释放资源
 	 *
-	 * Should check if resources were already freed by @cleanup_early.
+	 * 实现时应自行判断资源是否已经在 @cleanup_early 中释放过。
 	 */
 	void (*cleanup)(struct device *dev, void *data);
 };
 
 /**
- * struct i2c_of_probe_cfg - I2C OF component prober configuration
- * @ops: Callbacks for the prober to use.
- * @type: A string to match the device node name prefix to probe for.
+ * struct i2c_of_probe_cfg - I2C OF 组件探测器配置
+ * @ops:  探测器要使用的回调集合
+ * @type: 用于匹配设备节点名前缀的字符串
  */
 struct i2c_of_probe_cfg {
 	const struct i2c_of_probe_ops *ops;
@@ -72,42 +70,37 @@ struct i2c_of_probe_cfg {
 int i2c_of_probe_component(struct device *dev, const struct i2c_of_probe_cfg *cfg, void *ctx);
 
 /**
- * DOC: I2C OF component prober simple helpers
+ * DOC: I2C OF 组件探测器的简化辅助函数
  *
- * Components such as trackpads are commonly connected to a devices baseboard
- * with a 6-pin ribbon cable. That gives at most one voltage supply and one
- * GPIO (commonly a "enable" or "reset" line) besides the I2C bus, interrupt
- * pin, and common ground. Touchscreens, while integrated into the display
- * panel's connection, typically have the same set of connections.
+ * 触摸板这类组件通常通过 6 针排线接到主板上。除了 I2C 总线、IRQ 和地，
+ * 往往只剩下一路电源和一路 GPIO（常见是 enable 或 reset）。
+ * 集成在显示面板上的触摸屏，连接关系通常也与此类似。
  *
- * A simple set of helpers are provided here for use with the I2C OF component
- * prober. This implementation targets such components, allowing for at most
- * one regulator supply.
+ * 因此这里提供了一组简单 helper，专门服务这类“最多一路 regulator +
+ * 一路 GPIO”的 I2C 组件探测场景。
  *
- * The following helpers are provided:
+ * 目前提供的 helper 有：
  * * i2c_of_probe_simple_enable()
  * * i2c_of_probe_simple_cleanup_early()
  * * i2c_of_probe_simple_cleanup()
  */
 
 /**
- * struct i2c_of_probe_simple_opts - Options for simple I2C component prober callbacks
- * @res_node_compatible: Compatible string of device node to retrieve resources from.
- * @supply_name: Name of regulator supply.
- * @gpio_name: Name of GPIO. NULL if no GPIO line is used. Empty string ("") if GPIO
- *	       line is unnamed.
- * @post_power_on_delay_ms: Delay after regulators are powered on. Passed to msleep().
- * @post_gpio_config_delay_ms: Delay after GPIO is configured. Passed to msleep().
- * @gpio_assert_to_enable: %true if GPIO should be asserted, i.e. set to logical high,
- *			   to enable the component.
+ * struct i2c_of_probe_simple_opts - 简化 I2C 组件探测回调的配置项
+ * @res_node_compatible: 用于寻找资源节点的 compatible 字符串
+ * @supply_name:         regulator 供电名
+ * @gpio_name:           GPIO 名称。若不用 GPIO 则为 NULL；若 GPIO 无名字，
+ *			 则传空字符串 ("")
+ * @post_power_on_delay_ms:   供电打开后的延迟，传给 msleep()
+ * @post_gpio_config_delay_ms: GPIO 配置完成后的延迟，传给 msleep()
+ * @gpio_assert_to_enable: 若为 %true，则 GPIO 置为逻辑高表示使能组件
  *
- * This describes power sequences common for the class of components supported by the
- * simple component prober:
- * * @gpio_name is configured to the non-active setting according to @gpio_assert_to_enable.
- * * @supply_name regulator supply is enabled.
- * * Wait for @post_power_on_delay_ms to pass.
- * * @gpio_name is configured to the active setting according to @gpio_assert_to_enable.
- * * Wait for @post_gpio_config_delay_ms to pass.
+ * 这描述的是一类常见上电时序：
+ * * 先按 @gpio_assert_to_enable 的反向状态配置 @gpio_name
+ * * 再使能 @supply_name 对应的 regulator
+ * * 等待 @post_power_on_delay_ms
+ * * 再按 @gpio_assert_to_enable 的有效状态配置 @gpio_name
+ * * 最后等待 @post_gpio_config_delay_ms
  */
 struct i2c_of_probe_simple_opts {
 	const char *res_node_compatible;
@@ -122,9 +115,9 @@ struct gpio_desc;
 struct regulator;
 
 struct i2c_of_probe_simple_ctx {
-	/* public: provided by user before helpers are used. */
+	/* 公共输入：由调用者在 helper 使用前填好。 */
 	const struct i2c_of_probe_simple_opts *opts;
-	/* private: internal fields for helpers. */
+	/* 私有状态：供 helper 内部维护。 */
 	struct regulator *supply;
 	struct gpio_desc *gpiod;
 };
