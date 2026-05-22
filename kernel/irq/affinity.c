@@ -1,5 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * affinity.c — 中断亲和性 (CPU 绑定) 管理。
+ *
+ * 为多队列设备 (NVMe, 网卡等) 自动计算 IRQ 到 CPU 的
+ * 最优映射。核心算法:
+ *   - 计算每个中断向量的"最优 CPU 集合" (通过 irq_calc_affinity_vectors)
+ *   - 考虑 NUMA 拓扑: 将中断分配到设备所在 NUMA 节点的 CPU
+ *   - 跨 socket 分布: 在多个 CPU socket 之间公平分配向量
+ *
  * Copyright (C) 2016 Thomas Gleixner.
  * Copyright (C) 2016-2017 Christoph Hellwig.
  */

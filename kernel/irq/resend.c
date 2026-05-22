@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * resend.c — 中断重发机制。
+ *
+ * 边沿触发中断可能丢失: 如果在 handler 处理期间中断线再次触发,
+ * 控制器可能不产生新的中断。解决方案:
+ *   - check_irq_resend() 在 handler 返回后检查是否错过了中断
+ *   - 通过设置 IRQS_PENDING 标志 + 重新调用 flow handler 来模拟重发
+ *   - tasklet 机制用作软中断上下文中的延迟重发
+ *
  * Copyright (C) 1992, 1998-2006 Linus Torvalds, Ingo Molnar
  * Copyright (C) 2005-2006, Thomas Gleixner
- *
  * This file contains the IRQ-resend code
  *
  * If the interrupt is waiting to be processed, we try to re-run it.

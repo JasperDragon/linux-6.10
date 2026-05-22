@@ -1,22 +1,40 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * handle.c — 核心中断处理入口 (irq_handle / irq_handler dispatch).
+ *
  * Copyright (C) 1992, 1998-2006 Linus Torvalds, Ingo Molnar
  * Copyright (C) 2005-2006, Thomas Gleixner, Russell King
  *
- * This file contains the core interrupt handling code. Detailed
- * information is available in Documentation/core-api/genericirq.rst
+ * ============================================================================
+ * 中断处理流程
+ * ============================================================================
  *
+ * 当 CPU 收到一个 IRQ 时, 经过以下路径:
+ *
+ *   架构入口 (arch entry, e.g. vectors.S)
+ *     → 读取中断控制器寄存器获取 hwirq
+ *     → irq_domain 将 hwirq 翻译为 Linux IRQ 号
+ *     → generic_handle_irq(irq)
+ *       └─ generic_handle_irq_desc(desc)
+ *           └─ desc->handle_irq(desc)    ← 高层 flow handler
+ *                ├─ handle_level_irq()   — 电平触发
+ *                ├─ handle_edge_irq()    — 边沿触发
+ *                ├─ handle_fasteoi_irq() — EOI 型控制器 (ARM GIC)
+ *                └─ handle_percpu_irq()  — per-CPU 中断 (PPI/SGI)
+ *                     │
+ *                     └─ handle_irq_event(desc)
+ *                          └─ handle_irq_event_percpu(desc)
+ *                               ├─ 遍历 desc->action 链表
+ *                               │   ├─ 调用 action->handler (主 handler)
+ *                               │   └─ 若返回 IRQ_WAKE_THREAD, 唤醒 action->thread_fn
+ *                               └─ 统计计数 + 随机熵采集
+ *
+ * 关键概念:
+ *   - flow handler: 负责处理中断控制器的硬件协议 (mask/ack/eoi),
+ *     确保相同中断线不会嵌套重入
+ *   - handler / thread_fn: 驱动注册的业务处理逻辑
+ *   - ONESHOT: 主 handler 处理完后不自动 unmask, 线程 handler 完成后才 unmask
  */
-
-#include <linux/irq.h>
-#include <linux/random.h>
-#include <linux/sched.h>
-#include <linux/interrupt.h>
-#include <linux/kernel_stat.h>
-
-#include <asm/irq_regs.h>
-
-#include <trace/events/irq.h>
 
 #include "internals.h"
 
@@ -182,6 +200,20 @@ static inline void irqhandler_duration_check(u64 ts_start, unsigned int irq,
 	}
 }
 
+/*
+ * __handle_irq_event_percpu — 在当前 CPU 上执行中断处理链 (核心 hot path)。
+ * @desc: 中断描述符
+ *
+ * 这是中断子系统最核心的执行函数, 负责:
+ *   1) 遍历 desc->action 链表, 逐个调用已注册的 handler
+ *   2) 根据返回值决定是否唤醒线程 handler:
+ *      - IRQ_NONE:        中断不属于此 handler, 继续下一个
+ *      - IRQ_HANDLED:     中断已被处理, 继续下一个 handler
+ *      - IRQ_WAKE_THREAD: 主 handler 完成, 需要唤醒 thread_fn 继续处理
+ *   3) 累加 retval: 只要有一个 handler 返回了 IRQ_HANDLED, 最终就是 IRQ_HANDLED
+ *
+ * 锁上下文: 在中断上下文中运行 (hardirq), 关中断, 持有 desc->lock
+ */
 irqreturn_t __handle_irq_event_percpu(struct irq_desc *desc)
 {
 	irqreturn_t retval = IRQ_NONE;

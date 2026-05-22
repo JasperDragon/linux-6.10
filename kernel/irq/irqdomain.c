@@ -1,13 +1,38 @@
 // SPDX-License-Identifier: GPL-2.0
-
-#define pr_fmt(fmt)  "irq: " fmt
-
-#include <linux/acpi.h>
-#include <linux/debugfs.h>
-#include <linux/hardirq.h>
-#include <linux/interrupt.h>
-#include <linux/irq.h>
-#include <linux/irqdesc.h>
+/*
+ * irqdomain.c — IRQ 域 (irq_domain) 管理。
+ *
+ * ============================================================================
+ * irq_domain 概念
+ * ============================================================================
+ *
+ * 中断控制器的"硬件 IRQ 编号" (hwirq) 与 Linux 的"逻辑 IRQ 编号"
+ * 是两套不同的命名空间。irq_domain 负责在二者之间做映射。
+ *
+ * 为什么需要 irq_domain?
+ *   - 一个系统可能有多个中断控制器 (GIC + GPIO 扩展 + PCI MSI...)
+ *   - 每个控制器的 hwirq 都从 0 开始编号
+ *   - 需要统一翻译为全局唯一的 Linux IRQ 号
+ *
+ * 映射类型 (domain->hwirq → Linux IRQ):
+ *
+ *   linear (线性映射):
+ *     irq = hwirq + domain->revmap_base
+ *     固定偏移, O(1) 查找, 适用于 GIC 等连续编号的控制器
+ *
+ *   tree (红黑树映射):
+ *     通过 radix_tree 存储映射关系
+ *     适用于 hwirq 稀疏分布的场景 (如 PCI MSI)
+ *
+ *   direct (直接映射):
+ *     专用的全范围数组, O(1) 查找, 适用于已知范围的场景
+ *
+ * 层级 irq_domain (Hierarchy):
+ *   现代 ARM64 SoC 的中断控制器通常是层级结构:
+ *     [设备] → [GPIO 控制器] → [二级 GIC] → [GIC] → CPU
+ *   每个层级都是一个 irq_domain, 通过 parent 指针串联。
+ *   分配 Linux IRQ 号时, 从根 domain 开始逐层分配和配置。
+ */
 #include <linux/irqdomain.h>
 #include <linux/module.h>
 #include <linux/mutex.h>

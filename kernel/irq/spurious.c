@@ -1,8 +1,34 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * spurious.c — 伪中断 (spurious interrupt) 检测与处理。
+ *
  * Copyright (C) 1992, 1998-2004 Linus Torvalds, Ingo Molnar
  *
- * This file contains spurious interrupt handling.
+ * ============================================================================
+ * 伪中断检测机制
+ * ============================================================================
+ *
+ * 伪中断是指硬件中断控制器触发后, 却没有对应的设备 handler 认领
+ * (所有 handler 返回 IRQ_NONE) 的中断。可能原因:
+ *   - 电气噪声
+ *   - 中断线共享但触发源不明确
+ *   - 硬件故障
+ *
+ * 检测策略:
+ *   - 对每个 IRQ 维护计数器 (irq_count / irqs_unhandled / last_unhandled)
+ *   - 如果在短时间内 (HZ/100) 收到了 100,000 个未处理的中断,
+ *     则认为该中断线有问题
+ *   - 处理方式: 调用 note_interrupt() → __report_bad_irq()
+ *     → 禁用该中断线 (设置 IRQS_SPURIOUS_DISABLED)
+ *
+ * 轮询机制 (IRQ polling):
+ *   对于被伪中断检测禁用的中断, 内核会以轮询方式定期检查,
+ *   如果中断恢复正常则重新启用。
+ *
+ * noirqdebug 启动参数:
+ *   传递 "noirqdebug" 可禁用伪中断检测,
+ *   在某些已知有噪音但无害的硬件上使用。
+ */
  */
 
 #include <linux/jiffies.h>

@@ -1,12 +1,43 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * manage.c — 中断管理 API (request_irq / free_irq / 线程化中断 / 亲和性)。
+ *
  * Copyright (C) 1992, 1998-2006 Linus Torvalds, Ingo Molnar
  * Copyright (C) 2005-2006 Thomas Gleixner
  *
- * This file contains driver APIs to the irq subsystem.
+ * ============================================================================
+ * 驱动侧 API 概览
+ * ============================================================================
+ *
+ * 驱动代码通过以下 API 与中断子系统交互:
+ *
+ *   request_irq() / request_threaded_irq()
+ *     — 注册中断处理程序
+ *     — 可指定: handler (硬中断) + thread_fn (线程处理)
+ *     — 关键标志:
+ *         IRQF_SHARED:     多个设备共享同一 IRQ 线
+ *         IRQF_ONESHOT:    主 handler 执行后不 unmask, 等线程处理完
+ *         IRQF_TRIGGER_*:  触发类型 (边沿/电平/...)
+ *         IRQF_NOBALANCING: 禁止 IRQ 平衡 (特定 CPU 绑定)
+ *         IRQF_PERCPU:     per-CPU 中断
+ *
+ *   free_irq() — 注销中断处理程序 (等待可能正在运行的 handler 完成)
+ *
+ *   disable_irq() / enable_irq()
+ *     — 禁用/使能中断 (disable 是异步的——等待可能正在运行的 handler)
+ *
+ *   disable_irq_nosync() — 立即禁用, 不等待 handler 完成
+ *
+ * 线程化中断 (Threaded IRQ):
+ *   CONFIG_IRQ_FORCED_THREADING 下, 所有非标记 IRQF_NO_THREAD 的
+ *   中断处理程序被强制移至内核线程中执行。主 handler 只做最基本的
+ *   ack + mask, 真正的处理逻辑在线程上下文中完成。这降低了中断关闭
+ *   的延迟, 提高了实时性。
+ *
+ * 中断亲和性 (IRQ affinity):
+ *   /proc/irq/N/smp_affinity 控制系统将中断路由到哪些 CPU。
+ *   内核通过 irq_affinity 机制在多 CPU 之间平衡中断负载。
  */
-
-#define pr_fmt(fmt) "genirq: " fmt
 
 #include <linux/irq.h>
 #include <linux/kthread.h>

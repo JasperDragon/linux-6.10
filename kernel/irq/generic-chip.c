@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Library implementing the most common irq chip callback functions
+ * generic-chip.c — 通用 irq_chip 库。
+ *
+ * 为简单的中断控制器提供开箱即用的 irq_chip 实现,
+ * 包括 irq_mask/irq_unmask/irq_ack 等标准回调。
+ * 适用于 GPIO 扩展中断控制器和简单 SoC 内置控制器。
  *
  * Copyright (C) 2011, Thomas Gleixner
  */

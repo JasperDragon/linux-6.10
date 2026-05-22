@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2009 Rafael J. Wysocki <rjw@sisk.pl>, Novell Inc.
+ * pm.c — 中断子系统电源管理 (suspend/resume)。
  *
- * This file contains power management functions related to interrupts.
+ * suspend 时: 将唤醒源 IRQ 配置为唤醒中断 (enable_irq_wake),
+ *   其他 IRQ 被屏蔽 (suspend_device_irqs)
+ * resume 时: 恢复被屏蔽的 IRQ (resume_device_irqs)
+ *
+ * Copyright (C) 2009 Rafael J. Wysocki <rjw@sisk.pl>, Novell Inc.
  */
 
 #include <linux/irq.h>

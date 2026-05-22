@@ -1,10 +1,33 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * IRQ subsystem internal functions and variables:
+ * IRQ subsystem internal functions and variables.
  *
- * Do not ever include this file from anything else than
- * kernel/irq/. Do not even think about using any information outside
- * of this file for your non core code.
+ * 此文件仅供 kernel/irq/ 内部使用, 外部代码请勿引用。
+ *
+ * ============================================================================
+ * 中断子系统核心概念
+ * ============================================================================
+ *
+ * 两条 IRQ 状态线:
+ *
+ * 1) irq_data.state_use_accessors (IRQD_* flags)
+ *    - 描述 irq_chip 级别的硬件状态
+ *    - 如: IRQD_IRQ_MASKED (硬件屏蔽), IRQD_IRQ_INPROGRESS (正在处理中),
+ *      IRQD_TRIGGER_MASK (触发类型: 边沿/电平/...)
+ *
+ * 2) irq_desc.status_use_accessors (_IRQ_* flags, 通过 settings.h 访问)
+ *    - 描述 Linux IRQ 子系统的软件状态
+ *    - 如: _IRQ_PER_CPU (per-CPU 中断), _IRQ_LEVEL (电平触发),
+ *      _IRQ_NOPROBE (禁止自动探测), _IRQ_NOTHREAD (禁止线程化)
+ *
+ * 3) irq_desc.istate (IRQS_* flags, 内部核心状态)
+ *    - 中断处理流程的瞬时状态机
+ *    - 如: IRQS_PENDING (待重发), IRQS_REPLAY (已重发), IRQS_ONESHOT,
+ *      IRQS_SUSPENDED, IRQS_SPURIOUS_DISABLED
+ *
+ * 4) irqaction 线程标志 (IRQTF_*)
+ *    - 中断线程的状态控制
+ *    - 如: IRQTF_RUNTHREAD (唤醒线程), IRQTF_FORCED_THREAD (强制线程化)
  */
 #include <linux/irqdesc.h>
 #include <linux/kernel_stat.h>
@@ -25,12 +48,13 @@ extern int irq_poll_cpu;
 extern struct irqaction chained_action;
 
 /*
- * Bits used by threaded handlers:
- * IRQTF_RUNTHREAD - signals that the interrupt handler thread should run
- * IRQTF_WARNED    - warning "IRQ_WAKE_THREAD w/o thread_fn" has been printed
- * IRQTF_AFFINITY  - irq thread is requested to adjust affinity
- * IRQTF_FORCED_THREAD  - irq action is force threaded
- * IRQTF_READY     - signals that irq thread is ready
+ * 中断线程标志 (IRQTF_*) — 控制 threaded interrupt handler 的行为。
+ *
+ * IRQTF_RUNTHREAD      — 通知 irq 线程: 有工作要处理
+ * IRQTF_WARNED         — 已打印 "IRQ_WAKE_THREAD w/o thread_fn" 警告 (防重复)
+ * IRQTF_AFFINITY       — irq 线程被请求调整 CPU 亲和性
+ * IRQTF_FORCED_THREAD  — 该 irqaction 被强制线程化 (irq_thread 内核参数)
+ * IRQTF_READY          — irq 线程已准备好 (已完成初始化, 可以处理中断)
  */
 enum {
 	IRQTF_RUNTHREAD,
@@ -41,22 +65,20 @@ enum {
 };
 
 /*
- * Bit masks for desc->core_internal_state__do_not_mess_with_it
+ * desc->istate 位掩码 (IRQS_*) — 中断处理流程的核心状态机。
  *
- * IRQS_AUTODETECT		- autodetection in progress
- * IRQS_SPURIOUS_DISABLED	- was disabled due to spurious interrupt
- *				  detection
- * IRQS_POLL_INPROGRESS		- polling in progress
- * IRQS_ONESHOT			- irq is not unmasked in primary handler
- * IRQS_REPLAY			- irq has been resent and will not be resent
- * 				  again until the handler has run and cleared
- * 				  this flag.
- * IRQS_WAITING			- irq is waiting
- * IRQS_PENDING			- irq needs to be resent and should be resent
- * 				  at the next available opportunity.
- * IRQS_SUSPENDED		- irq is suspended
- * IRQS_NMI			- irq line is used to deliver NMIs
- * IRQS_SYSFS			- descriptor has been added to sysfs
+ * IRQS_AUTODETECT        — 自动探测正在进行 (探测哪个 IRQ 触发了)
+ * IRQS_SPURIOUS_DISABLED — 因伪中断检测被禁用 (spurious.c)
+ * IRQS_POLL_INPROGRESS   — 轮询模式正在处理此中断
+ * IRQS_ONESHOT           — ONESHOT 模式: 主 handler 返回后不自动 unmask,
+ *                          由线程 handler 负责重新使能中断
+ * IRQS_REPLAY            — 中断已重发, 在 handler 运行并清除此标志前
+ *                          不会再次重发
+ * IRQS_WAITING           — 中断正在等待重发 (边沿中断丢失检测)
+ * IRQS_PENDING           — 中断需要重发, 在下一个可用时机重发
+ * IRQS_SUSPENDED         — 中断因系统挂起而被暂停
+ * IRQS_NMI               — 此中断线用于递送 NMI (不可屏蔽中断)
+ * IRQS_SYSFS             — 描述符已添加到 sysfs
  */
 enum {
 	IRQS_AUTODETECT		= 0x00000001,

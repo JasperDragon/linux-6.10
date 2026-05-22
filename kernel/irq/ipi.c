@@ -1,8 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * ipi.c — IPI (Inter-Processor Interrupt) 框架。
+ *
+ * IPI 是 CPU 之间通信的机制, 用于:
+ *   - SMP TLB 刷新 (flush_tlb_others)
+ *   - 跨 CPU 函数调用 (smp_call_function)
+ *   - 调度器 IPI (reschedule)
+ *   - RCU 回调处理
+ *
+ * 提供 irq_reserve_ipi() / irq_request_ipi() 等 API,
+ * 将 IPI 作为特殊类型的 IRQ 管理 (通常为 per-CPU 虚拟中断)。
+ *
  * Copyright (C) 2015 Imagination Technologies Ltd
  * Author: Qais Yousef <qais.yousef@imgtec.com>
- *
  * This file contains driver APIs to the IPI subsystem.
  */
 

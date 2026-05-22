@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 1992, 1998-2004 Linus Torvalds, Ingo Molnar
+ * autoprobe.c — 中断自动探测。
  *
- * This file contains the interrupt probing code and driver APIs.
+ * 在 ISA/传统设备时代，设备无法告诉内核它们使用哪个 IRQ 线。
+ * 自动探测通过"轮询所有候选 IRQ, 看哪个触发了设备"来确定映射。
+ * 在现代系统中 (PCI/ACPI/DT 显式声明 IRQ) 已基本不再使用。
+ *
+ * Copyright (C) 1992, 1998-2004 Linus Torvalds, Ingo Molnar
  */
 
 #include <linux/irq.h>

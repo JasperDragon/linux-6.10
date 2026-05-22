@@ -1,8 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * msi.c — MSI (Message Signaled Interrupts) 中断管理。
+ *
  * Copyright (C) 2014 Intel Corp.
  * Author: Jiang Liu <jiang.liu@linux.intel.com>
  *
+ * ============================================================================
+ * MSI 架构
+ * ============================================================================
+ *
+ * MSI 是 PCI 设备的一种中断机制, 与传统基于引脚的 INTx 不同:
+ *   - 设备直接向内存地址写入特定数据来触发中断 (而不是拉高/拉低引脚)
+ *   - 每个设备可以有多个 MSI 向量 (MSI-X 支持多达 2048 个)
+ *   - 天然支持 per-CPU 中断路由
+ *
+ * MSI 域层次:
+ *   PCI 设备 → PCI 总线 → ITS (ARM) / IOMMU (x86) → CPU
+ *   每一层都有对应的 irq_domain, 负责 hwirq → Linux IRQ 的映射
+ *
+ * API:
+ *   pci_alloc_irq_vectors() — 分配 MSI/MSI-X 向量
+ *   pci_free_irq_vectors()  — 释放
+ *   底层通过 msi_domain_ops 回调操作具体的中断控制器
+ */
  * This file is licensed under GPLv2.
  *
  * This file contains common code to support Message Signaled Interrupts for

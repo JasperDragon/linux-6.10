@@ -1,11 +1,41 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * irqdesc.c — 中断描述符 (irq_desc) 管理。
+ *
  * Copyright (C) 1992, 1998-2006 Linus Torvalds, Ingo Molnar
  * Copyright (C) 2005-2006, Thomas Gleixner, Russell King
  *
- * This file contains the interrupt descriptor management code. Detailed
- * information is available in Documentation/core-api/genericirq.rst
+ * ============================================================================
+ * 架构概览
+ * ============================================================================
  *
+ * irq_desc 是 Linux 中断子系统的核心数据结构。每个 Linux IRQ 号
+ * 对应一个 irq_desc, 其中包含:
+ *
+ *   irq_desc
+ *   ├─ irq_data           — 硬件相关的 IRQ 数据 (chip, domain, hwirq...)
+ *   ├─ irq_common_data    — 通用数据 (affinity, node...)
+ *   ├─ action (irqaction链表) — 已注册的中断处理程序
+ *   ├─ kstat_irqs         — per-CPU 中断计数
+ *   ├─ istate             — 内部状态机 (IRQS_* flags)
+ *   └─ status_use_accessors — 软件配置状态 (_IRQ_* flags)
+ *
+ * 两种IRQ编号模式:
+ *
+ * 1) SPARSE_IRQ (稀疏IRQ, 默认):
+ *    - irq_desc 只在实际需要时才分配 (通过 radix tree / maple tree 动态管理)
+ *    - 支持大范围 IRQ 编号, 节省内存
+ *    - alloc_descs() 分配, irq_free_descs() 释放
+ *
+ * 2) !SPARSE_IRQ (静态数组, 传统模式):
+ *    - irq_desc[NR_IRQS] 编译期静态数组
+ *    - 简单但浪费内存 (即使只用几个 IRQ 也分配全表)
+ *
+ * 启动路径:
+ *   start_kernel()
+ *     → early_irq_init()     — 初始化静态预分配的 irq_desc
+ *     → init_IRQ()           — 架构中断控制器初始化 (arm64: irqchip_init)
+ *     → 之后 request_irq() 才可用
  */
 #include <linux/irq.h>
 #include <linux/slab.h>

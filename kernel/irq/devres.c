@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
+/*
+ * devres.c — 设备资源管理 (devm_*) IRQ API。
+ *
+ * 提供 devm_request_threaded_irq() 和 devm_free_irq(),
+ * 确保在设备 detach 时自动释放已注册的中断, 防止驱动遗漏
+ * free_irq() 导致的内存泄漏和 IRQ 资源泄漏。
+ */
 #include <linux/module.h>
 #include <linux/interrupt.h>
 #include <linux/irqdomain.h>

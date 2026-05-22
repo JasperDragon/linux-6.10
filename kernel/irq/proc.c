@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 1992, 1998-2004 Linus Torvalds, Ingo Molnar
+ * proc.c — /proc/interrupts 和 /proc/irq/N/ 文件系统接口。
  *
- * This file contains the /proc/irq/ handling code.
+ * /proc/interrupts: 显示每 CPU 的 IRQ 计数和关联设备
+ * /proc/irq/N/smp_affinity: 控制 IRQ 亲和性 (位图格式)
+ * /proc/irq/N/smp_affinity_list: CPU 列表格式的亲和性
+ *
+ * Copyright (C) 1992, 1998-2004 Linus Torvalds, Ingo Molnar
  */
 
 #include <linux/irq.h>

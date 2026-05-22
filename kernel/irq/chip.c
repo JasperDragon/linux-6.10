@@ -1,11 +1,33 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * chip.c — irq_chip 操作实现 (mask/unmask/ack/eoi/set_type...)。
+ *
  * Copyright (C) 1992, 1998-2006 Linus Torvalds, Ingo Molnar
  * Copyright (C) 2005-2006, Thomas Gleixner, Russell King
  *
- * This file contains the core interrupt handling code, for irq-chip based
- * architectures. Detailed information is available in
- * Documentation/core-api/genericirq.rst
+ * ============================================================================
+ * irq_chip 接口
+ * ============================================================================
+ *
+ * irq_chip 是中断控制器驱动的抽象接口, 定义了一组操作回调:
+ *
+ *   irq_startup:    首次启用中断 (默认: irq_enable)
+ *   irq_shutdown:   关闭中断 (默认: irq_disable)
+ *   irq_enable:     使能中断线 (通常调用 irq_unmask)
+ *   irq_disable:    禁用中断线 (通常调用 irq_mask)
+ *   irq_ack:        确认中断 (通知控制器中断已被接收)
+ *   irq_mask:       屏蔽中断 (控制器不再转发此 IRQ)
+ *   irq_unmask:     取消屏蔽
+ *   irq_eoi:        中断结束 (ARM GIC 使用此而非 ack)
+ *   irq_set_type:   设置触发类型 (电平/边沿/...)
+ *   irq_set_affinity: 设置 CPU 亲和性
+ *
+ * 关键概念 — 延迟 disable (lazy disable):
+ *   调用 disable_irq() 时并不立即屏蔽硬件中断, 而是设置
+ *   IRQD_IRQ_DISABLED 标志。只有当中断实际到达时, 才在
+ *   irq_disable() → mask_irq() 路径中真正屏蔽。
+ *   这避免了昂贵的外设总线访问, 特别对慢速总线 (I2C/SPI) 上的
+ *   GPIO 扩展中断控制器至关重要。
  */
 
 #include <linux/irq.h>

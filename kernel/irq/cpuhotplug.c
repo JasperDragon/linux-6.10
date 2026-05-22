@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Generic cpu hotunplug interrupt migration code copied from the
- * arch/arm implementation
+ * cpuhotplug.c — CPU 热插拔时的中断迁移。
  *
+ * 当 CPU 下线 (offline) 时, 必须把该 CPU 上的中断迁移到其他 CPU,
+ * 否则这些中断将永远无法被处理。核心函数:
+ *   irq_migrate_all_off_this_cpu() — 批量迁移当前 CPU 的所有中断
+ *   irq_affinity_online_cpu()    — CPU 上线时恢复中断亲和性
+ *
+ * 基于 arch/arm 的实现演化而来
  * Copyright (C) Russell King
  *
  * This program is free software; you can redistribute it and/or modify

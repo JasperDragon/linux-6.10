@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
-
+/*
+ * migration.c — 中断迁移: 将正在处理的中断从一个 CPU 转移到另一个。
+ *
+ * 仅当 irq_chip 的 IRQCHIP_MOVE_DEFERRED 标志置位时使用。
+ * 此时硬件屏蔽操作被延迟到目标 CPU 的上下文中执行,
+ * 避免了在硬中断上下文中进行昂贵的跨 CPU 同步。
+ */
 #include <linux/irq.h>
 #include <linux/interrupt.h>
 
