@@ -289,6 +289,30 @@ static int __irq_startup(struct irq_desc *desc)
 	return ret;
 }
 
+/**
+ * irq_startup — 首次启动一条中断线。
+ * @desc:  中断描述符
+ * @resend: 是否检查并重发可能丢失的中断
+ * @force:  强制启动 (IRQ_START_FORCE) 还是条件启动 (IRQ_START_COND)
+ *
+ * 这是中断从"未使用"到"活跃"的关键转换点:
+ *
+ * 路径分三种:
+ *   IRQ_STARTUP_NORMAL: 正常启动
+ *     1) 若设置了 IRQCHIP_AFFINITY_PRE_STARTUP, 先设置亲和性
+ *     2) __irq_startup(): 调用 chip->irq_startup 或 irq_enable
+ *     3) 若未设置 PRE_STARTUP, 后设置亲和性 (默认行为)
+ *
+ *   IRQ_STARTUP_MANAGED: 托管中断 (managed interrupt)
+ *     - 用于多队列设备的自动中断分配
+ *     - 先设置亲和性到托管 CPU, 再启动
+ *
+ *   IRQ_STARTUP_ABORT: 无可用 CPU
+ *     - 设置 depth=1 模拟关闭状态
+ *     - 等 CPU 上线后再通过 irq_startup_managed() 重试
+ *
+ * 调用上下文: 持有 desc->lock
+ */
 int irq_startup(struct irq_desc *desc, bool resend, bool force)
 {
 	struct irq_data *d = irq_desc_get_irq_data(desc);
@@ -394,24 +418,25 @@ static void __irq_disable(struct irq_desc *desc, bool mask)
 }
 
 /**
- * irq_disable - Mark interrupt disabled
- * @desc:	irq descriptor which should be disabled
+ * irq_disable — 标记中断为已禁用 (延迟 mask 策略)。
+ * @desc: 中断描述符
  *
- * If the chip does not implement the irq_disable callback, we
- * use a lazy disable approach. That means we mark the interrupt
- * disabled, but leave the hardware unmasked. That's an
- * optimization because we avoid the hardware access for the
- * common case where no interrupt happens after we marked it
- * disabled. If an interrupt happens, then the interrupt flow
- * handler masks the line at the hardware level and marks it
- * pending.
+ * 核心优化 — lazy disable (延迟屏蔽):
  *
- * If the interrupt chip does not implement the irq_disable callback,
- * a driver can disable the lazy approach for a particular irq line by
- * calling 'irq_set_status_flags(irq, IRQ_DISABLE_UNLAZY)'. This can
- * be used for devices which cannot disable the interrupt at the
- * device level under certain circumstances and have to use
- * disable_irq[_nosync] instead.
+ * 如果 irq_chip 没有提供 irq_disable 回调, 则使用延迟策略:
+ *   1) 只设置 IRQD_IRQ_DISABLED 标志, 不操作硬件
+ *   2) 当中断真的到达时, 在 flow handler 的 mask_irq() 路径中
+ *      才真正屏蔽硬件
+ *
+ * 为什么这样做?
+ *   - 对 I2C/SPI 总线上的 GPIO 扩展中断控制器, 一次寄存器写
+ *     可能耗时数百微秒。如果用户调用 disable_irq() 后该中断
+ *     再也没来, 这次硬件访问就是浪费
+ *   - 延迟到中断真正到达时再 mask, 避免了不必要的总线事务
+ *
+ * 如果驱动需要立即 mask (例如设备无法在设备侧禁用中断):
+ *   调用 irq_set_status_flags(irq, IRQ_DISABLE_UNLAZY)
+ *   强制 irq_disable() 走立即 mask 路径
  */
 void irq_disable(struct irq_desc *desc)
 {
@@ -748,13 +773,24 @@ static inline void cond_eoi_irq(struct irq_chip *chip, struct irq_data *data)
 }
 
 /**
- * handle_fasteoi_irq - irq handler for transparent controllers
- * @desc:	the interrupt description structure for this irq
+ * handle_fasteoi_irq — 现代 EOI 型中断控制器的 flow handler (ARM GIC 默认)。
+ * @desc: 中断描述符
  *
- * Only a single callback will be issued to the chip: an ->eoi() call when
- * the interrupt has been serviced. This enables support for modern forms
- * of interrupt handlers, which handle the flow details in hardware,
- * transparently.
+ * 与 handle_level_irq 的区别:
+ *   - 不需要在 handler 之前 mask+ack (硬件已经在分发时处理了)
+ *   - 只需要在 handler 之后发 EOI (End Of Interrupt)
+ *   - EOI 告诉 GIC "此中断处理完毕, 可以发送同一 IRQ 的下一个实例"
+ *
+ * ONESHOT 模式下的特殊处理:
+ *   - handler 执行前先 mask (阻止同一 IRQ 在 ONESHOT 完成前再次触发)
+ *   - 如果 handler 唤醒了线程: 保持 mask 状态, 只发 EOI
+ *   - 线程 handler 完成后由 irq_finalize_oneshot() 负责 unmask + EOI
+ *   - 如果 handler 没有唤醒线程 (伪中断或 handler 完全处理了):
+ *     直接 unmask + EOI
+ *
+ * 亲和性竞争处理:
+ *   如果亲和性变更与中断处理同时发生, 新中断可能在旧 CPU 完成 EOI
+ *   之前到达新 CPU。通过检查 IRQS_PENDING 和处理后重发来解决。
  */
 void handle_fasteoi_irq(struct irq_desc *desc)
 {

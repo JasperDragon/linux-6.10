@@ -51,6 +51,21 @@ static atomic_t irq_poll_active;
 /*
  * Recovery handler for misrouted interrupts.
  */
+/*
+ * try_one_irq — 轮询单个 IRQ 的恢复处理。
+ * @desc:  中断描述符
+ * @force: 是否强制执行 (即使 IRQD_IRQ_DISABLED 已置位)
+ *
+ * 用于伪中断检测禁用 IRQ 后的恢复机制:
+ *   - 定期 (通过 poll_spurious_irqs timer) 轮询被禁用的 IRQ
+ *   - 如果中断现在能正常处理 (IRQ_HANDLED), 说明问题已清除
+ *   - 只轮询 IRQF_SHARED 中断——非共享中断不会出现"没人认领"的情况
+ *
+ * 排除条件: per-CPU、嵌套线程、已标记 polled、
+ *   非共享、timer 中断 都不参与轮询
+ *
+ * 返回值: true = 中断被成功处理, false = 未处理或无法轮询
+ */
 static bool try_one_irq(struct irq_desc *desc, bool force)
 {
 	struct irqaction *action;
@@ -245,6 +260,29 @@ static inline bool try_misrouted_irq(unsigned int irq, struct irq_desc *desc,
 
 #define SPURIOUS_DEFERRED	0x80000000
 
+/*
+ * note_interrupt — 记录中断处理结果, 检测伪中断。
+ * @desc:       中断描述符
+ * @action_ret: handle_irq_event 的累积返回值
+ *
+ * 核心算法 (在 handle_irq_event 之后由 flow handler 调用):
+ *
+ * 1) 如果 action_ret == IRQ_NONE (所有 handler 都不认领):
+ *    - irqs_unhandled++
+ *    - 如果在短时间内 (HZ/100, 即 10ms) 收到了 100,000 次未处理中断:
+ *      → __report_bad_irq() 标记 IRQS_SPURIOUS_DISABLED
+ *      → 禁用该中断线
+ *    - 如果间隔较长, 重置计数器
+ *
+ * 2) 如果 action_ret == IRQ_HANDLED:
+ *    - 重置未处理计数器 (中断正常)
+ *
+ * 3) 如果 action_ret == IRQ_WAKE_THREAD:
+ *    - 延迟检测: 等到下一次硬中断到来时再做判断
+ *    - 因为线程 handler 的结果此时还未知
+ *    - 使用 SPURIOUS_DEFERRED 标志 + thread_handled_last 位
+ *      来判断线程 handler 是否成功处理了中断
+ */
 void note_interrupt(struct irq_desc *desc, irqreturn_t action_ret)
 {
 	unsigned int irq;

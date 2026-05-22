@@ -53,6 +53,22 @@ static void resend_irqs(struct tasklet_struct *unused)
 /* Tasklet to handle resend: */
 static DECLARE_TASKLET(resend_tasklet, resend_irqs);
 
+/*
+ * irq_sw_resend — 通过软件 tasklet 机制重发中断。
+ * @desc: 需要重发的中断描述符
+ *
+ * 当硬件重发不可行时 (例如通过写控制器寄存器), 使用 tasklet
+ * 在软中断上下文中模拟中断重发:
+ *   1) 将 desc 加入 irq_resend_list 全局链表
+ *   2) 调度 resend_tasklet → resend_irqs()
+ *      └─ 遍历链表, 调用 desc->handle_irq(desc) 重新处理
+ *
+ * 约束:
+ *   - 不能在非中断上下文中注入 (enforce_irqctx 检查)
+ *   - 嵌套线程中断重发到父中断
+ *
+ * 典型场景: 亲和性正在迁移时, 中断到达了错误的 CPU
+ */
 static int irq_sw_resend(struct irq_desc *desc)
 {
 	/*

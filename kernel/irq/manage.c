@@ -1499,6 +1499,43 @@ static bool valid_percpu_irqaction(struct irqaction *old, struct irqaction *new)
  * request/free_irq().
  */
 static int
+/*
+ * __setup_irq — request_irq / request_threaded_irq 的核心实现。
+ * @irq:  Linux IRQ 号
+ * @desc: 对应的中断描述符 (已获取并锁定)
+ * @new:  要注册的 irqaction
+ *
+ * 这是中断子系统最复杂的函数之一, 负责:
+ *
+ * 1) 参数校验:
+ *    - irq_chip 是否存在
+ *    - IRQF_ONESHOT 必须配合 thread_fn
+ *    - 嵌套线程中断的特殊处理
+ *
+ * 2) 共享 IRQ 兼容性检查:
+ *    - 遍历已有的 irqaction, 检查新 handler 是否可以共存
+ *    - 触发类型必须兼容 (IRQF_TRIGGER_MASK)
+ *    - IRQF_ONESHOT 与 IRQF_SHARED 不兼容
+ *    - IRQF_PERCPU 不能与共享 IRQ 共存
+ *
+ * 3) 线程创建 (如果需要):
+ *    - 为 thread_fn 创建内核线程 (kthread_create)
+ *    - 设置线程调度策略 (SCHED_FIFO, 默认优先级 50)
+ *    - 线程入口: irq_thread() → 循环调用 thread_fn
+ *
+ * 4) 首次启动中断:
+ *    - 如果是该 IRQ 的第一个 handler, 调用 irq_startup()
+ *    - 设置触发类型 (通过 chip->irq_set_type)
+ *    - 配置亲和性
+ *
+ * 5) 注册 action:
+ *    - 将 new action 加入 desc->action 链表
+ *    - 如果是共享 IRQ, 追加到链表末尾
+ *    - 设置线程掩码 (用于 oneshot 跟踪)
+ *
+ * 锁: 调用方持有 desc->lock (通过 request_irq → request_threaded_irq
+ *      → __setup_irq), 但线程创建时临时释放锁
+ */
 __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
 {
 	struct irqaction *old, **old_ptr;

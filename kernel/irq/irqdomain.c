@@ -732,6 +732,18 @@ static int irq_domain_associate_locked(struct irq_domain *domain, unsigned int v
 	return 0;
 }
 
+/*
+ * irq_domain_associate — 在 domain 中建立 hwirq ↔ virq 的双向关联。
+ *
+ * 这是 irq_domain 的"登记"操作:
+ *   - 设置 desc->irq_data.hwirq = hwirq (硬件侧)
+ *   - 设置 desc->irq_data.domain = domain (软件侧)
+ *   - 调用 domain->ops->map() 回调 (配置硬件, 如 GIC 的 gic_irq_domain_map)
+ *   - 在 domain->revmap 中注册 (linear: 直接计算偏移, tree: radix tree 插入)
+ *
+ * 完成后, 通过 irq_find_mapping() 就可以从 hwirq 查到 virq,
+ * 通过 irq_to_desc(virq) 就可以获取完整的 irq_desc。
+ */
 int irq_domain_associate(struct irq_domain *domain, unsigned int virq,
 			 irq_hw_number_t hwirq)
 {
@@ -832,15 +844,23 @@ static unsigned int irq_create_mapping_affinity_locked(struct irq_domain *domain
 }
 
 /**
- * irq_create_mapping_affinity() - Map a hardware interrupt into linux irq space
- * @domain: domain owning this hardware interrupt or NULL for default domain
- * @hwirq: hardware irq number in that domain space
- * @affinity: irq affinity
+ * irq_create_mapping_affinity — 将硬件中断号映射为 Linux IRQ 号。
+ * @domain:   IRQ 域 (NULL 则使用默认域)
+ * @hwirq:    域内的硬件中断号
+ * @affinity: CPU 亲和性描述符 (可选)
  *
- * Only one mapping per hardware interrupt is permitted. Returns a linux
- * irq number.
- * If the sense/trigger is to be specified, set_irq_type() should be called
- * on the number returned from that call.
+ * 这是 irq_domain 最核心的映射接口, 完成:
+ *   1) 查找已有映射 → 直接返回 (每个 hwirq 只能映射一次)
+ *   2) irq_domain_alloc_descs() — 分配一个新的 Linux IRQ 号
+ *      (从全局 IDR/radix tree 中获取, 并关联 irq_desc)
+ *   3) irq_domain_associate_locked() — 建立 hwirq ↔ virq 的关联
+ *      (在 domain 的 revmap 中注册: linear→直接计算, tree→radix tree 插入)
+ *
+ * 层级 domain:
+ *   如果是子 domain, __irq_domain_alloc_irqs() 会递归向父 domain
+ *   分配资源, 每一层都可能调用 chip->irq_set_type 配置硬件。
+ *
+ * 返回值: Linux IRQ 号 (>0), 失败返回 0
  */
 unsigned int irq_create_mapping_affinity(struct irq_domain *domain,
 					 irq_hw_number_t hwirq,
