@@ -41,6 +41,73 @@
 #define INIT_MEMBLOCK_MEMORY_REGIONS		INIT_MEMBLOCK_REGIONS
 #endif
 
+/*
+ * ============================================================================
+ * memblock.c — 内核启动早期物理内存管理器
+ * ============================================================================
+ *
+ * 【定位】memblock 是 Linux 最早期的内存分配器，在 buddy allocator（伙伴分配器）
+ * 启动之前运行。它直接管理物理地址空间，使用简单但高效的区域（region）模型。
+ *
+ * 【为什么需要 memblock】
+ *   内核启动早期，buddy allocator 尚未初始化：没有页表、没有 freelist、
+ *   没有 percpu 缓存。但内核需要分配 page table、percpu 区域、SPARSEMEM
+ *   元数据等。memblock 就是为满足这些"boot time"分配需求而生的。
+ *
+ * 【数据模型：三个区域集合】
+ *
+ *   struct memblock {
+ *       .memory     → "哪些物理内存可用"（从 firmware/DT 获取）
+ *       .reserved   → "哪些已被占用"（内核镜像、initrd、已分配块等）
+ *       .physmem    → "实际存在的物理内存"（不考虑 mem= 限制，仅部分架构)
+ *   }
+ *
+ *   空闲内存 = memory 中不在 reserved 中的部分
+ *   每个集合最多 128 个区域（初始），可通过 memblock_double_array() 动态扩容。
+ *
+ * 【核心算法：__next_mem_range() 迭代器】
+ *
+ *   绝大多数 memblock 操作基于此迭代器。它在 memory 和 reserved 两个
+ *   有序数组间做双指针归并扫描，找出 memory 中未被 reserved 覆盖的区域。
+ *
+ *   原理（类似归并排序的 merge 步骤）：
+ *     idx_a 遍历 memory, idx_b 遍历 reserved (两者都按地址有序)
+ *     - 若 memory 完全在 reserved 之前 → 返回整块 memory, idx_a++
+ *     - 若 memory 完全在 reserved 之后 → idx_b++ (跳过此保留区)
+ *     - 若有重叠 → 返回重叠前的部分, 推进先结束的那一侧
+ *
+ *   __next_mem_range() 被封装为多个 for_each_* 宏：
+ *   - for_each_free_mem_range()    — 遍历空闲区域（memory \ reserved）
+ *   - for_each_mem_range()         — 遍历所有 memory（忽略 reserved）
+ *   - for_each_mem_range_rev()     — 反向遍历（top-down 分配使用）
+ *   - for_each_reserved_mem_range() — 遍历 reserved
+ *
+ * 【分配策略：top-down vs bottom-up】
+ *
+ *   top-down（默认）: 从高地址向下搜索 → 减少低地址碎片
+ *   bottom-up:       从低地址向上搜索 → 避免与 initrd/kernel 区域冲突
+ *   可通过 memblock_set_bottom_up(true) 切换。
+ *
+ * 【区域合并与有序性保证】
+ *   每次 memblock_add/reserve 时自动合并相邻/重叠区域，保证 regions[]
+ *   数组始终按 base 地址有序且无重叠。这是 __next_mem_range() 算法
+ *   正确性的基础。
+ *
+ * 【生命周期】
+ *   setup_arch()
+ *     └→ memblock_add()         — 注册物理内存
+ *     └→ memblock_reserve()     — 保留内核/initrd/DTB 等
+ *   paging_init() → memblock_alloc() — 分配 page table
+ *   mm_init()
+ *     └→ memblock_free_all()    — 将空闲内存释放给 buddy allocator
+ *     └→ memblock_discard()     — 释放 memblock 元数据自身
+ *
+ * 【关键全局变量】
+ *   struct memblock memblock  — 全局单例（__initdata_memblock，init 完成后释放）
+ *   max_pfn / max_low_pfn     — 最大页框号
+ *   memblock.current_limit    — 分配地址上限（=MEMBLOCK_ALLOC_ANYWHERE 表示无限制）
+ */
+
 /**
  * DOC: memblock overview
  *
@@ -127,16 +194,45 @@ static struct memblock_region memblock_reserved_init_regions[INIT_MEMBLOCK_RESER
 static struct memblock_region memblock_physmem_init_regions[INIT_PHYSMEM_REGIONS];
 #endif
 
+/*
+ * memblock 全局单例的静态初始化。
+ * __initdata_memblock 标记表示该结构体内存在内核初始化完成后可被丢弃
+ * （除非配置了 CONFIG_ARCH_KEEP_MEMBLOCK）。
+ */
 struct memblock memblock __initdata_memblock = {
+	/*
+	 * .memory 成员描述系统中所有可用的物理内存。
+	 * 这是 memblock 分配器的"资源池"——所有分配都从这里取。
+	 * regions 初始指向静态分配的 memblock_memory_init_regions[128]，
+	 * 当 region 数量超过 128 时会被动态扩容。
+	 */
 	.memory.regions		= memblock_memory_init_regions,
 	.memory.max		= INIT_MEMBLOCK_MEMORY_REGIONS,
 	.memory.name		= "memory",
 
+	/*
+	 * .reserved 成员跟踪已被占用的物理内存区域。
+	 * 包括：内核镜像、initrd、设备树、页表等已分配的内存。
+	 * 空闲内存 = memory 中不在 reserved 中的部分。
+	 * 同样初始使用静态数组，后续可动态扩容。
+	 */
 	.reserved.regions	= memblock_reserved_init_regions,
 	.reserved.max		= INIT_MEMBLOCK_RESERVED_REGIONS,
 	.reserved.name		= "reserved",
 
+	/*
+	 * bottom_up = false 表示默认采用 top-down 分配策略。
+	 * top-down：从高地址向低地址分配，有利于减少低地址碎片，
+	 * 并确保低地址区域留给 DMA 等有特殊地址要求的设备。
+	 * 可通过 memblock_set_bottom_up(true) 切换为 bottom-up。
+	 */
 	.bottom_up		= false,
+	/*
+	 * current_limit 限制分配的地址上限。
+	 * MEMBLOCK_ALLOC_ANYWHERE (~0) 表示无限制。
+	 * 内核启动过程中，memblock_set_current_limit() 会将其
+	 * 调整为实际可访问的物理地址范围（如 lowmem 上限）。
+	 */
 	.current_limit		= MEMBLOCK_ALLOC_ANYWHERE,
 };
 
@@ -240,15 +336,37 @@ __memblock_find_range_bottom_up(phys_addr_t start, phys_addr_t end,
 	phys_addr_t this_start, this_end, cand;
 	u64 i;
 
+	/*
+	 * 从低地址到高地址遍历所有空闲内存区域。
+	 * for_each_free_mem_range 内部调用 __next_mem_range()，使用双指针归并算法
+	 * 扫描 memory 数组和 reserved 数组，生成 "memory 中有而 reserved 中没有" 的区间。
+	 */
 	for_each_free_mem_range(i, nid, flags, &this_start, &this_end, NULL) {
+		/*
+		 * 将当前空闲区间裁剪到 [start, end) 范围内。
+		 * clamp(x, lo, hi) 返回 lo <= x <= hi 的值。
+		 * 如果区间完全在 [start, end) 之外，裁剪后 this_start >= this_end，
+		 * 后续的检查会自动跳过。
+		 */
 		this_start = clamp(this_start, start, end);
 		this_end = clamp(this_end, start, end);
 
+		/*
+		 * 以对齐要求向上取整起始地址。
+		 * 例如: this_start=0x1000, align=0x1000 → cand=0x1000
+		 *       this_start=0x1100, align=0x1000 → cand=0x2000
+		 */
 		cand = round_up(this_start, align);
+		/*
+		 * 检查对齐后的候选地址是否仍在区间内，
+		 * 并且剩余空间是否足够容纳要求的 size。
+		 * 注意: cand < this_end 防止整数溢出；this_end - cand >= size 保证空间足够。
+		 */
 		if (cand < this_end && this_end - cand >= size)
 			return cand;
 	}
 
+	/* 未找到合适区域，返回 0（分配失败） */
 	return 0;
 }
 
@@ -275,15 +393,42 @@ __memblock_find_range_top_down(phys_addr_t start, phys_addr_t end,
 	phys_addr_t this_start, this_end, cand;
 	u64 i;
 
+	/*
+	 * 从高地址到低地址反向遍历所有空闲内存区域。
+	 * for_each_free_mem_range_reverse 内部调用 __next_mem_range_rev()，
+	 * 与 bottom-up 方向相反：从 memory 数组的末尾开始向前扫描。
+	 *
+	 * 与 bottom-up 的关键区别：
+	 *   1. 迭代方向相反（反向）
+	 *   2. 使用 round_down 而非 round_up（从区间尾部向前对齐）
+	 *   3. 先检查区间是否有足够空间（this_end < size 则跳过）
+	 */
 	for_each_free_mem_range_reverse(i, nid, flags, &this_start, &this_end,
 					NULL) {
 		this_start = clamp(this_start, start, end);
 		this_end = clamp(this_end, start, end);
 
+		/*
+		 * 如果区间长度本身就不够 size，直接跳过。
+		 * （top-down 特有检查：bottom-up 不提前检查总长度，
+		 *  而是通过 round_up 后的 cand < this_end 隐式检查）
+		 */
 		if (this_end < size)
 			continue;
 
+		/*
+		 * 从区间尾部向前对齐：cand = (this_end - size) 向下对齐到 align。
+		 * 例如: this_end=0x5000, size=0x1000, align=0x1000
+		 *       → cand = round_down(0x4000, 0x1000) = 0x4000
+		 * 这样分配的区域 [cand, cand+size) 会紧贴区间尾部，
+		 * 有利于减少低地址碎片。
+		 */
 		cand = round_down(this_end - size, align);
+		/*
+		 * 检查候选地址是否 >= 区间起始地址（即对齐后的候选地址仍在区间内）。
+		 * 如果 cand < this_start，说明对齐后候选地址落在了区间之前，
+		 * 此区间不满足条件，继续扫描下一个区间。
+		 */
 		if (cand >= this_start)
 			return cand;
 	}
@@ -364,12 +509,18 @@ again:
 
 static void __init_memblock memblock_remove_region(struct memblock_type *type, unsigned long r)
 {
+	/* 从 total_size 中减去被移除 region 的大小 */
 	type->total_size -= type->regions[r].size;
+	/*
+	 * 使用 memmove 将 r+1 之后的所有 region 向前移动一个位置，
+	 * 覆盖掉第 r 个 region。memmove 处理了重叠问题（当 src 和 dst
+	 * 区域重叠时也能正确工作）。
+	 */
 	memmove(&type->regions[r], &type->regions[r + 1],
 		(type->cnt - (r + 1)) * sizeof(type->regions[r]));
 	type->cnt--;
 
-	/* Special case for empty arrays */
+	/* 如果数组变空了，将其重置为一个空的初始状态 */
 	if (type->cnt == 0) {
 		WARN_ON(type->total_size != 0);
 		type->regions[0].base = 0;
@@ -427,6 +578,19 @@ void __init memblock_discard(void)
  * Return:
  * 0 on success, -1 on failure.
  */
+/*
+ * memblock_double_array — 将 memblock region 数组容量翻倍
+ *
+ * 这是 memblock 中最微妙的自引用分配场景：
+ * memblock 自身的 region 数组满了需要扩容，但扩容所需的新数组
+ * 又需要通过 memblock 来分配。
+ *
+ * 尤其是当 reserved 数组满时情况最复杂：
+ *   1. 新数组需要被 reserve 以避免后续分配覆盖
+ *   2. 但旧的 reserved 数组已满，无法插入新的 reserve 记录！
+ *   3. 解法：先 find（不 reserve），再 memcpy 切换指针，
+ *      最后 reserve（此时新数组已就位，操作可正常进行）。
+ */
 static int __init_memblock memblock_double_array(struct memblock_type *type,
 						phys_addr_t new_area_start,
 						phys_addr_t new_area_size)
@@ -459,15 +623,35 @@ static int __init_memblock memblock_double_array(struct memblock_type *type,
 	else
 		in_slab = &memblock_reserved_in_slab;
 
-	/* Try to find some space for it */
+	/*
+	 * === 分配新数组 ===
+	 *
+	 * 如果 slab 分配器已就绪（use_slab == true），使用 kmalloc。
+	 * kmalloc 分配的内存由 slab 管理，memblock 无需追踪，
+	 * 完美避免了自引用问题。
+	 *
+	 * 如果 slab 尚未就绪，需要通过 memblock 自身来找空闲内存：
+	 * 先 memblock_find_in_range （只查找，不 reserve），
+	 * 后续再手动 reserve。
+	 */
 	if (use_slab) {
+		/* slab 可用时直接用 kmalloc，简单可靠 */
 		new_array = kmalloc(new_size, GFP_KERNEL);
 		addr = new_array ? __pa(new_array) : 0;
 	} else {
 		/* only exclude range when trying to double reserved.regions */
+		/*
+		 * 只有在扩容 reserved 数组时才需要排除 new_area 范围。
+		 * new_area 是调用者（memblock_add_range）正在添加的新区域，
+		 * 避免新数组与它重叠。如果扩容的是 memory 数组则无需排除。
+		 */
 		if (type != &memblock.reserved)
 			new_area_start = new_area_size = 0;
 
+		/*
+		 * 先尝试在 new_area 之后分配（避免与正在添加的新区域重叠）。
+		 * 如果失败且 new_area_size > 0，再尝试在 new_area 之前分配。
+		 */
 		addr = memblock_find_in_range(new_area_start + new_area_size,
 						memblock.current_limit,
 						new_alloc_size, PAGE_SIZE);
@@ -500,13 +684,29 @@ static int __init_memblock memblock_double_array(struct memblock_type *type,
 	 * reserved region since it may be our reserved array itself that is
 	 * full.
 	 */
+	/*
+	 * === 数据迁移与指针切换 ===
+	 *
+	 * 这是整个扩容流程的核心步骤，顺序至关重要：
+	 *
+	 * 1. memcpy: 将旧数组全部数据复制到新数组
+	 * 2. memset: 清空新数组的后半部分（新增的容量，所有字段为 0）
+	 * 3. old_array = type->regions: 保存旧指针以便后续释放
+	 * 4. type->regions = new_array: 切换为新数组（此时新数组正式生效）
+	 * 5. type->max <<= 1: 容量翻倍
+	 *
+	 * 为什么在 reserve 之前就必须切换指针？
+	 *   如果是 reserved 数组扩容，只有新指针生效后，
+	 *   type 才有足够的空闲槽位来接收后续的 reserve 操作。
+	 *   这是典型的"提着鞋带把自己拉起来"（bootstrapping）技巧。
+	 */
 	memcpy(new_array, type->regions, old_size);
 	memset(new_array + type->max, 0, old_size);
 	old_array = type->regions;
 	type->regions = new_array;
 	type->max <<= 1;
 
-	/* Free old array. We needn't free it if the array is the static one */
+	/* 根据旧数组的来源选择释放方式 */
 	if (*in_slab)
 		kfree(old_array);
 	else if (old_array != memblock_memory_init_regions &&
@@ -517,10 +717,25 @@ static int __init_memblock memblock_double_array(struct memblock_type *type,
 	 * Reserve the new array if that comes from the memblock.  Otherwise, we
 	 * needn't do it
 	 */
+	/*
+	 * 如果新数组来自 memblock 分配（非 slab），必须立即 reserve。
+	 * 否则后续的 memblock_alloc() 可能分配到这块内存，导致数据覆盖！
+	 *
+	 * 使用 BUG_ON 是因为：如果这里 reserve 失败，系统无法继续安全运行
+	 * （新数组的内存完整性无法保证）。
+	 *
+	 * 注意：此时新数组已切换为生效状态，所以 reserve 操作
+	 * 能够正常插入记录——这正是上面先切换指针的原因。
+	 */
 	if (!use_slab)
 		BUG_ON(memblock_reserve_kern(addr, new_alloc_size));
 
 	/* Update slab flag */
+	/*
+	 * 记录新数组的分配方式，供后续操作参考：
+	 * - memblock_discard(): 根据此标志选择 kfree 或 memblock_free
+	 * - 再次扩容时：根据此标志决定下次的分配策略
+	 */
 	*in_slab = use_slab;
 
 	return 0;
@@ -621,7 +836,7 @@ static int __init_memblock memblock_add_range(struct memblock_type *type,
 	if (!size)
 		return 0;
 
-	/* special case for empty array */
+	/* 空数组特例：直接初始化第一个 region */
 	if (type->regions[0].size == 0) {
 		WARN_ON(type->cnt != 0 || type->total_size);
 		type->regions[0].base = base;
@@ -634,20 +849,35 @@ static int __init_memblock memblock_add_range(struct memblock_type *type,
 	}
 
 	/*
-	 * The worst case is when new range overlaps all existing regions,
-	 * then we'll need type->cnt + 1 empty regions in @type. So if
-	 * type->cnt * 2 + 1 is less than or equal to type->max, we know
-	 * that there is enough empty regions in @type, and we can insert
-	 * regions directly.
+	 * 判断数组容量是否足够直接插入。
+	 *
+	 * 最坏情况：新区域与所有现有 region 都重叠，
+	 * 每个重叠处最多产生一个新插入，总共需要 type->cnt + 1 个空槽。
+	 *
+	 * 技巧：如果 type->cnt * 2 + 1 <= type->max，说明空闲槽
+	 * 至少为 cnt+1（因为 max - cnt >= cnt+1），足够直接插入。
+	 * 否则需要先扩容再插入。
+	 *
+	 * 为什么是 type->cnt * 2 + 1 而不是 type->cnt + 1？
+	 * 因为 type->max 可能只比 type->cnt 大一点，不够容纳 cnt+1 个新区域。
+	 * 用 cnt*2+1 来比较可以快速判断是否足够宽松。
 	 */
 	if (type->cnt * 2 + 1 <= type->max)
 		insert = true;
 
 repeat:
 	/*
-	 * The following is executed twice.  Once with %false @insert and
-	 * then with %true.  The first counts the number of regions needed
-	 * to accommodate the new area.  The second actually inserts them.
+	 * 两遍扫描设计（two-pass approach）：
+	 *
+	 * 第一遍 (insert == false):
+	 *   只做统计，数出实际需要插入多少个 region (nr_new)，
+	 *   不修改 regions 数组内容。
+	 *
+	 * 第二遍 (insert == true):
+	 *   根据第一遍的统计结果，执行实际的插入操作。
+	 *
+	 * 如果第一遍发现容量不足（nr_new 太大），调用 memblock_double_array()
+	 * 扩容后 goto repeat 重新执行第二遍。
 	 */
 	base = obase;
 	nr_new = 0;
@@ -656,13 +886,24 @@ repeat:
 		phys_addr_t rbase = rgn->base;
 		phys_addr_t rend = rbase + rgn->size;
 
+		/*
+		 * 当前 region 完全在新区域之后：
+		 * regions 数组按地址升序排列，后面的 region 地址更大，
+		 * 不再可能与新区域重叠，break。
+		 */
 		if (rbase >= end)
 			break;
+		/*
+		 * 当前 region 完全在新区域之前：
+		 * 尚未重叠，继续检查下一个 region。
+		 */
 		if (rend <= base)
 			continue;
 		/*
-		 * @rgn overlaps.  If it separates the lower part of new
-		 * area, insert that portion.
+		 * 到此：rbase < end 且 rend > base，即重叠。
+		 *
+		 * 如果 rbase > base，则 [base, rbase) 是新区域中
+		 * 没有被当前 region 覆盖的头部部分，需要单独插入。
 		 */
 		if (rbase > base) {
 #ifdef CONFIG_NUMA
@@ -674,16 +915,26 @@ repeat:
 				if (start_rgn == -1)
 					start_rgn = idx;
 				end_rgn = idx + 1;
+				/*
+				 * 在 idx 位置插入 [base, rbase) 区间，
+				 * 插入后 idx++ 因为后面的 region 都被推后了一位，
+				 * 需要跳过刚刚插入的 region 和原来的 rgn。
+				 */
 				memblock_insert_region(type, idx++, base,
 						       rbase - base, nid,
 						       flags);
 			}
 		}
-		/* area below @rend is dealt with, forget about it */
+		/*
+		 * 推进 base 越过当前 region 的覆盖范围。
+		 * 这是"截断"算法的关键步骤：
+		 * 每次处理一个重叠后，将新区域的起始地址向前推进，
+		 * 逐步消耗新区域，直到完全处理完。
+		 */
 		base = min(rend, end);
 	}
 
-	/* insert the remaining portion */
+	/* 遍历完所有现有 region 后，如果 base 仍未到达 end，插入剩余尾部 */
 	if (base < end) {
 		nr_new++;
 		if (insert) {
@@ -699,8 +950,9 @@ repeat:
 		return 0;
 
 	/*
-	 * If this was the first round, resize array and repeat for actual
-	 * insertions; otherwise, merge and return.
+	 * 根据 insert 标志判断当前是哪一遍：
+	 * - 第一遍 (!insert): 扩容后跳回 repeat 执行第二遍
+	 * - 第二遍 (insert):  合并相邻兼容 region 后返回
 	 */
 	if (!insert) {
 		while (type->cnt + nr_new > type->max)
@@ -709,6 +961,18 @@ repeat:
 		insert = true;
 		goto repeat;
 	} else {
+		/*
+		 * 合并相邻的兼容 region。
+		 * start_rgn - 1 用于向前合并（新插入的 region 可能和前一个
+		 * region 相邻且兼容。end_rgn 用于向后合并（新插入的尾部
+		 * 可能和下一个 region 相邻且兼容）。
+		 *
+		 * memblock_merge_regions 会检查三个条件：
+		 * 1. 地址是否相邻（this->base + this->size == next->base）
+		 * 2. NUMA 节点是否相同
+		 * 3. flags 是否相同
+		 * 全部满足才合并。
+		 */
 		memblock_merge_regions(type, start_rgn, end_rgn);
 		return 0;
 	}
@@ -823,11 +1087,38 @@ static int __init_memblock memblock_isolate_range(struct memblock_type *type,
 	if (!size)
 		return 0;
 
-	/* we'll create at most two more regions */
+	/*
+	 * 隔离操作最多会创建 2 个新 region（从下方切入 + 从上方切出），
+	 * 确保数组有至少 2 个空闲槽位。
+	 */
 	while (type->cnt + 2 > type->max)
 		if (memblock_double_array(type, base, size) < 0)
 			return -ENOMEM;
 
+	/*
+	 * === region 分割逻辑 ===
+	 *
+	 * 对于 [base, end) 范围内的每个 region，有 3 种情况：
+	 *
+	 * 情况 A (rbase < base)：region 从范围下方切入
+	 *   原始: [---rbase-----------rend---)
+	 *   范围:        [---base--------end---)
+	 *   分割后: [A---) [B-------------)
+	 *   → region 被分成两部分，A 部分留在原地，
+	 *     B 部分缩小后继续参与后续检查。
+	 *   操作：更新 rgn（原地缩小为后半段），插入前半段。
+	 *
+	 * 情况 B (rend > end)：region 从范围上方切出
+	 *   原始: [---rbase-----------rend---)
+	 *   范围: [---base--------end---)
+	 *   分割后: [-------------B) [---A---)
+	 *   → region 被分成两部分，A 部分留在原地，
+	 *     B 部分通过 idx-- 重做一次以正确记录。
+	 *   操作：更新 rgn（原地缩小为后半段），插入前半段后 idx--。
+	 *
+	 * 情况 C (rbase >= base && rend <= end)：region 完全在范围内
+	 *   记录其索引到 start_rgn/end_rgn。
+	 */
 	for_each_memblock_type(idx, type, rgn) {
 		phys_addr_t rbase = rgn->base;
 		phys_addr_t rend = rbase + rgn->size;
@@ -839,8 +1130,17 @@ static int __init_memblock memblock_isolate_range(struct memblock_type *type,
 
 		if (rbase < base) {
 			/*
-			 * @rgn intersects from below.  Split and continue
-			 * to process the next region - the new top half.
+			 * 情况 A：region 从下方切入 [base, end)
+			 *
+			 * 原始 region: [rbase, rend)
+			 * 目标范围:     [base,  end)
+			 *
+			 * 将原始 region 分裂为：
+			 *   下半段 [rbase, base) → 新插入的 region（在 base 之前）
+			 *   上半段 [base, rend)   → 原地缩小后的 rgn（在 base 之后）
+			 *
+			 * idx 不推进，因为分裂后 idx+1 是刚插入的下半段，
+			 * 继续到 idx+2 处理下一个原始 region。
 			 */
 			rgn->base = base;
 			rgn->size -= base - rbase;
@@ -850,8 +1150,18 @@ static int __init_memblock memblock_isolate_range(struct memblock_type *type,
 					       rgn->flags);
 		} else if (rend > end) {
 			/*
-			 * @rgn intersects from above.  Split and redo the
-			 * current region - the new bottom half.
+			 * 情况 B：region 从上方切出 [base, end)
+			 *
+			 * 原始 region: [rbase, rend)
+			 * 目标范围:     [base,  end)
+			 *
+			 * 将原始 region 分裂为：
+			 *   下半段 [rbase, end)   → 新插入的 region（在 end 之前）
+			 *   上半段 [end,   rend)  → 原地缩小后的 rgn（在 end 之后）
+			 *
+			 * idx-- 是关键：因为刚插入的 [rbase, end) 完全在范围内，
+			 * 需要记录它。idx-- 后重新进入循环体，会在 else 分支中
+			 * 记录它（rbase >= base && rend <= end）。
 			 */
 			rgn->base = end;
 			rgn->size -= end - rbase;
@@ -860,7 +1170,11 @@ static int __init_memblock memblock_isolate_range(struct memblock_type *type,
 					       memblock_get_region_node(rgn),
 					       rgn->flags);
 		} else {
-			/* @rgn is fully contained, record it */
+			/*
+			 * 情况 C：region 完全在 [base, end) 范围内
+			 * 记录 start_rgn（第一次遇到）和 end_rgn（每次更新）。
+			 * end_rgn 是"第一个超出范围的索引"（半开区间）。
+			 */
 			if (!*end_rgn)
 				*start_rgn = idx;
 			*end_rgn = idx + 1;
@@ -1309,9 +1623,23 @@ void __next_mem_range(u64 *idx, int nid, enum memblock_flags flags,
 		      struct memblock_type *type_b, phys_addr_t *out_start,
 		      phys_addr_t *out_end, int *out_nid)
 {
+	/*
+	 * idx 编码为 64 位整数：
+	 *   低 32 位 (idx_a): type_a (memory) 中的当前 region 索引
+	 *   高 32 位 (idx_b): type_b (reserved) 中的"间隙"索引
+	 *
+	 * idx_b 的设计很巧妙：它不仅索引 reserved region 本身，
+	 * 还索引 region 之间的"间隙"。见上方的 kernel-doc 图示。
+	 */
 	int idx_a = *idx & 0xffffffff;
 	int idx_b = *idx >> 32;
 
+	/*
+	 * === 外层循环：遍历 type_a (memory) 的每个 region ===
+	 *
+	 * 对每个 memory region [m_start, m_end)，在内层寻找
+	 * 其中不被任何 reserved region 覆盖的子区间。
+	 */
 	for (; idx_a < type_a->cnt; idx_a++) {
 		struct memblock_region *m = &type_a->regions[idx_a];
 
@@ -1319,9 +1647,14 @@ void __next_mem_range(u64 *idx, int nid, enum memblock_flags flags,
 		phys_addr_t m_end = m->base + m->size;
 		int	    m_nid = memblock_get_region_node(m);
 
+		/* 根据 nid、flags 判断是否跳过此 region */
 		if (should_skip_region(type_a, m, nid, flags))
 			continue;
 
+		/*
+		 * type_b == NULL：只遍历 type_a，不排除任何区域
+		 * 用于 for_each_mem_region() 等简单遍历场景
+		 */
 		if (!type_b) {
 			if (out_start)
 				*out_start = m_start;
@@ -1334,7 +1667,24 @@ void __next_mem_range(u64 *idx, int nid, enum memblock_flags flags,
 			return;
 		}
 
-		/* scan areas before each reservation */
+		/*
+		 * === 内层循环：遍历 type_b (reserved) 的"间隙" ===
+		 *
+		 * 核心思想：将 reserved region 数组重新解释为一组"空闲间隙"。
+		 * idx_b 从 0 到 cnt（含），每个值对应一个间隙：
+		 *
+		 *   idx_b = 0:      [0,                rgn[0].base)
+		 *   idx_b = k:      [rgn[k-1].end,      rgn[k].base)   (0<k<cnt)
+		 *   idx_b = cnt:    [rgn[cnt-1].end,    PHYS_ADDR_MAX)
+		 *
+		 * 然后 memory region 和这些"间隙"做交集运算，
+		 * 得到的就是 memory 中有而 reserved 中没有的"空闲内存"。
+		 *
+		 * 这是经典的变体双指针归并算法：
+		 * 一个指针（idx_a）遍历 memory 数组，
+		 * 另一个指针（idx_b）遍历 reserved 的间隙数组，
+		 * 在 lockstep 中推进先结束的那一侧。
+		 */
 		for (; idx_b < type_b->cnt + 1; idx_b++) {
 			struct memblock_region *r;
 			phys_addr_t r_start;
@@ -1346,12 +1696,28 @@ void __next_mem_range(u64 *idx, int nid, enum memblock_flags flags,
 				r->base : PHYS_ADDR_MAX;
 
 			/*
-			 * if idx_b advanced past idx_a,
-			 * break out to advance idx_a
+			 * 情况 A：reserved 间隙已完全在当前 memory region 之后
+			 *
+			 * 图示：memory [---m_start---m_end)
+			 *       间隙             [---r_start---r_end)
+			 *
+			 * r_start >= m_end：此间隙及其后的所有间隙
+			 * 都在当前 memory region 之外，跳出内层循环
+			 * 推进到下一个 memory region（idx_a++）。
 			 */
 			if (r_start >= m_end)
 				break;
-			/* if the two regions intersect, we're done */
+
+			/*
+			 * 情况 B：memory 与 reserved 间隙相交
+			 *
+			 * 图示：memory [---m_start--------m_end---)
+			 *       间隙         [---r_start---r_end)
+			 *       空闲     [---max-------min---)
+			 *
+			 * 交集 [max(m_start, r_start), min(m_end, r_end))
+			 * 就是一段空闲物理内存——memory 中有而 reserved 中没有。
+			 */
 			if (m_start < r_end) {
 				if (out_start)
 					*out_start =
@@ -1360,9 +1726,20 @@ void __next_mem_range(u64 *idx, int nid, enum memblock_flags flags,
 					*out_end = min(m_end, r_end);
 				if (out_nid)
 					*out_nid = m_nid;
+
 				/*
-				 * The region which ends first is
-				 * advanced for the next iteration.
+				 * 双指针归并核心规则：谁先结束就推进谁
+				 *
+				 * - memory region 先结束 (m_end <= r_end)：
+				 *   当前 memory region 已被完全遍历，
+				 *   下次推进 idx_a 到下一个 memory region，
+				 *   idx_b 保持不变。
+				 *
+				 * - reserved 间隙先结束 (r_end < m_end)：
+				 *   当前间隙已被完全遍历，
+				 *   memory region 还有剩余部分未处理，
+				 *   下次推进 idx_b 到下一个间隙，
+				 *   idx_a 保持不变。
 				 */
 				if (m_end <= r_end)
 					idx_a++;
@@ -1371,10 +1748,14 @@ void __next_mem_range(u64 *idx, int nid, enum memblock_flags flags,
 				*idx = (u32)idx_a | (u64)idx_b << 32;
 				return;
 			}
+			/*
+			 * 情况 C：reserved 间隙完全在当前 memory 之前
+			 * （即 m_start >= r_end），无需处理，idx_b++ 继续。
+			 */
 		}
 	}
 
-	/* signal end of iteration */
+	/* idx == ULLONG_MAX 是迭代终止信号 */
 	*idx = ULLONG_MAX;
 }
 
@@ -1572,9 +1953,9 @@ phys_addr_t __init memblock_alloc_range_nid(phys_addr_t size,
 	phys_addr_t found;
 
 	/*
-	 * Detect any accidental use of these APIs after slab is ready, as at
-	 * this moment memblock may be deinitialized already and its
-	 * internal data may be destroyed (after execution of memblock_free_all)
+	 * 安全检查：如果在 slab 分配器已可用后调用 memblock 分配，
+	 * 说明调用时机可能不正确。此时 memblock 可能已被释放。
+	 * 直接回退到 kzalloc_node 分配。
 	 */
 	if (WARN_ON_ONCE(slab_is_available())) {
 		void *vaddr = kzalloc_node(size, GFP_NOWAIT, nid);
@@ -1582,6 +1963,11 @@ phys_addr_t __init memblock_alloc_range_nid(phys_addr_t size,
 		return vaddr ? virt_to_phys(vaddr) : 0;
 	}
 
+	/*
+	 * 对齐参数为 0 时，使用 SMP_CACHE_BYTES 作为默认对齐。
+	 * 这是为了保证分配的内存与缓存行对齐，避免伪共享问题。
+	 * powerpc 早期启动时不能使用 WARN，故用 dump_stack。
+	 */
 	if (!align) {
 		/* Can't use WARNs this early in boot on powerpc */
 		dump_stack();
@@ -1589,11 +1975,26 @@ phys_addr_t __init memblock_alloc_range_nid(phys_addr_t size,
 	}
 
 again:
+	/*
+	 * === 核心分配逻辑（三步重试策略） ===
+	 *
+	 * 第一步：在指定节点上查找空闲内存
+	 * memblock_find_in_range_node 会选择合适的 bottom-up 或
+	 * top-down 搜索策略，在 [start, end) 范围内寻找符合条件的空闲区域。
+	 * 找到后用 __memblock_reserve 立即标记为已保留。
+	 *
+	 * __memblock_reserve 返回 0 表示 reserve 成功。
+	 */
 	found = memblock_find_in_range_node(size, align, start, end, nid,
 					    flags);
 	if (found && !__memblock_reserve(found, size, nid, MEMBLOCK_RSRV_KERN))
 		goto done;
 
+	/*
+	 * 第二步（NUMA 回退）：
+	 * 如果在指定节点上分配失败，且 exact_nid == false（允许跨节点），
+	 * 放松 NUMA 约束，尝试在任何节点上分配（NUMA_NO_NODE）。
+	 */
 	if (numa_valid_node(nid) && !exact_nid) {
 		found = memblock_find_in_range_node(size, align, start,
 						    end, NUMA_NO_NODE,
@@ -1602,6 +2003,12 @@ again:
 			goto done;
 	}
 
+	/*
+	 * 第三步（MIRROR 回退）：
+	 * 如果请求的是 mirrored memory 但没有找到，
+	 * 去除 MEMBLOCK_MIRROR 标志，重试非 mirrored 内存。
+	 * 这是最后的 fallback，因为 mirrored 内存通常更稀缺。
+	 */
 	if (flags & MEMBLOCK_MIRROR) {
 		flags &= ~MEMBLOCK_MIRROR;
 		pr_warn_ratelimited("Could not allocate %pap bytes of mirrored memory\n",
@@ -1609,28 +2016,22 @@ again:
 		goto again;
 	}
 
+	/* 所有尝试都失败，返回 0 */
 	return 0;
 
 done:
 	/*
-	 * Skip kmemleak for those places like kasan_init() and
-	 * early_pgtable_alloc() due to high volume.
+	 * kmemleak 跟踪：除非明确要求不跟踪（MEMBLOCK_ALLOC_NOLEAKTRACE），
+	 * 否则将分配通知 kmemleak。memblock 分配的块不会被报告为泄漏，
+	 * 因为它们通常只通过物理地址访问，而 kmemleak 不扫描物理地址。
 	 */
 	if (end != MEMBLOCK_ALLOC_NOLEAKTRACE)
-		/*
-		 * Memblock allocated blocks are never reported as
-		 * leaks. This is because many of these blocks are
-		 * only referred via the physical address which is
-		 * not looked up by kmemleak.
-		 */
 		kmemleak_alloc_phys(found, size, 0);
 
 	/*
-	 * Some Virtual Machine platforms, such as Intel TDX or AMD SEV-SNP,
-	 * require memory to be accepted before it can be used by the
-	 * guest.
-	 *
-	 * Accept the memory of the allocated buffer.
+	 * 机密虚拟机平台（Intel TDX, AMD SEV-SNP 等）要求内存在使用前
+	 * 先被"接受"（accept）。对于这些平台，内存必须经过特定的
+	 * 安全转换后才能被内核访问。accept_memory() 处理此转换。
 	 */
 	accept_memory(found, size);
 
@@ -1707,21 +2108,50 @@ static void * __init memblock_alloc_internal(
 {
 	phys_addr_t alloc;
 
-
+	/*
+	 * 限制 max_addr 不超过 current_limit。
+	 * current_limit 是 memblock 分配的上限防火墙，
+	 * 通常由架构代码在早期启动时设置（例如限制在 lowmem 范围内）。
+	 * 这样可以防止分配器越界分配到不可访问的物理地址。
+	 */
 	if (max_addr > memblock.current_limit)
 		max_addr = memblock.current_limit;
 
+	/*
+	 * 第一轮尝试：在 [min_addr, max_addr) 范围内按指定 nid 分配。
+	 *
+	 * memblock_alloc_range_nid 内部实现了三级回退：
+	 *   1. 指定节点分配
+	 *   2. 放松 NUMA 约束（任何节点）
+	 *   3. 放松 mirror 要求
+	 */
 	alloc = memblock_alloc_range_nid(size, align, min_addr, max_addr, nid,
 					exact_nid);
 
-	/* retry allocation without lower limit */
+	/*
+	 * 第二轮尝试（回退）：降低 min_addr 到 0。
+	 *
+	 * 如果第一轮失败且 min_addr > 0（即有下限约束），
+	 * 说明在 [min_addr, max_addr) 范围内没有足够的空间。
+	 * 放宽下限到 0，让分配器可以在更低地址寻找空间。
+	 *
+	 * 这是地址范围松弛策略：先尝试偏好范围，
+	 * 失败后扩大到允许范围。
+	 */
 	if (!alloc && min_addr)
 		alloc = memblock_alloc_range_nid(size, align, 0, max_addr, nid,
 						exact_nid);
 
+	/* 所有尝试都失败，返回 NULL */
 	if (!alloc)
 		return NULL;
 
+	/*
+	 * 将物理地址转换为内核虚拟地址。
+	 * 物理内存已被直接映射（在大多数架构上），
+	 * phys_to_virt 只是做一个简单的偏移量转换（PAGE_OFFSET）。
+	 * 调用者可以直接使用返回的虚拟地址访问分配的内存。
+	 */
 	return phys_to_virt(alloc);
 }
 

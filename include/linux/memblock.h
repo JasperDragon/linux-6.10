@@ -8,6 +8,40 @@
  * Copyright (C) 2001 Peter Bergner, IBM Corp.
  */
 
+/*
+ * ============================================================================
+ * memblock.h — 启动早期物理内存管理器 API 头文件
+ * ============================================================================
+ *
+ * memblock 是 buddy allocator 初始化前使用的早期内存分配器。
+ * 它管理三种内存区域集合：
+ *   - memory:   系统可用物理内存（从 firmware/DT 获取）
+ *   - reserved: 已分配/保留的内存（内核、initrd、分配出去的内存）
+ *   - physmem:  实际存在的物理内存（不考虑 mem= 限制）
+ *
+ * 核心数据结构：
+ *   struct memblock_region — 单个区域 (base + size + flags + nid)
+ *   struct memblock_type   — 区域集合 (regions[] + cnt + max + total_size)
+ *   struct memblock         — 全局单例 (memory + reserved + bottom_up + current_limit)
+ *
+ * 区域数组初始 128 项，运行时可通过 memblock_allow_resize() 启用自动扩容。
+ * 区域始终按 base 地址有序且无重叠（通过插入时自动合并保证）。
+ *
+ * 主要 API 类别：
+ *   - 区域注册: memblock_add(), memblock_remove(), memblock_reserve(), memblock_free()
+ *   - 物理分配: memblock_phys_alloc() 系列 → 返回物理地址
+ *   - 虚拟分配: memblock_alloc() 系列 → 返回虚拟地址 (物理→虚拟映射后)
+ *   - 查询:     memblock_start_of_DRAM(), memblock_end_of_DRAM()
+ *   - 清理:     memblock_free_all() → 释放给 buddy; memblock_discard() → 释放元数据
+ *
+ * 标志位 (enum memblock_flags):
+ *   NOMAP    — 不加入内核直接映射（保留在 firmware 的特定区域）
+ *   HOTPLUG  — 内存热插拔
+ *   MIRROR   — 镜像内存（高可靠性）
+ *   RSRV_KERN— 内核保留（memblock 分配的默认标志）
+ *   RSRV_NOINIT — struct page 未初始化
+ */
+
 #include <linux/init.h>
 #include <linux/mm.h>
 #include <asm/dma.h>
