@@ -1,6 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0
 
-#include <linux/compiler_types.h>
+/*
+ * ============================================================================
+ * binderfs.c — Binder 文件系统
+ * ============================================================================
+ *
+ * binderfs 是 Android Binder IPC 的虚拟文件系统，允许在独立的挂载点中
+ * 创建多个 binder 设备节点（如 /dev/binderfs/binder1, binder2...）。
+ *
+ * 相比传统的 /dev/binder miscdevice 方式，binderfs 提供：
+ *   - 每个 binder 设备独立的 IPC 命名空间隔离
+ *   - 动态创建/删除 binder 设备（通过 binder-control ioctl）
+ *   - 每个 binder 设备独立的 context manager (servicemanager)
+ *   - 更好的权限控制（每个设备独立 uid/gid）
+ *
+ * 架构:
+ *   mount -t binderfs /dev/binderfs
+ *     └── binder-control    ← 控制节点 (ioctl 创建/删除 binder 设备)
+ *     ├── binder1           ← binder 设备 (miscdevice)
+ *     ├── binder2
+ *     └── ...
+ *
+ * 挂载选项:
+ *   max=N     — 最大可创建的 binder 设备数
+ *   stats=global — 启用全局统计 (proc/sys/binder/目录)
+ */
 #include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/fsnotify.h>

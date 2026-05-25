@@ -3,6 +3,54 @@
  * Copyright (C) 2017 Google, Inc.
  */
 
+// ============================================================================
+// binder_alloc -- Binder 驱动的内存分配器
+// ============================================================================
+//
+// 概述
+// binder_alloc 是 Binder IPC 驱动中负责管理进程间通信缓冲区的内存分配器。
+// 每个 Binder 进程上下文（binder_proc）拥有一个独立的 binder_alloc 实例，
+// 用于管理通过 mmap() 系统调用创建的共享内存区域。
+//
+// 内存布局
+// 每个进程通过 mmap() 映射一块连续的虚拟地址空间，起始地址由 @vm_start 记录，
+// 总大小由 @buffer_size 指定。这块空间被分割成多个 binder_buffer，每个 buffer
+// 要么是空闲的（free），要么已被分配用于承载一次 Binder 事务的数据。
+//
+// 数据结构 -- buffer 管理
+// - @buffers: 双向链表，按地址顺序链接该进程的所有 buffer（包括空闲和已分配），
+//   用于遍历和合并操作。
+// - @free_buffers: 红黑树，按 buffer 大小排序，用于快速查找最适合的空闲块。
+// - @allocated_buffers: 红黑树，按 buffer 地址排序，用于根据用户空间指针
+//   快速定位已分配的 buffer。
+//
+// 分配策略 -- Best-fit
+// 当需要分配一个大小为 S 的 buffer 时，分配器在 @free_buffers 红黑树中查找
+// 第一个大小 >= S 的空闲节点（即"最佳适应"）。如果找到的块比所需大得多，
+// 则将其分裂为两块：一块用于分配，剩余部分作为一个新的空闲块重新插入
+// @free_buffers。这种策略有助于减少内存碎片。
+//
+// 释放与合并
+// 当 buffer 被释放时，分配器通过 @buffers 链表查找其地址前后的相邻 buffer。
+// 如果相邻的 buffer 也是空闲的，则将它们合并成一个更大的连续空闲块，以
+// 减少外部碎片。合并操作会同时更新 @free_buffers 红黑树。
+//
+// 异步事务流控
+// @free_async_space 记录可用于异步事务的地址空间余量，初始化为总空间的一半。
+// 每个异步事务分配时扣减该值，释放时加回。当异步事务占用空间超过阈值时，
+// 触发 oneway 垃圾检测（@oneway_spam_detected 置位），后续异步请求将被拒绝，
+// 直到空间恢复到健康水平。
+//
+// 物理页面回收
+// @pages 数组记录每个虚拟页面对应的 struct page 指针，@freelist 是一个 LRU
+// 链表，在系统内存压力下通过 shrinker 机制回收不再使用的物理页面。回收由
+// binder_alloc_free_page() 回调函数完成。
+//
+// 线程安全
+// 所有对 binder_alloc 内部数据结构的修改都由 @mutex 保护，确保在多线程
+// 并发访问 Binder 驱动时的安全性。
+// ============================================================================
+
 #ifndef _LINUX_BINDER_ALLOC_H
 #define _LINUX_BINDER_ALLOC_H
 
@@ -42,19 +90,19 @@ struct binder_buffer {
 	struct list_head entry; /* free and allocated entries by address */
 	struct rb_node rb_node; /* free entry by size or allocated entry */
 				/* by address */
-	unsigned free:1;
-	unsigned clear_on_free:1;
-	unsigned allow_user_free:1;
-	unsigned async_transaction:1;
-	unsigned oneway_spam_suspect:1;
-	unsigned debug_id:27;
-	struct binder_transaction *transaction;
-	struct binder_node *target_node;
-	size_t data_size;
-	size_t offsets_size;
-	size_t extra_buffers_size;
-	unsigned long user_data;
-	int pid;
+	unsigned free:1;			// 标记此 buffer 是否空闲（1=空闲，0=已分配）
+	unsigned clear_on_free:1;		// 释放时是否需要将缓冲区内容清零
+	unsigned allow_user_free:1;		// 是否允许用户空间主动释放此 buffer
+	unsigned async_transaction:1;		// 是否用于承载异步（oneway）事务
+	unsigned oneway_spam_suspect:1;		// 异步分配大小是否超过垃圾检测阈值
+	unsigned debug_id:27;			// 调试用途的唯一标识符
+	struct binder_transaction *transaction;	// 指向使用此 buffer 的事务对象
+	struct binder_node *target_node;	// 指向事务目标 binder_node
+	size_t data_size;			// 事务数据的大小（字节）
+	size_t offsets_size;			// 偏移数组的大小（字节）
+	size_t extra_buffers_size;		// 额外对象（如 sg 列表）的空间大小
+	unsigned long user_data;		// 用户空间缓冲区基地址
+	int pid;				// 分配此 buffer 的调用者 PID
 };
 
 /**
@@ -64,9 +112,9 @@ struct binder_buffer {
  * @page_index:  offset in @alloc->pages[] into the page to reclaim
  */
 struct binder_shrinker_mdata {
-	struct list_head lru;
-	struct binder_alloc *alloc;
-	unsigned long page_index;
+	struct list_head lru;			// 在 binder_freelist LRU 链表中的节点
+	struct binder_alloc *alloc;		// 拥有此待回收页面的 binder_alloc
+	unsigned long page_index;		// 在 alloc->pages[] 数组中的索引
 };
 
 static inline struct list_head *page_to_lru(struct page *p)
@@ -105,20 +153,20 @@ static inline struct list_head *page_to_lru(struct page *p)
  * struct binder_buffer objects used to track the user buffers
  */
 struct binder_alloc {
-	struct mutex mutex;
-	struct mm_struct *mm;
-	unsigned long vm_start;
-	struct list_head buffers;
-	struct rb_root free_buffers;
-	struct rb_root allocated_buffers;
-	size_t free_async_space;
-	struct page **pages;
-	struct list_lru *freelist;
-	size_t buffer_size;
-	int pid;
-	size_t pages_high;
-	bool mapped;
-	bool oneway_spam_detected;
+	struct mutex mutex;			// 保护 binder_alloc 内部状态的互斥锁
+	struct mm_struct *mm;			// 关联进程的 mm_struct（打开后不变）
+	unsigned long vm_start;			// mmap 映射的虚拟地址空间基址
+	struct list_head buffers;		// 所有 buffer 的链表，按地址升序排列
+	struct rb_root free_buffers;		// 空闲 buffer 的红黑树，按大小排序（best-fit 查找）
+	struct rb_root allocated_buffers;	// 已分配 buffer 的红黑树，按地址排序
+	size_t free_async_space;		// 异步事务可用空间余量，初始为总 VA 空间的一半
+	struct page **pages;			// 页指针数组，记录每个虚拟页映射的 struct page
+	struct list_lru *freelist;		// 空闲页面的 LRU 链表，用于 shrinker 回收
+	size_t buffer_size;			// 通过 mmap 指定的地址空间总大小
+	int pid;				// 所属 binder_proc 的 PID（初始化后不变）
+	size_t pages_high;			// pages 数组已使用偏移的高水位标记
+	bool mapped;				// VMA 是否已映射（每个实例只允许一次映射）
+	bool oneway_spam_detected;		// 是否触发了 oneway 垃圾检测
 };
 
 enum lru_status binder_alloc_free_page(struct list_head *item,

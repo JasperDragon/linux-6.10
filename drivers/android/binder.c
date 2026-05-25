@@ -7,6 +7,112 @@
  */
 
 /*
+ * Binder 整体架构概览
+ * ===================
+ *
+ * Binder 是 Android 系统的进程间通信 (IPC) 核心驱动, 实现基于服务引用的
+ * 轻量级远程过程调用 (RPC). 与传统的 System V IPC / D-Bus 不同, Binder
+ * 采用共享内存 + 内核驱动的设计, 每次事务只需一次数据拷贝即可完成.
+ *
+ * 四大核心数据结构
+ * ----------------
+ * (1) binder_proc   -- 每个打开 binder 设备文件的进程对应一个 proc,
+ *                      管理该进程的线程池 / 内存分配 / 节点引用等.
+ * (2) binder_thread -- 进程内每个参与 Binder 通信的线程对应一个 thread,
+ *                      管理待处理工作项 (todo) 和正在进行的事务栈.
+ * (3) binder_node   -- 每个对外提供的 Binder 服务对应一个 node,
+ *                      记录服务的弱/强引用计数和优先级等属性.
+ * (4) binder_ref    -- 进程内对远程 node 的引用, 通过句柄 (handle) 查找,
+ *                      实现跨进程的对象引用传递.
+ *
+ * 三级锁层次 (必须按以下顺序加锁, 避免死锁)
+ * -----------------------------------------
+ * outer_lock (proc->outer_lock)
+ *     -> 保护 binder_ref 引用表 (binder_proc_lock/unlock)
+ * node->lock
+ *     -> 保护 binder_node 的大多数字段 (binder_node_lock/unlock)
+ * inner_lock (proc->inner_lock)
+ *     -> 保护线程/节点链表, 所有 todo 队列, 事务栈
+ *       (binder_inner_proc_lock/unlock)
+ *
+ * RPC 事务流程
+ * -----------
+ * 1. 客户端通过 ioctl(BINDER_WRITE_READ) 发送 BC_TRANSACTION 命令,
+ *    携带目标服务的句柄 (handle) 和数据.
+ * 2. binder_thread_write() 解析命令, 调用 binder_transaction().
+ * 3. binder_transaction() 通过 handle 查找 proc 的 ref 树,
+ *    再通过 ref->node 找到目标进程和目标 service 组件.
+ * 4. 在目标进程的 binder_alloc 中分配缓冲区 (binder_buffer),
+ *    然后将用户空间数据从源进程拷贝到目标进程的共享内存.
+ * 5. 处理特殊对象类型: BINDER_TYPE_FD (文件描述符传递),
+ *    BINDER_TYPE_PTR (Binder 对象引用), BINDER_TYPE_FDA (FD 数组).
+ * 6. 唤醒目标线程, 目标线程在 binder_thread_read() 中收到 BR_TRANSACTION.
+ * 7. 被调用方处理请求后, 通过 BC_REPLY 回复结果,
+ *    唤醒等待的客户端线程, 客户端收到 BR_REPLY.
+ *
+ * 同步 vs 异步事务
+ * ----------------
+ * 同步事务 (默认): 客户端发送后阻塞等待 BR_REPLY,
+ *                  适用于需要返回结果的 RPC 调用.
+ * 异步事务 (TF_ONE_WAY): 客户端发送后立即返回,
+ *                        适用于不需要回复的通知/回调.
+ * 异步事务的总缓冲区大小限制为总映射空间的一半, 防止内存耗尽.
+ *
+ * 内存模型
+ * --------
+ * 每个进程通过 mmap() 映射最多 4MB 共享内存 (用户态和内核态共享).
+ * binder_alloc 管理这些内存, 采用最佳适应 (best-fit) 算法分配缓冲区,
+ * 缓冲区以红黑树组织 (allocated_buffers / free_buffers).
+ * 物理页按需分配 (on-demand), 在使用时通过 alloc_page() 分配,
+ * 然后通过 vm_insert_page() 映射到进程地址空间.
+ * 当内存压力大时, 通过 shrinker 机制回收未使用的页面.
+ *
+ * ioctl 接口
+ * ----------
+ * BINDER_WRITE_READ: 核心接口, 包含 write (BC_* 命令) 和
+ *                    read (BR_* 响应) 两个方向的数据.
+ * BINDER_SET_MAX_THREADS: 设置进程的最大线程数.
+ * BINDER_SET_CONTEXT_MGR: 将当前进程注册为 context manager.
+ * BINDER_THREAD_EXIT: 通知内核某线程退出.
+ * BINDER_VERSION: 获取 Binder 协议版本.
+ * BINDER_SET_IDLE_TIMEOUT / BINDER_SET_IDLE_PRIORITY: 空闲线程管理.
+ *
+ * BC_* 命令 (write 方向, 用户->内核)
+ * ----------------------------------
+ * BC_TRANSACTION / BC_REPLY: 发送事务请求/回复.
+ * BC_FREE_BUFFER: 释放已处理的缓冲区.
+ * BC_INCREFS / BC_ACQUIRE / BC_RELEASE / BC_DECREFS: 引用计数管理.
+ * BC_ENTER_LOOPER / BC_REGISTER_LOOPER / BC_EXIT_LOOPER: 线程池管理.
+ * BC_REQUEST_DEATH_NOTIFICATION / BC_CLEAR_DEATH_NOTIFICATION: 死亡通知.
+ * BC_DEAD_BINDER_DONE: 死亡通知处理完成确认.
+ * BC_ATTEMPT_ACQUIRE / BC_ACQUIRE_RESULT: (已废弃, 兼容旧协议).
+ *
+ * BR_* 命令 (read 方向, 内核->用户)
+ * ----------------------------------
+ * BR_TRANSACTION / BR_REPLY: 收到事务请求/回复.
+ * BR_SPAWN_LOOPER: 内核建议创建新线程.
+ * BR_TRANSACTION_COMPLETE: 内核已收到事务数据.
+ * BR_INCREFS / BR_ACQUIRE / BR_RELEASE / BR_DECREFS: 引用计数操作.
+ * BR_DEAD_BINDER / BR_CLEAR_DEATH_NOTIFICATION_DONE: 死亡通知相关.
+ * BR_FINISHED: 线程完成工作.
+ * BR_OK / BR_NOOP: 通用 OK / 空操作.
+ *
+ * 文件描述符传递
+ * -------------
+ * Binder 支持跨进程传递文件描述符 (BINDER_TYPE_FD / BINDER_TYPE_FDA).
+ * 发送进程在事务数据中标注 fd 偏移, binder_transaction() 在内核中
+ * 分配新的 fd (get_unused_fd_flags), 并将 struct file 安装到目标进程,
+ * 实现跨进程的 fd 传递 (实际上是共享同一个 file 结构体).
+ *
+ * 线程池管理
+ * ----------
+ * 每个进程维护一个 Binder 线程池. 线程通过 BC_ENTER_LOOPER (主线程)
+ * 或 BC_REGISTER_LOOPER (注册线程) 注册到内核. 当内核发现 work 堆积
+ * 而没有空闲线程读取时, 发送 BR_SPAWN_LOOPER 建议用户空间创建新线程.
+ * 线程退出时发送 BC_EXIT_LOOPER 通知内核.
+ */
+
+/*
  * Locking overview
  *
  * There are 3 main spinlocks which must be acquired in the
@@ -3052,6 +3158,100 @@ free_skb:
 	nlmsg_free(skb);
 }
 
+/*
+ * binder_transaction -- Binder 事务处理的核心函数
+ * ==============================================
+ *
+ * 功能: 处理 BC_TRANSACTION 和 BC_REPLY 命令, 完成一次完整的
+ *       Binder RPC 事务. 这是整个 Binder 驱动最复杂的关键路径.
+ *
+ * 调用者: binder_thread_write() 在处理 BC_TRANSACTION/BC_REPLY 时调用.
+ *
+ * 参数:
+ *   proc   -- 发起事务的进程 (binder_proc)
+ *   thread -- 发起事务的线程 (binder_thread)
+ *   tr     -- 从用户空间拷贝的 binder_transaction_data, 包含目标句柄/数据/偏移
+ *   reply  -- 是否为 BC_REPLY (1=回复, 0=请求)
+ *   extra_buffers_size -- 额外缓冲区大小 (用于存储 Binder 对象内联数据)
+ *
+ * 完整流程:
+ * --------
+ * 1. 查找目标:
+ *    a) 如果是 reply: 从 thread->transaction_stack 栈顶获取待回复的事务,
+ *       通过 in_reply_to->from_parent 找到目标线程和目标进程.
+ *    b) 如果是请求: 通过 tr->target.handle 在 proc 的 ref 红黑树中查找,
+ *       找到对应的 binder_ref, 再通过 ref->node 获取 binder_node,
+ *       进而得到目标进程 target_proc.
+ *
+ * 2. 安全检查:
+ *    通过 security_binder_transaction() 进行 LSM (SELinux) 权限检查.
+ *
+ * 3. 目标线程选择:
+ *    a) 如果目标有正在等待回复的线程 (transaction_stack 非空), 复用该线程.
+ *    b) 否则查找空闲线程 (looper 状态为等待且 todo 为空).
+ *    c) 如果找不到合适线程, 使用目标进程的 todo 列表 (由进程内任意线程处理).
+ *
+ * 4. 缓冲区分配:
+ *    在目标进程的 binder_alloc 中分配 binder_buffer.
+ *    缓冲区包含: 事务数据 + 偏移数组 + 额外缓冲区.
+ *    分配使用 best-fit 算法, 从 target_proc->alloc.free_buffers 红黑树查找.
+ *
+ * 5. 数据拷贝:
+ *    通过 copy_from_user() 将用户空间数据从源进程拷贝到目标进程的
+ *    共享内存缓冲区中. 注意此时目标进程的 mm 必须处于活跃状态.
+ *
+ * 6. 对象类型处理 (偏移数组遍历):
+ *    遍历 tr->offsets 指定的偏移数组, 对每个偏移处的对象类型进行处理:
+ *
+ *    a) BINDER_TYPE_BINDER / BINDER_TYPE_WEAK_BINDER:
+ *       传递 Binder 服务节点本身. 检查 target_proc 是否已有对该 node 的引用,
+ *       如果没有则创建新的 binder_ref. 将 node 的强/弱引用计数递增.
+ *
+ *    b) BINDER_TYPE_HANDLE / BINDER_TYPE_WEAK_HANDLE:
+ *       传递 Binder 服务句柄 (用于在回复中返回服务引用).
+ *       在 target_proc 中查找或创建对源 node 的引用.
+ *
+ *    c) BINDER_TYPE_FD:
+ *       文件描述符传递. 获取源进程的 struct file, 在目标进程中分配新的 fd,
+ *       增加 file 的引用计数. 延迟到目标线程使用前才完成 fd_install().
+ *
+ *    d) BINDER_TYPE_FDA (File Descriptor Array):
+ *       批量传递多个文件描述符. 流程与 BINDER_TYPE_FD 类似,
+ *       遍历整个数组中每个 fd 单独处理.
+ *
+ *    e) BINDER_TYPE_PTR (父对象指针修正):
+ *       处理内联对象中的指针偏移修正 (binder_fixup).
+ *
+ * 7. 工作项入队:
+ *    a) 创建 binder_transaction 对象 (t) 和 binder_work 对象 (w).
+ *    b) 将 t->work (BR_TRANSACTION 或 BR_REPLY) 入队到目标线程的 todo 列表,
+ *       或目标进程的 todo 列表 (当无合适线程时).
+ *    c) 将 t->tcomplete (BR_TRANSACTION_COMPLETE) 入队到当前线程的 todo,
+ *       让当前线程确认命令已接收.
+ *    d) 唤醒目标线程 (binder_wakeup_thread) 或目标进程.
+ *
+ * 8. 返回路径:
+ *    当前线程在 binder_thread_read() 中先处理 tcomplete,
+ *    返回 BR_TRANSACTION_COMPLETE 给用户.
+ *    目标线程被唤醒后, 在自己的 binder_thread_read() 中处理 w,
+ *    返回 BR_TRANSACTION (或 BR_REPLY) 给用户空间的服务端.
+ *
+ * 异步事务 (TF_ONE_WAY) 的特殊处理:
+ *   - 不需要 target_thread, 直接入队到 target_proc->todo.
+ *   - 发送者不等待回复, 立即返回.
+ *   - 异步事务缓冲区大小受 free_async_space 限制 (总映射空间的一半).
+ *
+ * 错误处理:
+ *   任何错误 (如目标进程死亡/内存不足/权限拒绝) 都会:
+ *   - 清除已分配的资源 (缓冲区/引用计数/file 指针)
+ *   - 通过 binder_set_extended_error() 设置线程的错误码
+ *   - 调用 binder_transaction_buffer_release() 释放已部分处理的对象
+ *
+ * 锁顺序:
+ *   binder_inner_proc_lock(proc) -> binder_proc_lock(target_proc)
+ *   -> binder_node_lock(target_node)
+ *   严格遵守三级锁层次, 避免死锁.
+ */
 static void binder_transaction(struct binder_proc *proc,
 			       struct binder_thread *thread,
 			       struct binder_transaction_data *tr, int reply,
@@ -4112,6 +4312,82 @@ binder_free_buf(struct binder_proc *proc,
 	binder_alloc_free_buf(&proc->alloc, buffer);
 }
 
+/*
+ * binder_thread_write -- 处理 BC_* 命令的入口函数
+ * ==============================================
+ *
+ * 功能: 解析用户在 BINDER_WRITE_READ 的 write 段中发送的 BC_* 命令流,
+ *       并逐一执行相应操作. 这是用户->内核方向的主处理函数.
+ *
+ * 调用者: binder_ioctl_write_read() -> binder_thread_write()
+ *
+ * 参数:
+ *   proc          -- 当前进程
+ *   thread        -- 当前线程
+ *   binder_buffer -- 用户空间的命令缓冲区地址
+ *   size          -- 缓冲区总大小
+ *   consumed      -- 已消耗的字节数 (输入/输出参数)
+ *
+ * 命令处理列表:
+ * ------------
+ * BC_INCREFS / BC_ACQUIRE:
+ *     增加 binder_ref 的弱/强引用计数, 防止 target node 被释放.
+ *     通过 handle 查找 ref, 调用 binder_inc_ref().
+ *
+ * BC_RELEASE / BC_DECREFS:
+ *     减少 binder_ref 的弱/强引用计数, 可能触发 node 清理.
+ *
+ * BC_INCREFS_DONE / BC_ACQUIRE_DONE:
+ *     确认引用计数操作已完成 (配合 BR_INCREFS/BR_ACQUIRE 使用).
+ *
+ * BC_FREE_BUFFER:
+ *     通知内核释放已处理完的缓冲区.
+ *     通过 binder_alloc_prepare_to_free() 查找缓冲区并释放.
+ *
+ * BC_TRANSACTION / BC_REPLY:
+ *     发送事务请求或回复. 从用户空间拷贝 binder_transaction_data,
+ *     然后调用 binder_transaction() 完成核心事务处理.
+ *     这是最重要的 BC 命令.
+ *
+ * BC_ATTEMPT_ACQUIRE / BC_ACQUIRE_RESULT:
+ *     已废弃 (legacy), 仅兼容旧版 Android 协议.
+ *
+ * BC_REGISTER_LOOPER:
+ *     线程通过 BINDER_SET_MAX_THREADS 注册自己到 Binder 线程池.
+ *     设置 thread->looper |= BINDER_LOOPER_STATE_REGISTERED.
+ *
+ * BC_ENTER_LOOPER:
+ *     主线程 (或任意线程) 主动声明进入 Binder 主循环.
+ *     设置 thread->looper |= BINDER_LOOPER_STATE_ENTERED.
+ *
+ * BC_EXIT_LOOPER:
+ *     线程退出 Binder 线程池, 设置 looper 状态并清理.
+ *
+ * BC_REQUEST_DEATH_NOTIFICATION:
+ *     注册对某个 binder_node 的死亡通知.
+ *     当目标 node 死亡时, 内核会发送 BR_DEAD_BINDER.
+ *
+ * BC_CLEAR_DEATH_NOTIFICATION:
+ *     取消之前注册的死亡通知.
+ *
+ * BC_DEAD_BINDER_DONE:
+ *     用户空间确认已处理 BR_DEAD_BINDER, 内核可释放死亡通知资源.
+ *
+ * BC_TRANSACTION_SG:
+ *     与 BC_TRANSACTION 相同, 但支持 scatter-gather 传递额外缓冲区.
+ *
+ * BC_REPLY_SG:
+ *     与 BC_REPLY 相同, 但支持 scatter-gather 模式.
+ *
+ * BC_CLEAR_EXTENDED_ERROR:
+ *     清除线程的扩展错误状态 (thread->ee).
+ *
+ * 处理流程:
+ * --------
+ * while (ptr < end): 从用户缓冲区逐条读取 4 字节命令码,
+ * 根据命令码执行对应操作. 所有命令处理完后, 用户可在后续的
+ * binder_thread_read() 中收到对应的 BR_* 响应.
+ */
 static int binder_thread_write(struct binder_proc *proc,
 			struct binder_thread *thread,
 			binder_uintptr_t binder_buffer, size_t size,
@@ -4726,6 +5002,87 @@ err:
 	return ret;
 }
 
+/*
+ * binder_thread_read -- 生成 BR_* 响应, 返回给用户空间
+ * ====================================================
+ *
+ * 功能: 将内核中累积的 binder_work 转换为 BR_* 命令,
+ *       写入用户空间的 read 缓冲区. 这是内核->用户方向的主函数.
+ *
+ * 调用者: binder_ioctl_write_read() -> binder_thread_read()
+ *
+ * 参数:
+ *   proc          -- 当前进程
+ *   thread        -- 当前线程
+ *   binder_buffer -- 用户空间的响应缓冲区地址
+ *   size          -- 缓冲区总大小
+ *   consumed      -- 已消耗的字节数
+ *   non_block     -- 非阻塞模式标志 (EPOLL 或 O_NONBLOCK)
+ *
+ * 三种 todo 队列及其优先级:
+ * ------------------------
+ * 1) thread->todo (最高优先级):
+ *    专属于当前线程的工作项. 包括 BR_TRANSACTION (目标线程收到的请求),
+ *    BR_REPLY (客户端收到的回复), BR_TRANSACTION_COMPLETE (确认),
+ *    BR_DEAD_BINDER (死亡通知) 等. 这些工作只能由本线程处理.
+ *
+ * 2) proc->todo (中等优先级):
+ *    属于进程的工作项. 当没有合适的目标线程时, 事务被投递到
+ *    proc->todo, 由进程内第一个空闲线程取出处理.
+ *
+ * 3) node->async_todo (最低优先级):
+ *    异步事务 (TF_ONE_WAY) 的工作项. 当 node 已经有正在处理
+ *    的异步事务时, 新来的异步事务会被暂存于此, 等前一个处理完毕
+ *    后再移入 proc->todo. 防止异步事务淹没服务端.
+ *
+ * 执行流程:
+ * --------
+ * 1. 初始写入 BR_NOOP (如果 consumed==0, 确保至少有一个有效响应).
+ *
+ * 2. 等待工作:
+ *    a) 检查 binder_available_for_proc_work_ilocked(): 如果线程没有
+ *       正在进行的事务 (transaction_stack == NULL), 可以处理 proc 的工作.
+ *    b) 如果没有 work 可用, 线程进入等待状态:
+ *       - 非阻塞模式: 立即返回.
+ *       - 阻塞模式: wait_event_freezable() 等待直到有 work 到达或被唤醒.
+ *
+ * 3. 处理工作 (while 循环):
+ *    a) 加锁 binder_inner_proc_lock(proc).
+ *    b) 从 todo 队列取出一个 binder_work (w).
+ *    c) 根据 w->type 生成对应的 BR_* 命令:
+ *
+ *       BINDER_WORK_TRANSACTION -> BR_TRANSACTION 或 BR_REPLY:
+ *          从 w 还原 binder_transaction, 将 tr (binder_transaction_data)
+ *          拷贝到用户缓冲区. 如果是回复 (指向当前线程的回复), 则是
+ *          BR_REPLY, 否则是 BR_TRANSACTION.
+ *
+ *       BINDER_WORK_TRANSACTION_COMPLETE -> BR_TRANSACTION_COMPLETE:
+ *          确认事务已提交, 写入 BR_TRANSACTION_COMPLETE.
+ *
+ *       BINDER_WORK_RETURN_ERROR -> BR_FAILED_REPLY:
+ *          事务失败通知, 从 binder_work 中取出错误码写入用户缓冲区.
+ *
+ *       BINDER_WORK_DEAD_BINDER -> BR_DEAD_BINDER:
+ *          通知用户目标 service 已死亡, 写入死亡通知的句柄.
+ *
+ *       BINDER_WORK_CLEAR_DEATH_NOTIFICATION -> BR_CLEAR_DEATH_NOTIFICATION_DONE:
+ *          确认死亡通知已清除.
+ *
+ *       BINDER_WORK_DEAD_BINDER_AND_CLEAR -> BR_DEAD_BINDER:
+ *          死亡通知 + 自动清除的组合处理.
+ *
+ *    d) 如果写用户空间失败 (EFAULT), 回滚并错误处理.
+ *
+ * 4. 返回条件:
+ *    - 缓冲区写满 (无剩余空间).
+ *    - 处理了至少一个非完整工作 (returned > 0 且无法立即处理更多).
+ *    - 发生错误.
+ *
+ * 关键设计:
+ *   binder_thread_read 会持续尝试从所有三种 todo 队列取工作,
+ *   以在单个 ioctl 调用中尽可能多地返回 BR_* 响应,
+ *   减少用户态->内核态的上下文切换次数.
+ */
 static int binder_thread_read(struct binder_proc *proc,
 			      struct binder_thread *thread,
 			      binder_uintptr_t binder_buffer, size_t size,
@@ -5451,6 +5808,46 @@ static __poll_t binder_poll(struct file *filp,
 	return 0;
 }
 
+/*
+ * binder_ioctl_write_read -- 处理 BINDER_WRITE_READ 命令
+ * ======================================================
+ *
+ * Binder IPC 的核心 ioctl 处理函数. BINDER_WRITE_READ 是
+ * Binder 驱动最重要的入口点, 几乎所有的 IPC 通信都通过它完成.
+ *
+ * 设计模式: 先写后读 (write-then-read)
+ * --------
+ * 用户空间传入一个 binder_write_read 结构体, 包含 write_buffer
+ * (BC_* 命令) 和 read_buffer (接收 BR_* 响应) 两部分.
+ * 内核先处理 write, 再处理 read:
+ *
+ *   [write 阶段] binder_thread_write():
+ *     解析 BC_TRANSACTION/BC_REPLY/BC_FREE_BUFFER 等命令,
+ *     修改内核状态 (分配缓冲区, 传递引用, 唤醒线程等).
+ *     如果 write 返回负值 (错误), 跳过 read 阶段.
+ *
+ *   [read 阶段] binder_thread_read():
+ *     将内核中累积的 binder_work 转换为 BR_* 响应,
+ *     写入 read_buffer 返回用户态.
+ *
+ *     write 阶段产生的工作项 (如 BR_TRANSACTION_COMPLETE)
+ *     会立即在 read 阶段被取走, 返回给同一线程.
+ *     发送的事务会唤醒目标线程, 目标线程在自己的
+ *     binder_thread_read() 中收到 BR_TRANSACTION/BR_REPLY.
+ *
+ * 这种设计保证了:
+ * 1) 每个 ioctl 调用都能高效地同时完成发送和接收.
+ * 2) 减少用户态<->内核态切换次数.
+ * 3) 自然的同步点: 发送请求后立即等待响应.
+ *
+ * 参数:
+ *   filp  -- 设备文件指针 (通过 filp->private_data 获取 proc)
+ *   arg   -- 用户空间地址, 指向 struct binder_write_read
+ *   thread -- 当前线程
+ *
+ * 返回:
+ *   0 成功, 负值表示错误 (EFAULT/ERESTARTSYS 等)
+ */
 static int binder_ioctl_write_read(struct file *filp, unsigned long arg,
 				struct binder_thread *thread)
 {
@@ -5770,6 +6167,58 @@ static int binder_ioctl_get_extended_error(struct binder_thread *thread,
 	return 0;
 }
 
+/*
+ * binder_ioctl -- Binder 设备文件的主 ioctl 分发函数
+ * =================================================
+ *
+ * 功能: 处理 binder 字符设备的所有 ioctl 命令.
+ *       每个打开 binder 设备的进程通过此函数与 Binder 驱动交互.
+ *
+ * 先决条件:
+ *   - 如果 binder_stop_on_user_error >= 2, 所有进程会阻塞等待
+ *     binder_user_error_wait, 防止错误级联扩散.
+ *   - 通过 binder_get_thread() 获取或创建当前线程的 binder_thread.
+ *     (线程首次调用 ioctl 时创建, 后续复用).
+ *
+ * 处理的 ioctl 命令:
+ * ----------------
+ * BINDER_WRITE_READ:
+ *    核心 IPC 命令. 调用 binder_ioctl_write_read() 处理.
+ *    所有 BC_TRANSACTION/BC_REPLY/BC_FREE_BUFFER 等命令都在此处理.
+ *
+ * BINDER_SET_MAX_THREADS:
+ *    设置进程的最大 Binder 线程数 (proc->max_threads).
+ *    内核根据此值决定是否发送 BR_SPAWN_LOOPER.
+ *
+ * BINDER_SET_CONTEXT_MGR:
+ *    将当前进程注册为 Binder context manager.
+ *    Context manager 是 Binder 服务的命名服务器,
+ *    负责服务注册和句柄查询 (handle 0 始终指向 context manager).
+ *    只有未设置或已死亡时才能注册新的 manager.
+ *
+ * BINDER_THREAD_EXIT:
+ *    通知内核当前 Binder 线程即将退出.
+ *    释放线程相关资源, 处理 transaction_stack 上的残留事务.
+ *
+ * BINDER_VERSION:
+ *    返回 Binder 内核协议版本号 (binder_version 结构体).
+ *
+ * BINDER_SET_IDLE_TIMEOUT / BINDER_SET_IDLE_PRIORITY:
+ *    设置空闲线程的超时时间和优先级.
+ *
+ * BINDER_SET_LOW_MEM_MARGIN / BINDER_SET_HIGH_MEM_MARGIN:
+ *    设置低/高内存水位线, 影响内存分配策略.
+ *
+ * BINDER_GET_LOW_MEM_MARGIN / BINDER_GET_HIGH_MEM_MARGIN:
+ *    获取当前的低/高内存水位线配置.
+ *
+ * BINDER_GET_EXTENDED_ERROR:
+ *    获取线程的扩展错误信息 (binder_extended_error),
+ *    包含 debug_id / 错误命令 / 错误参数.
+ *
+ * 每种命令完成后, 都会将 thread->return_error 重置为 BR_OK,
+ * 确保后续命令可以正常执行.
+ */
 static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int ret;
@@ -6023,6 +6472,45 @@ static const struct vm_operations_struct binder_vm_ops = {
 	.fault = binder_vm_fault,
 };
 
+/*
+ * binder_mmap -- 映射 Binder 共享内存 (mmap 入口)
+ * ===============================================
+ *
+ * 每个使用 Binder 的进程都必须先调用 mmap() 映射共享内存,
+ * 这是 Binder IPC 实现一次数据拷贝的基础 -- 数据直接从
+ * 发送进程的用户空间拷贝到目标进程的共享内存.
+ *
+ * 流程:
+ * 1. 检查是否为同一线程组 (只有 mmap 的进程自身可以使用).
+ * 2. 检查 vma 标志: 禁止 VM_WRITE (FORBIDDEN_MMAP_FLAGS),
+ *    因为 Binder 不需要可写映射 (数据通过 ioctl 传递).
+ * 3. 设置 vma 标志 VM_DONTCOPY (fork 时不复制映射) 和 VM_MIXEDMAP,
+ *    安装自定义 vm_ops (binder_vm_ops) 处理页面错误的关闭.
+ * 4. 委托 binder_alloc_mmap_handler() 进行实际初始化:
+ *    a) 设置 buffer_size = min(vma 大小, SZ_4M), 记录 vm_start.
+ *    b) 分配 pages 数组 (每个 page 对应一个 struct page 指针).
+ *    c) 创建初始的空闲缓冲区, 插入 free_buffers 红黑树.
+ *    d) 设置 free_async_space = buffer_size / 2 (异步事务限额).
+ *
+ * 页分配 (按需分配, on-demand):
+ * 实际物理页面不在 mmap 时一次性分配, 而是在缓冲区分配后,
+ * 由 binder_alloc.c 中的 binder_install_buffer_pages() 按需分配:
+ *   - binder_page_alloc(): 通过 alloc_page() 分配单个物理页,
+ *     并附带 binder_shrinker_mdata (用于 shrinker 回收).
+ *   - binder_page_insert(): 通过 vm_insert_page() 将物理页
+ *     映射到用户 VMA 的指定地址.
+ *   - binder_install_single_page(): 组合上述两步, 处理并发安装.
+ *
+ * 这种按需分配确保:
+ * - 即使映射了 4MB 虚拟空间, 也只分配实际使用的物理页.
+ * - 通过内核 shrinker 机制可以在内存压力时回收未使用页面.
+ * - 所有进程共享同一套页分配/回收机制, 避免内存浪费.
+ *
+ * 注意: 旧版本内核中有 binder_update_page_range() 函数
+ * 负责直接的页分配/释放, 新版已将页管理重构到 binder_alloc.c,
+ * 通过 binder_install_buffer_pages() 和 binder_lru_freelist_del()
+ * 实现更细粒度的页生命周期管理.
+ */
 static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	struct binder_proc *proc = filp->private_data;

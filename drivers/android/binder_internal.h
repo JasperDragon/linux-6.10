@@ -3,6 +3,72 @@
 #ifndef _LINUX_BINDER_INTERNAL_H
 #define _LINUX_BINDER_INTERNAL_H
 
+/*
+ * ============================================================================
+ * binder_internal.h — Binder 驱动内部数据结构和 API
+ * ============================================================================
+ *
+ * 【Binder IPC 机制概述】
+ *
+ * Binder 是 Android 的核心 IPC 机制，以内核驱动形式实现轻量级 RPC 框架。
+ * 每个进程通过 open("/dev/binder") + mmap() + ioctl() 与驱动交互。
+ *
+ * 【四大核心数据结构】
+ *
+ *   binder_proc    — 每个使用 Binder 的进程一个实例，管理线程池和事务队列
+ *   binder_thread  — 进程内每个调用 binder ioctl 的线程一个实例
+ *   binder_node    — 服务端注册的 Binder 对象 (代表可远程调用的服务)
+ *   binder_ref     — 客户端持有的对远程 binder_node 的引用 (handle/句柄)
+ *
+ * 【关系拓扑】
+ *
+ *   procA (Client)                    procB (Server)
+ *   ┌──────────────┐                 ┌──────────────┐
+ *   │ refs_by_desc │──binder_ref──→  │   nodes      │
+ *   │ refs_by_node │    .desc=3      │   └─binder_node
+ *   │ threads      │    .node ───────│←──────.refs  │
+ *   │ todo         │                 │   threads    │
+ *   └──────────────┘                 │   todo       │
+ *                                    └──────────────┘
+ *
+ * 【引用计数系统】
+ *
+ *   local_strong_refs  — 本地进程持有的强引用 (BC_ACQUIRE)
+ *   local_weak_refs    — 本地进程持有的弱引用 (BC_INCREFS)
+ *   internal_strong_refs — 内核在发起事务时自动增加的强引用
+ *   tmp_refs           — 内核临时引用 (事务处理期间)
+ *
+ *   只要强引用 > 0，binder_node 就不能被销毁。
+ *   弱引用允许客户端探测服务是否还活着 (BR_DEAD_BINDER)。
+ *
+ * 【三级锁层次结构】(获取顺序必须遵守!)
+ *   1. proc->outer_lock — 保护 binder_ref
+ *   2. node->lock       — 保护 binder_node 字段
+ *   3. proc->inner_lock — 保护线程链表、todo 队列、transaction_stack
+ *
+ *   函数命名约定:
+ *     foo_olocked()  = 需要 outer_lock
+ *     foo_nlocked()  = 需要 node->lock
+ *     foo_ilocked()  = 需要 inner_lock
+ *     foo_nilocked() = 需要 node->lock + inner_lock
+ *
+ * 【Work 类型 (todo 队列中的工作项)】
+ *
+ *   BINDER_WORK_TRANSACTION          — 普通 RPC 调用
+ *   BINDER_WORK_TRANSACTION_COMPLETE — 事务已送达 (通知客户端)
+ *   BINDER_WORK_RETURN_ERROR         — 返回错误
+ *   BINDER_WORK_DEAD_BINDER          — 目标进程死亡通知
+ *   BINDER_WORK_FROZEN_BINDER        — Binder 冻结通知
+ *
+ *   三个 todo 队列: proc->todo, thread->todo, node->async_todo
+ *   处理优先级: thread->todo > proc->todo > node->async_todo
+ *
+ * 【同步 vs 异步事务】
+ *
+ *   同步 (默认):  客户端阻塞等待 BR_REPLY，服务端返回 BC_REPLY
+ *   异步 (TF_ONE_WAY): 客户端立即返回，入队到 node->async_todo
+ */
+
 #include <linux/fs.h>
 #include <linux/list.h>
 #include <linux/miscdevice.h>
