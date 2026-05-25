@@ -11,6 +11,44 @@
  * Copyright (C) 2012 Renesas Electronics Corp.
  * Author: Guennadi Liakhovetski <g.liakhovetski@gmx.de>
  */
+
+/*
+ * ============================================================================
+ * V4L2 Firmware Node 解析库
+ * ============================================================================
+ *
+ * 本头文件定义了从 Device Tree (OF) 和 ACPI firmware node 解析
+ * V4L2 设备配置的接口。
+ *
+ * 【核心功能】
+ * - v4l2_fwnode_endpoint_parse(): 解析 DT "port/endpoint" 节点
+ *   提取: bus_type (parallel/BT.656/CPI), bus 配置 (极性、时钟、lane数),
+ *         link-frequencies, clock-noncontinuous, data-lanes 等
+ *
+ * - v4l2_fwnode_device_parse(): 解析设备级属性
+ *   提取: rotation, orientation, lens-focus 等传感器属性
+ *
+ * 【关键数据结构】
+ * - v4l2_fwnode_endpoint: 单个 endpoint 的解析结果
+ *   - bus_type: V4L2_MBUS_PARALLEL / V4L2_MBUS_BT656 / V4L2_MBUS_CSI2_DPHY / ...
+ *   - bus: union 包含特定总线的配置结构体
+ *     - parallel: hsync/vsync/pclk 极性
+ *     - mipi_csi2: data_lanes[], clock_lane, lane_polarities
+ *     - bt656: 兼容模式标志
+ *   - nr_of_link_frequencies + link_frequencies[]
+ *   - fwnode: 指向原始 fwnode_handle
+ *
+ * - v4l2_fwnode_device_properties: 设备级属性
+ *   - orientation: 传感器朝向 (front/back/external)
+ *   - rotation: 传感器旋转角度 (0/90/180/270)
+ *   - flash_led_dev: 关联的闪光灯 LED 设备名
+ *   - lens_focus: 镜头对焦距离
+ *
+ * 【使用场景】
+ *   子设备驱动 probe 时调用 v4l2_fwnode_endpoint_parse() 从 DT 获取
+ *   总线配置和链路频率，然后据此初始化硬件寄存器。
+ */
+
 #ifndef _V4L2_FWNODE_H
 #define _V4L2_FWNODE_H
 

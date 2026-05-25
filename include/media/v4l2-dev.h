@@ -21,6 +21,26 @@
 
 #define VIDEO_MAJOR	81
 
+//
+// video_device 代表 /dev/videoX 设备节点，是用户空间与 V4L2 驱动的接口。
+// 它嵌入标准字符设备 cdev，主设备号 81。
+// 通过 v4l2_ioctl_ops 映射 ioctl 到驱动回调。
+// 通过 vb2_queue 管理视频缓冲区。
+//
+// 设备类型（vfl_devnode_type）：
+//   VIDEO  - 视频输入/输出设备
+//   VBI    - 图文/隐藏字幕数据
+//   RADIO  - 收音机调谐器
+//   SUBDEV - V4L2 子设备（sensor、isp 等）
+//   SDR    - 软件无线电
+//   TOUCH  - 触摸传感器
+//
+// 设备方向（vfl_devnode_direction）：
+//   RX  - 采集/接收方向
+//   TX  - 输出/发送方向
+//   M2M - 内存到内存（如编解码器）
+//
+
 /**
  * enum vfl_devnode_type - type of V4L2 device node
  *
@@ -96,6 +116,14 @@ enum v4l2_video_device_flags {
 	V4L2_FL_QUIRK_INVERTED_CROP	= 2,
 	V4L2_FL_SUBDEV_RO_DEVNODE	= 3,
 };
+
+//
+// 优先级机制用于多进程访问同一设备时的资源仲裁。
+// V4L2 定义了三种优先级：V4L2_PRIORITY_DEFAULT（低）、
+// V4L2_PRIORITY_INTERMEDIATE（中）、V4L2_PRIORITY_RECORD（高）。
+// 高优先级的进程可以锁住某些操作（如开始流传输），
+// 防止低优先级进程干扰。
+//
 
 /* Priority helper functions */
 
@@ -263,50 +291,51 @@ struct v4l2_file_operations {
 
 struct video_device {
 #if defined(CONFIG_MEDIA_CONTROLLER)
-	struct media_entity entity;
-	struct media_intf_devnode *intf_devnode;
-	struct media_pipeline pipe;
+	struct media_entity entity;       // 内嵌媒体实体：将设备节点挂入 Media Controller 拓扑图
+	struct media_intf_devnode *intf_devnode; // 媒体接口：连接 entity 到 /dev/videoX
+	struct media_pipeline pipe;       // 关联的 media pipeline (用于 pipeline start/stop)
 #endif
-	const struct v4l2_file_operations *fops;
+	const struct v4l2_file_operations *fops; // 驱动文件操作集 (read/write/mmap/open/release)
 
-	u32 device_caps;
+	u32 device_caps;                  // 设备能力 (V4L2_CAP_*)，在 v4l2_capability 中上报用户空间
 
 	/* sysfs */
-	struct device dev;
-	struct cdev *cdev;
+	struct device dev;                // 内嵌 struct device，用于 sysfs (class video4linux)
+	struct cdev *cdev;               // 字符设备 (/dev/videoX 的 cdev)
 
-	struct v4l2_device *v4l2_dev;
-	struct device *dev_parent;
+	struct v4l2_device *v4l2_dev;     // 父 V4L2 设备，指向所属的 v4l2_device
+	struct device *dev_parent;        // 父物理设备 (如 &pci_dev->dev)，用于 sysfs 层级
 
-	struct v4l2_ctrl_handler *ctrl_handler;
+	struct v4l2_ctrl_handler *ctrl_handler; // 此设备节点的控制处理器 (可为 NULL)
+	                                         // 控制继承链: 此 handler → v4l2_dev->ctrl_handler
 
-	struct vb2_queue *queue;
+	struct vb2_queue *queue;          // 视频缓冲区队列：驱动创建并赋值，用于 V4L2 buffer ioctl
 
-	struct v4l2_prio_state *prio;
+	struct v4l2_prio_state *prio;     // 优先级状态：NULL 时使用 v4l2_dev->prio
 
 	/* device info */
-	char name[64];
-	enum vfl_devnode_type vfl_type;
-	enum vfl_devnode_direction vfl_dir;
-	int minor;
-	u16 num;
-	unsigned long flags;
-	int index;
+	char name[64];                    // 设备名称，显示在 sysfs 和 /dev 中
+	enum vfl_devnode_type vfl_type;   // 设备类型：VIDEO/VBI/RADIO/SUBDEV/SDR/TOUCH
+	enum vfl_devnode_direction vfl_dir; // 数据方向：RX(采集)/TX(输出)/M2M(内存到内存)
+	int minor;                        // 次设备号，-1 表示注册失败
+	u16 num;                          // 设备节点编号 (/dev/video{num})
+	unsigned long flags;              // V4L2_FL_* 标志: REGISTERED, USES_V4L2_FH, ...
+	int index;                        // 物理设备上的多实例索引 (如 video0 vs video1)
 
 	/* V4L2 file handles */
-	spinlock_t		fh_lock;
-	struct list_head	fh_list;
+	spinlock_t		fh_lock;    // 保护 fh_list 的自旋锁
+	struct list_head	fh_list;    // 所有打开的 v4l2_fh 链表
 
-	int dev_debug;
+	int dev_debug;                    // 调试标志位 (V4L2_DEV_DEBUG_*)，通过 sysfs 控制
 
-	v4l2_std_id tvnorms;
+	v4l2_std_id tvnorms;              // 支持的电视标准 (V4L2_STD_* 位掩码)
 
 	/* callbacks */
-	void (*release)(struct video_device *vdev);
-	const struct v4l2_ioctl_ops *ioctl_ops;
-	DECLARE_BITMAP(valid_ioctls, BASE_VIDIOC_PRIVATE);
+	void (*release)(struct video_device *vdev);       // 释放回调：video_put() 引用归零时调用
+	const struct v4l2_ioctl_ops *ioctl_ops;           // ioctl 操作表：VIDIOC_* 到驱动回调的映射
+	DECLARE_BITMAP(valid_ioctls, BASE_VIDIOC_PRIVATE); // 有效 ioctl 位图：bit=0 表示已禁用
 
-	struct mutex *lock;
+	struct mutex *lock;               // 序列化互斥锁：保护此设备节点的访问
 };
 
 /**
@@ -457,6 +486,15 @@ void video_device_release(struct video_device *vdev);
  */
 void video_device_release_empty(struct video_device *vdev);
 
+//
+// valid_ioctls 位图机制：
+//   video_device 中的 valid_ioctls 是 DECLARE_BITMAP，
+//   用于标记该设备支持哪些 ioctl 命令。
+//   驱动通过 v4l2_disable_ioctl() 在注册前禁用特定 ioctl，
+//   使得多个使用同一 ioctl_ops 的设备可以各自裁剪功能。
+//   determine_valid_ioctls() 在注册时自动计算并初始化该位图。
+//
+
 /**
  * v4l2_disable_ioctl- mark that a given command isn't implemented.
  *	shouldn't use core locking
@@ -561,6 +599,12 @@ static inline struct dentry *v4l2_debugfs_root(void)
 #endif
 
 #if defined(CONFIG_MEDIA_CONTROLLER)
+
+//
+// Pipeline 概念：从 video_device 沿 enabled links 遍历所有关联 entity，
+// 形成完整数据通路。pipeline 用于管理数据流从采集到输出的整个链路，
+// 确保所有涉及的硬件单元都被正确配置和同步。
+//
 
 /**
  * video_device_pipeline_start - Mark a pipeline as streaming

@@ -5,6 +5,10 @@
  * Copyright (C) 2012-2013, Guennadi Liakhovetski <g.liakhovetski@gmx.de>
  */
 
+// v4l2-async: 异步子设备注册机制——解决 bridge 驱动和子设备 probe 顺序不确定的问题。
+// bridge 创建 notifier，等待子设备通过 firmware node 或 I2C 地址匹配后回调 bound。
+// 流程：notifier → match → bound → complete → unbind
+
 #include <linux/debugfs.h>
 #include <linux/device.h>
 #include <linux/err.h>
@@ -25,6 +29,8 @@
 #include <media/v4l2-subdev.h>
 
 #include "v4l2-subdev-priv.h"
+
+// === 绑定/解绑回调 (bound/unbind) ===
 
 static int v4l2_async_nf_call_bound(struct v4l2_async_notifier *n,
 				    struct v4l2_subdev *subdev,
@@ -62,6 +68,8 @@ static void v4l2_async_nf_call_destroy(struct v4l2_async_notifier *n,
 
 	n->ops->destroy(asc);
 }
+
+// === 匹配 (match) ===
 
 static bool match_i2c(struct v4l2_async_notifier *notifier,
 		      struct v4l2_subdev *sd,
@@ -576,6 +584,8 @@ static int v4l2_async_nf_match_valid(struct v4l2_async_notifier *notifier,
 
 	return 0;
 }
+
+// === Notifier 初始化 (notifier init) ===
 
 void v4l2_async_nf_init(struct v4l2_async_notifier *notifier,
 			struct v4l2_device *v4l2_dev)

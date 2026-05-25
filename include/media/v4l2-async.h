@@ -8,6 +8,41 @@
 #ifndef V4L2_ASYNC_H
 #define V4L2_ASYNC_H
 
+/*
+ * 中文概述：
+ *
+ * 异步子设备注册框架。V4L2 子设备（如传感器、解码器）通常独立于
+ * bridge 主设备探测，本框架提供了一种异步匹配和绑定机制。
+ *
+ * 核心工作流程：
+ *  1. bridge 驱动创建一个 v4l2_async_notifier，并通过
+ *     v4l2_async_nf_add_fwnode() / v4l2_async_nf_add_i2c() 添加
+ *     期望匹配的子设备描述（fwnode 或 I2C 地址）。
+ *  2. 调用 v4l2_async_nf_register() 注册 notifier。
+ *  3. 子设备驱动在探测时调用 v4l2_async_register_subdev()。
+ *  4. 框架自动匹配：比较子设备的 fwnode/I2C 地址与 notifier 中
+ *     的等待列表（waiting_list），匹配成功则调用 bound 回调，
+ *     并将 asc 移至 done_list。
+ *  5. 当 notifier 中所有 asc 都完成绑定后，调用 complete 回调。
+ *  6. 子设备移除时触发 unbind 回调。
+ *
+ * 匹配类型：
+ *  - V4L2_ASYNC_MATCH_TYPE_FWNODE：基于 firmware node（设备树或
+ *    ACPI）句柄匹配。
+ *  - V4L2_ASYNC_MATCH_TYPE_I2C：基于 I2C adapter ID 和地址匹配。
+ *
+ * 关键数据结构：
+ *  - v4l2_async_connection (asc)：描述一个待匹配的子设备连接，
+ *    包含匹配信息、所属 notifier、匹配后的子设备指针。
+ *  - v4l2_async_notifier：notifier 包含 waiting_list（待匹配）、
+ *    done_list（已完成）、操作回调（bound/complete/unbind）。
+ *  - v4l2_async_subdev_endpoint：用于从单个设备注册多个端点。
+ *
+ * 连接生命周期：
+ *  create -> add to notifier -> register -> match -> bound callback
+ *  -> complete (all done) -> unbind (on removal) -> cleanup
+ */
+
 #include <linux/list.h>
 #include <linux/mutex.h>
 

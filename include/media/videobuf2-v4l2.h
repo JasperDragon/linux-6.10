@@ -9,6 +9,31 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation.
  */
+
+/*
+ * ============================================================================
+ * videobuf2-v4l2 — VB2 的 V4L2 适配层
+ * ============================================================================
+ *
+ * 本文件提供 videobuf2 核心框架与 V4L2 子系统之间的适配层。
+ *
+ * vb2_v4l2_buffer 将 vb2_buffer 扩展为包含 V4L2 特定字段
+ * （flags, field, timecode, sequence, request_fd），对应 videodev2.h
+ * 中的 v4l2_buffer 结构体。
+ *
+ * 关键功能：
+ * - vb2_ioctl_reqbufs/dqbuf/qbuf — 标准 V4L2 缓冲区 ioctl 的 VB2 实现
+ * - vb2_ioctl_streamon/streamoff — 流控制 ioctl
+ * - vb2_fop_read/write/mmap/poll — VFS 文件操作的 VB2 实现，可直接赋值给 v4l2_file_operations
+ * - M2M hold capture buffer 支持（VB2_V4L2_FL_SUPPORTS_M2M_HOLD_CAPTURE_BUF）
+ *
+ * 驱动通常将此头文件中的函数直接赋值给 v4l2_ioctl_ops 和 v4l2_file_operations：
+ *   .vidioc_reqbufs       = vb2_ioctl_reqbufs;
+ *   .vidioc_qbuf          = vb2_ioctl_qbuf;
+ *   .vidioc_dqbuf         = vb2_ioctl_dqbuf;
+ *   .vidioc_streamon      = vb2_ioctl_streamon;
+ */
+
 #ifndef _MEDIA_VIDEOBUF2_V4L2_H
 #define _MEDIA_VIDEOBUF2_V4L2_H
 

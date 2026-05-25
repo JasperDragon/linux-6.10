@@ -31,6 +31,85 @@
 
 #include <trace/events/vb2.h>
 
+/*
+ * ==========================================================================
+ * videobuf2 (VB2) 核心框架概述
+ * ==========================================================================
+ *
+ * videobuf2 是 V4L2（Video for Linux 2）的视频缓冲区管理框架，是整个 V4L2
+ * 驱动栈中负责缓冲区生命周期管理的核心组件。它处理从缓冲区分配、DMA 映射、
+ * 队列管理到用户空间交互的全套流程。
+ *
+ * --- 三种内存模型 ---
+ * VB2 支持三种内存访问模式，以适应不同的使用场景和硬件需求：
+ *
+ *  1) MMAP（内存映射）：
+ *     内核分配物理连续或非连续的 DMA 缓冲区，用户空间通过 mmap() 系统调用
+ *     将同一块物理内存映射到进程地址空间。这是最常用的模式，由驱动分配内存，
+ *     用户和内核共享零拷贝访问。
+ *
+ *  2) USERPTR（用户指针）：
+ *     用户空间自行分配内存（如 malloc()），并通过指针传递给驱动。内核通过
+ *     get_user_pages() 将用户虚拟地址固定为物理页面。适用于用户需要自定义
+ *     内存管理策略的场景，但存在页锁定开销。
+ *
+ *  3) DMABUF（DMA 缓冲区共享）：
+ *     通过 DMA-BUF 机制实现多个设备间的零拷贝缓冲区共享。一个设备导出 dma_buf
+ *     文件描述符，另一个设备导入并附接到自己的 DMA 地址空间。适用于嵌入式
+ *     SoC 中 ISP/Codec/Display 流水线。
+ *
+ * --- 核心数据结构 ---
+ *  struct vb2_queue:
+ *      每个视频设备节点对应一个 vb2_queue，是帧缓冲队列的核心管理结构。
+ *      它维护了缓冲区区数组（bufs[]）、待处理缓冲区链表（queued_list）、
+ *      完成缓冲区链表（done_list），以及流状态（streaming）、内存模型
+ *      （memory）等全局状态。
+ *
+ *  struct vb2_buffer:
+ *      代表单个视频帧缓冲区。包含多个平面（planes），每个平面对应一个
+ *      内存块。记录缓冲区状态（state）、索引（index）、时间戳等元数据。
+ *
+ * --- 驱动回调接口 (vb2_ops) ---
+ *  驱动通过实现 vb2_ops 结构体中的回调函数与 VB2 框架交互：
+ *  - queue_setup:     在 REQBUFS/CREATE_BUFS 时调用，告知框架需要的缓冲区数量
+ *                     和每个平面的大小
+ *  - buf_init:        缓冲区初始化，驱动可在此设置硬件相关的描述符
+ *  - buf_prepare:     在 QBUF 前调用，驱动可在此做 cache 同步或地址设置
+ *  - buf_queue:       将缓冲区提交给硬件处理队列
+ *  - buf_finish:      在 DQBUF 时调用，驱动做清理工作
+ *  - buf_cleanup:     释放驱动相关的缓冲区资源
+ *  - start_streaming: 启动数据流（调用 STREAMON 且缓冲区充足时触发）
+ *  - stop_streaming:  停止数据流（调用 STREAMOFF 时触发）
+ *
+ * --- 缓冲区状态机 ---
+ *  缓冲区在其生命周期中经历以下状态转换：
+ *  DEQUEUED -> (QBUF) -> PREPARING -> PREPARED -> QUEUED -> ACTIVE
+ *  -> (DONE/ERROR) -> DEQUEUED
+ *  或者：DEQUEUED -> IN_REQUEST（请求 API 模式下）
+ *
+ * --- 流控制 ---
+ *  vb2_start_streaming() 在以下条件满足时调用：
+ *  1) 用户调用 STREAMON
+ *  2) 队列中已排队的缓冲区数量 >= min_queued_buffers
+ *  若 start_streaming 失败，驱动必须将所有 ACTIVE 缓冲区返回到 QUEUED 状态。
+ *
+ * --- 多平面支持 ---
+ *  VB2 原生支持 V4L2 的多平面格式（multi-planar），每个 vb2_buffer 可包含
+ *  多个 plane，分别对应 Y、Cb、Cr 等分量。最多支持 VIDEO_MAX_PLANES 个平面。
+ *
+ * --- DMA 缓冲同步 ---
+ *  通过 mem_ops 中的 prepare/finish 回调实现 DMA 方向的 cache 同步。
+ *  DMABUF 模式下由导出者负责 cache 同步，VB2 可跳过内部 sync 操作。
+ *
+ * --- 请求 API (Request API) ---
+ *  支持通过 media_request 将多个缓冲区绑定到同一个请求中，实现无状态
+ *  codec 的原子提交。缓冲区状态 IN_REQUEST 表示它已绑定到请求但还未被
+ *  提交给硬件。
+ *
+ *  作者: Pawel Osciak <pawel@osciak.com>, Marek Szyprowski
+ * ==========================================================================
+ */
+
 #define PLANE_INDEX_BITS	3
 #define PLANE_INDEX_SHIFT	(PAGE_SHIFT + PLANE_INDEX_BITS)
 #define PLANE_INDEX_MASK	(BIT_MASK(PLANE_INDEX_BITS) - 1)
@@ -200,6 +279,62 @@ module_param(debug, int, 0644);
 
 static void __vb2_queue_cancel(struct vb2_queue *q);
 
+/*
+ * ============================================================================
+ * 缓冲区状态机 (Buffer State Machine)
+ * ============================================================================
+ *
+ * vb2 定义了严格的缓冲区状态转换，是整个框架的核心契约：
+ *
+ *                  ┌─────────────────────────────────────────────┐
+ *                  ↓                                             │
+ *           DEQUEUED ─→ PREPARING ─→ QUEUED ─→ ACTIVE ─→ DONE ─→ DEQUEUED
+ *               ↑              ↑         ↑          │     │
+ *               │              │         │          │     │
+ *               └──────────────┘         └──────────┘     └→ ERROR ─→ DEQUEUED
+ *           (start_streaming          (start_streaming   (驱动报告错误
+ *            失败时回退)                失败时回退)         或超时/故障)
+ *
+ * 各状态转换触发点：
+ * ┌────────────┬──────────────────────────────────────────────────────┐
+ * │ 状态        │ 含义与触发                                           │
+ * ├────────────┼──────────────────────────────────────────────────────┤
+ * │ DEQUEUED   │ 缓冲区空闲，由用户 QBUF。REQBUFS 分配后初始状态。     │
+ * │            │ DQBUF 后也回到此状态。                                │
+ * ├────────────┼──────────────────────────────────────────────────────┤
+ * │ PREPARING  │ 内核准备缓冲区（仅 QBUF 时短暂进入）。                │
+ * │            │ MMAP: DMA sync; USERPTR: get_user_pages;             │
+ * │            │ DMABUF: dma_buf_attach。完成后立即退出。             │
+ * ├────────────┼──────────────────────────────────────────────────────┤
+ * │ QUEUED     │ 已入队，在 queued_list 中等待。                      │
+ * │            │ STREAMON 时批量送入驱动；streaming 中 QBUF 直接送入。│
+ * ├────────────┼──────────────────────────────────────────────────────┤
+ * │ IN_REQUEST │ 缓冲区已绑定到 media_request 但请求尚未提交。         │
+ * │            │ 请求提交后转变为 QUEUED → ACTIVE 流程。              │
+ * ├────────────┼──────────────────────────────────────────────────────┤
+ * │ ACTIVE     │ 驱动正在处理。owned_by_drv_count++。                  │
+ * │            │ 驱动通过 vb2_buffer_done() 交还。                     │
+ * ├────────────┼──────────────────────────────────────────────────────┤
+ * │ DONE       │ 驱动处理完成，在 done_list 中等待用户 DQBUF。         │
+ * ├────────────┼──────────────────────────────────────────────────────┤
+ * │ ERROR      │ 处理出错，在 done_list 中，DQBUF 返回错误给用户。     │
+ * └────────────┴──────────────────────────────────────────────────────┘
+ *
+ * 三个关键链表的流转：
+ *
+ *   用户 QBUF         驱动 buf_queue        驱动处理完成
+ *       │                  │                     │
+ *       ▼                  ▼                     ▼
+ *   queued_list  ────→ (驱动内部)  ────→  done_list  ────→  用户 DQBUF
+ *       │                                       │
+ *   queued_count                            done_wq
+ *    (入队计数)                         (poll/DQBUF 阻塞点)
+ *
+ * min_queued_buffers 延迟启动机制：
+ *   某些 DMA 引擎需要最少 N 个缓冲区才能启动（如 ring buffer）。
+ *   STREAMON 时若 queued_count < min_queued_buffers，只设 streaming=1，
+ *   推迟 start_streaming；每次 QBUF 时自动检查条件满足后触发。
+ */
 static const char *vb2_state_name(enum vb2_buffer_state s)
 {
 	static const char * const state_names[] = {
@@ -216,6 +351,8 @@ static const char *vb2_state_name(enum vb2_buffer_state s)
 		return state_names[s];
 	return "unknown";
 }
+
+// ===== 内存分配器 (Memory Allocators) =====
 
 /*
  * __vb2_buf_mem_alloc() - allocate video memory for the given buffer
@@ -1173,6 +1310,25 @@ void *vb2_plane_cookie(struct vb2_buffer *vb, unsigned int plane_no)
 }
 EXPORT_SYMBOL_GPL(vb2_plane_cookie);
 
+/*
+ * vb2_buffer_done() — 驱动归还缓冲区所有权（关键回调）
+ * @vb:    已处理完成的缓冲区
+ * @state: 处理结果: DONE (成功), ERROR (故障), QUEUED (start_streaming 失败回退)
+ *
+ * 这是驱动 "还回" 缓冲区的唯一入口，通常在驱动的 ISR 或工作线程中调用。
+ *
+ * 三种目标状态：
+ * - DONE:  正常完成 → 加入 done_list → 唤醒 done_wq → 用户 DQBUF 获取
+ * - ERROR: 处理出错 → 加入 done_list → 用户 DQBUF 获取到错误标志
+ * - QUEUED: start_streaming 失败回退 → 保持 QUEUED 状态（不通知用户空间）
+ *           这确保失败的流启动对用户空间透明
+ *
+ * 调用契约：
+ *   1. 缓冲区状态必须是 ACTIVE（驱动明确拥有）
+ *   2. 此函数可在中断上下文中调用（done_lock 使用 spin_lock_irqsave）
+ *   3. DONE/ERROR 路径：唤醒 done_wq 等待队列
+ *   4. Request API 路径：自动解绑 request_object
+ */
 void vb2_buffer_done(struct vb2_buffer *vb, enum vb2_buffer_state state)
 {
 	struct vb2_queue *q = vb->vb2_queue;
@@ -1187,28 +1343,28 @@ void vb2_buffer_done(struct vb2_buffer *vb, enum vb2_buffer_state state)
 		state = VB2_BUF_STATE_ERROR;
 
 #ifdef CONFIG_VIDEO_ADV_DEBUG
-	/*
-	 * Although this is not a callback, it still does have to balance
-	 * with the buf_queue op. So update this counter manually.
-	 */
 	vb->cnt_buf_done++;
 #endif
 	dprintk(q, 4, "done processing on buffer %d, state: %s\n",
 		vb->index, vb2_state_name(state));
 
+	/* DONE/ERROR 时同步 DMA 缓存，QUEUED (回退) 时跳过 */
 	if (state != VB2_BUF_STATE_QUEUED)
 		__vb2_buf_mem_finish(vb);
 
+	/* 关键：done_lock 保护 done_list，支持中断上下文 */
 	spin_lock_irqsave(&q->done_lock, flags);
 	if (state == VB2_BUF_STATE_QUEUED) {
+		/* 回退路径：直接置回 QUEUED（下次 streamon 重试）*/
 		vb->state = VB2_BUF_STATE_QUEUED;
 	} else {
-		/* Add the buffer to the done buffers list */
+		/* 完成路径：放入 done_list 等待用户 DQBUF */
 		list_add_tail(&vb->done_entry, &q->done_list);
 		vb->state = state;
 	}
-	atomic_dec(&q->owned_by_drv_count);
+	atomic_dec(&q->owned_by_drv_count);  /* 驱动不再持有 */
 
+	/* Request API: 解绑并释放 request 对象引用 */
 	if (state != VB2_BUF_STATE_QUEUED && vb->req_obj.req) {
 		media_request_object_unbind(&vb->req_obj);
 		media_request_object_put(&vb->req_obj);
@@ -1220,9 +1376,9 @@ void vb2_buffer_done(struct vb2_buffer *vb, enum vb2_buffer_state state)
 
 	switch (state) {
 	case VB2_BUF_STATE_QUEUED:
-		return;
+		return;  /* 回退场景：不通知用户空间 */
 	default:
-		/* Inform any processes that may be waiting for buffers */
+		/* 唤醒阻塞在 DQBUF/poll 上的用户空间进程 */
 		wake_up(&q->done_wq);
 		break;
 	}
@@ -1526,7 +1682,20 @@ err_put_vb2_buf:
 }
 
 /*
- * __enqueue_in_driver() - enqueue a vb2_buffer in driver for processing
+ * __enqueue_in_driver() — 将缓冲区正式提交给驱动处理
+ *
+ * 这是 VB2 框架与驱动之间的关键交接点。调用此函数后，缓冲区的所有权
+ * 从 VB2 转移到驱动。驱动通过 buf_queue 回调接收缓冲区，将其提交给
+ * DMA 引擎或硬件队列。
+ *
+ * 调用时机：
+ * - start_streaming 时：遍历 queued_list 批量送入驱动
+ * - streaming 中 QBUF 时：单个缓冲区直接送入驱动
+ *
+ * 关键副作用：
+ * - vb->state = ACTIVE (驱动现在拥有此缓冲区)
+ * - owned_by_drv_count++ (跟踪驱动持有的缓冲区数量)
+ *   驱动处理完毕后必须调用 vb2_buffer_done() 来归还所有权
  */
 static void __enqueue_in_driver(struct vb2_buffer *vb)
 {
@@ -1539,6 +1708,8 @@ static void __enqueue_in_driver(struct vb2_buffer *vb)
 
 	call_void_vb_qop(vb, buf_queue, vb);
 }
+
+// ===== 缓冲区操作 (Buffer Operations) =====
 
 static int __buf_prepare(struct vb2_buffer *vb)
 {
@@ -1755,16 +1926,26 @@ unlock:
 }
 EXPORT_SYMBOL_GPL(vb2_core_remove_bufs);
 
+// ===== 流控制 (Streaming Control) =====
+
 /*
- * vb2_start_streaming() - Attempt to start streaming.
- * @q:		videobuf2 queue
+ * vb2_start_streaming() — 启动流的核心函数
+ * @q: videobuf2 队列
  *
- * Attempt to start streaming. When this function is called there must be
- * at least q->min_queued_buffers queued up (i.e. the minimum
- * number of buffers required for the DMA engine to function). If the
- * @start_streaming op fails it is supposed to return all the driver-owned
- * buffers back to vb2 in state QUEUED. Check if that happened and if
- * not warn and reclaim them forcefully.
+ * 调用条件：queued_count >= min_queued_buffers（由 STREAMON 或 QBUF 触发）。
+ *
+ * 执行流程：
+ *   1. 将 queued_list 中所有缓冲区送入驱动 (buf_queue 回调)
+ *      → 每个缓冲区状态变为 ACTIVE，owned_by_drv_count++
+ *   2. 调用驱动的 start_streaming 回调，传入驱动当前持有的缓冲区数量
+ *      → 驱动启动 DMA 引擎或硬件处理
+ *   3. 若 start_streaming 失败：
+ *      a. 驱动应主动将所有 ACTIVE 缓冲区归还 (vb2_buffer_done → QUEUED)
+ *      b. VB2 检查 owned_by_drv_count 是否清零，若未清零则强制回收
+ *         (这是安全网，防止有缺陷的驱动导致缓冲区泄漏)
+ *
+ * 关键契约：start_streaming 失败时，驱动必须将缓冲区归还到 QUEUED 状态，
+ * 不能放入 done_list (因为此时还没有运行流，DQBUF 不应返回任何数据)。
  */
 static int vb2_start_streaming(struct vb2_queue *q)
 {
@@ -1772,13 +1953,13 @@ static int vb2_start_streaming(struct vb2_queue *q)
 	int ret;
 
 	/*
-	 * If any buffers were queued before streamon,
-	 * we can now pass them to driver for processing.
+	 * 将 STREAMON 之前入队的缓冲区全部送入驱动。
+	 * 若已在 streaming 中（延迟启动场景），这些缓冲区来自 QBUF 的累积。
 	 */
 	list_for_each_entry(vb, &q->queued_list, queued_entry)
 		__enqueue_in_driver(vb);
 
-	/* Tell the driver to start streaming */
+	/* 通知驱动开始流处理 */
 	q->start_streaming_called = 1;
 	ret = call_qop(q, start_streaming, q,
 		       atomic_read(&q->owned_by_drv_count));
@@ -1789,18 +1970,13 @@ static int vb2_start_streaming(struct vb2_queue *q)
 
 	dprintk(q, 1, "driver refused to start streaming\n");
 	/*
-	 * If you see this warning, then the driver isn't cleaning up properly
-	 * after a failed start_streaming(). See the start_streaming()
-	 * documentation in videobuf2-core.h for more information how buffers
-	 * should be returned to vb2 in start_streaming().
+	 * 安全网：如果驱动在 start_streaming 失败后没有正确归还缓冲区，
+	 * 强制将所有 ACTIVE 状态的缓冲区回收至 QUEUED。
+	 * 看到此 WARNING 说明驱动有 bug。
 	 */
 	if (WARN_ON(atomic_read(&q->owned_by_drv_count))) {
 		unsigned i;
 
-		/*
-		 * Forcefully reclaim buffers if the driver did not
-		 * correctly return them to vb2.
-		 */
 		for (i = 0; i < q->max_num_buffers; ++i) {
 			vb = vb2_get_buffer(q, i);
 
@@ -1810,13 +1986,11 @@ static int vb2_start_streaming(struct vb2_queue *q)
 			if (vb->state == VB2_BUF_STATE_ACTIVE)
 				vb2_buffer_done(vb, VB2_BUF_STATE_QUEUED);
 		}
-		/* Must be zero now */
 		WARN_ON(atomic_read(&q->owned_by_drv_count));
 	}
 	/*
-	 * If done_list is not empty, then start_streaming() didn't call
-	 * vb2_buffer_done(vb, VB2_BUF_STATE_QUEUED) but STATE_ERROR or
-	 * STATE_DONE.
+	 * 如果 done_list 非空，说明驱动在失败时错误地调用了
+	 * vb2_buffer_done(vb, DONE/ERROR) 而不是 QUEUED。
 	 */
 	WARN_ON(!list_empty(&q->done_list));
 	return ret;
@@ -2123,6 +2297,23 @@ static void __vb2_dqbuf(struct vb2_buffer *vb)
 	call_void_bufop(q, init_buffer, vb);
 }
 
+/*
+ * vb2_core_dqbuf() — VIDIOC_DQBUF 的处理函数
+ * @q:           videobuf2 队列
+ * @pindex:      输出参数，返回出队缓冲区的 index
+ * @pb:          用户空间 v4l2_buffer 指针（用于 fill_user_buffer）
+ * @nonblocking: true=非阻塞 (O_NONBLOCK), false=阻塞等待
+ *
+ * 出队流程：
+ *   1. __vb2_get_done_vb() — 从 done_list 获取一个已完成的缓冲区
+ *      - 非阻塞模式：done_list 为空时立即返回 -EAGAIN
+ *      - 阻塞模式：在 done_wq 上等待（释放 q->lock 后 sleep，避免死锁）
+ *   2. buf_finish 回调 — 驱动完成后续处理
+ *   3. fill_user_buffer — 填充用户空间可读的 v4l2_buffer 结构
+ *   4. 从 queued_list 中移除，queued_count--
+ *   5. __vb2_dqbuf → vb->state = DEQUEUED
+ *   6. [Request API] 释放 request 引用
+ */
 int vb2_core_dqbuf(struct vb2_queue *q, unsigned int *pindex, void *pb,
 		   bool nonblocking)
 {
@@ -2146,25 +2337,27 @@ int vb2_core_dqbuf(struct vb2_queue *q, unsigned int *pindex, void *pb,
 		return -EINVAL;
 	}
 
+	/* 驱动后处理：同步缓存，释放驱动私有资源 */
 	call_void_vb_qop(vb, buf_finish, vb);
 	vb->prepared = 0;
 
 	if (pindex)
 		*pindex = vb->index;
 
-	/* Fill buffer information for the userspace */
+	/* 将内核缓冲区信息转换填充为用户空间 v4l2_buffer 格式 */
 	if (pb)
 		call_void_bufop(q, fill_user_buffer, vb, pb);
 
-	/* Remove from vb2 queue */
+	/* 从 queued_list 移除（该节点在 QBUF 时加入）*/
 	list_del(&vb->queued_entry);
 	q->queued_count--;
 
 	trace_vb2_dqbuf(q, vb);
 
-	/* go back to dequeued state */
+	/* 回到空闲状态，等待下次 QBUF */
 	__vb2_dqbuf(vb);
 
+	/* Request API 清理：确保未完成的 request 对象被释放 */
 	if (WARN_ON(vb->req_obj.req)) {
 		media_request_object_unbind(&vb->req_obj);
 		media_request_object_put(&vb->req_obj);
@@ -2298,6 +2491,21 @@ static void __vb2_queue_cancel(struct vb2_queue *q)
 	}
 }
 
+/*
+ * vb2_core_streamon() — VIDIOC_STREAMON 的处理函数
+ * @q:    videobuf2 队列
+ * @type: 缓冲区类型 (必须与 q->type 匹配)
+ *
+ * 流启动的核心逻辑。关键特性：延迟启动机制
+ *
+ * 如果已入队缓冲区足够 (queued_count >= min_queued_buffers)：
+ *   → 立即调用 vb2_start_streaming() 启动驱动
+ *
+ * 如果缓冲区不足：
+ *   → 仅设置 q->streaming = 1，不调用 start_streaming
+ *   → 后续每次 QBUF 时自动检查条件，满足后立即触发
+ *   → 此机制允许用户分批次 QBUF 而不必一次性全部入队
+ */
 int vb2_core_streamon(struct vb2_queue *q, unsigned int type)
 {
 	unsigned int q_num_bufs = vb2_get_num_buffers(q);
@@ -2324,13 +2532,15 @@ int vb2_core_streamon(struct vb2_queue *q, unsigned int type)
 		return -EINVAL;
 	}
 
+	/* 允许驱动在流启动前做预处理（如电源管理、时钟使能）*/
 	ret = call_qop(q, prepare_streaming, q);
 	if (ret)
 		return ret;
 
 	/*
-	 * Tell driver to start streaming provided sufficient buffers
-	 * are available.
+	 * 条件满足 → 立即启动；否则等待 QBUF 触发。
+	 * q->streaming 在 start_streaming 成功后才设为 1，
+	 * 确保失败时驱动可以正确清理资源。
 	 */
 	if (q->queued_count >= q->min_queued_buffers) {
 		ret = vb2_start_streaming(q);
@@ -2357,6 +2567,19 @@ void vb2_queue_error(struct vb2_queue *q)
 }
 EXPORT_SYMBOL_GPL(vb2_queue_error);
 
+/*
+ * vb2_core_streamoff() — VIDIOC_STREAMOFF 的处理函数
+ * @q:    videobuf2 队列
+ * @type: 缓冲区类型
+ *
+ * 停止流的完整清理流程：
+ *   1. __vb2_queue_cancel() — 通知驱动停止并回收所有 ACTIVE 缓冲区
+ *      - 调用驱动的 stop_streaming 回调
+ *      - 将所有 ACTIVE 和 QUEUED 缓冲区重置为 DEQUEUED
+ *      - 清空 done_list（阻止 DQBUF 继续返回数据）
+ *   2. unprepare_streaming — 驱动流后清理（关时钟、电源管理）
+ *   3. 重置所有流控制标志
+ */
 int vb2_core_streamoff(struct vb2_queue *q, unsigned int type)
 {
 	if (type != q->type) {
@@ -2365,8 +2588,8 @@ int vb2_core_streamoff(struct vb2_queue *q, unsigned int type)
 	}
 
 	/*
-	 * Cancel will pause streaming and remove all buffers from the driver
-	 * and vb2, effectively returning control over them to userspace.
+	 * Cancel 将暂停流并将所有缓冲区从驱动回收回 VB2，
+	 * 有效地将缓冲区控制权归还给用户空间。
 	 *
 	 * Note that we do this even if q->streaming == 0: if you prepare or
 	 * queue buffers, and then call streamoff without ever having called
@@ -2484,6 +2707,8 @@ int vb2_core_expbuf(struct vb2_queue *q, int *fd, unsigned int type,
 }
 EXPORT_SYMBOL_GPL(vb2_core_expbuf);
 
+// ===== MMAP 操作 =====
+
 int vb2_mmap(struct vb2_queue *q, struct vm_area_struct *vma)
 {
 	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
@@ -2586,6 +2811,8 @@ unlock:
 }
 EXPORT_SYMBOL_GPL(vb2_get_unmapped_area);
 #endif
+
+// ===== 队列生命周期 =====
 
 int vb2_core_queue_init(struct vb2_queue *q)
 {

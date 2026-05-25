@@ -8,6 +8,78 @@
  *	    Sakari Ailus <sakari.ailus@iki.fi>
  */
 
+//
+// =============================================================================
+// V4L2 子设备框架 (Sub-Device Framework) -- 架构总览
+// =============================================================================
+//
+// 本文件实现 V4L2 (Video for Linux 2) 子设备框架，这是 V4L2 驱动架构中管理
+// I2C/SPI 传感器、编解码器、TV 调谐器等外设的核心基础设施。子设备 (subdev)
+// 是连接在 bridge 芯片上的外设，通过分类的操作函数集 (ops) 提供功能。
+//
+// 1. 子设备模型
+//    v4l2_subdev 结构体表示一个子设备实例。它通过 ops 指针挂载不同类别的
+//    操作函数:
+//      - core:   核心操作 (log_status, ioctl, s_register 等)
+//      - video:  视频流控制 (s_stream, g_std, s_std 等)
+//      - audio:  音频操作
+//      - tuner:  调谐器操作
+//      - vbi:    VBI (Vertical Blanking Interval) 操作
+//      - ir:     红外接收器操作
+//      - sensor: 传感器特定操作 (如曝光、增益控制)
+//      - pad:    Pad 级操作 (get/set_fmt, get/set_selection, enum 等)
+//
+// 2. 生命周期管理
+//    - v4l2_subdev_init():        初始化子设备的基本字段
+//    - __v4l2_subdev_init_finalize(): 分配 active state 并验证 ops 一致性
+//    - v4l2_subdev_cleanup():     释放 active state 和异步端点列表
+//
+// 3. 流控制模型
+//    旧 API: s_stream(enable) -- 全局开关，一次打开/关闭所有流
+//    新 API: enable_streams/disable_streams -- 按 pad 和 stream mask 精确控制
+//    迁移路径: 支持 s_stream 回退，驱动可以逐步迁移到新 API
+//    enabled_pads 位图跟踪哪些 pad 有活动流 (用于非 streams 子设备)
+//
+// 4. State 管理
+//    v4l2_subdev_state 是每实例的状态对象，存储每个 pad 的 format/crop/compose/
+//    interval 配置。支持两种模式:
+//      - 传统模式: 使用 pads[] 数组，每 pad 一个配置
+//      - Streams 模式: 使用 stream_configs[] 动态数组，按 (pad, stream) 索引
+//
+// 5. Routing 路由表
+//    支持 V4L2_SUBDEV_FL_STREAMS 的子设备通过 routing table 描述数据流从
+//    sink pad 到 source pad 的映射关系。每条 route 包含 sink_pad/sink_stream
+//    和 source_pad/source_stream，实现多路流复用 (MUX) 和解复用 (DEMUX)。
+//
+// 6. v4l2_subdev_call 宏
+//    安全调用机制，自动检查 sd 非空、ops 非空、wrapper 存在性。
+//    DEFINE_STATE_WRAPPER 为 pad ops 生成 state 管理包装器，
+//    当调用者未提供 state 时自动获取 active state。
+//    v4l2_subdev_call_wrappers 是包含包装器的 ops 结构体，确保调用的安全性。
+//
+// 7. Active State 集中管理
+//    sd->active_state 指向子设备的活跃状态对象。所有 ioctl 路径通过
+//    subdev_ioctl_get_state() 确定使用 TRY state 还是 ACTIVE state。
+//    支持流式子设备 (client_caps & V4L2_SUBDEV_CLIENT_CAP_STREAMS)。
+//
+// 8. Media Controller 集成
+//    v4l2_subdev_link_validate() 验证 media link 两端的 format 一致性
+//    (width/height/code/field)，支持多流验证。
+//    v4l2_subdev_has_pad_interdep() 通过 routing table 判断 pad 间依赖关系。
+//
+// 9. 帧描述符 (Frame Descriptor)
+//    get_frame_desc 返回 pad 上的媒体总线帧描述，包含 CSI-2 VC/DT 信息。
+//    __v4l2_subdev_get_frame_desc_passthrough 实现帧描述符的透传，
+//    从远程子设备获取帧描述并通过 routing table 映射 stream ID。
+//
+// 10. ioctl 处理路径
+//     subdev_do_ioctl_lock() 加锁后调用 subdev_do_ioctl() 分发 ioctl 命令。
+//     支持 QUERYCAP、G/S_FMT、G/S_SELECTION、G/S_ROUTING、G/S_EDID、
+//     DV_TIMINGS、控制类 (G/S_CTRL)、事件订阅 (SUBSCRIBE_EVENT) 等。
+//
+// =============================================================================
+//
+
 #include <linux/export.h>
 #include <linux/ioctl.h>
 #include <linux/leds.h>
@@ -472,6 +544,34 @@ static int call_get_mbus_config(struct v4l2_subdev *sd, unsigned int pad,
 	       sd->ops->pad->get_mbus_config(sd, pad, config);
 }
 
+//
+// call_s_stream -- 旧 API s_stream 包装器，提供安全启停保护
+//
+// 这是 v4l2_subdev_call_wrappers 中 video.s_stream 的包装函数，
+// 替代驱动直接调用 sd->ops->video->s_stream()。它提供以下保护:
+//
+// 1. 双重启动/停止检测
+//    sd->s_stream_enabled 布尔标志跟踪子设备当前的流传输状态:
+//      - true:  流已启动 (之前成功调用了 s_stream(1))
+//      - false: 流已停止 (之前成功调用了 s_stream(0))
+//    当 enable=1 但 s_stream_enabled 已为 true (或反之) 时，
+//    WARN_ON 会触发内核告警，但函数静默返回 0 以避免回归。
+//    这是一种防御性编程措施，捕获驱动中的错误调用序列。
+//
+// 2. 禁用失败宽容处理
+//    如果 s_stream(0) 返回错误 (disable 失败)，不向上传播错误，
+//    而是打印警告并返回 0。这是因为 disable 失败通常不影响后续
+//    操作，过于严格可能导致资源泄漏或链路无法重建。
+//
+// 3. 状态同步与隐私 LED
+//    调用成功后同步更新 s_stream_enabled。启用流时点亮 privacy LED
+//    (如摄像头隐私指示灯)，禁用时熄灭。这符合现代笔记本/手机
+//    摄像头隐私保护要求 (用户可见的摄像头活动指示)。
+//
+// 注意: 这是回退路径的核心。当驱动未实现 enable_streams() 时，
+// v4l2_subdev_enable_streams() 和 disable_streams() 都通过
+// call_s_stream() 来实现全局启停，此时需要确保启停配对的正确性。
+//
 static int call_s_stream(struct v4l2_subdev *sd, int enable)
 {
 	int ret;
@@ -1494,6 +1594,74 @@ static int v4l2_subdev_link_validate_locked(struct media_link *link, bool states
 	return 0;
 }
 
+//
+// ===== Link 验证 =====
+//
+// Media link 验证是 Media Controller 框架的重要环节，确保 pipeline 中
+// 连接的子设备之间格式一致。验证在 link 的 sink 端设备上下文中进行。
+//
+// v4l2_subdev_link_validate():
+//   顶层入口。处理三种情况:
+//     1. source 是 video device -> 委托给 video device 的 link_validate
+//     2. source 是 subdev -> 进行完整的 subdev-subdev link 验证
+//     3. sink 不是 subdev -> 驱动程序 bug，WARN_ON
+//
+// v4l2_subdev_link_validate_locked():
+//   实际验证逻辑。对每个 stream:
+//     1. 获取 source 端 format
+//     2. 获取 sink 端 format
+//     3. 调用 sink subdev 的 link_validate op
+//     4. 如果驱动未实现，使用 v4l2_subdev_link_validate_default()
+//        逐字段比较 width/height/code/field
+//
+// v4l2_link_validate_get_streams():
+//   确定 link 两端需要验证的 stream ID 集合。
+//   非 STREAMS 子设备隐式使用 stream 0。
+//   STREAMS 子设备通过 routing table 的激活路由收集 stream 信息。
+//
+//
+// v4l2_subdev_link_validate -- 完整链路验证流程的顶层入口
+//
+// 本函数作为 Media Controller 框架中 media link 验证的回调函数，
+// 用于验证两个子设备之间 (或 video device 到 subdev 之间) 的
+// link 配置一致性。完整的执行流程如下:
+//
+// 1. sink 端检查
+//    验证 link->sink->entity 是 v4l2_subdev 类型。如果不是，
+//    WARN_ON_ONCE 触发告警，返回 -EINVAL。这在框架设计中是
+//    不可能发生的情况，属于驱动 bug。
+//
+// 2. source 端分支处理
+//    情况 A: source 是 video device (如 DMA engine 输出)
+//      委托给 video device 的 link_validate 回调处理。
+//      特别注意死循环检测: 如果 video device 错误地将自身
+//      的 link_validate 设为本函数，WARN_ON 捕获并返回错误。
+//      这是兼容性路径: 许多旧驱动未实现 link_validate，此时
+//      打印警告并返回 0 以避免破坏用户空间。
+//
+//    情况 B: source 也是 subdev (最常见的 subdev-to-subdev 场景)
+//      获取两端 subdev 的 active state，进入锁定状态后委托
+//      给 v4l2_subdev_link_validate_locked() 执行实际验证。
+//      states_locked 标志用于指示是否已同时持有两端 state 锁，
+//      避免亚死锁 (ABBA deadlock) 场景。
+//
+// 3. v4l2_subdev_link_validate_locked() 执行:
+//    a. 收集 source 端和 sink 端的 stream 集合
+//       - 非 STREAMS 子设备隐含 stream 0
+//       - STREAMS 子设备通过 routing table 获取激活流
+//    b. 检查 sink stream 是否存在对应的 source stream
+//       (dangling_sink_streams 检查)
+//    c. 对每个 stream，依次:
+//       - 获取 source 端 format
+//       - 获取 sink 端 format
+//       - 调用 sink subdev 的 link_validate op
+//       - 若 op 返回 -ENOIOCTLCMD (未实现)，使用默认验证:
+//         比较 width、height、code、field 四要素是否匹配
+//       - 任何不匹配返回 -EPIPE
+//
+// 注意: 多流验证时，某个 stream 的 get_fmt 失败会被跳过
+// (dev_dbg + continue)，不会导致整体验证失败。
+//
 int v4l2_subdev_link_validate(struct media_link *link)
 {
 	struct v4l2_subdev *source_sd, *sink_sd;
@@ -1599,6 +1767,31 @@ bool v4l2_subdev_has_pad_interdep(struct media_entity *entity,
 }
 EXPORT_SYMBOL_GPL(v4l2_subdev_has_pad_interdep);
 
+//
+// ===== State 状态管理 =====
+//
+// v4l2_subdev_state 是子设备的核心状态对象，存储每个 pad 的格式、裁剪、
+// 合成和帧间隔配置。支持两种存储模式:
+//
+// 传统模式 (非 STREAMS 子设备):
+//   使用 state->pads[] 数组，每 pad 一个 v4l2_subdev_pad_config 条目。
+//   每条目包含 format、crop、compose、interval 四个字段。
+//   stream 参数必须为 0。
+//
+// Streams 模式 (V4L2_SUBDEV_FL_STREAMS):
+//   使用 state->stream_configs.configs[] 动态数组，按 (pad, stream) 索引。
+//   每条路由条目的 sink 端和 source 端各需要一个配置条目。
+//   v4l2_subdev_init_stream_configs() 从 routing table 生成配置数组。
+//
+// state 支持两种类型:
+//   - ACTIVE state (sd->active_state): 硬件当前配置
+//   - TRY state (subdev_fh->state): ioctl 调用者用于试配置
+//
+// state 的锁机制:
+//   state->_lock 是内部 mutex，state->lock 指向实际使用的锁。
+//   如果 sd->state_lock 被设置 (用于多个 state 间协调)，则使用它。
+//   否则使用 state->_lock。
+//
 struct v4l2_subdev_state *
 __v4l2_subdev_state_alloc(struct v4l2_subdev *sd, const char *lock_name,
 			  struct lock_class_key *lock_key)
@@ -1731,6 +1924,28 @@ void v4l2_subdev_cleanup(struct v4l2_subdev *sd)
 }
 EXPORT_SYMBOL_GPL(v4l2_subdev_cleanup);
 
+//
+// ===== Pad 操作 =====
+//
+// 以下函数提供了对 v4l2_subdev_state 中每 pad 配置的读取接口。
+// 每种配置支持两种查询模式:
+//
+// 传统模式 (state->pads != NULL):
+//   直接通过 pads[pad] 数组索引访问，stream 必须为 0。
+//   不需要持有 state 锁 (但实际调用者通常已持有)。
+//
+// Streams 模式 (state->stream_configs):
+//   在 stream_configs.configs[] 数组中线性搜索匹配
+//   (pad, stream) 的条目。需要持有 state->lock。
+//
+// 支持的配置类型:
+//   - format:   v4l2_mbus_framefmt (媒体总线帧格式)
+//   - crop:     v4l2_rect (裁剪矩形)
+//   - compose:  v4l2_rect (合成矩形)
+//   - interval: v4l2_fract (帧间隔)
+//
+// 这些函数被 V4L2 ioctl 处理路径和驱动内部广泛使用。
+//
 struct v4l2_mbus_framefmt *
 __v4l2_subdev_state_get_format(struct v4l2_subdev_state *state,
 			       unsigned int pad, u32 stream)
@@ -1950,6 +2165,83 @@ int v4l2_subdev_get_frame_interval(struct v4l2_subdev *sd,
 }
 EXPORT_SYMBOL_GPL(v4l2_subdev_get_frame_interval);
 
+//
+// ===== Routing 路由管理 =====
+//
+// Routing table (路由表) 是 Streams API 的核心概念，描述数据流从 sink pad
+// 到 source pad 的内部连接关系。每个子设备可配置多条 route，形成灵活的
+// 数据路由拓扑。
+//
+// 路由条目 (v4l2_subdev_route):
+//   - sink_pad, sink_stream: 输入端的 pad 和 stream ID
+//   - source_pad, source_stream: 输出端的 pad 和 stream ID
+//   - flags: V4L2_SUBDEV_ROUTE_FL_ACTIVE 标记激活的路由
+//
+// 典型路由场景:
+//   1-to-1: 一个 sink 流直通到一个 source 流 (如传感器)
+//   MUX: 多个 sink 流复用到单个 source 流 (如 DMA 引擎)
+//   DEMUX: 一个 sink 流解复用到多个 source 流 (如 HDMI 解复用器)
+//
+// v4l2_subdev_set_routing():
+//   设置路由表，同时重新初始化 stream_configs。从 src 复制路由
+//   条目到 state->routing，并根据新路由重建配置数组。
+//
+// v4l2_subdev_routing_validate():
+//   验证路由表的合法性，支持多种约束检查:
+//   - NO_STREAM_MIX: 同一 pad 上的流不能混合到不同远端 pad
+//   - NO_MULTIPLEXING: pad 不支持流复用
+//   - NO_1_TO_N / NO_N_TO_1: 禁止流广播或聚合
+//   - NO_SINK/SOURCE_STREAM_MIX: sink/source 端流不混送
+//
+// v4l2_subdev_routing_find_opposite_end():
+//   查找路由中指定端口的对端 (pad, stream)。
+//
+// v4l2_subdev_state_xlate_streams():
+//   在路由两端之间转换 stream 位图表示。
+//
+//
+// v4l2_subdev_set_routing -- 设置子设备路由表并重建 stream 配置
+//
+// 路由表是 Streams API 的核心数据结构，描述数据在子设备内部从
+// sink pad 到 source pad 的流动路径。每条路由 (v4l2_subdev_route) 包含:
+//   sink_pad + sink_stream   ->  source_pad + source_stream
+// 例如: 一个 MIPI CSI-2 传感器可将虚通道 0 (stream 0) 路由到
+// source pad 0 的 stream 0，虚通道 1 路由到 source pad 0 的 stream 1。
+//
+// 本函数的执行流程:
+//
+// 1. 溢出检查
+//    使用 check_mul_overflow 验证 src->num_routes * sizeof(route)
+//    不会溢出 size_t。这是内核安全编程的标准实践，防止整数溢出
+//    导致 kmemdup 分配过小的缓冲区。
+//
+// 2. 复制路由表
+//    通过 kmemdup 从 src 复制所有路由条目到 new_routing.routes。
+//    这里不直接修改 state->routing，而是先构建新表，确保出错时
+//    原路由表不受影响 (事务语义)。
+//
+// 3. 重建 stream_configs
+//    调用 v4l2_subdev_init_stream_configs() 从新路由表生成新的
+//    stream 配置数组。每条激活路由需要两个配置条目: 一个在 sink 端
+//    (sink_pad, sink_stream)，一个在 source 端 (source_pad, source_stream)。
+//    此步骤会释放旧的 stream_configs.configs 并分配新数组。
+//    注意: 这里只初始化 pad 和 stream 字段，fmt/crop/compose 等
+//    字段被置零，驱动需要在 set_routing 回调中通过 init_cfg 或
+//    后续的 set_fmt 调用来填充。
+//
+// 4. 原子替换
+//    kfree 释放旧路由表，将 state->routing 指向新表。
+//
+// 关键设计决策: 本函数不执行任何路由验证 (如流混合检查)，
+// 验证由 v4l2_subdev_routing_validate() 单独完成，在驱动
+// 的 set_routing 回调中由驱动决定何时以及如何验证。
+//
+// 与 VIDIOC_SUBDEV_S_ROUTING ioctl 的关系:
+// ioctl 处理路径在调用此函数前已完成了路由条目的合法性检查
+// (pad 范围、pad 方向、stream ID 上限、active route 数量等)，
+// 然后调用驱动的 set_routing op，驱动内部再使用此函数
+// 或 v4l2_subdev_set_routing_with_fmt() 完成实际的 routing 更新。
+//
 int v4l2_subdev_set_routing(struct v4l2_subdev *sd,
 			    struct v4l2_subdev_state *state,
 			    const struct v4l2_subdev_krouting *routing)
@@ -2243,6 +2535,26 @@ out:
 }
 EXPORT_SYMBOL_GPL(v4l2_subdev_routing_validate);
 
+//
+// 流控制辅助函数 -- 新 API (enable/disable_streams) vs 旧 API (s_stream)
+// =====================================================================
+//
+// 回退逻辑:
+//   如果子设备驱动实现了 .enable_streams() 和 .disable_streams():
+//     - enable/disable 直接调用驱动提供的操作
+//     - 每 (pad, stream) 启用状态记录在 stream_configs[].enabled
+//
+//   如果子设备驱动只实现了 .s_stream():
+//     - enable_streams 回退: 首个流启用时调用 s_stream(1)
+//     - disable_streams 回退: 最后流禁用后调用 s_stream(0)
+//     - sd->enabled_pads (u64 位图) 跟踪非 streams 子设备中
+//       哪些 pad 有活动流: 第 N 位 = 1 表示 pad N 有活动流
+//
+// v4l2_subdev_collect_streams(): 收集指定 pad 上请求的流集合。
+//   - found_streams:   在 state 中找到的流的位置掩码
+//   - enabled_streams: 其中已启用的流的位置掩码
+//   非 STREAMS 子设备隐式使用 stream 0，通过 enabled_pads 位图判断。
+//
 static void v4l2_subdev_collect_streams(struct v4l2_subdev *sd,
 					struct v4l2_subdev_state *state,
 					u32 pad, u64 streams_mask,
@@ -2279,6 +2591,11 @@ static void v4l2_subdev_collect_streams(struct v4l2_subdev *sd,
 		sd->entity.name, pad, *found_streams, *enabled_streams);
 }
 
+//
+// v4l2_subdev_set_streams_enabled(): 在 state 中标记指定流的启用或禁用状态。
+//   非 STREAMS 子设备: 使用 sd->enabled_pads 位图的第 pad 位来记录。
+//   STREAMS 子设备: 遍历 stream_configs，设置匹配条目的 enabled 字段。
+//
 static void v4l2_subdev_set_streams_enabled(struct v4l2_subdev *sd,
 					    struct v4l2_subdev_state *state,
 					    u32 pad, u64 streams_mask,
@@ -2301,6 +2618,86 @@ static void v4l2_subdev_set_streams_enabled(struct v4l2_subdev *sd,
 	}
 }
 
+//
+// ===== Stream 流控制 =====
+//
+// V4L2 子设备流控制支持两套 API，驱动可逐步迁移:
+//
+// 旧 API (s_stream):
+//   通过 sd->ops->video->s_stream(sd, enable) 全局启停所有流。
+//   简单但粒度粗，一次调用影响所有 pad 上所有流。
+//   sd->s_stream_enabled 标志位跟踪当前是否在流传输。
+//
+// 新 API (enable_streams/disable_streams):
+//   按 (pad, stream_mask) 精确启停特定流集合，支持多路流复用。
+//   每 (pad, stream) 启用状态记录在 stream_configs[].enabled。
+//   仅 V4L2_SUBDEV_FL_STREAMS 子设备可使用完整 streams 功能。
+//
+// 回退逻辑:
+//   若子设备未实现 enable_streams，则回退到 s_stream:
+//     enable_streams:  首次启用流时调用 s_stream(1)
+//     disable_streams: 最后流禁用后调用 s_stream(0)
+//   enabled_pads 位图 (u64) 跟踪非 streams 子设备的 pad 流活动:
+//     第 N 位 = 1 表示 pad N 有活动流
+//
+//
+// v4l2_subdev_enable_streams -- 启用指定 source pad 上的流集合 (新 API)
+//
+// 这是 Streams API 的核心入口函数之一。调用者指定一个 source pad 和
+// 一个 stream 位掩码 (streams_mask)，该函数负责启用这些流。
+//
+// 执行流程:
+//
+// 1. 参数验证
+//    - pad 必须在子设备有效 pad 范围内
+//    - pad 必须是 source pad (MEDIA_PAD_FL_SOURCE)，否则返回 -EOPNOTSUPP
+//    - pad 索引必须 < 64 (因为使用 u64 enabled_pads 位图跟踪)
+//    - streams_mask 不能为 0 (空操作直接返回 0)
+//
+// 2. 确定回退策略
+//    use_s_stream 标志指示是否使用旧 API 回退:
+//    - 驱动实现了 .enable_streams() op -> 使用新 API
+//    - 驱动只实现了 .s_stream() -> 回退到旧 API
+//    新 API 需要锁定 state，旧 API 不需要。
+//
+// 3. 收集流信息 (v4l2_subdev_collect_streams)
+//    检查请求的流集合是否有效:
+//    - found_streams: 在 state 中找到的流的位掩码
+//    - enabled_streams: 其中已经启用 (cfg->enabled == true) 的流
+//    如果 found_streams != streams_mask，说明请求了不存在的流 -> -EINVAL
+//    如果 enabled_streams != 0，说明有流已经启用 -> -EALREADY
+//    注意: EALREADY 返回错误，防止重复启用导致状态计数混乱。
+//
+// 4. 检查是否已在流传输 (already_streaming)
+//    通过 v4l2_subdev_is_streaming() 判断:
+//    对新 API: 检查 state->stream_configs[].enabled
+//    对旧 API: 检查 sd->s_stream_enabled
+//    非 STREAMS 子设备: 检查 sd->enabled_pads
+//
+// 5a. 新 API 路径 (enable_streams op)
+//    直接调用 sd->ops->pad->enable_streams(state, pad, streams_mask)
+//    驱动接收 stream_mask 位图，精确启用指定的流。
+//
+// 5b. 旧 API 回退路径 (s_stream)
+//    仅当 already_streaming == false 时调用 s_stream(1)，
+//    即第一个流启用时触发全局启动。后续流的启用不再重复调用。
+//    这是旧 API 的局限性: 无法按流精确控制。
+//
+// 6. 更新状态
+//    调用 v4l2_subdev_set_streams_enabled() 将启用状态写入:
+//    - 新 API: 设置 stream_configs[].enabled = true
+//    - 旧 API: 设置 sd->enabled_pads 位图的第 pad 位
+//
+// 7. 隐私 LED
+//    新 API 且首次启动流 -> 点亮 privacy LED
+//    (旧 API 的 LED 处理在 call_s_stream() 中完成)
+//
+// 关键约定:
+//   - streams_mask 必须是已经存在于 stream_configs 中的流
+//     (即通过 routing table 配置过的流)
+//   - 不允许重复启用: 已启用的流再次请求返回 -EALREADY
+//   - 驱动应按幂等原则设计 enable_streams op
+//
 int v4l2_subdev_enable_streams(struct v4l2_subdev *sd, u32 pad,
 			       u64 streams_mask)
 {
@@ -2403,6 +2800,58 @@ done:
 }
 EXPORT_SYMBOL_GPL(v4l2_subdev_enable_streams);
 
+//
+// v4l2_subdev_disable_streams -- 禁用指定 source pad 上的流集合
+//
+// 本函数是 enable_streams 的逆操作，负责关闭子设备上指定 pad 的流。
+// 与 enable 对称，同样支持新 API (.disable_streams()) 和旧 API 回退
+// (.s_stream(0)) 两条路径。
+//
+// 执行流程:
+//
+// 1. 参数验证 (对称于 enable)
+//    - pad 范围检查、source pad 方向检查、pad < 64 检查
+//    - streams_mask 不能为 0 (空操作直接返回 0)
+//
+// 2. 确定回退策略
+//    use_s_stream 标志: 驱动是否实现了 .disable_streams() op
+//    新 API 路径锁定 state，旧 API 路径不需要。
+//
+// 3. 收集流信息并验证 (v4l2_subdev_collect_streams)
+//    - found_streams: 在 stream_configs 中找到的流
+//    - enabled_streams: 其中当前已启用 (cfg->enabled == true) 的流
+//    检查条件与 enable 不同: 这里要求 enabled_streams == streams_mask，
+//    即请求禁用的流必须全部已启用。如果任何请求的流尚未启用
+//    (enabled_streams != streams_mask)，返回 -EALREADY。
+//    这是对称性设计: enable 检查"没有被启用过的流"，
+//    disable 检查"没有不是已启用的流"。
+//
+// 4a. 新 API 路径 (disable_streams op)
+//    调用 sd->ops->pad->disable_streams(state, pad, streams_mask)
+//
+// 4b. 旧 API 回退路径 (s_stream)
+//    判断是否需要实际调用 s_stream(0):
+//    - 检查 sd->enabled_pads & ~BIT_ULL(pad): 除当前 pad 外是否
+//      还有其他 pad 有活动流
+//    - 如果这是最后一次禁用 (没有其他 pad 有活动流) -> 调用 s_stream(0)
+//    - 否则只是更新位图，不调用 s_stream
+//    这是回退路径的核心逻辑: 只有所有 pad 的所有流都关闭时才
+//    真正停止硬件流传输。
+//
+// 5. 更新状态
+//    v4l2_subdev_set_streams_enabled(sd, state, pad, streams_mask, false)
+//    - 新 API: 设置 stream_configs[].enabled = false
+//    - 旧 API: 清除 sd->enabled_pads 的第 pad 位
+//
+// 6. 隐私 LED 管理
+//    新 API 路径下，如果所有流都已禁用 (!v4l2_subdev_is_streaming(sd))，
+//    熄灭 privacy LED。旧 API 的 LED 处理在 call_s_stream() 中完成。
+//
+// 注意: disable 失败的处理策略
+// 如果 disable_streams op 返回错误，状态位图不会更新 (保持启用状态)，
+// 调用者可借此实现重试逻辑。这与 call_s_stream() 的 disable 失败
+// 宽容处理不同 — 新 API 将决定权留给调用者。
+//
 int v4l2_subdev_disable_streams(struct v4l2_subdev *sd, u32 pad,
 				u64 streams_mask)
 {
@@ -2545,6 +2994,29 @@ int v4l2_subdev_s_stream_helper(struct v4l2_subdev *sd, int enable)
 }
 EXPORT_SYMBOL_GPL(v4l2_subdev_s_stream_helper);
 
+//
+// ===== 帧描述符 (Frame Descriptor) =====
+//
+// 帧描述符 (v4l2_mbus_frame_desc) 描述了子设备 source pad 上的媒体总线
+// 帧传输细节，包括:
+//   - type: 总线类型 (V4L2_MBUS_FRAME_DESC_TYPE_PARALLEL / CSI2)
+//   - num_entries: 帧描述条目数
+//   - entry[]: 每个 stream 的传输参数
+//     - stream: stream ID
+//     - pixelcode: 像素格式码
+//     - length: 每帧字节数
+//     - flags: 属性标志
+//     - bus.csi2.vc: CSI-2 Virtual Channel (用于 CSI-2 总线)
+//     - bus.csi2.dt: CSI-2 Data Type (用于 CSI-2 总线)
+//
+// __v4l2_subdev_get_frame_desc_passthrough():
+//   实现帧描述符透传。遍历本设备所有 sink pad，对每个 sink pad 找到其
+//   远程 source pad，调用远程子设备的 get_frame_desc 获取原始描述，
+//   再通过 routing table 将 sink stream ID 映射为 source stream ID。
+//
+//   典型用途: bridge 芯片透传传感器的 CSI-2 帧描述，使上级驱动能了解
+//   底层传感器的 VC、DT 等传输参数，用于 ISP 配置或协议分析。
+//
 int __v4l2_subdev_get_frame_desc_passthrough(struct v4l2_subdev *sd,
 					     struct v4l2_subdev_state *state,
 					     unsigned int pad,
@@ -2668,6 +3140,20 @@ EXPORT_SYMBOL_GPL(v4l2_subdev_get_frame_desc_passthrough);
 
 #endif /* CONFIG_MEDIA_CONTROLLER */
 
+//
+// ===== 生命周期管理 =====
+//
+// v4l2_subdev_init: 初始化子设备的基本字段，包括 ops、flags、name 和
+// media entity 类型。这是每个子设备驱动必须调用的入口函数。初始化后
+// 还需调用 __v4l2_subdev_init_finalize 完成 active state 的分配。
+//
+// __v4l2_subdev_init_finalize: 分配 active state 并验证 ops 的一致性。
+// 检查 enable_streams/disable_streams 是否成对实现，以及 streams 子设备
+// 必须实现这些新 API，不能只依赖 s_stream。
+//
+// v4l2_subdev_cleanup: 释放 active state 和异步端点列表 (async subdev
+// endpoint list)，在子设备注销时调用以回收资源。
+//
 void v4l2_subdev_init(struct v4l2_subdev *sd, const struct v4l2_subdev_ops *ops)
 {
 	INIT_LIST_HEAD(&sd->list);

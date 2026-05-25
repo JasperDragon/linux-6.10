@@ -9,6 +9,45 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation.
  */
+
+/*
+ * ============================================================================
+ * videobuf2 — V4L2 视频缓冲区管理框架核心头文件
+ * ============================================================================
+ *
+ * 本头文件定义了 VB2 框架的核心数据结构和驱动回调接口。
+ *
+ * 【核心数据结构】
+ * - vb2_queue: 缓冲区队列，管理所有缓冲区及流状态
+ *   - 每个 video_device 关联一个 vb2_queue
+ *   - io_modes: 支持的 I/O 模式（MMAP/USERPTR/DMABUF）
+ *   - buf_struct_size: 驱动私有数据大小，vb2 自动分配
+ * - vb2_buffer: 单个视频帧缓冲区
+ *   - 多平面支持（planes[] 数组，最多 VB2_MAX_PLANES=8）
+ *   - 状态机: DEQUEUED → PREPARING → QUEUED → ACTIVE → DONE/ERROR
+ * - vb2_mem_ops: 内存分配器操作集
+ *   - 三种实现: dma-contig, dma-sg, vmalloc
+ *
+ * 【驱动回调 (vb2_ops)】
+ * - queue_setup:  设置队列参数（缓冲区数量、大小、平面数）
+ * - buf_init:     缓冲区分配后初始化（可选）
+ * - buf_prepare:  缓冲区入队前准备（同步缓存、验证数据）
+ * - buf_finish:   缓冲区处理完成后清理（可选）
+ * - buf_cleanup:  缓冲区释放前清理（可选）
+ * - buf_queue:    将缓冲区提交到驱动处理队列
+ * - start_streaming: 开始流处理（驱动启动 DMA/硬件）
+ * - stop_streaming:  停止流处理（驱动停止 DMA/硬件）
+ *
+ * 【内存模型】
+ * - MMAP:    内核分配物理连续内存，用户空间 mmap 访问
+ * - USERPTR: 用户空间分配缓冲区，内核获取物理页面
+ * - DMABUF:  基于 DMA-buf 的零拷贝共享（跨设备/进程）
+ *
+ * 【Request API 集成】
+ * - vb2_qbuf 可携带 request_fd，将缓冲区绑定到 media_request
+ * - stateless codecs 使用请求实现 per-frame 参数更新
+ */
+
 #ifndef _MEDIA_VIDEOBUF2_CORE_H
 #define _MEDIA_VIDEOBUF2_CORE_H
 
@@ -599,70 +638,70 @@ struct vb2_buf_ops {
  *		if left empty by drivers.
  */
 struct vb2_queue {
-	unsigned int			type;
-	unsigned int			io_modes;
-	struct device			*dev;
-	unsigned long			dma_attrs;
-	unsigned int			bidirectional:1;
-	unsigned int			fileio_read_once:1;
-	unsigned int			fileio_write_immediately:1;
-	unsigned int			allow_zero_bytesused:1;
-	unsigned int		   quirk_poll_must_check_waiting_for_buffers:1;
-	unsigned int			supports_requests:1;
-	unsigned int			requires_requests:1;
-	unsigned int			uses_qbuf:1;
-	unsigned int			uses_requests:1;
-	unsigned int			allow_cache_hints:1;
-	unsigned int			non_coherent_mem:1;
+	unsigned int			type;        // 缓冲区类型 (V4L2_BUF_TYPE_VIDEO_CAPTURE 等)
+	unsigned int			io_modes;    // 支持的 I/O 模式 (VB2_MMAP | VB2_USERPTR | VB2_DMABUF)
+	struct device			*dev;        // 用于 DMA 映射的 struct device
+	unsigned long			dma_attrs;   // 额外的 DMA 属性标志
+	unsigned int			bidirectional:1;     // 双向 DMA (同时 READ + WRITE)
+	unsigned int			fileio_read_once:1;  // 文件 IO 读取只调用一次
+	unsigned int			fileio_write_immediately:1; // 文件 IO 写入立即执行
+	unsigned int			allow_zero_bytesused:1;    // 允许 REQBUFS 时的 bytesused=0
+	unsigned int		   quirk_poll_must_check_waiting_for_buffers:1; // 兼容旧驱动的 poll quirk
+	unsigned int			supports_requests:1;   // 支持 Request API
+	unsigned int			requires_requests:1;   // 必须使用 Request API (如 stateless codecs)
+	unsigned int			uses_qbuf:1;           // QBUF 可用 (vs read/write 模式)
+	unsigned int			uses_requests:1;       // 当前正在使用 Request API
+	unsigned int			allow_cache_hints:1;   // 允许缓冲区缓存 hint flags
+	unsigned int			non_coherent_mem:1;    // 使用非一致性 DMA 内存
 
-	struct mutex			*lock;
-	void				*owner;
+	struct mutex			*lock;       // 队列互斥锁 (驱动提供，保护此队列)
+	void				*owner;      // 队列 owner (通常为 THIS_MODULE)
 
-	const struct vb2_ops		*ops;
-	const struct vb2_mem_ops	*mem_ops;
-	const struct vb2_buf_ops	*buf_ops;
+	const struct vb2_ops		*ops;        // 驱动回调：buf_init/prepare/queue, start/stop_streaming ...
+	const struct vb2_mem_ops	*mem_ops;    // 内存分配器操作 (dma-contig / dma-sg / vmalloc)
+	const struct vb2_buf_ops	*buf_ops;    // 缓冲区清理/同步操作
 
-	void				*drv_priv;
-	u32				subsystem_flags;
-	unsigned int			buf_struct_size;
-	u32				timestamp_flags;
-	gfp_t				gfp_flags;
-	u32				min_queued_buffers;
-	u32				min_reqbufs_allocation;
+	void				*drv_priv;   // 驱动私有数据
+	u32				subsystem_flags; // 子系统标志 (VB2_V4L2_FL_*)
+	unsigned int			buf_struct_size; // 驱动缓冲区结构体大小 (含 vb2_v4l2_buffer 扩展)
+	u32				timestamp_flags; // 时间戳标志 (V4L2_BUF_FLAG_TIMESTAMP_*)
+	gfp_t				gfp_flags;   // 内存分配标志 (GFP_KERNEL / GFP_DMA32)
+	u32				min_queued_buffers;      // start_streaming 前最少入队缓冲数
+	u32				min_reqbufs_allocation;  // REQBUFS 时最少分配的缓冲数
 
-	struct device			*alloc_devs[VB2_MAX_PLANES];
+	struct device			*alloc_devs[VB2_MAX_PLANES]; // 每平面独立设备 (DMA 别名)
 
 	/* private: internal use only */
-	struct mutex			mmap_lock;
-	unsigned int			memory;
-	enum dma_data_direction		dma_dir;
-	struct vb2_buffer		**bufs;
-	unsigned long			*bufs_bitmap;
-	unsigned int			max_num_buffers;
+	struct mutex			mmap_lock;   // mmap 互斥锁
+	unsigned int			memory;      // 当前内存模型 (VB2_MEMORY_MMAP / USERPTR / DMABUF)
+	enum dma_data_direction		dma_dir;     // DMA 数据方向 (DMA_TO_DEVICE / DMA_FROM_DEVICE)
+	struct vb2_buffer		**bufs;      // 缓冲区指针数组 (以 index 索引)
+	unsigned long			*bufs_bitmap;// 缓冲区位图：跟踪已分配的缓冲区
+	unsigned int			max_num_buffers; // 最大缓冲区数量 (通常 VB2_MAX_FRAME=32)
 
-	struct list_head		queued_list;
-	unsigned int			queued_count;
+	struct list_head		queued_list; // 已入队缓冲区链表
+	unsigned int			queued_count;// 已入队缓冲区计数
 
-	atomic_t			owned_by_drv_count;
-	struct list_head		done_list;
-	spinlock_t			done_lock;
-	wait_queue_head_t		done_wq;
+	atomic_t			owned_by_drv_count; // 驱动持有但尚未完成的缓冲区数
+	struct list_head		done_list;   // 已完成缓冲区链表 (等待 DQBUF)
+	spinlock_t			done_lock;   // done_list 自旋锁
+	wait_queue_head_t		done_wq;     // 等待队列：poll/select 阻塞点
 
-	unsigned int			streaming:1;
-	unsigned int			start_streaming_called:1;
-	unsigned int			error:1;
-	unsigned int			waiting_for_buffers:1;
-	unsigned int			waiting_in_dqbuf:1;
-	unsigned int			is_multiplanar:1;
-	unsigned int			is_output:1;
-	unsigned int			is_busy:1;
-	unsigned int			copy_timestamp:1;
-	unsigned int			last_buffer_dequeued:1;
+	unsigned int			streaming:1;              // 流正在运行
+	unsigned int			start_streaming_called:1; // start_streaming 成功调用
+	unsigned int			error:1;                  // 流错误标志
+	unsigned int			waiting_for_buffers:1;    // start_streaming 等待缓冲区就绪
+	unsigned int			waiting_in_dqbuf:1;       // 通常为 1
+	unsigned int			is_multiplanar:1;         // 多平面格式 (V4L2_BUF_TYPE_*_MPLANE)
+	unsigned int			is_output:1;              // 输出类型 (非采集类型)
+	unsigned int			is_busy:1;                // 检测队列是否忙碌中
+	unsigned int			copy_timestamp:1;         // 将 OUTPUT 的时间戳拷贝到 CAPTURE
+	unsigned int			last_buffer_dequeued:1;   // 最后一个缓冲区已被 DQBUF
 
-	struct vb2_fileio_data		*fileio;
-	struct vb2_threadio_data	*threadio;
+	struct vb2_fileio_data		*fileio;     // 文件 IO 模拟器数据 (read/write 路径)
+	struct vb2_threadio_data	*threadio;   // 线程 IO 数据 (内核线程 read/write)
 
-	char				name[32];
+	char				name[32];    // 队列名称 (用于 debug)
 
 #ifdef CONFIG_VIDEO_ADV_DEBUG
 	/*

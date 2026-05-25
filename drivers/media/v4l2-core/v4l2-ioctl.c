@@ -8,6 +8,98 @@
  *              Mauro Carvalho Chehab <mchehab@kernel.org> (version 2)
  */
 
+/*
+ * 本文件是 V4L2（Video for Linux 2）ioctl 的核心分发引擎，是整个 V4L2
+ * 驱动框架中最大、最核心的文件之一（约 3500 行）。
+ *
+ * === 总体架构 ===
+ * video_ioctl2() 是入口函数，处理所有来自用户空间的 VIDIOC_* 系列 ioctl 调用。
+ * 调用链如下：
+ *   用户空间 (open/ioctl)
+ *     -> v4l2_fops.unlocked_ioctl (v4l2-dev.c 中注册)
+ *       -> video_ioctl2()                     [入口点]
+ *         -> video_usercopy()                 [封装：用户/内核空间参数复制]
+ *           -> __video_do_ioctl()             [核心分发逻辑]
+ *             -> v4l2_ioctls[] 查询表         [VIDIOC_* -> 处理函数映射]
+ *               -> v4l_xxx() 处理函数         [参数验证 + 驱动回调]
+ *                 -> ops->vidioc_xxx()        [最终调用驱动实现]
+ *
+ * === ioctl 路由机制 ===
+ * 1. video_device->ioctl_ops (struct v4l2_ioctl_ops) 是驱动注册的回调集合，
+ *    包含了所有 VIDIOC_* 命令对应的驱动级处理函数。
+ *
+ * 2. v4l2_ioctls[] 静态数组是一个包含约 70 个条目的 ioctl 描述符表，
+ *    用 IOCTL_INFO() 宏初始化。每个条目包含：
+ *    - ioctl 命令号
+ *    - 标志位 (INFO_FL_PRIO/CTRL/QUEUE/ALWAYS_COPY/CLEAR)
+ *    - 名称字符串
+ *    - func: 中间层处理函数 (v4l_xxx 系列)
+ *    - debug: 调试打印函数 (v4l_print_xxx 系列)
+ *
+ * 3. video_device->valid_ioctls 位图屏蔽不支持的 ioctl。在驱动注册时
+ *    由 determine_valid_ioctls() 根据 ops 中非空回调自动构建，也支持
+ *    通过 v4l2_disable_ioctl() 手动禁用。
+ *
+ * === ioctl 分类及对应处理函数 ===
+ * 本文件中的 v4l_xxx() 函数按功能可分为以下几大类：
+ *
+ *   [能力查询]     QUERYCAP                    -> v4l_querycap()
+ *   [格式枚举/协商] ENUM_FMT, G/S/TRY_FMT      -> v4l_enum_fmt(), v4l_g_fmt(),
+ *                                                   v4l_s_fmt(), v4l_try_fmt()
+ *   [输入/输出]    ENUMINPUT, G/S_INPUT,
+ *                  ENUMOUTPUT, G/S_OUTPUT,
+ *                  G/S_AUDIO, G/S_AUDOUT        -> v4l_enuminput(), v4l_g_input(),
+ *                                                   v4l_enumoutput(), 等
+ *   [缓冲区管理]   REQBUFS, QUERYBUF, QBUF,
+ *                  DQBUF, CREATE_BUFS,
+ *                  PREPARE_BUF, REMOVE_BUFS,
+ *                  EXBUF                        -> v4l_reqbufs(), v4l_qbuf(),
+ *                                                   v4l_dqbuf(), 等
+ *   [流控制]       STREAMON, STREAMOFF          -> v4l_streamon(), v4l_streamoff()
+ *   [控制操作]     G/S_CTRL, G/S/TRY_EXT_CTRLS,
+ *                  QUERYCTRL, QUERY_EXT_CTRL,
+ *                  QUERYMENU                    -> v4l_g_ctrl(), v4l_g_ext_ctrls(),
+ *                                                   v4l_queryctrl(), 等
+ *   [裁剪/选择]    G/S_CROP, G/S_SELECTION,
+ *                  CROPCAP                      -> v4l_g_crop(), v4l_g_selection(),
+ *                                                   v4l_cropcap()
+ *   [视频标准]     ENUMSTD, G/S_STD, QUERYSTD   -> v4l_enumstd(), v4l_s_std(),
+ *                                                   v4l_querystd()
+ *   [调谐器]       G/S_TUNER, G/S_FREQUENCY,
+ *                  G/S_MODULATOR, HW_FREQ_SEEK,
+ *                  ENUM_FREQ_BANDS              -> v4l_g_tuner(), v4l_g_frequency(), 等
+ *   [数字时序]     G/S_DV_TIMINGS, ENUM/QUERY_DV_TIMINGS,
+ *                  DV_TIMINGS_CAP               -> 直通到驱动的 stub 函数
+ *   [帧参数]       G/S_PARM, ENUM_FRAMESIZES,
+ *                  ENUM_FRAMEINTERVALS          -> v4l_g_parm(), v4l_s_parm()
+ *   [VBI]          G_SLICED_VBI_CAP             -> v4l_g_sliced_vbi_cap()
+ *   [SDR]          格式操作                      -> 与视频共享处理框架
+ *   [META]         格式操作                      -> 与视频共享处理框架
+ *   [事件]         DQEVENT, SUBSCRIBE_EVENT,
+ *                  UNSUBSCRIBE_EVENT            -> v4l_dqevent(), v4l_subscribe_event()
+ *   [调试]         DBG_G/S_REGISTER,
+ *                  DBG_G_CHIP_INFO, LOG_STATUS  -> v4l_dbg_*(), v4l_log_status()
+ *   [覆盖]         G/S_FBUF, OVERLAY            -> v4l_s_fbuf(), v4l_overlay()
+ *   [优先权]       G/S_PRIORITY                 -> v4l_g_priority(), v4l_s_priority()
+ *   [JPEG/编码器]  G/S_JPEGCOMP, ENCODER_CMD,
+ *                  DECODER_CMD                  -> 直通到驱动的 stub 函数
+ *
+ * === 通用处理模式 ===
+ * 每个 v4l_xxx() 处理函数遵循相同的模式：
+ *   1. 参数检查 (check_fmt() 验证设备类型兼容性)
+ *   2. 权限验证 (优先级检查 + 媒体源使能)
+ *   3. 参数净化 (sanitize / memset 清零保留字段)
+ *   4. 调用驱动回调 (ops->vidioc_xxx())
+ *   5. 结果处理 (填充辅助字段 / 调试输出)
+ *
+ * === 32 位兼容模式 ===
+ * 通过 v4l2-compat-ioctl32.c（内核中）和 v4l2_compat_ioctl32() 实现
+ * 32 位用户空间在 64 位内核上的兼容。转换逻辑在 video_get_user() 和
+ * video_put_user() 中，调用 v4l2_compat_get_user() 和
+ * v4l2_compat_put_user() 处理 32/64 位结构体差异（如指针宽度、
+ * 内存对齐填充等）。
+ */
+
 #include <linux/compat.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -1089,6 +1181,12 @@ static void v4l_sanitize_format(struct v4l2_format *fmt)
 	}
 }
 
+// ===== 能力查询 (Capability Query) =====
+// VIDIOC_QUERYCAP: 查询设备能力, 包括驱动名称、设备描述、总线信息、
+// 以及 capabilities/device_caps 位掩码。这是用户空间打开 V4L2 设备后
+// 调用的第一个 ioctl, 用于了解设备支持的特性和 buffer 类型。
+// v4l_querycap() 自动设置 version、device_caps 和 capabilities 字段,
+// 然后调用驱动回调填充驱动名称和总线信息。
 static int v4l_querycap(const struct v4l2_ioctl_ops *ops, struct file *file,
 			void *arg)
 {
@@ -1199,6 +1297,13 @@ static int v4l_s_priority(const struct v4l2_ioctl_ops *ops, struct file *file,
 	return v4l2_prio_change(vfd->prio, &vfh->prio, *p);
 }
 
+// ===== 输入/输出 (Input/Output) =====
+// VIDIOC_ENUMINPUT/ENUMOUTPUT: 枚举设备支持的物理输入/输出端口。
+// VIDIOC_G_INPUT/G_OUTPUT: 查询当前选中的输入/输出端口索引。
+// VIDIOC_S_INPUT/S_OUTPUT: 切换到指定的输入/输出端口。
+// VIDIOC_G_AUDIO/G_AUDOUT/S_AUDIO/S_AUDOUT: 获取/设置音频输入/输出。
+// 对于支持 MC (Media Controller) 的设备, 输入/输出路由由 media
+// controller 管理, 这些 ioctl 被简化处理（仅支持索引 0）。
 static int v4l_enuminput(const struct v4l2_ioctl_ops *ops, struct file *file,
 			 void *arg)
 {
@@ -1681,6 +1786,14 @@ static void v4l_pix_format_touch(struct v4l2_pix_format *p)
 	p->xfer_func = 0;
 }
 
+// ===== 格式操作 (Format Operations) =====
+// VIDIOC_G_FMT: 查询当前视频格式（获取驱动当前配置的像素格式、分辨率等）。
+// VIDIOC_S_FMT: 设置视频格式（尝试设置并返回驱动实际采用的格式）。
+// VIDIOC_TRY_FMT: 尝试视频格式（仅验证格式是否支持, 不修改硬件状态）。
+// 支持的 buffer 类型包括: VIDEO_CAPTURE/OUTPUT、VBI_CAPTURE/OUTPUT、
+// SDR_CAPTURE/OUTPUT、META_CAPTURE/OUTPUT 以及 overlay。
+// v4l_sanitize_format() 用于净化传入的格式参数, 确保 colorspace 等
+// 扩展字段的合法性。
 static int v4l_g_fmt(const struct v4l2_ioctl_ops *ops, struct file *file,
 		     void *arg)
 {
@@ -1740,6 +1853,22 @@ static int v4l_g_fmt(const struct v4l2_ioctl_ops *ops, struct file *file,
 	return -EINVAL;
 }
 
+// v4l_s_fmt() - VIDIOC_S_FMT 处理函数：设置数据格式
+//
+// 这是 VIDIOC_S_FMT ioctl 的中间层处理函数, 实现"尝试并设置格式"
+// 的协商模式：驱动尝试设置用户请求的格式, 然后返回实际采用的格式。
+// 处理流程：
+//   1. check_fmt() 验证 p->type 指定的缓冲区类型是否合法。
+//   2. v4l_sanitize_format() 清理色彩空间等字段的非法默认值。
+//   3. memset_after() 清除 fmt 联合体中 type 之后的字段, 防止
+//      驱动读取到未初始化的内核栈数据。
+//   4. 调用驱动注册的 ops->vidioc_s_fmt_xxx() 执行实际设置。
+//   5. 对 VIDIOC_CAPTURE 类型, 设置 pix.priv = V4L2_PIX_FMT_PRIV_MAGIC,
+//      以兼容检查该 magic 值的旧版驱动; 对 TOUCH 设备调用
+//      v4l_pix_format_touch() 强制设置为触摸格式。
+// 支持的缓冲区类型涵盖：视频单/多平面捕获和输出、视频叠加、
+// VBI/Sliced VBI 捕获、SDR 接收/发送、Meta 数据捕获/输出等。
+//
 static int v4l_s_fmt(const struct v4l2_ioctl_ops *ops, struct file *file,
 		     void *arg)
 {
@@ -1959,6 +2088,14 @@ static int v4l_try_fmt(const struct v4l2_ioctl_ops *ops, struct file *file,
 	return -EINVAL;
 }
 
+// ===== 流控制 (Stream Control) =====
+// VIDIOC_STREAMON: 启动视频流（指定 buffer 类型）。驱动开始从硬件捕获
+// 或向硬件输出视频数据。调用前必须已通过 REQBUFS 分配缓冲区并通过
+// QBUF 将缓冲区加入队列。
+// VIDIOC_STREAMOFF: 停止视频流。释放所有排队的缓冲区, 将流状态
+// 恢复到 STREAMON 之前的状态。
+// 这两个 ioctl 需要 INFO_FL_PRIO 优先权检查, 并且涉及硬件 DMA 操作,
+// 需要持有关联队列锁 (q_lock) 来保证线程安全。
 static int v4l_streamon(const struct v4l2_ioctl_ops *ops, struct file *file,
 			void *arg)
 {
@@ -2066,6 +2203,14 @@ static int v4l_s_frequency(const struct v4l2_ioctl_ops *ops,
 	return ops->vidioc_s_frequency(file, NULL, p);
 }
 
+// ===== 标准与定时 (Standards & Timings) =====
+// VIDIOC_ENUMSTD: 枚举设备支持的视频标准（如 NTSC、PAL、SECAM）。
+// VIDIOC_G_STD: 查询当前检测到的视频标准。
+// VIDIOC_S_STD: 设置视频标准。驱动会根据 tvnorms 位掩码验证请求的标准。
+// VIDIOC_QUERYSTD: 检测当前输入信号的视频标准（通常是渐进式检测）。
+// VIDIOC_S/G_DV_TIMINGS: 设置/获取数字视频时序（用于 HDMI、DisplayPort
+// 等数字接口）。比模拟视频标准更灵活, 支持自定义分辨率和刷新率。
+// VIDIOC_ENUM/QUERY_DV_TIMINGS: 枚举/查询支持的 DV 时序。
 static int v4l_enumstd(const struct v4l2_ioctl_ops *ops, struct file *file,
 		       void *arg)
 {
@@ -2152,6 +2297,33 @@ static int v4l_overlay(const struct v4l2_ioctl_ops *ops, struct file *file,
 	return ops->vidioc_overlay(file, NULL, *(unsigned int *)arg);
 }
 
+// ===== 缓冲区操作 (Buffer Operations) =====
+// VIDIOC_REQBUFS: 请求分配视频缓冲区。指定 buffer 类型、内存模型
+// (MMAP/USERPTR/DMABUF) 和数量。驱动会分配对应的 DMA 缓冲区。
+// VIDIOC_QUERYBUF: 查询缓冲区信息（如内存偏移量、大小等）。
+// VIDIOC_QBUF: 将缓冲区放入驱动队列（入队）, 等待填充数据。
+// VIDIOC_DQBUF: 从驱动队列取出已填充数据的缓冲区（出队）。
+// VIDIOC_CREATE_BUFS: 创建额外的缓冲区（在 REQBUFS 之后动态增加）。
+// VIDIOC_PREPARE_BUF: 预备缓冲区（用于缓存同步等预处理操作）。
+// VIDIOC_REMOVE_BUFS: 移除指定的缓冲区。
+// VIDIOC_EXPBUF: 将缓冲区导出为 DMABUF 文件描述符（用于跨设备共享）。
+// 这些 ioctl 涉及 DMA 内存管理和硬件队列操作, 需要 INFO_FL_QUEUE 标志,
+// 并通过 q_lock 进行序列化保护。
+// v4l_reqbufs() - VIDIOC_REQBUFS 处理函数：请求分配缓冲区
+//
+// 该函数是 V4L2 缓冲区管理流程的起点, 用户空间通过此 ioctl
+// 告知驱动需要分配的缓冲区数量和类型。
+// 处理流程：
+//   1. check_fmt() 验证缓冲区类型 (p->type) 是否合法。
+//   2. memset_after() 清除 flags 之后的字段确保驱动一致性。
+//   3. 如果驱动同时支持 REMOVE_BUFS, 在 capabilities 中设置
+//      V4L2_BUF_CAP_SUPPORTS_REMOVE_BUFS 标志。
+//   4. 调用 ops->vidioc_reqbufs(), 进入 videobuf2 (vb2) 框架：
+//      vb2_reqbufs() 分配/释放 DMA 缓冲区, 涉及 MMAP/DMABUF/
+//      USERPTR 内存类型的选择和 DMA 内存分配。
+// 注意：此 ioctl 带有 INFO_FL_QUEUE 标志, 通过 q_lock 与
+// QBUF/DQBUF/STREAMON 等队列操作互斥。
+//
 static int v4l_reqbufs(const struct v4l2_ioctl_ops *ops, struct file *file,
 		       void *arg)
 {
@@ -2292,6 +2464,15 @@ static int v4l_s_parm(const struct v4l2_ioctl_ops *ops, struct file *file,
 	return ops->vidioc_s_parm(file, NULL, p);
 }
 
+// ===== 控制操作 (Control Operations) =====
+// VIDIOC_QUERYCTRL/QUERY_EXT_CTRL: 查询控制属性（ID、类型、范围、步长等）。
+// VIDIOC_QUERYMENU: 查询菜单类控制项的枚举值。
+// VIDIOC_G_CTRL/G_EXT_CTRLS: 获取当前控制值。
+// VIDIOC_S_CTRL/S_EXT_CTRLS: 设置控制值。
+// VIDIOC_TRY_EXT_CTRLS: 尝试控制值（仅验证, 不修改硬件）。
+// V4L2 控件系统支持通过 ctrl_handler 链式处理, 优先使用 file handle
+// 级别的 ctrl_handler, 然后使用 video_device 级别的。
+// check_ext_ctrls() 验证扩展控制请求的合法性（控制类一致性等）。
 static int v4l_queryctrl(const struct v4l2_ioctl_ops *ops, struct file *file,
 			 void *arg)
 {
@@ -2478,6 +2659,15 @@ static int v4l_try_ext_ctrls(const struct v4l2_ioctl_ops *ops,
  * restore it afterwards. This way applications can use either buffer
  * type and drivers don't need to check for both.
  */
+// ===== 裁剪与选择 (Crop & Selection) =====
+// VIDIOC_G_SELECTION/S_SELECTION: 获取/设置裁剪或组合矩形（Selection API）。
+//   支持的目标包括：CROP（裁剪源）、COMPOSE（组合目标）、
+//   CROP_BOUNDS/COMPOSE_BOUNDS（边界限制）、CROP_DEFAULT/COMPOSE_DEFAULT
+//   （默认矩形）、以及 NATIVE_SIZE（原生分辨率）。
+// VIDIOC_G_CROP/S_CROP: 传统的裁剪 API（已废弃, 内部通过 Selection API 实现）。
+// VIDIOC_CROPCAP: 查询裁剪能力（边界矩形和缺省矩形）。
+// Selection API 会自动将 _MPLANE 类型的 buffer 映射为单平面类型,
+// 简化驱动的处理逻辑。
 static int v4l_g_selection(const struct v4l2_ioctl_ops *ops,
 			   struct file *file, void *arg)
 {
@@ -3061,6 +3251,25 @@ void v4l_printk_ioctl(const char *prefix, unsigned int cmd)
 }
 EXPORT_SYMBOL(v4l_printk_ioctl);
 
+// __video_do_ioctl() - V4L2 ioctl 核心分发函数
+//
+// 该函数是 V4L2 ioctl 处理链路中的核心路由引擎, 负责：
+// 1. ioctl 描述符查找：通过 _IOC_NR(cmd) 索引 v4l2_ioctls[] 静态表,
+//    获得对应的 v4l2_ioctl_info 描述符（包含处理函数、标志、调试打印）。
+//    如果命令号不在已知范围内, 则回退到 ops->vidioc_default 处理。
+// 2. valid_ioctls 位图检查：每个 video_device 维护一个 valid_ioctls
+//    位图, 记录驱动实际支持的 ioctl。如果位图中未设置且不是
+//    INFO_FL_CTRL 类型, 则直接返回 -ENOTTY 拒绝该 ioctl。
+// 3. 优先级检查：对于 INFO_FL_PRIO 标记的 ioctl（如 S_FMT、S_CTRL 等
+//    会修改设备状态的命令）, 调用 v4l2_prio_check() 进行优先级验证,
+//    防止低优先级文件句柄抢占高优先级操作。
+// 4. 锁管理：根据 cmd 类型获取适当的锁 (ioctl_lock 或 q_lock), 确保
+//    并发 ioctl 的互斥访问。STREAMON/OFF/REQBUFS 还额外获取
+//    req_queue_mutex 以防止请求队列操作冲突。
+// 5. 跟踪与调试：调用 info->func(ops, file, arg) 最终分发到处理函数。
+//    如果 video_device 设置了 V4L2_DEV_DEBUG_IOCTL 标志, 则通过
+//    v4l_printk_ioctl() 打印每个 ioctl 调用和返回值, 辅助调试。
+//
 static long __video_do_ioctl(struct file *file,
 		unsigned int cmd, void *arg)
 {
@@ -3415,6 +3624,28 @@ static int video_put_user(void __user *arg, void *parg,
 	return 0;
 }
 
+// video_usercopy() - V4L2 ioctl 用户空间内存复制封装函数
+//
+// 该函数是内核空间和用户空间之间的数据交换桥梁, 负责：
+// 1. 参数复制：将 ioctl 参数从用户空间复制到内核临时缓冲区。小对象
+//    （<= 128 字节）使用栈上静态缓冲区 sbuf[128] 以避免动态分配；
+//    大对象则通过 kmalloc 动态分配 mbuf。
+// 2. 32/64 位兼容转换 (compat_ioctl32)：当 32 位用户空间程序在
+//    64 位内核上运行时, 调用 v4l2_translate_cmd() 转换 ioctl 命令号,
+//    并通过 video_get_user()/video_put_user() 处理结构体布局差异
+//    (指针宽度 4 字节 vs 8 字节、对齐填充差异等), 确保驱动始终
+//    看到内核原生格式的参数。
+// 3. 数组参数处理：对包含内嵌指针的 ioctl（如 QBUF 的 planes 数组、
+//    G/S_EDID 的 edid 数据块、G/S_EXT_CTRLS 的 controls 数组等),
+//    通过 check_array_args() 识别并递归复制和转换内嵌数组。
+//    在 compat 模式下使用 v4l2_compat_get_array_args() 进行转换。
+// 4. 结果回写：将驱动填充的结果数据通过 video_put_user() 复制回
+//    用户空间。即使 ioctl 返回部分错误, 只要设置了 always_copy 标志
+//    （如 SUBDEV_ROUTING 在错误时也需要返回路由表）, 也确保用户空间
+//    能获取部分有效结果。
+// 5. 跟踪事件：对 DQBUF/QBUF 发出 trace 事件 (trace_v4l2_dqbuf/
+//    trace_v4l2_qbuf), 便于性能分析和调试。
+// 调用链: video_ioctl2() -> video_usercopy() -> __video_do_ioctl()
 long
 video_usercopy(struct file *file, unsigned int orig_cmd, unsigned long arg,
 	       v4l2_kioctl func)
@@ -3526,6 +3757,33 @@ out:
 	return err;
 }
 
+// video_ioctl2() - V4L2 ioctl 分发入口点
+//
+// 这是整个 V4L2 ioctl 处理的顶层入口函数, 在 v4l2-dev.c 的
+// video_device->fops->unlocked_ioctl 字段中注册。当用户空间程序
+// 调用 ioctl(fd, VIDIOC_xxx, ...) 时, 内核 VFS 层通过 file_operations
+// 最终调用到本函数。
+//
+// 完整调用链：
+//   video_ioctl2()
+//     -> video_usercopy()        用户/内核空间参数复制 + 32/64位兼容转换
+//       -> __video_do_ioctl()    核心 ioctl 查找与分发逻辑
+//          -> v4l2_ioctls[]      按命令号查找 ioctl 描述符表
+//          -> info->func()       调用 v4l_xxx 中间层处理函数
+//            -> ops->vidioc_xxx() 最终调用驱动注册的具体回调
+//
+// V4L2_FL_USES_V4L2_FH 标志的处理：
+// 该标志由 video_device 的驱动在初始化时设置 (vfl_flags)。设置后,
+// v4l2_fh 对象 (v4l2_file_handle) 会在 open() 时自动分配并挂载到
+// file->private_data 上, 带来以下便利:
+//   1) __video_do_ioctl() 通过 file_to_v4l2_fh() 自动获取 vfh 指针,
+//      从而支持优先级检查 (v4l2_prio_check) 和事件订阅处理。
+//   2) 驱动无需手动管理 v4l2_fh 生命周期; v4l2_fh 提供事件队列框架
+//      和优先级管理, 允许多个文件句柄共享同一 video_device。
+//   3) info->flags 包含 INFO_FL_CTRL 的 ioctl 可通过 vfh->ctrl_handler
+//      自动路由到控制框架, 无需驱动额外介入。
+//
+// 返回值：成功返回 0, 失败返回负的错误码。
 long video_ioctl2(struct file *file,
 	       unsigned int cmd, unsigned long arg)
 {

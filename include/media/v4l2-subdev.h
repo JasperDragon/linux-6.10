@@ -5,6 +5,115 @@
  *  Copyright (C) 2008  Hans Verkuil <hverkuil@kernel.org>
  */
 
+//
+// ============================================================================
+// V4L2 子设备 (Sub-Device) 架构概述
+// ============================================================================
+//
+// 1. 什么是子设备?
+//    V4L2 子设备是连接在主桥接芯片 (bridge) 上的外围器件，通常通过 I2C 或
+//    SPI 总线进行通信和控制。常见的子设备类型包括:
+//      - 图像传感器 (Sensor): 如 OV5640、IMX219 等 CMOS 摄像头传感器
+//      - 视频编码器/解码器 (Encoder/Decoder): 如 ADV7180 模拟视频解码器
+//      - 音频编解码器 (Audio Codec): 音频信号的采集/播放芯片
+//      - 调谐器 (Tuner): AM/FM 收音机或电视调谐器
+//      - ISP (Image Signal Processor): 图像信号处理器，处理 RAW 数据
+//      - 视频多路复用器 (Mux): 视频信号的路由切换
+//      - 红外控制器: 红外遥控信号的接收和发射
+//    操作系统通过 v4l2_device (bridge 设备) 统一管理所有连接的子设备。
+//
+// 2. Ops 分类设计哲学
+//    子设备操作按功能领域划分为独立的 ops 结构体，每种功能类别各有一组
+//    函数指针。这种设计的核心优势:
+//      - 低耦合: 驱动只需实现设备相关的操作类别，无关类别指针设为 NULL
+//      - 高内聚: 相关功能聚合在同一结构体中，便于理解和维护
+//      - 可扩展: 新增操作类别不会影响已有驱动
+//    各操作类别简述:
+//      core:  日志、调试、电源、事件 -- 所有子设备的共同基础
+//      tuner: 频率、频段、调制器 -- 仅调谐器设备
+//      audio: 时钟、路由、音频流 -- 仅音频设备
+//      video: 标准、流控 (s_stream 已废弃) -- 视频设备
+//      vbi:   VBI 编解码 -- 视频解码器
+//      ir:    红外收发 -- 红外设备
+//      sensor: 跳过帧/行 -- 图像传感器
+//      pad:   格式、路由、per-stream 流控 -- 推荐所有新驱动实现
+//
+// 3. 子设备与 media_entity 的关系
+//    struct v4l2_subdev 内嵌 struct media_entity，将子设备接入媒体控制器
+//    (Media Controller) 框架。通过 media_entity_to_v4l2_subdev() 宏
+//    可在两者之间安全转换。子设备的 pads (输入/输出端口) 通过
+//    media_entity_pads_init() 初始化，子设备间的连接通过 media_link 描述。
+//    Userspace 通过 Media Controller API (MEDIA_IOC_ENUM_ENTITIES/LINKS)
+//    枚举和配置整个视频管道的拓扑。
+//
+// 4. 流控制模型: 从 s_stream 到 enable/disable_streams + routing
+//    [传统模型 - s_stream]
+//    v4l2_subdev_video_ops.s_stream(enable) 对整个子设备进行全局流启停。
+//    简单直接但粒度粗糙，无法独立控制每个 pad 上的流。
+//    此接口已废弃，新驱动不应使用。
+//
+//    [新模型 - Multiplexed Streams]
+//    v4l2_subdev_pad_ops 中的 enable_streams/disable_streams 配合路由表
+//    (routing table) 实现 per-pad per-stream 粒度的精细流控制。
+//    子设备通过设置 V4L2_SUBDEV_FL_STREAMS 标志启用此功能。
+//    路由表定义 sink pad/stream 到 source pad/stream 的映射，
+//    支持 1:N 扇出、N:1 合并和 N:M 等复杂路由拓扑。
+//
+//    [兼容性层]
+//    v4l2_subdev_s_stream_helper() 将 enable/disable_streams 封装为传统
+//    s_stream 接口以兼容旧版应用。v4l2_subdev_enable_streams()/
+//    disable_streams() 是推荐的流控入口函数，内部自动处理新老模型适配。
+//
+// 5. 子设备状态管理 (State Management): ACTIVE vs TRY
+//    子设备状态由 struct v4l2_subdev_state 管理，包含 per-pad 的格式
+//    (v4l2_mbus_framefmt)、裁剪/合成矩形 (v4l2_rect)、帧间隔和路由表。
+//    状态操作支持两种模式:
+//
+//    V4L2_SUBDEV_FORMAT_ACTIVE:
+//      通过 v4l2_subdev_init_finalize() 为子设备分配持久的 active_state。
+//      驱动在 pad ops 中收到 ACTIVE 请求时，操作实时写入硬件寄存器，
+//      同时更新 state 以保持软硬同步。
+//      对 active_state 的访问需要通过 state->lock 互斥锁保护。
+//
+//    V4L2_SUBDEV_FORMAT_TRY:
+//      分配临时 state 用于"试配置"操作 (如 S_FMT 之前验证格式是否支持)。
+//      不修改硬件状态，仅在内核空间模拟配置效果。
+//      通常由 userspace 的 VIDIOC_SUBDEV_S_FMT ioctl 的 TRY 类型触发，
+//      用于在不实际更改硬件的前提下获取可行的格式参数。
+//
+//    状态访问器函数族 (get_format/crop/compose/interval) 支持两种调用:
+//      双参数: state + pad (stream 默认为 0，用于非多流驱动)
+//      三参数: state + pad + stream (用于多流驱动)
+//    当 state 参数为 const 时，返回 const 指针以保证常量安全性。
+//
+// 6. V4L2_SUBDEV_FL_* 标志位的作用
+//    V4L2_SUBDEV_FL_IS_I2C       - 子设备挂载在 I2C 总线上
+//    V4L2_SUBDEV_FL_IS_SPI       - 子设备挂载在 SPI 总线上
+//    V4L2_SUBDEV_FL_HAS_DEVNODE  - 拥有 /dev/v4l-subdevX 设备节点
+//    V4L2_SUBDEV_FL_HAS_EVENTS   - 能产生并上报事件 (如控制值变化)
+//    V4L2_SUBDEV_FL_STREAMS      - 支持多路复用流:
+//      - 启用集中式 active state 管理
+//      - 不支持传统 pad config (state->pads = NULL)
+//      - 支持路由 ioctl (VIDIOC_SUBDEV_S_ROUTING)
+//      - 每个 pad 可承载多个独立 stream
+//
+// 7. 本文件结构导览
+//    文件按以下顺序组织:
+//      - VBI 解码辅助结构 (v4l2_decode_vbi_line)
+//      - IO 引脚配置枚举和结构体
+//      - 子设备操作集 (core -> tuner -> audio -> video -> vbi -> sensor -> ir)
+//      - Pad 级操作集 (v4l2_subdev_pad_ops)
+//      - 顶层操作集聚合 (v4l2_subdev_ops, v4l2_subdev_internal_ops)
+//      - 子设备标志位 (V4L2_SUBDEV_FL_*)
+//      - 子设备主结构体 (v4l2_subdev) 和访问宏
+//      - 文件句柄 (v4l2_subdev_fh) 和数据访问器
+//      - 媒体控制器相关函数 (链接验证、状态分配、状态访问器)
+//      - 路由表管理和多路流控制
+//      - 状态锁管理和调用宏 (v4l2_subdev_call 机制)
+//      - 辅助函数 (事件通知、流状态查询)
+// ============================================================================
+//
+
 #ifndef _V4L2_SUBDEV_H
 #define _V4L2_SUBDEV_H
 
@@ -40,6 +149,16 @@ struct v4l2_subdev_stream_config;
 struct tuner_setup;
 struct v4l2_mbus_frame_desc;
 struct led_classdev;
+
+//
+// ========== VBI 解码辅助结构 ==========
+// v4l2_decode_vbi_line 用于从视频解码器中提取和解析
+// VBI (Vertical Blanking Interval) 消隐期数据。
+// VBI 数据通常包含隐藏字幕 (Closed Caption)、图文电视 (Teletext)、
+// VPS (Video Programming System) 等信息。
+// 解码器驱动解析原始 VBI 数据流，填充此结构体中的各字段，
+// 上层应用据此获取结构化 VBI 内容。
+//
 
 /**
  * struct v4l2_decode_vbi_line - used to decode_vbi_line
@@ -101,6 +220,15 @@ struct v4l2_decode_vbi_line {
  * not yet implemented) since ops provide proper type-checking.
  */
 
+//
+// ========== IO 引脚配置 ==========
+// 以下枚举和结构体用于配置子设备芯片的外部 IO 引脚。
+// 某些芯片将多种内部信号复用到有限的物理引脚上，
+// 通过 v4l2_subdev_core_ops.s_io_pin_config 进行配置。
+// 配置项包括: 引脚方向 (输入/输出)、输出值、驱动强度、
+// 有效电平 (高/低有效) 和内部信号路由选择。
+//
+
 /**
  * enum v4l2_subdev_io_pin_bits - Subdevice external IO pin configuration
  *	bits
@@ -138,6 +266,20 @@ struct v4l2_subdev_io_pin_config {
 	u8 value;
 	u8 strength;
 };
+
+//
+// 核心操作集: 所有子设备都应实现的最基础操作。
+// log_status: 输出设备当前状态到内核日志，是调试的核心入口。
+// s_io_pin_config: 配置芯片 IO 引脚功能复用。
+// init / reset / load_fw: 初始化/复位/加载固件 (init/reset 已废弃)。
+// s_gpio: GPIO 引脚设置。
+// command / ioctl: 通用命令和私有 ioctl 处理。
+// g_register / s_register: 寄存器调试读写 (需 CONFIG_VIDEO_ADV_DEBUG)。
+// s_power: 电源管理 (已废弃，改用 runtime PM)。
+// interrupt_service_routine: 中断服务例程 (在 IRQ 上下文中调用!)。
+// subscribe_event / unsubscribe_event: 控制事件订阅管理。
+// 注意: 新驱动应尽量使用标准化的子操作 (如 pad_ops) 而非 ioctl/cmd。
+//
 
 /**
  * struct v4l2_subdev_core_ops - Define core ops callbacks for subdevs
@@ -220,6 +362,20 @@ struct v4l2_subdev_core_ops {
 				 struct v4l2_event_subscription *sub);
 };
 
+//
+// 调谐器操作集: 用于 TV 调谐器或 AM/FM 收音机子设备。
+// standby: 将调谐器置于待机模式，下次使用时自动唤醒。
+// s_radio: 切换到收音机模式 (仅对 TV/Radio 复合设备需要)。
+// s_frequency / g_frequency: 设置/获取调谐频率。
+// enum_freq_bands: 枚举支持的频段 (如 FM、AM、VHF、UHF)。
+// g_tuner / s_tuner: 获取/设置调谐器参数 (如立体声/单声道模式)。
+// g_modulator / s_modulator: 获取/设置调制器参数。
+// s_type_addr: 设置调谐器类型和 I2C 地址。
+// s_config: 配置调谐器特定参数 (如 tda9887 的端口配置)。
+// 注意: 当设备同时支持 AM/FM 和 TV 时，驱动必须显式调用 s_radio
+// 切换模式后再操作调谐器参数。
+//
+
 /**
  * struct v4l2_subdev_tuner_ops - Callbacks used when v4l device was opened
  *	in radio mode.
@@ -283,6 +439,16 @@ struct v4l2_subdev_tuner_ops {
 	int (*s_type_addr)(struct v4l2_subdev *sd, struct tuner_setup *type);
 	int (*s_config)(struct v4l2_subdev *sd, const struct v4l2_priv_tun_config *config);
 };
+
+//
+// 音频操作集: 音频编解码器和具有音频功能的视频解码器使用。
+// s_clock_freq: 设置音频主时钟频率 (通常为 48000/44100/32000 Hz)，
+//   用于使音频处理器与视频解码器同步。
+// s_i2s_clock_freq: 设置 I2S 总线时钟频率 (bps)。
+// s_routing: 配置音频输入/输出引脚路由。
+// s_stream: 通知音频码流开始/停止传输。
+// 通常由音频 Codec 或集成音频功能的视频解码器实现。
+//
 
 /**
  * struct v4l2_subdev_audio_ops - Callbacks used for audio-related settings
@@ -411,6 +577,21 @@ enum v4l2_subdev_pre_streamon_flags {
 	V4L2_SUBDEV_PRE_STREAMON_FL_MANUAL_LP = BIT(0),
 };
 
+//
+// 视频操作集: 传统视频相关的操作集合。
+// s_routing: 视频输入/输出路由选择 (如选择 CVBS 或 S-Video 输入)。
+// s_std / g_std / querystd: 模拟视频标准选择/查询 (PAL/NTSC/SECAM)。
+// s_stream: 启动/停止数据流传输。注意: 此操作已废弃!
+//   新驱动应使用 pad_ops 的 enable_streams/disable_streams 来实现
+//   per-pad per-stream 粒度的流控制。
+//   s_stream 保留仅用于兼容旧版驱动和 userspace 应用。
+// pre_streamon / post_streamoff: 流启动前/停止后的总线配置钩子，
+//   用于 CSI-2 发送端设置 LP-11/LP-111 模式等预处理操作。
+// s_rx_buffer: 设置由主机分配的接收缓冲区。
+// 注意: 对于新驱动，建议尽可能使用 pad_ops，必要时通过
+//   v4l2_subdev_s_stream_helper() 提供 s_stream 兼容接口。
+//
+
 /**
  * struct v4l2_subdev_video_ops - Callbacks used when v4l device was opened
  *				  in video mode.
@@ -496,6 +677,20 @@ struct v4l2_subdev_video_ops {
 	int (*post_streamoff)(struct v4l2_subdev *sd);
 };
 
+//
+// VBI 操作集: 处理视频消隐期 (Vertical Blanking Interval) 数据的提取和注入。
+// VBI 是模拟视频信号中场消隐期间传输的数据区域，通常包含:
+//   - 隐藏字幕 (Closed Caption, CC)
+//   - 图文电视 (Teletext)
+//   - 视频节目系统 (VPS)
+//   - 宽屏信令 (WSS)
+// decode_vbi_line: 从原始 VBI 数据中解析出切片格式的 VBI 数据包。
+// s_vbi_data / g_vbi_data: 设置/获取 VBI 数据。
+// g_sliced_vbi_cap: 查询设备支持的切片 VBI 服务类型。
+// s_sliced_fmt / g_sliced_fmt: 配置/查询切片 VBI 格式。
+// 通常由模拟视频解码器驱动实现。
+//
+
 /**
  * struct v4l2_subdev_vbi_ops - Callbacks used when v4l device was opened
  *				  in video mode via the vbi device node.
@@ -540,6 +735,15 @@ struct v4l2_subdev_vbi_ops {
 	int (*g_sliced_fmt)(struct v4l2_subdev *sd, struct v4l2_sliced_vbi_format *fmt);
 	int (*s_sliced_fmt)(struct v4l2_subdev *sd, struct v4l2_sliced_vbi_format *fmt);
 };
+
+//
+// 传感器操作集: 图像传感器特有的辅助查询操作。
+// g_skip_top_lines: 返回图像顶部需要跳过的行数。某些传感器在输出图像
+//   的顶部几行会包含损坏的数据或元数据，应用层需跳过这些行。
+// g_skip_frames: 返回流启动时需要跳过的帧数。某些传感器在上电或
+//   切换格式后的最初几帧可能不稳定或有缺陷，驱动需丢弃这些帧。
+// 这两个操作帮助 bridge 驱动补偿传感器硬件的不完美行为。
+//
 
 /**
  * struct v4l2_subdev_sensor_ops - v4l2-subdev sensor operations
@@ -614,6 +818,13 @@ struct v4l2_subdev_ir_parameters {
 	u32 resolution;
 };
 
+//
+// 红外操作集: 红外遥控信号的接收和发射。包括脉冲宽度编码数据的读写、
+// 接收/发射参数配置 (载波频率、占空比、噪声滤波器带宽、分辨率等)。
+// 通常由红外接收器/发射器子设备驱动实现。
+// 接收和发射分别有独立的参数集合和读写接口。
+//
+
 /**
  * struct v4l2_subdev_ir_ops - operations for IR subdevices
  *
@@ -669,6 +880,29 @@ struct v4l2_subdev_ir_ops {
 				struct v4l2_subdev_ir_parameters *params);
 };
 
+//
+// ========== 子设备状态相关数据结构 ==========
+// 以下四个结构体构成子设备状态管理的层次化数据模型:
+//
+// v4l2_subdev_pad_config:
+//   单 pad 的配置数据，包含格式 (v4l2_mbus_framefmt)、裁剪矩形 (crop)、
+//   合成矩形 (compose) 和帧间隔 (fract)。state->pads[] 是该结构体的数组。
+//
+// v4l2_subdev_stream_configs:
+//   流配置集合 (仅 V4L2_SUBDEV_FL_STREAMS 启用时使用)。
+//   包含 num_configs 个 v4l2_subdev_stream_config 条目。
+//
+// v4l2_subdev_krouting:
+//   路由表，定义 sink pad/stream 到 source pad/stream 的映射。
+//   包含 routes 数组、num_routes (有效条目数) 和 len_routes (容量)。
+//
+// v4l2_subdev_state:
+//   子设备的完整运行时状态，整合了 pads 配置数组、路由表和流配置。
+//   所有 pad ops 通过 state 参数访问当前配置。
+//   ACTIVE 模式: state 指向 sd->active_state，操作实时写硬件。
+//   TRY 模式: state 指向临时分配的 state，仅用于验证。
+//
+
 /**
  * struct v4l2_subdev_pad_config - Used for storing subdev pad information.
  *
@@ -678,10 +912,10 @@ struct v4l2_subdev_ir_ops {
  * @interval: frame interval
  */
 struct v4l2_subdev_pad_config {
-	struct v4l2_mbus_framefmt format;
-	struct v4l2_rect crop;
-	struct v4l2_rect compose;
-	struct v4l2_fract interval;
+	struct v4l2_mbus_framefmt format;   // 此 pad 上的媒体总线帧格式 (分辨率、像素编码、色彩空间)
+	struct v4l2_rect crop;              // 裁剪矩形：从传感器全幅中选取感兴趣区域 (ROI)
+	struct v4l2_rect compose;           // 组合矩形：裁剪后缩放/平移输出到目标区域
+	struct v4l2_fract interval;         // 帧间隔：两帧之间的时间 (numerator/denominator)
 };
 
 /**
@@ -705,9 +939,9 @@ struct v4l2_subdev_stream_configs {
  * This structure contains the routing table for a subdev.
  */
 struct v4l2_subdev_krouting {
-	unsigned int len_routes;
-	unsigned int num_routes;
-	struct v4l2_subdev_route *routes;
+	unsigned int len_routes;           // routes 数组容量 (分配的元素数量)
+	unsigned int num_routes;           // 实际有效的路由条目数 (≤ len_routes)
+	struct v4l2_subdev_route *routes;  // 路由表数组，每条路由定义 pad/stream 对的连接
 };
 
 /**
@@ -726,13 +960,79 @@ struct v4l2_subdev_krouting {
  */
 struct v4l2_subdev_state {
 	/* lock for the struct v4l2_subdev_state fields */
-	struct mutex _lock;
-	struct mutex *lock;
-	struct v4l2_subdev *sd;
-	struct v4l2_subdev_pad_config *pads;
-	struct v4l2_subdev_krouting routing;
-	struct v4l2_subdev_stream_configs stream_configs;
+	struct mutex _lock;                             // 默认锁实例 (当 lock 指向别处时作为后备)
+	struct mutex *lock;                             // 当前使用的锁指针 (可通过 v4l2_subdev_state_lock 替换)
+	struct v4l2_subdev *sd;                         // 拥有此 state 的子设备
+	struct v4l2_subdev_pad_config *pads;            // 传统 per-pad 配置数组 (streams 模式下为 NULL)
+	struct v4l2_subdev_krouting routing;            // 路由表：定义子设备内部 pad/stream 的连接关系
+	struct v4l2_subdev_stream_configs stream_configs; // 多流配置 (仅 V4L2_SUBDEV_FL_STREAMS 启用)
 };
+
+//
+// ========== Pad 级操作集 (v4l2_subdev_pad_ops) ==========
+// 这是 V4L2 子设备框架中最核心、最复杂的操作集合，每个操作都关联到
+// 特定的 pad (输入/输出端口)，支持 per-pad 的精细配置。主要包括:
+//
+// [格式查询与配置]
+//   enum_mbus_code: 枚举 pad 支持的媒体总线像素格式
+//   enum_frame_size: 枚举 pad 支持的帧尺寸
+//   get_fmt / set_fmt: 获取/设置 pad 上某 stream 的格式
+//
+// [裁剪与合成]
+//   get_selection / set_selection: 获取/设置裁剪 (crop) 和合成 (compose) 矩形
+//   crop 定义从传感器读取的区域，compose 定义输出到总线的区域
+//
+// [显示时序]
+//   s_dv_timings / g_dv_timings: 设置/获取数字视频时序 (如 HDMI)
+//   query_dv_timings: 检测当前输入信号的时序
+//   dv_timings_cap / enum_dv_timings: 查询支持的时序能力
+//
+// [EDID 管理]
+//   get_edid / set_edid: 获取/设置 EDID 数据 (显示识别数据)
+//
+// [总线配置]
+//   get_mbus_config: 获取远程子设备的媒体总线配置 (如 CSI-2 通道数)
+//   get_frame_desc / set_frame_desc: 获取/设置底层帧描述 (CSI-2 VC/DT)
+//
+// [链接验证]
+//   link_validate: 验证 media link 两端的格式是否匹配
+//
+// ========== 路由和多路流 API 详解 ==========
+// 以下操作仅当子设备设置了 V4L2_SUBDEV_FL_STREAMS 标志时启用:
+//
+// set_routing:
+//   设置子设备内部路由表，定义 sink pad/stream 到 source pad/stream
+//   的映射关系。支持 1:N (扇出)、N:1 (合并)、N:M 等多种拓扑。
+//   路由表包含多个 v4l2_subdev_route 条目，每个条目描述一条
+//   单向数据路径。通过 v4l2_subdev_set_routing() 写入 state。
+//
+// enable_streams / disable_streams:
+//   替代已废弃的 s_stream()，实现 per-pad per-stream 粒度的流控制。
+//   streams_mask 是 u64 位掩码，每个 bit 代表一个 stream ID。
+//   调用流程:
+//     1. v4l2_subdev_enable_streams() (核心包装函数)
+//     2. -> 遍历 streams_mask 中的每个 stream
+//     3. -> 调用驱动实现的 enable_streams op
+//     4. -> 更新 enabled_pads 状态跟踪
+//   disable_streams 是逆操作，流程类似。
+//
+// 流翻译与验证:
+//   v4l2_subdev_state_xlate_streams():
+//     根据路由表将一端 pad 的 stream 位掩码翻译到另一端。
+//     对 pipeline 中的流传播至关重要。
+//   v4l2_subdev_routing_validate():
+//     使用 routing_restriction 枚举验证路由表是否满足驱动约束。
+//     约束包括: 禁止 1:N 扇出、禁止 N:1 合并、禁止流混合等。
+//
+// 传统兼容性:
+//   v4l2_subdev_s_stream_helper() 将 enable/disable_streams 封装为
+//   传统 s_stream 接口，使新版驱动仍可与旧版 userspace 应用兼容。
+//   此辅助函数仅适用于具有单个 source pad 的子设备。
+//
+// 帧描述符透传:
+//   v4l2_subdev_get_frame_desc_passthrough() 为简单透传子设备提供
+//   get_frame_desc 的默认实现，自动遍历路由表收集上游帧描述信息。
+//
 
 /**
  * struct v4l2_subdev_pad_ops - v4l2-subdev pad level operations
@@ -887,6 +1187,23 @@ struct v4l2_subdev_pad_ops {
 			       u64 streams_mask);
 };
 
+//
+// ========== 子设备操作集聚合 (v4l2_subdev_ops) ==========
+// v4l2_subdev_ops 是顶层操作集，聚合所有功能类别的操作指针。
+// 每个子设备驱动只需实现其设备相关的操作类别:
+//   core  - 必选 (日志、调试、电源管理、事件订阅)
+//   tuner - 仅调谐器设备
+//   audio - 仅音频编解码器
+//   video - 传统视频流控 (s_stream 已废弃，建议用 pad ops)
+//   vbi   - 仅视频解码器需要 VBI 数据
+//   ir    - 仅红外遥控设备
+//   sensor- 仅图像传感器
+//   pad   - 推荐实现，提供 per-pad 精细控制
+//
+// 未实现的类别指针设为 NULL 即可。核心通过 v4l2_subdev_call 宏
+// 安全地检查 NULL 指针，返回 -ENOIOCTLCMD。
+//
+
 /**
  * struct v4l2_subdev_ops - Subdev operations
  *
@@ -909,6 +1226,21 @@ struct v4l2_subdev_ops {
 	const struct v4l2_subdev_sensor_ops	*sensor;
 	const struct v4l2_subdev_pad_ops	*pad;
 };
+
+//
+// ========== 子设备内部操作集 (v4l2_subdev_internal_ops) ==========
+// 内部操作由 V4L2 框架自身调用，驱动开发人员不应直接调用:
+//   init_state:   初始化子设备状态为默认值
+//   registered:   子设备注册到 v4l2_device 后调用
+//   unregistered: 子设备从 v4l2_device 注销前调用
+//   open:         /dev/v4l-subdevX 设备节点被打开时调用
+//   close:        设备节点关闭时调用 (可能在 unregistered 之后!)
+//   release:      最后一个引用释放后调用，通常用于释放子设备内存
+//                 若设置了 V4L2_SUBDEV_FL_HAS_DEVNODE 标志，
+//                 则几乎必须实现此回调。
+//
+// 警告: 这些 ops 仅框架可调用，驱动永远不要直接调用它们!
+//
 
 /**
  * struct v4l2_subdev_internal_ops - V4L2 subdev internal ops
@@ -949,6 +1281,22 @@ struct v4l2_subdev_internal_ops {
 	void (*release)(struct v4l2_subdev *sd);
 };
 
+//
+// ========== V4L2_SUBDEV_FL_* 子设备标志位 ==========
+// 每个子设备通过 flags 字段声明自身能力和特性:
+//   V4L2_SUBDEV_FL_IS_I2C      - 挂载在 I2C 总线上
+//   V4L2_SUBDEV_FL_IS_SPI      - 挂载在 SPI 总线上
+//   V4L2_SUBDEV_FL_HAS_DEVNODE - 拥有独立的 /dev/v4l-subdevX 设备节点
+//   V4L2_SUBDEV_FL_HAS_EVENTS  - 能产生并上报事件 (如控制值变化)
+//   V4L2_SUBDEV_FL_STREAMS     - 支持多路复用流:
+//                                - 启用集中式 active state 管理
+//                                - 不支持传统 pad config (state->pads = NULL)
+//                                - 支持路由 ioctl (set_routing)
+//                                - 每个 pad 可承载多个独立流
+//                                启用此标志后，驱动必须实现 set_routing、
+//                                enable_streams、disable_streams 等操作。
+//
+
 /* Set this flag if this subdev is a i2c device. */
 #define V4L2_SUBDEV_FL_IS_I2C			(1U << 0)
 /* Set this flag if this subdev is a spi device. */
@@ -988,6 +1336,28 @@ struct v4l2_subdev_platform_data {
 
 	void *host_priv;
 };
+
+//
+// ========== 子设备主结构体 (struct v4l2_subdev) ==========
+// 这是 V4L2 子设备框架的核心数据结构，每个子设备驱动创建一个实例。
+// 关键字段说明:
+//   entity:      内嵌的 media_entity，将子设备接入 media controller 框架，
+//                通过 media_entity_to_v4l2_subdev() 可双向转换
+//   ops:         指向 v4l2_subdev_ops，定义所有可调用的子设备操作
+//   internal_ops:框架内部操作 (注册/注销/打开/关闭回调)
+//   ctrl_handler:控制处理器，管理子设备的 V4L2 控制 (如曝光、增益)
+//   active_state:集中管理的运行时 state (格式、裁剪、路由表等)
+//                通过 v4l2_subdev_init_finalize() 初始化
+//   fwnode:      固件节点句柄 (DT/ACPI)，用于设备树匹配和 async 绑定
+//   enabled_pads:跟踪已启用流的 pad，供 enable/disable_streams 使用
+//
+// 初始化流程:
+//   1. 分配 v4l2_subdev 实例 (独立或嵌入私有的设备结构体)
+//   2. 调用 v4l2_subdev_init() 或 v4l2_i2c_subdev_init() 初始化基本字段
+//   3. 调用 media_entity_pads_init() 初始化 pads
+//   4. (可选) 调用 v4l2_subdev_init_finalize() 分配 active_state
+//   5. 调用 v4l2_device_register_subdev() 注册到 bridge 设备
+//
 
 /**
  * struct v4l2_subdev - describes a V4L2 sub-device
@@ -1049,36 +1419,36 @@ struct v4l2_subdev_platform_data {
  */
 struct v4l2_subdev {
 #if defined(CONFIG_MEDIA_CONTROLLER)
-	struct media_entity entity;
+	struct media_entity entity; // 内嵌媒体实体：将子设备挂入 Media Controller 拓扑图
 #endif
-	struct list_head list;
-	struct module *owner;
-	bool owner_v4l2_dev;
-	u32 flags;
-	struct v4l2_device *v4l2_dev;
-	const struct v4l2_subdev_ops *ops;
-	const struct v4l2_subdev_internal_ops *internal_ops;
-	struct v4l2_ctrl_handler *ctrl_handler;
-	char name[52];
-	u32 grp_id;
-	void *dev_priv;
-	void *host_priv;
-	struct video_device *devnode;
-	struct device *dev;
-	struct fwnode_handle *fwnode;
-	struct list_head async_list;
-	struct list_head async_subdev_endpoint_list;
-	struct v4l2_async_notifier *subdev_notifier;
-	struct list_head asc_list;
-	struct v4l2_subdev_platform_data *pdata;
-	struct mutex *state_lock;
+	struct list_head list;       // v4l2_device->subdevs 链表节点
+	struct module *owner;        // 驱动模块 owner，防止子设备使用期间模块被卸载
+	bool owner_v4l2_dev;         // owner 是否与 v4l2_device->dev->driver->owner 相同
+	u32 flags;                   // V4L2_SUBDEV_FL_* 标志位：IS_I2C, HAS_DEVNODE, STREAMS ...
+	struct v4l2_device *v4l2_dev;// 父 V4L2 设备指针，注册后设置，注销后置 NULL
+	const struct v4l2_subdev_ops *ops;         // 功能操作集：core/video/audio/tuner/pad ...
+	const struct v4l2_subdev_internal_ops *internal_ops; // 框架内部操作：registered/unregistered/release
+	struct v4l2_ctrl_handler *ctrl_handler;    // 控制处理器：管理此子设备的 V4L2 控制项
+	char name[52];               // 全局唯一名称，用于 debug 和 sysfs
+	u32 grp_id;                  // 分组 ID：bridge 驱动用于批量操作同类子设备
+	void *dev_priv;              // 驱动私有数据 (通过 v4l2_set/get_subdevdata 存取)
+	void *host_priv;             // 主机私有数据：bridge 驱动通过 pdata->host_priv 传入
+	struct video_device *devnode;// 关联的 /dev/v4l-subdevX 设备节点 (如有 HAS_DEVNODE 标志)
+	struct device *dev;          // 物理设备指针 (如 &i2c_client->dev)
+	struct fwnode_handle *fwnode;// 固件节点：DT/ACPI 中的 endpoint 节点，用于 async 匹配
+	struct list_head async_list;              // async 全局子设备列表或 notifier->done 列表节点
+	struct list_head async_subdev_endpoint_list; // v4l2_async_subdev_endpoint 链表节点
+	struct v4l2_async_notifier *subdev_notifier; // 隐式 notifier (sensor 驱动自动创建)
+	struct list_head asc_list;               // Async connection 链表 (v4l2_async_connection.subdev_entry)
+	struct v4l2_subdev_platform_data *pdata; // 平台数据：regulators 和 host_priv
+	struct mutex *state_lock;                // state 互斥锁指针 (可选，NULL 时各 state 自有锁)
 
 	/*
 	 * The fields below are private, and should only be accessed via
 	 * appropriate functions.
 	 */
 
-	struct led_classdev *privacy_led;
+	struct led_classdev *privacy_led; // 隐私 LED：sensor 激活时自动点亮 LED
 
 	/*
 	 * TODO: active_state should most likely be changed from a pointer to an
@@ -1086,9 +1456,10 @@ struct v4l2_subdev {
 	 * easily catch uses of active_state in the cases where the driver
 	 * doesn't support it.
 	 */
-	struct v4l2_subdev_state *active_state;
-	u64 enabled_pads;
-	bool s_stream_enabled;
+	struct v4l2_subdev_state *active_state; // 集中管理的活跃 state (format/crop/routes)
+	                                         // 由 v4l2_subdev_init_finalize() 分配
+	u64 enabled_pads;        // 已启用流的 pad 位掩码：enable/disable_streams 回退逻辑使用
+	bool s_stream_enabled;   // s_stream() 旧 API 的流状态跟踪，仅 call_s_stream 内部使用
 };
 
 
@@ -1115,6 +1486,19 @@ struct v4l2_subdev {
  */
 #define vdev_to_v4l2_subdev(vdev) \
 	((struct v4l2_subdev *)video_get_drvdata(vdev))
+
+//
+// ========== 子设备文件句柄 (struct v4l2_subdev_fh) ==========
+// 每个打开 /dev/v4l-subdevX 的文件描述符关联一个 v4l2_subdev_fh 实例，
+// 其中包含:
+//   vfh:        V4L2 文件句柄基类
+//   state:      关联的子设备 TRY state (用于 VIDIOC_SUBDEV_S_FMT 等 TRY 操作)
+//   owner:      打开此句柄的内核模块指针
+//   client_caps:客户端能力标志 (如 V4L2_SUBDEV_CLIENT_CAP_STREAMS)
+//
+// 通过 to_v4l2_subdev_fh(fh) 宏从 v4l2_fh 转换得到。
+// v4l2_subdev_fops 提供了标准的 subdev 文件操作函数表。
+//
 
 /**
  * struct v4l2_subdev_fh - Used for storing subdev information per file handle
@@ -1262,6 +1646,19 @@ int v4l2_subdev_link_validate(struct media_link *link);
 bool v4l2_subdev_has_pad_interdep(struct media_entity *entity,
 				  unsigned int pad0, unsigned int pad1);
 
+//
+// ========== 子设备状态分配与初始化 ==========
+// 以下函数管理子设备状态 (v4l2_subdev_state) 的生命周期:
+//   __v4l2_subdev_state_alloc: 分配新的 state，包含 pads 数组和路由表
+//   __v4l2_subdev_state_free: 释放 state 及其动态分配的内部数据
+//   v4l2_subdev_init_finalize: 驱动初始化完成后调用，分配 active_state
+//     此宏内建 lock_class_key，确保锁验证 (lockdep) 正常工作
+//   v4l2_subdev_cleanup: 释放与子设备关联的所有资源 (async 连接、state 等)
+//
+// 注意: __v4l2_subdev_state_alloc/free 是内部函数，驱动不应直接调用。
+// 驱动应使用 v4l2_subdev_init_finalize() 和 v4l2_subdev_cleanup()。
+//
+
 /**
  * __v4l2_subdev_state_alloc - allocate v4l2_subdev_state
  *
@@ -1337,6 +1734,25 @@ void v4l2_subdev_cleanup(struct v4l2_subdev *sd);
 		const struct v4l2_subdev_state *: (const typeof(*(value)) *)(value), \
 		struct v4l2_subdev_state *: (value)				\
 	)
+
+/**
+//
+// ========== 子设备状态访问器 ==========
+// 以下宏和函数提供对子设备 state 中 per-pad per-stream 配置的访问:
+//   v4l2_subdev_state_get_format:  获取 pad/stream 的媒体总线格式
+//   v4l2_subdev_state_get_crop:    获取裁剪矩形
+//   v4l2_subdev_state_get_compose: 获取合成矩形
+//   v4l2_subdev_state_get_interval:获取帧间隔
+//
+// 每个访问器支持两种调用方式:
+//   - 双参数: state + pad, stream 默认为 0 (用于非多流驱动)
+//   - 三参数: state + pad + stream (用于多流驱动)
+// 这是通过 __v4l2_subdev_state_gen_call() 宏重载实现的。
+// 当 state 参数为 const 时，返回 const 指针，保证常量安全性。
+//
+// 对于不支持多路流的传统驱动，stream 参数始终为 0。
+// 若指定 pad 不存在，所有访问器返回 NULL。
+//
 
 /**
  * v4l2_subdev_state_get_format() - Get pointer to a stream format
@@ -1475,6 +1891,26 @@ int v4l2_subdev_get_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
 int v4l2_subdev_get_frame_interval(struct v4l2_subdev *sd,
 				   struct v4l2_subdev_state *state,
 				   struct v4l2_subdev_frame_interval *fi);
+
+//
+// ========== 子设备路由表管理 ==========
+// 路由表 (routing table) 是多路流 (Multiplexed Streams) 的核心数据结构，
+// 定义 sink pad/stream 到 source pad/stream 的映射关系。
+// 仅在子设备设置了 V4L2_SUBDEV_FL_STREAMS 标志时启用。
+//
+// 路由 API 主要函数:
+//   v4l2_subdev_set_routing: 将路由表写入 state，自动释放旧表
+//   v4l2_subdev_set_routing_with_fmt: 设置路由的同时用指定格式初始化所有流
+//   for_each_active_route: 遍历路由表中所有激活 (enabled) 的 route
+//   v4l2_subdev_routing_find_opposite_end: 查找 route 另一端的 pad/stream
+//   v4l2_subdev_state_get_opposite_stream_format: 获取对端流格式
+//   v4l2_subdev_state_xlate_streams: 将一端 stream 位掩码翻译到另一端
+//   v4l2_subdev_routing_validate: 验证路由表是否满足驱动约束
+//
+// 路由约束 (routing_restriction):
+//   驱动通过 v4l2_subdev_routing_validate() 和 routing_restriction 枚举
+//   限制允许的路由拓扑，如 1:N 扇出限制、N:1 合并限制、流混合限制等。
+//
 
 /**
  * v4l2_subdev_set_routing() - Set given routing to subdev state
@@ -1641,6 +2077,31 @@ int v4l2_subdev_routing_validate(struct v4l2_subdev *sd,
 				 const struct v4l2_subdev_krouting *routing,
 				 enum v4l2_subdev_routing_restriction disallow);
 
+//
+// ========== 流控制 (Per-Pad Per-Stream) ==========
+// enable/disable_streams 是多路流 API 的流控制核心操作，
+// 取代了传统的 v4l2_subdev_video_ops.s_stream()。
+//
+//   v4l2_subdev_enable_streams(sd, pad, streams_mask):
+//     在指定 source pad 上启用 streams_mask 中标记的流。
+//     可同时启用多个流 (如 BIT_ULL(0) | BIT_ULL(1))。
+//
+//   v4l2_subdev_disable_streams(sd, pad, streams_mask):
+//     禁用指定流的反向操作。
+//
+//   v4l2_subdev_s_stream_helper(sd, enable):
+//     将 enable/disable_streams 封装为传统 s_stream 接口，
+//     用于兼容旧版 userspace。仅适用于单 source pad 子设备。
+//
+//   __v4l2_subdev_get_frame_desc_passthrough / ...passthrough:
+//     为透传型子设备提供 get_frame_desc 的默认实现。
+//     自动遍历路由表，从上游收集帧描述信息 (如 CSI-2 VC/DT)。
+//
+// 注意: enable/disable 不允许重复操作已启用/禁用的流，
+// 重复操作将返回 -EALREADY。调用者应通过 v4l2_subdev_is_streaming()
+// 检查当前流状态。
+//
+
 /**
  * v4l2_subdev_enable_streams() - Enable streams on a pad
  * @sd: The subdevice
@@ -1782,6 +2243,19 @@ int v4l2_subdev_get_frame_desc_passthrough(struct v4l2_subdev *sd,
 
 #endif /* CONFIG_MEDIA_CONTROLLER */
 
+//
+// ========== 子设备状态锁管理 ==========
+// 以下函数管理子设备 active_state 的并发访问:
+//   v4l2_subdev_lock_state / unlock_state: 加/解锁单个 state
+//   v4l2_subdev_lock_states / unlock_states: 同时操作两个 state，
+//     当两 state 共享同一把锁时只锁一次以避免递归死锁
+//   v4l2_subdev_get_unlocked_active_state: 获取 state 并断言锁未持有
+//   v4l2_subdev_get_locked_active_state: 获取 state 并断言锁已持有
+//   v4l2_subdev_lock_and_get_active_state: "加锁 + 获取" 组合操作
+//
+// 使用规范: 所有对 active_state 字段的读写都必须持有 state->lock。
+//
+
 /**
  * v4l2_subdev_lock_state() - Locks the subdev state
  * @state: The subdevice state
@@ -1905,6 +2379,14 @@ v4l2_subdev_lock_and_get_active_state(struct v4l2_subdev *sd)
 	return sd->active_state;
 }
 
+//
+// ========== 子设备初始化函数 ==========
+// v4l2_subdev_init() 是基础的子设备初始化函数，设置 sd->ops 和基本字段。
+// 对于 I2C/SPI 设备应使用 v4l2_i2c_subdev_init()/v4l2_spi_subdev_init()。
+// 如需集中式 active state 管理，在 media_entity_pads_init() 之后调用
+// v4l2_subdev_init_finalize() 分配 active_state。
+//
+
 /**
  * v4l2_subdev_init - initializes the sub-device struct
  *
@@ -1913,6 +2395,31 @@ v4l2_subdev_lock_and_get_active_state(struct v4l2_subdev *sd)
  */
 void v4l2_subdev_init(struct v4l2_subdev *sd,
 		      const struct v4l2_subdev_ops *ops);
+
+//
+// ========== v4l2_subdev_call 宏：子设备操作调用分发机制 ==========
+// v4l2_subdev_call(sd, o, f, args...) 是调用子设备操作的核心宏:
+//   1. 空指针检查: sd == NULL 时返回 -ENODEV
+//   2. 存在性检查: ops->o 或 ops->o->f 为 NULL 时返回 -ENOIOCTLCMD
+//   3. 包装器检查: 若 v4l2_subdev_call_wrappers.o->f 存在则调用之。
+//      这种全局包装器机制允许 V4L2 核心框架在驱动操作前后注入额外行为
+//      (如参数验证、锁管理)，无需修改驱动代码。
+//   4. 直接调用: 否则执行 __sd->ops->o->f(__sd, args...)
+//   5. 返回 int 类型的 __result
+//
+// v4l2_subdev_call_state_active(sd, o, f, args...):
+//   pad ops 专用变体。自动获取 active_state，加锁后作为 state 参数
+//   传给操作函数，完成后解锁。省去手动锁管理。
+//
+// v4l2_subdev_call_state_try(sd, o, f, args...):
+//   为 TRY 模式分配临时 v4l2_subdev_state，用于格式验证。
+//   仅旧式非 MC 驱动需要此宏。
+//
+// v4l2_subdev_has_op(sd, o, f):
+//   检查子设备是否实现了特定操作 ops->o->f。
+//   展开为: (sd)->ops->o && (sd)->ops->o->f
+//   用于在调用前确认操作可用。
+//
 
 extern const struct v4l2_subdev_ops v4l2_subdev_call_wrappers;
 
@@ -2024,6 +2531,15 @@ extern const struct v4l2_subdev_ops v4l2_subdev_call_wrappers;
  */
 #define v4l2_subdev_has_op(sd, o, f) \
 	((sd)->ops->o && (sd)->ops->o->f)
+
+//
+// ========== 子设备辅助函数 ==========
+// v4l2_subdev_notify_event: 向所有订阅了子设备事件的 userspace 监听器
+//     以及 bridge 驱动发送事件通知。通知类型为 V4L2_DEVICE_NOTIFY_EVENT。
+// v4l2_subdev_is_streaming: 查询子设备当前是否处于流传输状态。
+//     当 s_stream() 或 enable_streams() 成功调用且尚未停止时返回 true。
+//     若子设备实现了 enable_streams()，调用此函数前需持有 active state 锁。
+//
 
 /**
  * v4l2_subdev_notify_event() - Delivers event notification for subdevice

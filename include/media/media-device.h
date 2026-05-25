@@ -8,6 +8,49 @@
  *	     Sakari Ailus <sakari.ailus@iki.fi>
  */
 
+//
+// ============================================================
+// media_device - 媒体拓扑图的根容器
+// ============================================================
+// media_device 是整个 Media Controller 框架的顶层抽象,代表一个
+// 完整的媒体设备。其核心职责:
+//
+// 1. 拓扑管理
+//    - 持有所有 entity、pad、link 的全局链表 (entities、pads、links)
+//    - 维护拓扑版本号 (topology_version),每次拓扑变更时递增
+//    - 通过 IDA 为每个 entity 分配唯一的内部索引
+//
+// 2. 设备节点
+//    - 通过 devnode 字段对应 /dev/mediaX 字符设备节点
+//    - 用户空间通过 MEDIA_IOC_DEVICE_INFO、MEDIA_IOC_GET_TOPOLOGY
+//      等 ioctl 查询拓扑信息
+//
+// 3. 回调机制 (media_device_ops)
+//    - link_notify   : 链路状态变更通知,在启用/禁用链路时回调
+//    - req_alloc/req_free     : 请求分配/释放
+//    - req_validate/req_queue : 请求验证/入队
+//
+// 4. 与 V4L2 的关联
+//    - v4l2_device 结构体中包含 mdev 字段,指向关联的 media_device
+//    - 通过 media_device_register_entity() 注册 v4l2_subdev 和
+//      video_device 对应的 entity
+//
+// 5. 生命周期
+//    media_device_init()      : 初始化(设置互斥锁、链表头等)
+//    media_device_register()  : 注册(创建设备节点,对外可见)
+//    media_device_unregister(): 注销(移除设备节点)
+//    media_device_cleanup()   : 清理(销毁互斥锁等)
+//
+// 并发保护:
+//   - graph_mutex 保护所有拓扑操作(增删 entity、修改 link)
+//   - req_queue_mutex 串行化请求的入队操作
+//
+// 典型拓扑结构示例:
+//   Camera Sensor -> CSI Receiver -> ISP -> DMA Engine -> video_device
+//        (entity)      (entity)     (entity)   (entity)      (entity)
+// ============================================================
+//
+
 #ifndef _MEDIA_DEVICE_H
 #define _MEDIA_DEVICE_H
 

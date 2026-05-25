@@ -5,6 +5,32 @@
  * Copyright (C) 2010-2021  Hans Verkuil <hverkuil@kernel.org>
  */
 
+/*
+ * V4L2 控制框架 —— 用户空间 API 实现层。
+ *
+ * 本文件实现了 V4L2 控制框架中面向 userspace 的接口部分，处理通过
+ * ioctl 系统调用传递的控制请求。它是 V4L2 控制子系统的前端，负责
+ * 将 VIDIOC_* 系列 ioctl 命令翻译为 control 框架的内部操作。
+ *
+ * 实现的 ioctl 处理函数包括：
+ *   - VIDIOC_G_EXT_CTRLS / VIDIOC_S_EXT_CTRLS / VIDIOC_TRY_EXT_CTRLS：
+ *     批量获取/设置/试设扩展控制值。这是 V4L2 控制 API 的核心入口，
+ *     支持一次调用操作多个控制项，并通过 request 机制支持 atomic
+ *     的 per-frame 控制更新。
+ *   - VIDIOC_QUERYCTRL：查询单个控制项的基本属性（类型、名称、范围等）。
+ *   - VIDIOC_QUERYMENU：查询枚举类型控制项的菜单选项。
+ *   - VIDIOC_QUERY_EXT_CTRL：查询扩展控制信息，包括推荐的步进值、
+ *     默认值、维度信息等增强属性。
+ *
+ * 内部实现围绕 struct v4l2_ctrl_helper 辅助结构体展开，该结构体将
+ * userspace 传入的 struct v4l2_ext_control 数组映射到内核内部的
+ * struct v4l2_ctrl_ref 和 struct v4l2_ctrl 对象上，实现 ID 到
+ * 指针的高效转换和集群（cluster）级别的批量处理。
+ *
+ * 该 API 层同时还处理控制值的 class 类 ID 匹配（如用户类、MPEG 类、
+ * 相机类等），并协调 control 的 set 操作与硬件实际生效之间的时序关系。
+ */
+
 #define pr_fmt(fmt) "v4l2-ctrls: " fmt
 
 #include <linux/export.h>

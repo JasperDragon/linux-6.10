@@ -5,6 +5,33 @@
  * Copyright (C) 2018-2021  Hans Verkuil <hverkuil@kernel.org>
  */
 
+/*
+ * V4L2 控制框架 —— Media Request API 集成层。
+ *
+ * 本文件实现了 V4L2 控制框架与 Media Controller Request API 的深度
+ * 集成，支持基于 request 的 per-frame（每帧）原子控制更新。这是现代
+ * 摄像头系统中实现精确控制的关键机制，允许应用程序将多个控制项（如
+ * 曝光时间、增益、白平衡等）的更新与特定的 buffer 绑定，确保它们在
+ * 同一帧中原子地生效。
+ *
+ * 核心功能包括：
+ *   - v4l2_ctrl_handler_init_request() / v4l2_ctrl_handler_free_request()：
+ *     初始化/释放 control handler 中的 request 相关字段，包括请求对象
+ *     列表和 media request object 的嵌入。
+ *   - v4l2_ctrl_request_complete()：当 request 完成时，将控制项的
+ *     最终生效值回写到 request 对象中，使得应用程序可以读取每个 request
+ *     实际使用的控制参数。
+ *   - v4l2_ctrl_request_setup()：在 request 开始执行时，将其中保存的
+ *     控制值应用到硬件，实现控制参数的原子切换。
+ *   - v4l2_ctrl_request_bind()：将 control handler 绑定到指定的
+ *     media request 上，建立控制更新请求的生命周期管理。
+ *
+ * 该集成层的设计遵从 V4L2 的"controls in requests"规范，支持控制值
+ * 的 try（试设）和 commit（提交）两阶段模型。通过 media_request_object
+ * 机制，控制更新请求与 buffer 的生命周期自动同步，确保帧序列的控制
+ * 一致性和可追踪性。
+ */
+
 #define pr_fmt(fmt) "v4l2-ctrls: " fmt
 
 #include <linux/export.h>

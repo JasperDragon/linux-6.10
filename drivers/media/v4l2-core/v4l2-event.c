@@ -9,6 +9,37 @@
  * Contact: Sakari Ailus <sakari.ailus@iki.fi>
  */
 
+/*
+ * ============================================================================
+ * v4l2-event.c — V4L2 事件机制实现
+ * ============================================================================
+ *
+ * 本文件实现 V4L2 的异步事件通知机制，允许内核驱动向用户空间发送事件。
+ *
+ * 【环形缓冲区存储】
+ *   每个订阅（v4l2_subscribed_event）维护一个环形缓冲区（elems 个 kevent）。
+ *   sev_pos() 通过 (first + idx) % elems 计算循环索引。
+ *   环形缓冲区的优点：即使用户空间未及时读取，新事件也会覆盖最旧的未读事件。
+ *
+ * 【事件生命周期】
+ *   - 用户调用 VIDIOC_SUBSCRIBE_EVENT → v4l2_event_subscribe()
+ *     创建 v4l2_subscribed_event，加入 fh->subscribed 链表
+ *   - 驱动调用 v4l2_event_queue(sd, type) → __v4l2_event_queue_fh()
+ *     创建 v4l2_kevent，加入 fh->available 链表，唤醒 poll 等待者
+ *   - merge/replace 回调：在 enqueue 前，如有已存在的事件，
+ *     调用 replace（替换）或 merge（合并）而非简单追加
+ *   - 用户调用 VIDIOC_DQEVENT → v4l2_event_dequeue()
+ *     从 fh->available 链表取出事件，复制到用户空间
+ *   - 用户调用 VIDIOC_UNSUBSCRIBE_EVENT → v4l2_event_unsubscribe()
+ *     从 fh->subscribed 移除订阅，释放所有待处理事件
+ *
+ * 【关键函数】
+ *   v4l2_event_queue()     — 驱动发送事件入口
+ *   v4l2_event_subscribe() — VIDIOC_SUBSCRIBE_EVENT 处理
+ *   v4l2_event_dequeue()   — VIDIOC_DQEVENT 处理
+ *   v4l2_event_pending()   — poll/select 检查是否有待处理事件
+ */
+
 #include <media/v4l2-dev.h>
 #include <media/v4l2-fh.h>
 #include <media/v4l2-event.h>

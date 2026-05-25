@@ -9,6 +9,32 @@
  * Copyright (c) 2016 Intel Corporation.
  */
 
+/*
+ * V4L2-MC 桥接层 —— 将 V4L2 视频设备与 Media Controller 框架连接起来。
+ *
+ * 本文件实现了 V4L2 子系统与 Media Controller 框架之间的关键桥接逻辑。
+ * Media Controller 提供了以实体（entity）和链路（link）为核心的拓扑管理
+ * 能力，而 V4L2 则专注于视频数据的采集、处理和输出。该桥接层负责为 V4L2
+ * 设备自动创建对应的 media entity 和 interface link，从而在 MC 框架下
+ * 实现 pipeline 的精细控制。
+ *
+ * 核心功能包括：
+ *   - v4l2_mc_create_media_graph()：遍历 V4L2 设备的所有 subdev 和
+ *     video 节点，在 media graph 中自动创建 entity 间的连接关系，
+ *     包括 tuner、decoder、VBI 和 video 节点的拓扑链接。
+ *   - v4l_enable_media_source() / v4l_disable_media_source()：在
+ *     V4L2 打开或关闭视频设备时，动态启用/禁用对应的 media source
+ *     link，确保 pipeline 的电源和时钟域正确管理。
+ *   - v4l2_video_std_link_common()：为 video 节点和 subdev 之间建立
+ *     基于视频标准的链路连接。
+ *   - v4l2_create_fwnode_links()：解析 firmware 节点（DT/ACPI）
+ *     中的 endpoint 描述，自动在对应的 media entity 之间创建数据链路，
+ *     实现了从 fwnode graph 到 media graph 的自动映射。
+ *
+ * 通过该桥接层，userspace 可以通过 Media Controller API 查询和控制
+ * 视频 pipeline 的完整拓扑，确保多路视频流场景下的资源正确隔离。
+ */
+
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/usb.h>

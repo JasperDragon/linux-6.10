@@ -13,6 +13,37 @@
 #ifndef V4L2_FH_H
 #define V4L2_FH_H
 
+/*
+ * 中文概述：
+ *
+ * v4l2_fh（V4L2 File Handle）是 V4L2 框架中每个打开的文件描述符
+ * 对应的私有数据结构，存储 per-filehandle 的状态信息。
+ *
+ * 关联链：
+ *  struct file (private_data)
+ *      -> struct v4l2_fh (vdev, ctrl_handler, prio, events)
+ *          -> struct video_device (v4l2_dev, 设备节点)
+ *
+ * 主要功能：
+ *  - 优先级管理：prio 字段记录当前文件句柄的访问优先级
+ *    (V4L2_PRIORITY_*)，用于控制多个应用程序同时访问设备时的
+ *    资源竞争。
+ *  - 事件订阅：通过 subscribed 链表跟踪已订阅的事件类型，
+ *    available 链表存储待读取的事件，navailable 计数可用事件数。
+ *  - 控制句柄：ctrl_handler 指针关联到 v4l2_ctrl_handler，实现
+ *    每个文件句柄独立的控制值设置。
+ *  - M2M 上下文：m2m_ctx 用于 memory-to-memory 设备，保存编解码
+ *    会话状态。
+ *
+ * 生命周期：
+ *  - v4l2_fh_init() 初始化 fh 并与 video_device 关联
+ *  - v4l2_fh_add() 将 fh 添加到 video_device 的文件句柄列表，
+ *    并将 fh 指针存入 filp->private_data
+ *  - v4l2_fh_del() 从列表中移除 fh
+ *  - v4l2_fh_exit() 释放事件和控制资源
+ *  - v4l2_fh_open() / v4l2_fh_release() 是上述步骤的快捷封装
+ */
+
 #include <linux/fs.h>
 #include <linux/kconfig.h>
 #include <linux/list.h>

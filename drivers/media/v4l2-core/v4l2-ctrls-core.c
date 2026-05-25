@@ -5,6 +5,58 @@
  * Copyright (C) 2010-2021  Hans Verkuil <hverkuil@kernel.org>
  */
 
+/*
+ * 概述：本文件实现 V4L2（Video for Linux 2）控制框架的核心逻辑。
+ *
+ * V4L2 控制框架是 Linux 多媒体子系统中用于统一管理设备参数的抽象层。
+ * 它将各种设备可调参数（如亮度和对比度等图像调节参数、编码器码率等
+ * 编码参数、电源频率等采集参数）抽象为"控制"（control），为应用程序
+ * 和驱动程序之间提供了一套标准化的参数访问接口。
+ *
+ * 核心数据结构：
+ *   - v4l2_ctrl：单个控制的抽象，包含控制的 ID、名称、类型、取值范围、
+ *     步长、默认值、当前值 (p_cur)、新值 (p_new) 以及 flags 等属性。
+ *     控制可以是简单的标量类型（INTEGER, BOOLEAN, MENU 等），也可以是
+ *     复杂的复合类型（如 H.264 SPS/PPS、HEVC、VP8/VP9、AV1 帧参数等）。
+ *   - v4l2_ctrl_handler：控制的容器。每个 video_device 或 subdev 拥有
+ *     一个 handler，负责管理其下所有控制的创建、查找、验证和生命周期。
+ *     Handler 内部使用哈希桶加速控制查找，同时维护一个有序链表用于遍历。
+ *   - v4l2_ctrl_ref：控制引用，将控制与 handler 关联。同一个控制可被
+ *     多个 handler 引用（如 subdev 的控制被 video_device 继承），实现
+ *     控制在不同设备节点间的共享。
+ *
+ * 控制继承链：
+ *   subdev → video_device → v4l2_device
+ *   Subdev（如传感器）创建基础控制，video_device 通过 add_handler 继承
+ *   这些控制，形成层次化的控制结构。
+ *
+ * 控制集群（Cluster）：
+ *   将多个相关的控制绑定为一个原子操作单元。集群中的第一个控制为 master，
+ *   其余为 slave。当集群中的任一控制被设置时，所有 slave 控制会一起被
+ *   验证和提交，确保控制间的依赖关系正确。典型的例子是自动曝光模式
+ *   (auto cluster)：当自动曝光开启时，手动曝光相关的控制自动失效。
+ *
+ * Request API 集成：
+ *   控制框架与 media_request 机制集成，支持 per-frame 的控制设置。
+ *   应用程序可以将一组控制值封装在一个 request 中提交，驱动仅在
+ *   处理对应帧时应用这些值。这实现了 controls 和 buffers 的同步。
+ *   Request 相关的功能包括 req_alloc_array/new_to_req/cur_to_req/req_to_new。
+ *
+ * 控制值的存储与生命周期：
+ *   - p_cur：当前生效的值
+ *   - p_new：新设置的值（尚未生效）
+ *   - p_req：request 中的值（仅用于 Request API）
+ *   当调用 s_ctrl 成功后，p_new 会同步到 p_cur。
+ *
+ * 验证机制：
+ *   每个控制值在设置前会经过 validate ops 的校验，确保值在合法范围内。
+ *   复合类型（如 H.264 SPS）还包含额外的字段级别语义验证。
+ *
+ * 通知机制：
+ *   控制值的变更通过 v4l2_event 通知订阅者。应用程序可以 subscribe 特定
+ *   控制的变更事件，在值变化时得到异步通知。
+ */
+
 #include <linux/export.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
@@ -39,6 +91,11 @@ static void fill_event(struct v4l2_event *ev, struct v4l2_ctrl *ctrl,
 	ev->u.ctrl.default_value = ctrl->default_value;
 }
 
+// ===== 通知与订阅 =====
+// 以下函数实现控制的变更通知机制。当控制值或 flags 发生变化时，
+// 通过 v4l2_event 向所有订阅了该控制事件的文件句柄 (fh) 发送通知。
+// send_initial_event 在首次订阅时发送当前值；send_event 在值变更时
+// 发送更新。通知机制允许应用程序异步监听控制变化，无需轮询。
 void send_initial_event(struct v4l2_fh *fh, struct v4l2_ctrl *ctrl)
 {
 	struct v4l2_event ev;
@@ -1546,6 +1603,14 @@ void cur_to_new(struct v4l2_ctrl *ctrl)
 	ptr_to_ptr(ctrl, ctrl->p_cur, ctrl->p_new, ctrl->new_elems);
 }
 
+// ===== Request API =====
+// 以下函数实现控制框架与 media_request 机制的集成。Request API 允许
+// 应用程序将一组控制值提交到一个 request 对象中，与 buffer 一起排队，
+// 实现 per-frame 粒度的控制。req_alloc_array 为 request 中的动态数组
+// 控制分配存储空间；new_to_req 将新值保存到 request；cur_to_req 将
+// 当前值保存到 request；req_to_new 将 request 中的值恢复到新值缓冲区。
+// 这套机制是现代 V4L2 编码/解码驱动（如 H.264、HEVC、VP9、AV1 等）
+// 实现逐帧参数控制的基础。
 static bool req_alloc_array(struct v4l2_ctrl_ref *ref, u32 elems)
 {
 	void *tmp;
@@ -1714,6 +1779,16 @@ static inline int handler_set_err(struct v4l2_ctrl_handler *hdl, int err)
 	return err;
 }
 
+// ===== Handler 管理 =====
+// v4l2_ctrl_handler 是控制的容器，每个视频设备（video_device/subdev）
+// 拥有一个 handler。以下函数实现 handler 的初始化、销毁和设置：
+//   - v4l2_ctrl_handler_init_class: 初始化 handler，分配哈希桶
+//   - v4l2_ctrl_handler_free: 释放所有控制、引用和哈希桶
+//   - handler_new_ref: 创建控制引用并将其插入 handler 的哈希表和有序链表
+//   - v4l2_ctrl_add_handler: 将一个 handler 中的控制添加到另一个 handler
+//     （实现控制继承，如 subdev → video_device）
+//   - __v4l2_ctrl_handler_setup: 调用所有控制（集群）的 s_ctrl 回调，
+//     用于在设备启动或恢复时将控制值同步到硬件
 /* Initialize the handler */
 int v4l2_ctrl_handler_init_class(struct v4l2_ctrl_handler *hdl,
 				 unsigned nr_of_controls_hint,
@@ -1840,6 +1915,13 @@ struct v4l2_ctrl_ref *find_ref_lock(struct v4l2_ctrl_handler *hdl, u32 id)
 	return ref;
 }
 
+// ===== 控制查找 =====
+// 以下函数实现控制的查找。Handler 内部使用哈希桶加速查找，
+// 并维护最近一次查找结果的缓存 (hdl->cached) 以提高重复查找的效率。
+// find_ref 在哈希桶中定位控制引用，返回 v4l2_ctrl_ref；
+// v4l2_ctrl_find 在 find_ref_lock（加锁版本）基础上返回 v4l2_ctrl 指针。
+// 控制 ID 的 V4L2_CID_PRIVATE_BASE 旧式私有控制使用 find_private_ref
+// 进行线性搜索以保持向后兼容性。
 /* Find a control with the given ID. */
 struct v4l2_ctrl *v4l2_ctrl_find(struct v4l2_ctrl_handler *hdl, u32 id)
 {
@@ -2274,6 +2356,16 @@ struct v4l2_ctrl *v4l2_ctrl_new_custom(struct v4l2_ctrl_handler *hdl,
 }
 EXPORT_SYMBOL(v4l2_ctrl_new_custom);
 
+// ===== 控制创建 (Standard Controls) =====
+// 以下函数创建标准（非复合）控制。标准控制包括 INTEGER、BOOLEAN、
+// MENU、INTEGER_MENU、BITMASK、BUTTON 等基础类型，由 v4l2_ctrl_fill
+// 根据控制 ID 自动填充类型、名称、范围等属性。
+//   - v4l2_ctrl_new_std: 创建标准非菜单控制
+//   - v4l2_ctrl_new_std_menu: 创建标准菜单控制（使用内核预定义的菜单项）
+//   - v4l2_ctrl_new_std_menu_items: 创建标准菜单控制（使用驱动自定义菜单）
+//   - v4l2_ctrl_new_int_menu: 创建整数菜单控制
+//   - v4l2_ctrl_new_custom: 创建自定义控制，允许驱动完全控制控制属性
+// 所有创建函数最终都调用 v4l2_ctrl_new 进行实际的分配和初始化。
 /* Helper function for standard non-menu controls */
 struct v4l2_ctrl *v4l2_ctrl_new_std(struct v4l2_ctrl_handler *hdl,
 			const struct v4l2_ctrl_ops *ops,
@@ -2365,6 +2457,19 @@ struct v4l2_ctrl *v4l2_ctrl_new_std_menu_items(struct v4l2_ctrl_handler *hdl,
 }
 EXPORT_SYMBOL(v4l2_ctrl_new_std_menu_items);
 
+// ===== 控制创建 (Compound Controls) =====
+// 以下函数创建复合控制。复合控制是用于编解码器参数的结构体类型控制，
+// 其类型 ID >= V4L2_CTRL_COMPOUND_TYPES。每个复合控制对应一个特定的
+// 编解码标准参数集，包括：
+//   - MPEG2: 序列/图像/量化参数
+//   - H.264: SPS/PPS/缩放矩阵/切片参数/解码参数/预测权重
+//   - HEVC: SPS/PPS/缩放矩阵/切片参数/解码参数/参考图像列表
+//   - VP8/VP9: 帧参数、压缩头信息
+//   - AV1: 序列/帧/片组/胶片颗粒参数
+//   - HDR10: 内容灯光级别/主屏显示参数
+//   - FWHT: 快速小波变换参数
+// 复合控制的 elem_size 由 v4l2_ctrl_new 根据类型自动计算，
+// 其验证由 std_validate_compound 实现字段级的语义检查。
 /* Helper function for standard compound controls */
 struct v4l2_ctrl *v4l2_ctrl_new_std_compound(struct v4l2_ctrl_handler *hdl,
 				const struct v4l2_ctrl_ops *ops, u32 id,
@@ -2470,6 +2575,18 @@ bool v4l2_ctrl_radio_filter(const struct v4l2_ctrl *ctrl)
 }
 EXPORT_SYMBOL(v4l2_ctrl_radio_filter);
 
+// ===== 集群操作 =====
+// 以下函数实现控制集群（Cluster）的管理。集群将多个逻辑上相关的控制
+// 绑定在一起，实现原子更新。集群中的第一个控制是 master，其余为 slave。
+// 当设置集群中的任一控制时，整个集群一起被验证和提交。
+//   - v4l2_ctrl_cluster: 将一组控制指针绑定为集群
+//   - v4l2_ctrl_auto_cluster: 创建自动/手动模式集群，其中 master 控制
+//     选择自动或手动模式，slave 控制在自动模式下自动失效 (INACTIVE)
+//   - update_from_auto_cluster: 从自动集群获取最新的易失值
+//   - cluster_changed: 检测集群中是否有控制值发生变更
+//   - try_or_set_cluster: 尝试验证或提交整个集群的新值
+// 自动集群的典型用例：自动曝光 (auto exposure) 控制作为 master，
+// 手动曝光时间、增益等作为 slave，自动模式下手动控制自动失效。
 /* Cluster controls */
 void v4l2_ctrl_cluster(unsigned ncontrols, struct v4l2_ctrl **controls)
 {
@@ -2575,10 +2692,55 @@ static int cluster_changed(struct v4l2_ctrl *master)
 	return changed;
 }
 
+// ===== 控制值操作 (Get/Set/Try) =====
+// 以下函数实现控制值的核心操作：
+//   - try_or_set_cluster: 尝试验证 (try_ctrl) 或设置 (s_ctrl) 整个集群。
+//     如果是 set 操作且值有变化，调用 s_ctrl 回调将值同步到硬件，
+//     然后通过 new_to_cur 将新值持久化为当前值，并发送变更通知。
+//   - new_to_cur: 将 p_new 复制到 p_cur，更新 flags，发送事件。
+//   - cur_to_new: 将当前值复制到新值缓冲区（用于重置）。
+//   - ptr_to_ptr: 底层内存复制函数。
+//   - v4l2_ctrl_activate: 激活/停用控制（设置 INACTIVE flag）。
+//   - __v4l2_ctrl_grab: 抓取/释放控制（设置 GRABBED flag），
+//     防止应用程序在驱动抓取期间修改控制值。
+//   - __v4l2_ctrl_handler_setup: 遍历 handler 中所有控制集群，
+//     对每个集群调用 s_ctrl，用于初始化硬件或恢复状态。
+// 所有 set 操作必须在持有 handler->lock 的情况下调用。
 /*
  * Core function that calls try/s_ctrl and ensures that the new value is
  * copied to the current value on a set.
  * Must be called with ctrl->handler->lock held.
+ */
+/*
+ * try_or_set_cluster() — 控制集群的核心操作函数
+ * @fh:     文件句柄 (可 NULL)
+ * @master: 集群的主控制 (cluster[0])
+ * @set:    true=设置 (s_ctrl), false=仅验证 (try_ctrl)
+ * @ch_flags: 变更标志
+ *
+ * 这是 V4L2 控制框架最核心的函数，实现集群的原子验证和设置。
+ *
+ * 执行流程（三阶段）：
+ *
+ * 阶段 1 — 构建一致性视图：
+ *   遍历集群中所有控制，对未标记 is_new 的控制调用 cur_to_new()，
+ *   将当前值复制到 p_new 中。这确保 try_ctrl/s_ctrl 看到的是集群
+ *   的完整一致视图，而不是用户只修改了部分成员的＂碎片＂视图。
+ *
+ * 阶段 2 — 验证 (try_ctrl)：
+ *   调用驱动的 try_ctrl 回调验证整个集群的值。驱动在此回调中：
+ *   - 检查每个控制的值是否在有效范围内
+ *   - 调整相关控制（如某增益改变时自动调整另一增益）
+ *   - 返回错误码阻止非法值
+ *   注：try_ctrl 必须是无副作用的，不应修改硬件寄存器。
+ *
+ * 阶段 3 — 应用 (s_ctrl)，仅当 set=true 且值有变化：
+ *   - 调用 s_ctrl 将集群值写入硬件
+ *   - 对集群中每个控制调用 new_to_cur() 将 p_new 持久化到 p_cur
+ *   - 发送 V4L2_EVENT_CTRL 事件通知用户空间值已变化
+ *   - 调用 handler->notify 通知 bridge 驱动
+ *
+ * 锁要求：调用者必须持有 ctrl->handler->lock
  */
 int try_or_set_cluster(struct v4l2_fh *fh, struct v4l2_ctrl *master,
 		       bool set, u32 ch_flags)
@@ -2588,10 +2750,9 @@ int try_or_set_cluster(struct v4l2_fh *fh, struct v4l2_ctrl *master,
 	int i;
 
 	/*
-	 * Go through the cluster and either validate the new value or
-	 * (if no new value was set), copy the current value to the new
-	 * value, ensuring a consistent view for the control ops when
-	 * called.
+	 * 阶段 1：构建集群的一致性视图
+	 * 遍历集群，对未标记 is_new 的控制将当前值复制到新值槽，
+	 * 确保 try_ctrl/s_ctrl 看到完整的集群视图。
 	 */
 	for (i = 0; i < master->ncontrols; i++) {
 		struct v4l2_ctrl *ctrl = master->cluster[i];
@@ -2604,23 +2765,25 @@ int try_or_set_cluster(struct v4l2_fh *fh, struct v4l2_ctrl *master,
 			continue;
 		}
 		/*
-		 * Check again: it may have changed since the
-		 * previous check in try_or_set_ext_ctrls().
+		 * 二次检查：可能在 try_or_set_ext_ctrls() 的
+		 * 首次检查之后被 grab 了。
 		 */
 		if (set && (ctrl->flags & V4L2_CTRL_FLAG_GRABBED))
 			return -EBUSY;
 	}
 
+	/* 阶段 2：验证（try_ctrl 无副作用，不写硬件）*/
 	ret = call_op(master, try_ctrl);
 
-	/* Don't set if there is no change */
+	/* 验证失败、非 set 操作、或无变化 → 到此为止 */
 	if (ret || !set || !cluster_changed(master))
 		return ret;
+	/* 阶段 3：应用（s_ctrl 写入硬件）*/
 	ret = call_op(master, s_ctrl);
 	if (ret)
 		return ret;
 
-	/* If OK, then make the new values permanent. */
+	/* 持久化：将 p_new 复制到 p_cur，标记为当前值 */
 	update_flag = is_cur_manual(master) != is_new_manual(master);
 
 	for (i = 0; i < master->ncontrols; i++) {
@@ -2682,6 +2845,23 @@ void __v4l2_ctrl_grab(struct v4l2_ctrl *ctrl, bool grabbed)
 }
 EXPORT_SYMBOL(__v4l2_ctrl_grab);
 
+/*
+ * __v4l2_ctrl_handler_setup() — 初始化/恢复 handler 中所有控制的硬件值
+ * @hdl: 控制处理器
+ *
+ * 遍历 handler 中所有控制集群，对每个集群调用 try_ctrl + s_ctrl，
+ * 将当前值（默认值或之前保存的值）写入硬件。这是驱动初始化和状态恢复
+ * 的关键函数。
+ *
+ * 典型调用路径：
+ *   - 驱动 probe 完成 → v4l2_ctrl_handler_setup() → 初始化硬件寄存器
+ *   - 驱动 resume → v4l2_ctrl_handler_setup() → 恢复挂起前的控制值
+ *
+ * 注意：
+ *   - 跳过 BUTTON 类型控制和 READ_ONLY 控制（它们不应被程序化设置）
+ *   - 使用 done 标记避免同一集群被重复处理（每个集群只调用一次）
+ *   - 调用者必须持有 hdl->lock
+ */
 /* Call s_ctrl for all controls owned by the handler */
 int __v4l2_ctrl_handler_setup(struct v4l2_ctrl_handler *hdl)
 {
@@ -2693,15 +2873,16 @@ int __v4l2_ctrl_handler_setup(struct v4l2_ctrl_handler *hdl)
 
 	lockdep_assert_held(hdl->lock);
 
+	/* 第一趟：将所有控制的 done 标记清零 */
 	list_for_each_entry(ctrl, &hdl->ctrls, node)
 		ctrl->done = false;
 
+	/* 第二趟：逐集群调用 try_ctrl + s_ctrl */
 	list_for_each_entry(ctrl, &hdl->ctrls, node) {
 		struct v4l2_ctrl *master = ctrl->cluster[0];
 		int i;
 
-		/* Skip if this control was already handled by a cluster. */
-		/* Skip button controls and read-only controls. */
+		/* 跳过已处理集群的成员 / 按钮控制 / 只读控制 */
 		if (ctrl->done || ctrl->type == V4L2_CTRL_TYPE_BUTTON ||
 		    (ctrl->flags & V4L2_CTRL_FLAG_READ_ONLY))
 			continue;

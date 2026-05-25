@@ -14,6 +14,34 @@
 #ifndef V4L2_COMMON_H_
 #define V4L2_COMMON_H_
 
+/*
+ * 中文概述：
+ *
+ * V4L2 通用工具函数集合，为 V4L2 驱动开发提供各种辅助功能：
+ *
+ * 主要内容：
+ *  - 打印宏：v4l_printk/v4l_dbg 等系列宏，为 I2C 和平台设备提供
+ *    统一的调试信息输出格式。
+ *  - I2C 子设备辅助：v4l2_i2c_new_subdev() 等函数用于加载 I2C 模块
+ *    并初始化 v4l2_subdev 结构体。
+ *  - SPI 子设备辅助：v4l2_spi_new_subdev() 系列函数提供 SPI 总线
+ *    上的子设备创建与初始化。
+ *  - 图像尺寸约束：v4l_bound_align_image() 根据对齐要求调整图像
+ *    宽度和高度。
+ *  - 像素格式信息：v4l2_format_info 结构体和相关函数提供 FourCC
+ *    格式的描述信息（像素编码、存储器平面数、色度采样因子等）。
+ *  - 分频器计算：v4l2_simplify_fraction() 简化分数，
+ *    v4l2_fraction_to_interval() 将分数转换为区间值。
+ *  - 时钟辅助：devm_v4l2_sensor_clk_get() 为摄像头传感器获取时钟
+ *    引用，支持 ACPI 平台的 clock-frequency 属性。
+ *  - 链路频率：v4l2_get_link_freq() 从 transmitter 获取链路速率，
+ *    v4l2_link_freq_to_bitmap() 匹配固件与驱动的频率列表。
+ *  - 帧参数辅助：v4l2_g_parm_cap()/v4l2_s_parm_cap() 通过子设备
+ *    的帧间隔操作来获取/设置捕获参数。
+ *  - 缓冲区时间戳：v4l2_buffer_get_timestamp()/set_timestamp()
+ *    在 buffer 时间戳和纳秒值之间转换。
+ */
+
 #include <linux/time.h>
 #include <media/v4l2-dev.h>
 

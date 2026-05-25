@@ -8,6 +8,25 @@
  *	     Sakari Ailus <sakari.ailus@iki.fi>
  */
 
+/*
+ * ==========================================================================
+ * mc-device.c -- Media Controller 设备框架概述
+ * ==========================================================================
+ *
+ * media_device 是媒体拓扑图的根容器。管理所有 entities、pads、links。
+ * 提供 /dev/mediaX 设备节点，通过 ioctl 向用户空间暴露拓扑信息。
+ *
+ * 核心职责:
+ *   - 设备分配与初始化 (media_device_alloc / media_device_init)
+ *   - 设备注册与注销 (media_device_register / media_device_unregister)
+ *   - 拓扑枚举 (MEDIA_IOC_ENUM_ENTITIES, MEDIA_IOC_ENUM_LINKS, MEDIA_IOC_G_TOPOLOGY)
+ *   - 链接控制 (MEDIA_IOC_SETUP_LINK)
+ *   - 请求分配 (MEDIA_IOC_REQUEST_ALLOC)
+ *
+ * 完整生命周期: media_device_init -> media_device_register
+ *   -> [用户空间通过 ioctl 交互] -> media_device_unregister -> media_device_cleanup
+ */
+
 #include <linux/compat.h>
 #include <linux/export.h>
 #include <linux/idr.h>
@@ -562,6 +581,8 @@ static ssize_t model_show(struct device *cd,
 }
 
 static DEVICE_ATTR_RO(model);
+
+// ===== 设备生命周期 =====
 
 /* -----------------------------------------------------------------------------
  * Registration/unregistration

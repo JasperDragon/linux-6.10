@@ -25,6 +25,26 @@ struct v4l2_subdev;
 struct v4l2_subscribed_event;
 struct video_device;
 
+//
+// V4L2 控制框架提供统一的设备参数管理机制，是 V4L2 驱动中控制参数的核心基础设施。
+// 标准控制类型包括：INTEGER（整数）、BOOLEAN（布尔）、MENU（菜单）、BUTTON（按钮）、
+// INTEGER64（64 位整数）、STRING（字符串）、BITMASK（位掩码）、INTEGER_MENU（整数菜单）。
+// 复合控制（Compound Controls）用于编解码器参数，支持 H.264、HEVC、VP8/VP9、AV1、
+// MPEG2、FWHT 等编码标准，通过 union v4l2_ctrl_ptr 提供类型安全的指针访问方式。
+// 控制集群（Cluster）将多个相关控制组织在一起，实现原子化的更新操作，确保一致性。
+// 控制处理器（Handler）管理控制的生命周期和访问同步，每个 video_device 或
+// v4l2_subdev 拥有自己的 ctrl_handler，处理器之间支持继承关系。
+// Request API 集成支持 per-frame 控制，通过 media_request 将控制值与视频帧绑定。
+// 控制继承链：subdev handler → video_device handler → v4l2_device handler。
+//
+
+// ========== 控制值指针（Control Value Pointer）==========
+// union v4l2_ctrl_ptr 定义了一个类型安全的联合体，用于以指针方式访问各类控制的
+// 当前值和目标值。它覆盖标准标量类型（s32、s64、u8、u16、u32、char）和所有复合
+// 控制类型（H.264/HEVC/VP8/VP9/AV1/MPEG2/FWHT 等编解码器参数结构体），以及通用
+// void 指针 p 和 const void 指针 p_const。驱动应通过对应的类型安全成员访问控制值，
+// 避免直接使用 void 指针。
+
 /**
  * union v4l2_ctrl_ptr - A pointer to a control value.
  * @p_s32:			Pointer to a 32-bit signed value.
@@ -106,6 +126,16 @@ static inline union v4l2_ctrl_ptr v4l2_ctrl_ptr_create(void *ptr)
 
 	return p;
 }
+
+// ========== 驱动回调（Driver Callbacks）==========
+// 驱动通过实现 v4l2_ctrl_ops 和 v4l2_ctrl_type_ops 来回调控制框架。
+// v4l2_ctrl_ops 包含三个核心回调：
+//  - g_volatile_ctrl：读取易变控制（如信号强度等持续变化的只读控制）
+//  - try_ctrl：校验控制值的合法性（当 min/max/step 检查不足时使用）
+//  - s_ctrl：提交新控制值到硬件（必选回调，调用时持有 handler 锁）
+// v4l2_ctrl_type_ops 提供类型相关的操作：比较（equal）、初始化（init）、
+// 取最值（minimum/maximum）、日志（log）、校验（validate），
+// 复合控制类型通常需要自定义这些操作。
 
 /**
  * struct v4l2_ctrl_ops - The control operations that the driver has to provide.
@@ -268,60 +298,60 @@ typedef void (*v4l2_ctrl_notify_fnc)(struct v4l2_ctrl *ctrl, void *priv);
  */
 struct v4l2_ctrl {
 	/* Administrative fields */
-	struct list_head node;
-	struct list_head ev_subs;
-	struct v4l2_ctrl_handler *handler;
-	struct v4l2_ctrl **cluster;
-	unsigned int ncontrols;
+	struct list_head node;           // 在 handler->ctrl_list 中的链表节点
+	struct list_head ev_subs;        // 事件订阅链表 (每个订阅者一个 v4l2_subscribed_event)
+	struct v4l2_ctrl_handler *handler; // 拥有此控制的处理器
+	struct v4l2_ctrl **cluster;      // 集群成员指针数组 (含自身，实现原子更新)
+	unsigned int ncontrols;          // 集群内的控制数量
 
-	unsigned int done:1;
+	unsigned int done:1;             // 集群已完成验证的标记
 
-	unsigned int is_new:1;
-	unsigned int has_changed:1;
-	unsigned int is_private:1;
-	unsigned int is_auto:1;
-	unsigned int is_int:1;
-	unsigned int is_string:1;
-	unsigned int is_ptr:1;
-	unsigned int is_array:1;
-	unsigned int is_dyn_array:1;
-	unsigned int has_volatiles:1;
-	unsigned int call_notify:1;
-	unsigned int manual_mode_value:8;
+	unsigned int is_new:1;           // 有新值待写入硬件 (p_new 与 p_cur 不同)
+	unsigned int has_changed:1;      // 值已更改，需要通知用户空间
+	unsigned int is_private:1;       // 私有控制：不继承到父 handler
+	unsigned int is_auto:1;          // 自动控制：控制集群的手动/自动模式切换
+	unsigned int is_int:1;           // 简单整数值控制 (使用 ctrl->val)
+	unsigned int is_string:1;        // 字符串类型控制 (V4L2_CTRL_TYPE_STRING)
+	unsigned int is_ptr:1;           // 指针类型：复合或字符串，通过 p 指针访问数据
+	unsigned int is_array:1;         // 多维数组控制
+	unsigned int is_dyn_array:1;     // 动态数组控制 (元素数量可变)
+	unsigned int has_volatiles:1;    // 集群含易变控制 (每次读取需查询硬件)
+	unsigned int call_notify:1;      // 值变化时调用 handler->notify 回调
+	unsigned int manual_mode_value:8;// 手动模式对应的 auto 控制值
 
-	const struct v4l2_ctrl_ops *ops;
-	const struct v4l2_ctrl_type_ops *type_ops;
-	u32 id;
-	const char *name;
-	enum v4l2_ctrl_type type;
-	s64 minimum, maximum, default_value;
-	u32 elems;
-	u32 elem_size;
-	u32 new_elems;
-	u32 dims[V4L2_CTRL_MAX_DIMS];
-	u32 nr_of_dims;
+	const struct v4l2_ctrl_ops *ops;        // 驱动回调：g_volatile_ctrl, try_ctrl, s_ctrl
+	const struct v4l2_ctrl_type_ops *type_ops; // 类型操作：equal, init, log, validate
+	u32 id;                          // 控制 ID (V4L2_CID_*)
+	const char *name;                // 控制名称 (如 "Brightness")
+	enum v4l2_ctrl_type type;        // 控制类型：INTEGER, BOOLEAN, MENU, H264_SPS ...
+	s64 minimum, maximum, default_value; // 范围与默认值
+	u32 elems;                       // 数组元素数量 (或 1 表示标量)
+	u32 elem_size;                   // 每个元素的大小 (字节)
+	u32 new_elems;                   // p_new 中的元素数 (动态数组时 ≤ p_array_alloc_elems)
+	u32 dims[V4L2_CTRL_MAX_DIMS];    // 多维数组各维度大小
+	u32 nr_of_dims;                  // 维度数量
 	union {
-		u64 step;
-		u64 menu_skip_mask;
+		u64 step;                  // 步进值 (非菜单控制)
+		u64 menu_skip_mask;        // 菜单项跳过掩码 (bit=1 的菜单项被跳过)
 	};
 	union {
-		const char * const *qmenu;
-		const s64 *qmenu_int;
+		const char * const *qmenu;     // 菜单项字符串数组 (V4L2_CTRL_TYPE_MENU)
+		const s64 *qmenu_int;          // 整数菜单值数组 (V4L2_CTRL_TYPE_INTEGER_MENU)
 	};
-	unsigned long flags;
-	void *priv;
-	void *p_array;
-	u32 p_array_alloc_elems;
-	s32 val;
+	unsigned long flags;             // 控制标志：READ_ONLY, WRITE_ONLY, VOLATILE, GRABBED ...
+	void *priv;                      // 驱动私有数据指针 (框架不触碰)
+	void *p_array;                   // 数组数据存储 (cur + new 两副本)
+	u32 p_array_alloc_elems;         // p_array 分配的元素总数
+	s32 val;                         // 当前简单整数值 (is_int=true 时使用)
 	struct {
-		s32 val;
+		s32 val;                    // cur.val: 用于 kAPI 内部访问的当前值
 	} cur;
 
-	union v4l2_ctrl_ptr p_def;
-	union v4l2_ctrl_ptr p_min;
-	union v4l2_ctrl_ptr p_max;
-	union v4l2_ctrl_ptr p_new;
-	union v4l2_ctrl_ptr p_cur;
+	union v4l2_ctrl_ptr p_def;       // 默认值
+	union v4l2_ctrl_ptr p_min;       // 最小值
+	union v4l2_ctrl_ptr p_max;       // 最大值
+	union v4l2_ctrl_ptr p_new;       // 新值：用户空间设置后存于此，待驱动 apply
+	union v4l2_ctrl_ptr p_cur;       // 当前值：硬件实际应用的值
 };
 
 /**
@@ -376,6 +406,16 @@ struct v4l2_ctrl_ref {
 	union v4l2_ctrl_ptr p_req;
 };
 
+// ========== 控制处理器（Control Handler）==========
+// v4l2_ctrl_handler 是控制框架的核心管理结构，负责：
+// - 控制对象的存储、查找和生命周期管理
+// - 通过互斥锁（lock）保证并发安全访问
+// - 支持控制继承：一个 handler 可以从另一个 handler 继承控制
+// - 提供哈希桶（buckets）加速控制查找
+// - 集成 Request API：通过 media_request_object 支持 per-frame 控制值
+// - 提供通知机制（notify callback）：控制值变化时通知驱动
+// 每个 video_device 或 v4l2_subdev 应拥有自己的 ctrl_handler。
+
 /**
  * struct v4l2_ctrl_handler - The control handler keeps track of all the
  *	controls: both the controls owned by the handler and those inherited
@@ -410,20 +450,20 @@ struct v4l2_ctrl_ref {
  *		&struct media_request. This request object has a refcount.
  */
 struct v4l2_ctrl_handler {
-	struct mutex _lock;
-	struct mutex *lock;
-	struct list_head ctrls;
-	struct list_head ctrl_refs;
-	struct v4l2_ctrl_ref *cached;
-	struct v4l2_ctrl_ref **buckets;
-	v4l2_ctrl_notify_fnc notify;
-	void *notify_priv;
-	u16 nr_of_buckets;
-	int error;
-	bool request_is_queued;
-	struct list_head requests;
-	struct list_head requests_queued;
-	struct media_request_object req_obj;
+	struct mutex _lock;               // 默认锁实例 (当 lock 指向别处时作为后备)
+	struct mutex *lock;               // 互斥锁指针，保护此 handler 的并发访问
+	struct list_head ctrls;           // 控制链表头 (v4l2_ctrl.node)
+	struct list_head ctrl_refs;       // 控制引用链表 (v4l2_ctrl_ref.node)，用于继承
+	struct v4l2_ctrl_ref *cached;     // 最近查找的 ctrl_ref 缓存 (加速高频查找)
+	struct v4l2_ctrl_ref **buckets;   // 哈希表桶数组，按 ID 快速查找控制
+	v4l2_ctrl_notify_fnc notify;      // 控制值变化通知回调 (用户空间事件 + bridge 通知)
+	void *notify_priv;                // notify 回调的私有数据
+	u16 nr_of_buckets;                // 哈希表桶数量
+	int error;                        // handler 初始化错误码 (0=成功)
+	bool request_is_queued;           // 此 handler 是否已排队到 media_request
+	struct list_head requests;        // 所有关联的 media_request 链表
+	struct list_head requests_queued; // 已排队的 media_request 链表
+	struct media_request_object req_obj; // 嵌入的请求对象：将 handler 绑定到 media_request
 };
 
 /**
@@ -643,6 +683,17 @@ int v4l2_ctrl_handler_setup(struct v4l2_ctrl_handler *hdl);
 void v4l2_ctrl_handler_log_status(struct v4l2_ctrl_handler *hdl,
 				  const char *prefix);
 
+// ========== 控制创建与查找 ==========
+// 控制创建函数族（v4l2_ctrl_new_*）用于分配和初始化不同类型的控制：
+//   - v4l2_ctrl_new_custom: 创建自定义控制（通过 v4l2_ctrl_config）
+//   - v4l2_ctrl_new_std: 创建标准标量控制（s32）
+//   - v4l2_ctrl_new_std_menu: 创建标准菜单控制
+//   - v4l2_ctrl_new_std_menu_items: 创建带自定义菜单项的菜单控制
+//   - v4l2_ctrl_new_std_compound: 创建复合控制
+//   - v4l2_ctrl_new_int_menu: 创建整数菜单控制
+// 控制查找函数 v4l2_ctrl_find() 通过控制 ID 在 handler 中查找控制。
+// 所有创建函数在失败时设置 hdl->error 并返回 NULL，调用者应检查 hdl->error。
+
 /**
  * v4l2_ctrl_new_custom() - Allocate and initialize a new custom V4L2
  *	control.
@@ -827,6 +878,14 @@ int v4l2_ctrl_add_handler(struct v4l2_ctrl_handler *hdl,
  * This function is to be used with v4l2_ctrl_add_handler().
  */
 bool v4l2_ctrl_radio_filter(const struct v4l2_ctrl *ctrl);
+
+// ========== 集群操作（Cluster Operations）==========
+// 控制集群将多个逻辑相关的控制绑定在一起，确保它们被原子化地处理。
+// v4l2_ctrl_cluster() 创建一个集群，集群内所有控制在 s_ctrl 时同时提交。
+// v4l2_ctrl_auto_cluster() 扩展了集群功能，支持"自动/手动"模式切换：
+// 第一个控制（如 auto_gain）控制自动模式，其余控制在手动模式下才生效。
+// 处于自动模式时，手动控制被标记为 INACTIVE 且读取时调用 g_volatile_ctrl 获取
+// 硬件实时值。典型应用包括：自动增益/增益、自动白平衡/白平衡等控制组。
 
 /**
  * v4l2_ctrl_cluster() - Mark all controls in the cluster as belonging

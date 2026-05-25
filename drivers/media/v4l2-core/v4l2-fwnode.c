@@ -14,6 +14,32 @@
  * Copyright (C) 2012 Renesas Electronics Corp.
  * Author: Guennadi Liakhovetski <g.liakhovetski@gmx.de>
  */
+
+/*
+ * V4L2 Firmware 节点解析引擎 —— 从 OF (Device Tree) 和 ACPI 固件描述中
+ * 提取 V4L2 设备配置。
+ *
+ * 本文件是 V4L2 框架中与固件描述交互的核心实现，负责解析设备树（DT）和
+ * ACPI 表中的 fwnode（firmware node）信息，将其转换为 V4L2 子系统可用的
+ * 配置参数。最初源自 v4l2-of.c，后扩展为同时支持 OF 和 ACPI 两种固件接口。
+ *
+ * 核心功能包括：
+ *   - v4l2_fwnode_endpoint_parse() / v4l2_fwnode_endpoint_alloc_parse()：
+ *     解析 fwnode graph 中的 endpoint 节点，提取总线和信号配置（如
+ *     parallel、MIPI CSI-2、BT.656 等接口类型和时序参数）。
+ *   - v4l2_fwnode_device_parse()：解析 device 级别的固件属性，获取
+ *     时钟频率、link频率等设备全局配置。
+ *   - v4l2_fwnode_put_link_properties()：将固件中描述的 link 属性
+ *     （如 data lanes、clock non-continuous 等）转换为标准化的
+ *     数据结构。
+ *   - v4l2_fwnode_reference_parse()：解析 fwnode 引用关系，构建
+ *     subdev 之间的异步连接关系。
+ *
+ * 该模块是硬件描述（固件）与软件抽象（V4L2 框架）之间的关键翻译层，
+ * 使得驱动开发者可以通过标准的固件接口描述摄像头等复杂的多媒体硬件
+ * 拓扑，而无需在驱动代码中硬编码配置参数。
+ */
+
 #include <linux/acpi.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>

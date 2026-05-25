@@ -6,6 +6,45 @@
 
  */
 
+/*
+ * ============================================================================
+ * v4l2_device — V4L2 顶层设备管理实现
+ * ============================================================================
+ *
+ * 本文件实现了 v4l2_device 的完整生命周期管理，是整个 V4L2 框架的入口。
+ *
+ * 【架构位置】
+ *   v4l2_device 位于 V4L2 框架的最顶层，代表一个完整的视频硬件设备
+ *   （如一个 PCI 采集卡、USB 摄像头、或 SoC 视频处理单元）。
+ *
+ * 【核心职责】
+ *   1. 设备注册/注销 — v4l2_device_register/unregister
+ *   2. 引用计数管理 — kref 机制，支持热插拔时的安全释放
+ *   3. 子设备管理   — 通过链表 subdevs 聚合所有 v4l2_subdev
+ *   4. Media Controller 集成 — 将子设备注册到 media_device 图拓扑中
+ *   5. 子设备节点创建 — 为带 V4L2_SUBDEV_FL_HAS_DEVNODE 标志的子设备
+ *      自动创建 /dev/v4l-subdevX 设备节点
+ *
+ * 【子设备注册流程】 __v4l2_device_register_subdev()
+ *   1. 模块引用计数保护（try_module_get）
+ *   2. 控制处理器继承（v4l2_ctrl_add_handler）
+ *   3. 注册到 Media Controller（media_device_register_entity）
+ *   4. 调用子设备的 registered 回调
+ *   5. 将子设备加入 v4l2_device->subdevs 链表
+ *
+ * 【引用计数与生命周期】
+ *   v4l2_device 使用 kref 管理生命周期：
+ *   - v4l2_device_get() 增加引用
+ *   - v4l2_device_put() 减少引用，计数归零时调用 release() 回调
+ *   - 当 USB 设备拔出时，v4l2_device_disconnect() 将 dev 指针置 NULL
+ *     防止访问已释放的父设备
+ *
+ * 【与 Media Controller 的关系】
+ *   v4l2_device->mdev 指向关联的 media_device。
+ *   当注册子设备时，如果 mdev 非空，会自动将子设备的 media_entity
+ *   注册到 media_device 的拓扑图中。
+ */
+
 #include <linux/types.h>
 #include <linux/ioctl.h>
 #include <linux/module.h>
@@ -14,6 +53,22 @@
 #include <media/v4l2-device.h>
 #include <media/v4l2-ctrls.h>
 
+/*
+ * 【设备注册】v4l2_device_register — 初始化并注册 V4L2 顶层设备
+ *
+ * 调用时机：bridge 驱动 probe 时最先调用此函数，创建 V4L2 框架的根实例。
+ *
+ * 初始化内容：
+ * - 子设备链表 (subdevs)：用于管理所有挂载的 v4l2_subdev
+ * - 自旋锁 (lock)：保护 subdevs 链表
+ * - 优先级状态 (prio)：多用户访问控制
+ * - 引用计数 (ref)：kref 计数，支持安全释放
+ * - 设备指针 (dev)：指向父 struct device
+ *   dev->driver_data 被设为指向此 v4l2_dev，形成双向关联
+ * - 名称 (name)：默认使用 "驱动名 设备名" 格式
+ *
+ * dev 可以为 NULL（仅 ISA 设备等罕见场景），此时调用者必须预填 name 字段。
+ */
 int v4l2_device_register(struct device *dev, struct v4l2_device *v4l2_dev)
 {
 	if (v4l2_dev == NULL)
@@ -108,6 +163,24 @@ void v4l2_device_unregister(struct v4l2_device *v4l2_dev)
 }
 EXPORT_SYMBOL_GPL(v4l2_device_unregister);
 
+/*
+ * 【子设备注册】__v4l2_device_register_subdev — 将子设备注册到 V4L2 设备
+ *
+ * 这是子设备生命周期的核心入口。每个 I2C 传感器、编码器、解码器
+ * 都需要通过此函数挂载到 bridge 驱动的 v4l2_device 上。
+ *
+ * 注册步骤：
+ *   1. 模块引用保护 — 防止子设备驱动模块被意外卸载
+ *      - 如果子设备 owner 与 v4l2_device 的 owner 相同，跳过 try_module_get
+ *      - 否则获取模块引用，保证模块在子设备使用期间不被卸载
+ *   2. 控制继承 — v4l2_ctrl_add_handler 将子设备的控制并入父设备
+ *      - 用户可通过父设备的设备节点访问子设备的控制项
+ *   3. Media Controller 注册 — 将子设备的 media_entity 加入 media_device 拓扑图
+ *   4. 回调通知 — 调用子设备的 registered() 内部回调
+ *   5. 链表管理 — 加入 v4l2_device->subdevs 链表（自旋锁保护）
+ *
+ * 错误处理：任一步骤失败都会回滚（unregister entity, module_put）
+ */
 int __v4l2_device_register_subdev(struct v4l2_device *v4l2_dev,
 				  struct v4l2_subdev *sd, struct module *module)
 {
@@ -188,6 +261,21 @@ static void v4l2_device_release_subdev_node(struct video_device *vdev)
 	kfree(vdev);
 }
 
+/*
+ * 【子设备节点创建】__v4l2_device_register_subdev_nodes
+ *
+ * 为所有带有 V4L2_SUBDEV_FL_HAS_DEVNODE 标志的子设备创建 /dev/v4l-subdevX 节点。
+ * 这允许用户空间直接通过 ioctl 与子设备（如 sensor）交互，实现格式协商等功能。
+ *
+ * 每个子设备节点：
+ * - 类型为 VFL_TYPE_SUBDEV
+ * - 使用 v4l2_subdev_fops（子设备专用的文件操作集）
+ * - 通过 video_set_drvdata(vdev, sd) 将子设备指针绑定到 video_device
+ * - read_only 模式下，设置 V4L2_FL_SUBDEV_RO_DEVNODE 标志限制写操作
+ * - 在 Media Controller 拓扑中创建 entity 到 interface 的 IMMUTABLE 链接
+ *
+ * 错误回滚：如果某个节点创建失败，clean_up 路径会注销所有已创建节点
+ */
 int __v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev,
 					bool read_only)
 {

@@ -5,6 +5,38 @@
  * Copyright (C) 2009, Guennadi Liakhovetski <g.liakhovetski@gmx.de>
  */
 
+/*
+ * ============================================================================
+ * Media Bus 配置框架 (Media Bus Configuration)
+ * ============================================================================
+ *
+ * Media Bus 是 V4L2 中描述子设备间硬件总线（如并行接口、CSI-2、BT.656）
+ * 配置参数的框架。
+ *
+ * 关键概念：
+ * - v4l2_mbus_config: 描述总线的电气特性（信号极性、时钟模式、数据宽度等）
+ * - V4L2_MBUS_* 标志位：按功能分组，每组互斥：
+ *   - 主从模式：MASTER（子设备输出同步信号）/ SLAVE（host 提供同步）
+ *   - 信号极性：HSYNC_ACTIVE_HIGH/LOW, VSYNC_ACTIVE_HIGH/LOW
+ *   - 数据有效性：DATA_ENABLE_HIGH/LOW（并行接口）
+ *   - 时钟模式：PCLK_SAMPLE_RISING/FALLING（采样边沿）
+ *   - CSI-2 通道：CSI2_1/2/3/4_LANE, CSI2_CONTINUOUS/NON_CONTINUOUS_CLOCK
+ *   - BT.656：BT656_COMPAT（兼容模式）
+ *
+ * - v4l2_mbus_framefmt: 描述某一 pad 上传输的帧格式
+ *   - width/height: 图像分辨率
+ *   - code: media bus pixel code (MEDIA_BUS_FMT_*)
+ *   - field: 场序 (none, interlaced, etc.)
+ *   - colorspace/xfer_func/ycbcr_enc/quantization: 色彩空间元数据
+ *
+ * - v4l2_get_mbus_config() — 获取对端子设备的 media bus 配置
+ *   用于接收端调整自身配置以匹配发送端
+ *
+ * 使用场景：
+ *   sensor 子设备通过 get_mbus_config 报告其并行接口的极性/时钟配置，
+ *   bridge 驱动的 CSI receiver 据此调整自身设置以匹配 sensor 的输出。
+ */
+
 #ifndef V4L2_MEDIABUS_H
 #define V4L2_MEDIABUS_H
 

@@ -20,6 +20,40 @@
 #include <linux/minmax.h>
 #include <linux/types.h>
 
+//
+// ============================================================
+// Media Controller 图模型概述
+// ============================================================
+// Media Controller 将视频管道建模为有向图,包含三种核心元素:
+//
+//   Entity (实体)   - 对应管道上的一个硬件模块,例如 sensor、CSI receiver、
+//                     ISP、DMA engine、video_device 等。每个 entity 完成
+//                     特定的图像处理或数据搬运功能。
+//
+//   Pad (端口)      - entity 的连接点。分为 SOURCE(输出)和 SINK(输入)
+//                     两种类型。source pad 产生数据,sink pad 接收数据。
+//
+//   Link (连接)     - 连接两个 pad,表示数据流路径。有三种状态:
+//                     ENABLED   - 链路已启用,可传输数据
+//                     DISABLED  - 链路已禁用,数据流中断
+//                     IMMUTABLE - 链路不可修改(通常硬件固定连接)
+//
+// 关键概念:
+//   - media_pipeline  : 从 video_device 出发,沿着所有 enabled links 遍历,
+//                       形成的完整数据流路径。pipeline 代表一次完整的图像
+//                       采集或处理流水线。
+//
+//   - media_graph_walk : 提供深度优先的图遍历能力,用于发现和跟踪整个媒体
+//                        拓扑中所有相连的 entity。
+//
+// 角色与职责:
+//   - bridge driver (桥接驱动) 负责注册所有 entity、创建 pad-to-pad links、
+//     管理 pipeline 的生命周期。
+//   - subdev drivers (子设备驱动) 通过 entity operations (link_setup、
+//     link_validate 等)参与链路配置和验证。
+// ============================================================
+//
+
 /* Enums used internally at the media controller to represent graphs */
 
 /**
@@ -96,6 +130,34 @@ struct media_graph {
 	struct media_entity_enum ent_enum;
 	int top;
 };
+
+//
+// ----------------------------------------------------------
+// Pipeline 生命周期 (start/stop)
+// ----------------------------------------------------------
+// media_pipeline_start() 是 pipeline 的起点。从指定的起始 pad 出发,
+// 沿着所有 enabled links 进行深度优先遍历,将沿途经过的所有 pad 和
+// entity 标记为 "streaming" 状态。调用链路:
+//
+//   media_pipeline_start()
+//     -> __media_pipeline_start()
+//       -> 遍历图,为每个 pad 设置 pipeline 指针
+//       -> 调用每个 entity 的 link_validate() 验证链路
+//
+// media_pipeline_stop() 是 pipeline 的终点。清除所有 pad 的 pipeline
+// 指针,将整个 pipeline 标记为非 streaming 状态。
+//
+// 嵌套调用:
+//   start/stop 可以嵌套调用。每次 start 递增 start_count,
+//   每次 stop 递减 start_count。只有当 start_count 归零时,
+//   才真正执行停止操作。这允许多个使用者共享同一个 pipeline。
+//
+// 关键行为:
+//   - 同一个 pad 不能同时属于多个 pipeline
+//   - 所有从 start pad 可达(通过 enabled links)的 pad 都会被加入 pipeline
+//   - link_validate 检查数据格式是否匹配
+// ----------------------------------------------------------
+//
 
 /**
  * struct media_pipeline - Media pipeline related information
@@ -275,6 +337,35 @@ struct media_pad {
  *    Those these callbacks are called with struct &media_device.graph_mutex
  *    mutex held.
  */
+
+//
+// ----------------------------------------------------------
+// Pad 互依性 (Pad Interdependency)
+// ----------------------------------------------------------
+// 多路复用流 (multiplexed streams) 场景下,entity 的某些 pad 之间
+// 存在互依关系。例如:
+//
+//   - 一个 CSI-2 receiver entity 有 4 条 virtual channel (VC)
+//     对应的 source pad。当 VC0 所属的 pipeline 启动后,VC0 对应的
+//     source pad 被"锁定",不允许重新配置。
+//
+//   - has_pad_interdep() 操作返回两个 pad 是否互依。如果互依,
+//     则当其中一个 pad 成为某个 pipeline 的一部分时,另一个 pad
+//     也会被隐式加入同一个 pipeline,并且其配置被锁定。
+//
+//   - 默认行为(未实现 has_pad_interdep): entity 的所有 pad 都被
+//     视为互依的(pin model)。即只要 entity 的任何一个 pad 属于
+//     某个 pipeline,所有 pad 都被锁定。
+//
+//   - 实现 has_pad_interdep 后可以精细控制:只有实际相关的 pad
+//     才被锁定,不相关的 pad 可以独立配置(pad-level multiplexing)。
+//
+// 典型场景:
+//   - 多个 source pad 共享同一个硬件 FIFO/phy
+//   - 多个 sink pad 复用同一个处理引擎
+// ----------------------------------------------------------
+//
+
 struct media_entity_operations {
 	int (*get_fwnode_pad)(struct media_entity *entity,
 			      struct fwnode_endpoint *endpoint);
@@ -347,28 +438,28 @@ enum media_entity_type {
  *    reference count bugs that would make it negative.
  */
 struct media_entity {
-	struct media_gobj graph_obj;	/* must be first field in struct */
-	const char *name;
-	enum media_entity_type obj_type;
-	u32 function;
-	unsigned long flags;
+	struct media_gobj graph_obj;    // 嵌入图对象 (必须为第一个字段!), id 唯一标识此 entity
+	const char *name;               // 实体名称 (如 "sensor", "csi2", "video0")
+	enum media_entity_type obj_type; // 对象类型: MEDIA_ENTITY_TYPE_*
+	u32 function;                   // 功能分类: MEDIA_ENT_F_* (CAM_SENSOR, VIDEO_MUX, IO_V4L ...)
+	unsigned long flags;            // 实体标志: MEDIA_ENT_FL_DEFAULT (默认 entity)
 
-	u16 num_pads;
-	u16 num_links;
-	u16 num_backlinks;
-	int internal_idx;
+	u16 num_pads;                   // pad 数量 (由 media_entity_pads_init 设置)
+	u16 num_links;                  // 出向链接总数
+	u16 num_backlinks;              // 入向链接总数
+	int internal_idx;               // mdev->entities_internal_idx_map 中的索引
 
-	struct media_pad *pads;
-	struct list_head links;
+	struct media_pad *pads;         // Pad 数组 (SOURCE/SINK 端口)
+	struct list_head links;         // 出向链接链表头 (media_link.graph_obj.list)
 
-	const struct media_entity_operations *ops;
+	const struct media_entity_operations *ops; // entity 操作回调 (link_validate, has_pad_interdep ...)
 
-	int use_count;
+	int use_count;                  // 使用计数：pipeline 电源管理的引用计数
 
 	union {
 		struct {
-			u32 major;
-			u32 minor;
+			u32 major;        // 关联设备的主设备号 (如 VIDEO_MAJOR=81)
+			u32 minor;        // 关联设备的次设备号
 		} dev;
 	} info;
 };

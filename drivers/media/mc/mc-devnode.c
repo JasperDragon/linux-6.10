@@ -18,6 +18,31 @@
  * counting.
  */
 
+/*
+ * Media Controller 设备节点管理 —— /dev/mediaX 字符设备生命周期。
+ *
+ * 本文件实现了 Media Controller 框架的字符设备节点管理功能，负责
+ * /dev/mediaX 设备的注册、打开、释放和注销。采用动态主设备号和
+ * 引用计数机制，确保设备节点在并发访问场景下的安全生命周期管理。
+ *
+ * 核心功能包括：
+ *   - media_devnode_register()：注册 media 设备节点，分配动态主设备
+ *     号（或使用固定值），创建 cdev 并添加到 vfs 层，生成设备文件。
+ *   - media_devnode_unregister()：注销设备节点，标记设备为死亡状态，
+ *     阻止新的打开操作，等待所有已有引用释放后清理资源。
+ *   - media_devnode_open() / media_devnode_close()：管理设备节点的
+ *     打开/关闭计数，协调底层驱动的 refcount 生命周期。
+ *   - media_devnode_get() / media_devnode_put()：对 media_devnode
+ *     结构体进行引用计数管理，确保在设备注销时不会出现 use-after-free。
+ *   - media_devnode_release()：当最后一个引用解除时，执行最终的
+ *     资源释放回调（通过 release 函数指针回调到 media_device 层）。
+ *
+ * 该模块的设计模式是 Linux 字符设备驱动的典型实现：使用 struct cdev
+ * 注册到内核，配合 struct device 进行设备模型集成，通过引用计数
+ * 实现安全的生命周期管理。它屏蔽了字符设备注册的底层细节，为上层
+ * Media Controller 核心提供了简洁的设备节点操作接口。
+ */
+
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/errno.h>

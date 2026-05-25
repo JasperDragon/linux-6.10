@@ -7,6 +7,29 @@
  * Copyright (c) 2016 Intel Corporation.
  */
 
+/*
+ * ============================================================================
+ * V4L2 — Media Controller 集成桥接层
+ * ============================================================================
+ *
+ * 本文件提供 V4L2 子系统与 Media Controller 框架之间的桥接函数。
+ *
+ * 核心功能：
+ * 1. v4l2_mc_create_media_graph() — 为传统 PC 消费类硬件（webcam, TV tuner）
+ *    自动创建 media_device 拓扑图中的 entity 和 link
+ * 2. v4l_enable_media_source/v4l_disable_media_source — 媒体源的独占获取/释放，
+ *    在改变视频源配置时驱动 pipeline 启停
+ * 3. v4l2_create_fwnode_links_to_pad/v4l2_create_fwnode_links —
+ *    从 Device Tree / ACPI firmware node 解析端点连接，自动创建 media_link
+ * 4. v4l2_pipeline_pm_get/put (已废弃) — 基于 pipeline 的电源管理，由
+ *    子设备驱动自行使用 Runtime PM 替代
+ *
+ * 使用场景：
+ * - bridge 驱动在子设备 bound 回调中调用 v4l2_create_fwnode_links()
+ *   自动建立子设备间的 media 连接
+ * - v4l2-core 在改变输入源时调用 v4l_enable_media_source() 确保独占访问
+ */
+
 #ifndef _V4L2_MC_H
 #define _V4L2_MC_H
 

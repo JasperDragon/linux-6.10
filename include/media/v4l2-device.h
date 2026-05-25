@@ -15,6 +15,27 @@
 
 struct v4l2_ctrl_handler;
 
+/*
+ * v4l2_device 是 V4L2(Video for Linux 2)框架中顶层的设备抽象结构体。
+ *
+ * 它代表一个完整的视频硬件设备（例如 PCI 捕获卡、USB 摄像头、TV 调谐器等），
+ * 是驱动模型中所有子设备（v4l2_subdev）的容器和管理者。
+ *
+ * 核心职责：
+ *   - 通过链表 subdevs 聚合管理所有挂载到该设备的 v4l2_subdev 实例，
+ *     包括 sensor、CSI receiver、ISP 等硬件抽象单元。
+ *   - 提供批量操作宏（如 v4l2_device_call_all 等），允许驱动一键向
+ *     所有匹配的子设备群发调用，简化子设备间协作。
+ *   - 通过 mdev 指针关联 media_device，作为整个媒体拓扑图的根节点，
+ *     为媒体控制器（MC）框架提供硬件拓扑描述。
+ *   - dev->driver_data 指向此结构体，使得通过 struct device 即可
+ *     反向查找到顶层设备。
+ *   - 支持引用计数（kref）和释放回调，便于安全地管理设备生命周期。
+ *
+ * 驱动开发者通常将此结构体嵌入自己定义的更大的设备结构体中，
+ * 或者单独分配后通过 v4l2_device_register() 初始化。
+ */
+
 /**
  * struct v4l2_device - main struct to for V4L2 device drivers
  *
@@ -43,17 +64,17 @@ struct v4l2_ctrl_handler;
  *    #) @dev might be %NULL if there is no parent device
  */
 struct v4l2_device {
-	struct device *dev;
-	struct media_device *mdev;
-	struct list_head subdevs;
-	spinlock_t lock;
-	char name[36];
+	struct device *dev;              // 父设备指针，可为 NULL (ISA 设备)。dev->driver_data 指向此结构体
+	struct media_device *mdev;       // 关联的 Media Controller 设备，为 NULL 时不启用 MC
+	struct list_head subdevs;        // 子设备链表头，管理所有注册的 v4l2_subdev
+	spinlock_t lock;                 // 自旋锁：保护 subdevs 链表的并发访问
+	char name[36];                   // 设备名称 (默认: "驱动名 设备名"，如 "ivtv 0000:01:00.0")
 	void (*notify)(struct v4l2_subdev *sd,
-			unsigned int notification, void *arg);
-	struct v4l2_ctrl_handler *ctrl_handler;
-	struct v4l2_prio_state prio;
-	struct kref ref;
-	void (*release)(struct v4l2_device *v4l2_dev);
+			unsigned int notification, void *arg); // 通知回调：子设备发出的通知 (如 IR 事件)
+	struct v4l2_ctrl_handler *ctrl_handler; // 设备级控制处理器：合并所有子设备的控制
+	struct v4l2_prio_state prio;     // 优先级状态：管理多用户对设备的占用 (RECORD > INTERACTIVE > BACKGROUND)
+	struct kref ref;                 // 引用计数：通过 v4l2_device_get/put 管理生命周期
+	void (*release)(struct v4l2_device *v4l2_dev); // 释放回调：ref 归零时调用，用于释放 v4l2_device 内存
 };
 
 /**
@@ -389,6 +410,11 @@ static inline bool v4l2_device_supports_requests(struct v4l2_device *v4l2_dev)
 						f , ##args);		\
 })
 
+/*
+ * v4l2_device_call_all - 对 grpid 匹配的所有子设备调用指定操作，忽略任何错误。
+ * grpid 为 0 时匹配所有子设备。
+ */
+
 /**
  * v4l2_device_call_all - Calls the specified operation for
  *	all subdevs matching the &v4l2_subdev.grp_id, as assigned
@@ -417,6 +443,10 @@ static inline bool v4l2_device_supports_requests(struct v4l2_device *v4l2_dev)
 			(grpid) == 0 || __sd->grp_id == (grpid), o, f ,	\
 			##args);					\
 	} while (0)
+
+/*
+ * v4l2_device_call_until_err - 对 grpid 匹配的所有子设备调用指定操作，遇错立即停止并返回错误码。
+ */
 
 /**
  * v4l2_device_call_until_err - Calls the specified operation for
@@ -450,6 +480,10 @@ static inline bool v4l2_device_supports_requests(struct v4l2_device *v4l2_dev)
 			##args);					\
 })
 
+/*
+ * v4l2_device_mask_call_all - 使用位掩码匹配 grpid，对所有匹配的子设备调用指定操作，忽略错误。
+ */
+
 /**
  * v4l2_device_mask_call_all - Calls the specified operation for
  *	all subdevices where a group ID matches a specified bitmask.
@@ -477,6 +511,10 @@ static inline bool v4l2_device_supports_requests(struct v4l2_device *v4l2_dev)
 			(grpmsk) == 0 || (__sd->grp_id & (grpmsk)), o,	\
 			f , ##args);					\
 	} while (0)
+
+/*
+ * v4l2_device_mask_call_until_err - 位掩码匹配 grpid，对所有匹配子设备调用操作，遇错停止并返回错误码。
+ */
 
 /**
  * v4l2_device_mask_call_until_err - Calls the specified operation for
@@ -510,6 +548,10 @@ static inline bool v4l2_device_supports_requests(struct v4l2_device *v4l2_dev)
 })
 
 
+/*
+ * v4l2_device_has_op - 检查是否存在实现了指定操作且 grpid 匹配的子设备。
+ */
+
 /**
  * v4l2_device_has_op - checks if any subdev with matching grpid has a
  *	given ops.
@@ -537,6 +579,10 @@ static inline bool v4l2_device_supports_requests(struct v4l2_device *v4l2_dev)
 	}								\
 	__result;							\
 })
+
+/*
+ * v4l2_device_mask_has_op - 使用位掩码检查是否存在实现了指定操作的子设备。
+ */
 
 /**
  * v4l2_device_mask_has_op - checks if any subdev with matching group

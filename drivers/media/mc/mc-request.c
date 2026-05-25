@@ -10,6 +10,46 @@
  * Author: Sakari Ailus <sakari.ailus@linux.intel.com>
  */
 
+/*
+ * ============================================================================
+ * Media Request API — 原子操作请求框架
+ * ============================================================================
+ *
+ * Request API 允许用户空间将多个操作（控制设置、缓冲区操作等）原子化地
+ * 提交到硬件，确保它们在同一帧或同一时间点生效。
+ *
+ * 【状态机】
+ *   IDLE → VALIDATING → QUEUED → COMPLETE → CLEANING → UPDATING → IDLE
+ *   - IDLE:       请求空闲，可添加/修改对象
+ *   - VALIDATING: 正在验证请求内容
+ *   - QUEUED:     请求已排队等待驱动处理
+ *   - COMPLETE:   驱动处理完毕
+ *   - CLEANING:   正在清理对象绑定
+ *   - UPDATING:   正在更新对象内容
+ *
+ * 【请求生命周期】
+ *   用户空间：
+ *   1. ioctl(MEDIA_IOC_REQUEST_ALLOC) → 分配 fd，关联 media_request
+ *   2. ioctl(VIDIOC_S_EXT_CTRLS) with request_fd → 将控制绑定到请求
+ *   3. ioctl(VIDIOC_QBUF) with request_fd → 将缓冲区绑定到请求
+ *   4. ioctl(MEDIA_REQUEST_IOC_QUEUE) → 提交请求（IDLE → QUEUED）
+ *   5. 驱动异步处理完成后 → 标记 COMPLETE
+ *   6. 用户 close(request_fd) → CLEANING → 释放
+ *
+ *   驱动端：
+ *   - vb2_request_validate() → 验证缓冲区和控制
+ *   - 请求被 hardware job 消费 → COMPLETE
+ *
+ * 【引用计数】
+ *   - request_fd 持有 refcount (request->kref)
+ *   - 每个绑定的 media_request_object 持有引用
+ *   - 引用归零时 → CLEANING → 解绑所有对象 → 释放 request
+ *
+ * 【应用场景】
+ *   - 无状态视频解码器：per-frame 解码参数 + 输入缓冲区 + 输出缓冲区
+ *   - 相机控制：将曝光、增益、白平衡绑定为一帧的原子操作
+ */
+
 #include <linux/anon_inodes.h>
 #include <linux/file.h>
 #include <linux/refcount.h>

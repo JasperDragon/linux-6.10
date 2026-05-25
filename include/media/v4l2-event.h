@@ -9,6 +9,37 @@
  * Contact: Sakari Ailus <sakari.ailus@iki.fi>
  */
 
+/*
+ * ============================================================================
+ * V4L2 事件机制 (Event Mechanism)
+ * ============================================================================
+ *
+ * V4L2 事件机制允许内核驱动向用户空间发送异步通知。典型使用场景：
+ * - 控制值变化通知（V4L2_EVENT_CTRL）：用户订阅某个控制后，控制值变化时自动通知
+ * - 垂直同步信号（V4L2_EVENT_VSYNC）：每帧同步
+ * - 运动检测（V4L2_EVENT_MOTION_DET）：运动检测报警
+ * - 自定义事件（V4L2_EVENT_PRIVATE_START）：驱动私有事件
+ *
+ * 核心数据结构：
+ * - v4l2_event：传递到用户空间的事件数据
+ * - v4l2_subscribed_event：内核内部的订阅记录，关联到 v4l2_fh
+ * - v4l2_kevent：内核事件实例，在 fh->available 链表中排队等待用户读取
+ * - v4l2_subscribed_event_ops：事件操作回调（add/del/replace/merge）
+ *
+ * 订阅流程：
+ *   用户 ioctl(VIDIOC_SUBSCRIBE_EVENT) → v4l2_event_subscribe()
+ *   → 创建 v4l2_subscribed_event 加入 fh->subscribed 链表
+ *   → 调用 sev->ops->add 通知驱动有新订阅者
+ *
+ * 事件发送流程：
+ *   驱动调用 v4l2_event_queue() → 创建 v4l2_kevent 加入 fh->available 链表
+ *   → 唤醒等待的 poll/select → 用户 ioctl(VIDIOC_DQEVENT) 读取事件
+ *
+ * 合并与替换：
+ *   - replace：新事件完全替换旧事件（如运动检测坐标更新）
+ *   - merge：新事件合并到旧事件中（如控制值变化的去重）
+ */
+
 #ifndef V4L2_EVENT_H
 #define V4L2_EVENT_H
 

@@ -8,6 +8,25 @@
  *	     Sakari Ailus <sakari.ailus@iki.fi>
  */
 
+/*
+ * ==========================================================================
+ * mc-entity.c -- Media Controller 实体框架概述
+ * ==========================================================================
+ *
+ * media_entity 代表拓扑图中的一个功能单元, 例如:
+ *   - sensor (传感器)
+ *   - CSI receiver (CSI 接收器)
+ *   - ISP (图像信号处理器)
+ *   - DMA engine (DMA 引擎)
+ *   - video_device (视频设备节点)
+ *
+ * media_pad 是实体的端口, 包含方向属性 (SOURCE 输出 / SINK 输入)。
+ * media_link 连接两个 media_pad, 构成实体间的数据通道。
+ * media_pipeline 从 video_device 出发, 沿 enabled links 遍历,
+ *   构成完整的数据处理路径, 用于流控制与验证。
+ * media_graph_walk 提供通用的图遍历能力, 基于深度优先搜索 (DFS)。
+ */
+
 #include <linux/bitmap.h>
 #include <linux/list.h>
 #include <linux/property.h>
@@ -191,6 +210,31 @@ void media_gobj_destroy(struct media_gobj *gobj)
  */
 #define MEDIA_ENTITY_MAX_PADS		512
 
+// ===== 实体初始化 (Entity Init) =====
+
+/**
+ * media_entity_pads_init - 初始化实体的 pads (端口数组)
+ *
+ * 该函数为 media_entity 初始化所有 pads, 是实体注册前的必要步骤。
+ *
+ * 核心逻辑:
+ *   1. 检查 num_pads 是否超过 MEDIA_ENTITY_MAX_PADS (512) 上限
+ *   2. 设置 entity->num_pads 和 entity->pads 指针指向驱动提供的 pads 数组
+ *   3. 在 graph_mutex 保护下, 遍历每个 pad:
+ *      a. 设置 pad->entity 指向所属实体
+ *      b. 为每个 pad 分配唯一的 index (0-based)
+ *      c. 验证 pad 方向标志: 必须恰好是 SINK 或 SOURCE, 不能两者皆非或皆是
+ *      d. 如果实体已注册到 media_device (mdev != NULL), 则为每个 pad
+ *         调用 media_gobj_create() 注册为图对象, 分配全局 ID
+ *   4. 若某个 pad 验证失败, 回滚所有已创建的 pad 图对象
+ *
+ * 必须在调用 media_device_register_entity() 之前完成 pad 初始化,
+ * 因为注册实体会使 pads 对外可见。调用者需确保 pads 数组生命周期
+ * 不短于 entity 本身。
+ *
+ * 上下文: 可能持有 graph_mutex (当 mdev != NULL 时)
+ * 返回: 0 成功, 负 errno 失败
+ */
 int media_entity_pads_init(struct media_entity *entity, u16 num_pads,
 			   struct media_pad *pads)
 {
@@ -207,6 +251,8 @@ int media_entity_pads_init(struct media_entity *entity, u16 num_pads,
 
 	if (mdev)
 		mutex_lock(&mdev->graph_mutex);
+
+	// ===== Pad 初始化 (Pad Init) =====
 
 	media_entity_for_each_pad(entity, iter) {
 		iter->entity = entity;
@@ -234,6 +280,9 @@ int media_entity_pads_init(struct media_entity *entity, u16 num_pads,
 	return ret;
 }
 EXPORT_SYMBOL_GPL(media_entity_pads_init);
+
+
+// ===== 图遍历 (Graph Walk) =====
 
 /* -----------------------------------------------------------------------------
  * Graph traversal
@@ -400,6 +449,36 @@ static void media_graph_walk_iter(struct media_graph *graph)
 	lockdep_assert_held(&entity->graph_obj.mdev->graph_mutex);
 }
 
+/**
+ * media_graph_walk_next - 图遍历的下一个实体 (深度优先遍历 DFS)
+ *
+ * 该函数实现了经典的深度优先遍历 (DFS) 算法, 用于在 media 拓扑图中
+ * 按拓扑顺序逐个返回可达的实体。
+ *
+ * 核心算法:
+ *   - 使用显式栈 (stack) 存储遍历状态, 栈中每个元素包含:
+ *     { entity 指针, 当前未访问的 link 链表游标 }
+ *   - 栈深度上限为 MEDIA_ENTITY_ENUM_MAX_DEPTH (16)
+ *   - 使用位图 ent_enum 记录已访问实体, 避免环路重复遍历
+ *
+ * 遍历步骤:
+ *   1. 检查栈顶是否为空 (NULL 哨兵表示遍历结束)
+ *   2. 从栈顶实体的 links 头部开始, 通过 media_graph_walk_iter() 迭代:
+ *      a. 跳过非 data link 类型 (如 interface link)
+ *      b. 跳过未启用 (MEDIA_LNK_FL_ENABLED) 的 link
+ *      c. 通过 media_entity_other() 获取 link 对端实体
+ *      d. 若对端已访问过 (ent_enum 测试), 跳过
+ *      e. 将对端新实体压入栈顶, 下次迭代从其开始 (深度优先)
+ *   3. 当栈顶实体的所有 link 都遍历完 (游标回到链表头), 弹出该实体
+ *   4. 返回被弹出的实体作为本次迭代结果
+ *
+ * 这个函数被 __media_pipeline_start() 在构建管线时使用,
+ * 通过 media_graph_walk_start() + media_graph_walk_next() 的循环
+ * 来收集所有参与的实体。由于它是纯拓扑遍历, 不涉及 pad-level
+ * 的内部依赖检测 (那是 pipeline_walk 的工作)。
+ *
+ * 返回: 下一个待访问实体, 遍历完成时返回 NULL
+ */
 struct media_entity *media_graph_walk_next(struct media_graph *graph)
 {
 	struct media_entity *entity;
@@ -422,6 +501,9 @@ struct media_entity *media_graph_walk_next(struct media_graph *graph)
 	return entity;
 }
 EXPORT_SYMBOL_GPL(media_graph_walk_next);
+
+
+// ===== 管线启动/停止 (Pipeline Start/Stop) =====
 
 /* -----------------------------------------------------------------------------
  * Pipeline management
@@ -768,6 +850,45 @@ done:
 	return ret;
 }
 
+/**
+ * __media_pipeline_start - 启动媒体管线 (核心入口)
+ *
+ * 该函数从指定的 origin pad 出发, 沿 enabled links 遍历整个媒体拓扑图,
+ * 收集所有可达的 pads, 执行验证, 并将 pipe 指针赋值给每个 pad。
+ *
+ * 完整算法流程:
+ *
+ *   == Phase 1: 管线填充 (media_pipeline_populate) ==
+ *    使用专用的 DFS 遍历器 (media_pipeline_walk), 从 origin pad 开始:
+ *    - 对每个 visited pad, 创建 media_pipeline_pad 加入 pipe->pads 链表
+ *    - 遍历实体的所有 link, 通过 media_entity_has_pad_interdep() 检测
+ *      pad 间的内部依赖, 只沿内部可达的 enabled link 前进
+ *    - 处理没有 link 的 "孤立 pad" (通过 pad interdependency 发现)
+ *    - 遍历栈动态增长 (MEDIA_PIPELINE_STACK_GROW_STEP = 16)
+ *
+ *   == Phase 2: 管线验证 ==
+ *    对收集到的每个 pad:
+ *    (a) pad->pipe 冲突检查: 如果 pad 已属于另一个管线, 返回 -EBUSY
+ *    (b) link_validate: 对每个以当前 pad 为 sink 的 enabled link,
+ *        调用 entity->ops->link_validate() 回调。该回调验证两端格式/
+ *        分辨率/编码等媒体参数是否匹配
+ *    (c) MUST_CONNECT 检查: 若 pad 设置了 MEDIA_PAD_FL_MUST_CONNECT 标志,
+ *        则必须至少有一个 enabled link, 否则返回 -ENOLINK
+ *    (d) 验证通过后设置 pad->pipe = pipe
+ *
+ *   == Phase 3: 嵌套调用支持 (start_count) ==
+ *    start_count 允许同一个管线被多次启动 (例如多个 video_device
+ *    指向同一条管线)。在 start_count > 0 时再次调用直接递增计数
+ *    并返回, 跳过验证。每次 __media_pipeline_stop() 递减计数,
+ *    仅当计数归零时才真正清理。
+ *
+ *   == 错误回滚 ==
+ *    若 Phase 2 中任何验证失败, 遍历之前已设置的 pad 并清空其
+ *    pipe 指针, 然后销毁 pipe->pads 链表, 保证系统状态一致性。
+ *
+ * 锁定要求: 调用者必须持有 graph_mutex
+ * 返回: 0 成功, 负 errno 失败
+ */
 __must_check int __media_pipeline_start(struct media_pad *origin,
 					struct media_pipeline *pipe)
 {
@@ -927,6 +1048,26 @@ __must_check int media_pipeline_start(struct media_pad *origin,
 }
 EXPORT_SYMBOL_GPL(media_pipeline_start);
 
+/**
+ * __media_pipeline_stop - 停止媒体管线
+ *
+ * 该函数是 __media_pipeline_start() 的逆操作, 负责解除管线与 pads 的关联。
+ *
+ * 核心逻辑:
+ *   1. 通过 origin pad 的 pipe 指针获取 media_pipeline 实例
+ *   2. 递减 start_count。若递减后仍大于 0, 说明存在嵌套调用,
+ *      直接返回, 不执行实际清理 (对称于 start 的嵌套语义)
+ *   3. 当 start_count 归零时, 遍历 pipe->pads 链表, 将所有 pad 的
+ *      pipe 指针置为 NULL, 解除管线绑定
+ *   4. 调用 media_pipeline_cleanup() 释放所有 media_pipeline_pad 节点
+ *   5. 如果管线是通过 media_pipeline_alloc_start() 动态分配的
+ *      (pipe->allocated 为 true), 释放 pipe 本身
+ *
+ * 重要: 该函数会清理 start 时遍历发现的 所有 pads, 即便不同的 pad
+ * 也可能作为 stop 的入参 (只要它们属于同一管线)。
+ *
+ * 锁定要求: 调用者必须持有 graph_mutex (由 media_pipeline_stop() 获取)
+ */
 void __media_pipeline_stop(struct media_pad *pad)
 {
 	struct media_pipeline *pipe = pad->pipe;
@@ -1127,6 +1268,8 @@ int media_get_pad_index(struct media_entity *entity, u32 pad_type,
 	return -EINVAL;
 }
 EXPORT_SYMBOL_GPL(media_get_pad_index);
+
+// ===== 链接创建 (Link Create) =====
 
 int
 media_create_pad_link(struct media_entity *source, u16 source_pad,

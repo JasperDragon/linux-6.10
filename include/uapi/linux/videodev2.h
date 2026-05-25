@@ -54,6 +54,56 @@
  *              Hans Verkuil <hverkuil@kernel.org>
  *		et al.
  */
+
+/*
+ * ============================================================================
+ * videodev2.h -- V4L2 (Video for Linux 2) 用户空间 API/ABI 定义
+ * ============================================================================
+ *
+ * 本文件是 Linux V4L2 子系统的用户空间接口头文件，定义了用户程序与视频设备
+ * 驱动交互的完整 ABI（Application Binary Interface）。用户空间程序通过
+ * ioctl(2) 系统调用操作 /dev/videoX 设备节点来使用本文件定义的所有结构
+ * 和命令。
+ *
+ * V4L2 的核心功能流程分为三大阶段：
+ *
+ * 1. 能力查询（VIDIOC_QUERYCAP）：
+ *    获取设备能力信息，如驱动名称、设备类型（捕获/输出）、支持的 I/O 方法、
+ *    是否为多平面设备等。v4l2_capability 结构体承载查询结果。
+ *
+ * 2. 格式协商（VIDIOC_ENUM_FMT / VIDIOC_G_FMT / VIDIOC_S_FMT / VIDIOC_TRY_FMT）：
+ *    枚举支持的像素格式、协商当前数据格式（分辨率、像素格式、颜色空间等）。
+ *    枚举帧尺寸（VIDIOC_ENUM_FRAMESIZES）和帧率（VIDIOC_ENUM_FRAMEINTERVALS）。
+ *    核心数据结构包括 v4l2_format、v4l2_pix_format、v4l2_fmtdesc 等。
+ *
+ * 3. 缓冲区管理与流控制：
+ *    a) 申请缓冲区：VIDIOC_REQBUFS（v4l2_requestbuffers）
+ *    b) 查询/映射缓冲区：VIDIOC_QUERYBUF（v4l2_buffer）
+ *    c) 入队/出队缓冲区：VIDIOC_QBUF / VIDIOC_DQBUF（v4l2_buffer）
+ *    d) 开始/停止数据流：VIDIOC_STREAMON / VIDIOC_STREAMOFF
+ *
+ * 像素格式分类：
+ *   - RGB 格式（RGB332 / RGB565 / RGB24 / RGB32 等）
+ *   - YUV 格式（打包格式如 YUYV、UYVY；双平面 NV12/NV21；三平面 YUV420 等）
+ *   - Bayer 格式（SBGGR8/SRGGB10 等传感器原始数据）
+ *   - 压缩格式（MJPEG / H264 / HEVC / VP8/VP9 / AV1 等编码标准）
+ *   - 多平面格式（Y/Cb/Cr 分别存储在不同内存平面）
+ *   - 元数据格式（统计信息、直方图、ISP 参数等）
+ *   - SDR 格式（软件无线电 IQ 采样数据）
+ *   - 触摸格式（触摸屏 delta 数据）
+ *
+ * 内存模型（v4l2_memory）：
+ *   - V4L2_MEMORY_MMAP：内存在内核与用户空间共享，通过 mmap 映射
+ *   - V4L2_MEMORY_USERPTR：用户空间分配内存，内核直接使用
+ *   - V4L2_MEMORY_DMABUF：通过 DMA-BUF 机制共享文件描述符
+ *   - V4L2_MEMORY_OVERLAY：视频覆盖（已废弃）
+ *
+ * V4L2 还定义了丰富的控制接口（VIDIOC_G/S_CTRL / VIDIOC_G/S_EXT_CTRLS），
+ * 用于调节亮度、对比度、饱和度等图像参数，以及编解码器控制参数。
+ *
+ * 事件机制（VIDIOC_DQEVENT / VIDIOC_SUBSCRIBE_EVENT）支持异步通知，
+ * 包括 VSYNC、控制变更、帧同步、源变化和运动检测等事件。
+ */
 #ifndef _UAPI__LINUX_VIDEODEV2_H
 #define _UAPI__LINUX_VIDEODEV2_H
 
@@ -85,6 +135,9 @@
 /*
  *	E N U M S
  */
+
+/* v4l2_field - 视频帧场序枚举，定义图像在缓冲区中的场排列方式 */
+/* 逐行扫描(NONE)、顶场优先/底场优先、隔行扫描、交替场等 */
 enum v4l2_field {
 	V4L2_FIELD_ANY           = 0, /* driver can choose from none,
 					 top, bottom, interlaced
@@ -138,6 +191,8 @@ enum v4l2_field {
 	((field) == V4L2_FIELD_SEQ_TB ||\
 	 (field) == V4L2_FIELD_SEQ_BT)
 
+/* v4l2_buf_type - 缓冲区类型枚举，标识数据流类型（视频/VBI/SDR/元数据/触摸） */
+/* 区分单平面与多平面（_MPLANE）类型，决定 v4l2_format 中使用的联合成员 */
 enum v4l2_buf_type {
 	V4L2_BUF_TYPE_VIDEO_CAPTURE        = 1,
 	V4L2_BUF_TYPE_VIDEO_OUTPUT         = 2,
@@ -181,6 +236,7 @@ enum v4l2_buf_type {
 #define V4L2_TYPE_IS_CAPTURE(type)	\
 	(V4L2_TYPE_IS_VALID(type) && !V4L2_TYPE_IS_OUTPUT(type))
 
+/* v4l2_tuner_type - 调谐器类型枚举，区分收音机/模拟电视/数字电视/SDR/RF */
 enum v4l2_tuner_type {
 	V4L2_TUNER_RADIO	     = 1,
 	V4L2_TUNER_ANALOG_TV	     = 2,
@@ -192,6 +248,9 @@ enum v4l2_tuner_type {
 /* Deprecated, do not use */
 #define V4L2_TUNER_ADC  V4L2_TUNER_SDR
 
+/* v4l2_memory - 缓冲区内存模型枚举 */
+/* MMAP: 内核分配内存，用户通过 mmap 映射访问 */
+/* USERPTR: 用户分配内存；DMABUF: 通过文件描述符共享缓冲区 */
 enum v4l2_memory {
 	V4L2_MEMORY_MMAP             = 1,
 	V4L2_MEMORY_USERPTR          = 2,
@@ -199,6 +258,8 @@ enum v4l2_memory {
 	V4L2_MEMORY_DMABUF           = 4,
 };
 
+/* v4l2_colorspace - 色彩空间枚举，定义视频信号的色域标准 */
+/* 包括 SDTV(SMPTE170M)、HDTV(Rec.709)、UHDTV(BT.2020)、sRGB、JPEG 等 */
 /* see also http://vektor.theorem.ca/graphics/ycbcr/ */
 enum v4l2_colorspace {
 	/*
@@ -272,6 +333,8 @@ enum v4l2_colorspace {
 	((is_sdtv) ? V4L2_COLORSPACE_SMPTE170M : \
 	 ((is_hdtv) ? V4L2_COLORSPACE_REC709 : V4L2_COLORSPACE_SRGB))
 
+/* v4l2_xfer_func - 传输函数（伽马曲线/光电转换函数）枚举 */
+/* 定义从场景亮度信号到编码值的映射，如 BT.709、sRGB、SMPTE ST 2084 等 */
 enum v4l2_xfer_func {
 	/*
 	 * Mapping of V4L2_XFER_FUNC_DEFAULT to actual transfer functions
@@ -320,6 +383,8 @@ enum v4l2_xfer_func {
 	    ((colsp) == V4L2_COLORSPACE_SRGB || (colsp) == V4L2_COLORSPACE_JPEG ? \
 	     V4L2_XFER_FUNC_SRGB : V4L2_XFER_FUNC_709)))))
 
+/* v4l2_ycbcr_encoding - Y'CbCr 编码标准枚举 */
+/* 定义亮度(Y')和色度(Cb/Cr)之间的数学转换关系，如 BT.601(SDTV)/BT.709(HDTV) */
 enum v4l2_ycbcr_encoding {
 	/*
 	 * Mapping of V4L2_YCBCR_ENC_DEFAULT to actual encodings for the
@@ -379,6 +444,9 @@ enum v4l2_ycbcr_encoding {
  * enum v4l2_hsv_encoding values should not collide with the ones from
  * enum v4l2_ycbcr_encoding.
  */
+
+/* v4l2_hsv_encoding - HSV（色相/饱和度/明度）编码枚举 */
+/* 取值 128/129 避免与 v4l2_ycbcr_encoding 冲突 */
 enum v4l2_hsv_encoding {
 
 	/* Hue mapped to 0 - 179 */
@@ -399,6 +467,8 @@ enum v4l2_hsv_encoding {
 	  ((colsp) == V4L2_COLORSPACE_SMPTE240M ? V4L2_YCBCR_ENC_SMPTE240M : \
 	   V4L2_YCBCR_ENC_601)))
 
+/* v4l2_quantization - 量化范围枚举 */
+/* FULL_RANGE: 0-255（RGB/JPEG 默认）；LIM_RANGE: 16-235（Y'CbCr 默认） */
 enum v4l2_quantization {
 	/*
 	 * The default for R'G'B' quantization is always full range.
@@ -431,6 +501,7 @@ enum v4l2_quantization {
 #define V4L2_XFER_FUNC_ADOBERGB  V4L2_XFER_FUNC_OPRGB
 #endif
 
+/* v4l2_priority - 设备访问优先级枚举，用于多应用共享设备时的访问控制 */
 enum v4l2_priority {
 	V4L2_PRIORITY_UNSET       = 0,  /* not initialized */
 	V4L2_PRIORITY_BACKGROUND  = 1,
@@ -468,13 +539,13 @@ struct v4l2_area {
   * @reserved:	   reserved fields for future extensions
   */
 struct v4l2_capability {
-	__u8	driver[16];
-	__u8	card[32];
-	__u8	bus_info[32];
-	__u32   version;
-	__u32	capabilities;
-	__u32	device_caps;
-	__u32	reserved[3];
+	__u8	driver[16];     // 驱动名称 (如 "uvcvideo")
+	__u8	card[32];       // 设备描述 (如 "HD Webcam C920")
+	__u8	bus_info[32];   // 总线信息 (如 "usb-0000:00:14.0-1")
+	__u32   version;        // 驱动版本号 (KERNEL_VERSION 格式)
+	__u32	capabilities;   // 设备能力位掩码 (V4L2_CAP_*)
+	__u32	device_caps;    // 设备节点能力位掩码 (同上，但仅为此 /dev/videoX 节点)
+	__u32	reserved[3];    // 保留字段 (未来扩展用)
 };
 
 /* Values for 'capabilities' field */
@@ -545,6 +616,7 @@ struct v4l2_pix_format {
 
 /*      Pixel format         FOURCC                          depth  Description  */
 
+/* ===== RGB 像素格式（单/双字节，8/16 位）===== */
 /* RGB formats (1 or 2 bytes per pixel) */
 #define V4L2_PIX_FMT_RGB332  v4l2_fourcc('R', 'G', 'B', '1') /*  8  RGB-3-3-2     */
 #define V4L2_PIX_FMT_RGB444  v4l2_fourcc('R', '4', '4', '4') /* 16  xxxxrrrr ggggbbbb */
@@ -571,6 +643,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_XRGB555X v4l2_fourcc_be('X', 'R', '1', '5') /* 16  XRGB-5-5-5 BE */
 #define V4L2_PIX_FMT_RGB565X v4l2_fourcc('R', 'G', 'B', 'R') /* 16  RGB-5-6-5 BE  */
 
+/* ===== RGB 像素格式（3/4/6 字节，24/32/48 位）===== */
 /* RGB formats (3 or 4 bytes per pixel) */
 #define V4L2_PIX_FMT_BGR666  v4l2_fourcc('B', 'G', 'R', 'H') /* 18  BGR-6-6-6	  */
 #define V4L2_PIX_FMT_BGR24   v4l2_fourcc('B', 'G', 'R', '3') /* 24  BGR-8-8-8     */
@@ -589,12 +662,14 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_RGBA1010102 v4l2_fourcc('R', 'A', '3', '0') /* 32  RGBA-10-10-10-2 */
 #define V4L2_PIX_FMT_ARGB2101010 v4l2_fourcc('A', 'R', '3', '0') /* 32  ARGB-2-10-10-10 */
 
+/* ===== RGB 深色格式（6/8 字节，48/64 位）===== */
 /* RGB formats (6 or 8 bytes per pixel) */
 #define V4L2_PIX_FMT_BGR48_12    v4l2_fourcc('B', '3', '1', '2') /* 48  BGR 12-bit per component */
 #define V4L2_PIX_FMT_BGR48       v4l2_fourcc('B', 'G', 'R', '6') /* 48  BGR 16-bit per component */
 #define V4L2_PIX_FMT_RGB48       v4l2_fourcc('R', 'G', 'B', '6') /* 48  RGB 16-bit per component */
 #define V4L2_PIX_FMT_ABGR64_12   v4l2_fourcc('B', '4', '1', '2') /* 64  BGRA 12-bit per component */
 
+/* ===== 灰度格式 ===== */
 /* Grey formats */
 #define V4L2_PIX_FMT_GREY    v4l2_fourcc('G', 'R', 'E', 'Y') /*  8  Greyscale     */
 #define V4L2_PIX_FMT_Y4      v4l2_fourcc('Y', '0', '4', ' ') /*  4  Greyscale     */
@@ -606,6 +681,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_Y16     v4l2_fourcc('Y', '1', '6', ' ') /* 16  Greyscale     */
 #define V4L2_PIX_FMT_Y16_BE  v4l2_fourcc_be('Y', '1', '6', ' ') /* 16  Greyscale BE  */
 
+/* ===== 灰度位打包格式 ===== */
 /* Grey bit-packed formats */
 #define V4L2_PIX_FMT_Y10BPACK    v4l2_fourcc('Y', '1', '0', 'B') /* 10  Greyscale bit-packed */
 #define V4L2_PIX_FMT_Y10P    v4l2_fourcc('Y', '1', '0', 'P') /* 10  Greyscale, MIPI RAW10 packed */
@@ -613,12 +689,15 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_Y12P    v4l2_fourcc('Y', '1', '2', 'P') /* 12  Greyscale, MIPI RAW12 packed */
 #define V4L2_PIX_FMT_Y14P    v4l2_fourcc('Y', '1', '4', 'P') /* 14  Greyscale, MIPI RAW14 packed */
 
+/* ===== 调色板格式 ===== */
 /* Palette formats */
 #define V4L2_PIX_FMT_PAL8    v4l2_fourcc('P', 'A', 'L', '8') /*  8  8-bit palette */
 
+/* ===== 色度格式 ===== */
 /* Chrominance formats */
 #define V4L2_PIX_FMT_UV8     v4l2_fourcc('U', 'V', '8', ' ') /*  8  UV 4:4 */
 
+/* ===== YUV 打包格式（亮度+色度交织）===== */
 /* Luminance+Chrominance formats */
 #define V4L2_PIX_FMT_YUYV    v4l2_fourcc('Y', 'U', 'Y', 'V') /* 16  YUV 4:2:2     */
 #define V4L2_PIX_FMT_YYUV    v4l2_fourcc('Y', 'Y', 'U', 'V') /* 16  YUV 4:2:2     */
@@ -640,6 +719,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_M420    v4l2_fourcc('M', '4', '2', '0') /* 12  YUV 4:2:0 2 lines y, 1 line uv interleaved */
 #define V4L2_PIX_FMT_YUV48_12    v4l2_fourcc('Y', '3', '1', '2') /* 48  YUV 4:4:4 12-bit per component */
 
+/* ===== YCbCr 高精度打包格式（10/12/16 位）===== */
 /*
  * YCbCr packed format. For each Y2xx format, xx bits of valid data occupy the MSBs
  * of the 16 bit components, and 16-xx bits of zero padding occupy the LSBs.
@@ -648,6 +728,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_Y212    v4l2_fourcc('Y', '2', '1', '2') /* 32  YUYV 4:2:2 */
 #define V4L2_PIX_FMT_Y216    v4l2_fourcc('Y', '2', '1', '6') /* 32  YUYV 4:2:2 */
 
+/* ===== YUV 双平面格式（一个 Y 平面 + 一个交织 CbCr 平面）===== */
 /* two planes -- one Y, one Cr + Cb interleaved  */
 #define V4L2_PIX_FMT_NV12    v4l2_fourcc('N', 'V', '1', '2') /* 12  Y/CbCr 4:2:0  */
 #define V4L2_PIX_FMT_NV21    v4l2_fourcc('N', 'V', '2', '1') /* 12  Y/CrCb 4:2:0  */
@@ -660,6 +741,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_P010    v4l2_fourcc('P', '0', '1', '0') /* 24  Y/CbCr 4:2:0 10-bit per component */
 #define V4L2_PIX_FMT_P012    v4l2_fourcc('P', '0', '1', '2') /* 24  Y/CbCr 4:2:0 12-bit per component */
 
+/* ===== YUV 非连续双平面格式 ===== */
 /* two non contiguous planes - one Y, one Cr + Cb interleaved  */
 #define V4L2_PIX_FMT_NV12M   v4l2_fourcc('N', 'M', '1', '2') /* 12  Y/CbCr 4:2:0  */
 #define V4L2_PIX_FMT_NV21M   v4l2_fourcc('N', 'M', '2', '1') /* 21  Y/CrCb 4:2:0  */
@@ -667,6 +749,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_NV61M   v4l2_fourcc('N', 'M', '6', '1') /* 16  Y/CrCb 4:2:2  */
 #define V4L2_PIX_FMT_P012M   v4l2_fourcc('P', 'M', '1', '2') /* 24  Y/CbCr 4:2:0 12-bit per component */
 
+/* ===== YUV 三平面格式（Y、Cb、Cr 各一个平面）===== */
 /* three planes - Y Cb, Cr */
 #define V4L2_PIX_FMT_YUV410  v4l2_fourcc('Y', 'U', 'V', '9') /*  9  YUV 4:1:0     */
 #define V4L2_PIX_FMT_YVU410  v4l2_fourcc('Y', 'V', 'U', '9') /*  9  YVU 4:1:0     */
@@ -675,6 +758,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_YVU420  v4l2_fourcc('Y', 'V', '1', '2') /* 12  YVU 4:2:0     */
 #define V4L2_PIX_FMT_YUV422P v4l2_fourcc('4', '2', '2', 'P') /* 16  YVU422 planar */
 
+/* ===== YUV 非连续三平面格式 ===== */
 /* three non contiguous planes - Y, Cb, Cr */
 #define V4L2_PIX_FMT_YUV420M v4l2_fourcc('Y', 'M', '1', '2') /* 12  YUV420 planar */
 #define V4L2_PIX_FMT_YVU420M v4l2_fourcc('Y', 'M', '2', '1') /* 12  YVU420 planar */
@@ -683,6 +767,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_YUV444M v4l2_fourcc('Y', 'M', '2', '4') /* 24  YUV444 planar */
 #define V4L2_PIX_FMT_YVU444M v4l2_fourcc('Y', 'M', '4', '2') /* 24  YVU444 planar */
 
+/* ===== 瓦片（Tile）YUV 格式 ===== */
 /* Tiled YUV formats */
 #define V4L2_PIX_FMT_NV12_4L4 v4l2_fourcc('V', 'T', '1', '2')   /* 12  Y/CbCr 4:2:0  4x4 tiles */
 #define V4L2_PIX_FMT_NV12_16L16 v4l2_fourcc('H', 'M', '1', '2') /* 12  Y/CbCr 4:2:0 16x16 tiles */
@@ -692,12 +777,14 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_NV12_8L128       v4l2_fourcc('A', 'T', '1', '2') /* Y/CbCr 4:2:0 8x128 tiles */
 #define V4L2_PIX_FMT_NV12_10BE_8L128  v4l2_fourcc_be('A', 'X', '1', '2') /* Y/CbCr 4:2:0 10-bit 8x128 tiles */
 
+/* ===== 瓦片 YUV 非连续平面格式 ===== */
 /* Tiled YUV formats, non contiguous planes */
 #define V4L2_PIX_FMT_NV12MT  v4l2_fourcc('T', 'M', '1', '2') /* 12  Y/CbCr 4:2:0 64x32 tiles */
 #define V4L2_PIX_FMT_NV12MT_16X16 v4l2_fourcc('V', 'M', '1', '2') /* 12  Y/CbCr 4:2:0 16x16 tiles */
 #define V4L2_PIX_FMT_NV12M_8L128      v4l2_fourcc('N', 'A', '1', '2') /* Y/CbCr 4:2:0 8x128 tiles */
 #define V4L2_PIX_FMT_NV12M_10BE_8L128 v4l2_fourcc_be('N', 'T', '1', '2') /* Y/CbCr 4:2:0 10-bit 8x128 tiles */
 
+/* ===== Bayer 原始格式（传感器 RAW 数据）===== */
 /* Bayer formats - see http://www.siliconimaging.com/RGB%20Bayer.htm */
 #define V4L2_PIX_FMT_SBGGR8  v4l2_fourcc('B', 'A', '8', '1') /*  8  BGBG.. GRGR.. */
 #define V4L2_PIX_FMT_SGBRG8  v4l2_fourcc('G', 'B', 'R', 'G') /*  8  GBGB.. RGRG.. */
@@ -745,10 +832,12 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_SGRBG16 v4l2_fourcc('G', 'R', '1', '6') /* 16  GRGR.. BGBG.. */
 #define V4L2_PIX_FMT_SRGGB16 v4l2_fourcc('R', 'G', '1', '6') /* 16  RGRG.. GBGB.. */
 
+/* ===== HSV 格式 ===== */
 /* HSV formats */
 #define V4L2_PIX_FMT_HSV24 v4l2_fourcc('H', 'S', 'V', '3')
 #define V4L2_PIX_FMT_HSV32 v4l2_fourcc('H', 'S', 'V', '4')
 
+/* ===== 压缩视频格式 ===== */
 /* compressed formats */
 #define V4L2_PIX_FMT_MJPEG    v4l2_fourcc('M', 'J', 'P', 'G') /* Motion-JPEG   */
 #define V4L2_PIX_FMT_JPEG     v4l2_fourcc('J', 'P', 'E', 'G') /* JFIF JPEG     */
@@ -780,6 +869,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_RV30     v4l2_fourcc('R', 'V', '3', '0') /* RealVideo 8 */
 #define V4L2_PIX_FMT_RV40     v4l2_fourcc('R', 'V', '4', '0') /* RealVideo 9 & 10 */
 
+/* ===== 厂商特定格式 ===== */
 /*  Vendor-specific formats   */
 #define V4L2_PIX_FMT_CPIA1    v4l2_fourcc('C', 'P', 'I', 'A') /* cpia1 YUV */
 #define V4L2_PIX_FMT_WNVA     v4l2_fourcc('W', 'N', 'V', 'A') /* Winnov hw compress */
@@ -847,6 +937,7 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_RAW_CRU14	v4l2_fourcc('C', 'R', '1', '4')
 #define V4L2_PIX_FMT_RAW_CRU20	v4l2_fourcc('C', 'R', '2', '0')
 
+/* ===== SDR（软件无线电）格式 ===== */
 /* SDR formats - used only for Software Defined Radio devices */
 #define V4L2_SDR_FMT_CU8          v4l2_fourcc('C', 'U', '0', '8') /* IQ u8 */
 #define V4L2_SDR_FMT_CU16LE       v4l2_fourcc('C', 'U', '1', '6') /* IQ u16le */
@@ -857,12 +948,14 @@ struct v4l2_pix_format {
 #define V4L2_SDR_FMT_PCU18BE	  v4l2_fourcc('P', 'C', '1', '8') /* planar complex u18be */
 #define V4L2_SDR_FMT_PCU20BE	  v4l2_fourcc('P', 'C', '2', '0') /* planar complex u20be */
 
+/* ===== 触摸设备格式 ===== */
 /* Touch formats - used for Touch devices */
 #define V4L2_TCH_FMT_DELTA_TD16	v4l2_fourcc('T', 'D', '1', '6') /* 16-bit signed deltas */
 #define V4L2_TCH_FMT_DELTA_TD08	v4l2_fourcc('T', 'D', '0', '8') /* 8-bit signed deltas */
 #define V4L2_TCH_FMT_TU16	v4l2_fourcc('T', 'U', '1', '6') /* 16-bit unsigned touch data */
 #define V4L2_TCH_FMT_TU08	v4l2_fourcc('T', 'U', '0', '8') /* 8-bit unsigned touch data */
 
+/* ===== 元数据格式 ===== */
 /* Meta-data formats */
 #define V4L2_META_FMT_VSP1_HGO    v4l2_fourcc('V', 'S', 'P', 'H') /* R-Car VSP1 1-D Histogram */
 #define V4L2_META_FMT_VSP1_HGT    v4l2_fourcc('V', 'S', 'P', 'T') /* R-Car VSP1 2-D Histogram */
@@ -942,6 +1035,8 @@ struct v4l2_fmtdesc {
 /*
  *	F R A M E   S I Z E   E N U M E R A T I O N
  */
+
+/* v4l2_frmsizetypes - 帧尺寸枚举类型：离散尺寸/连续范围/步进范围 */
 enum v4l2_frmsizetypes {
 	V4L2_FRMSIZE_TYPE_DISCRETE	= 1,
 	V4L2_FRMSIZE_TYPE_CONTINUOUS	= 2,
@@ -978,6 +1073,8 @@ struct v4l2_frmsizeenum {
 /*
  *	F R A M E   R A T E   E N U M E R A T I O N
  */
+
+/* v4l2_frmivaltypes - 帧间隔（帧率）枚举类型：离散/连续/步进 */
 enum v4l2_frmivaltypes {
 	V4L2_FRMIVAL_TYPE_DISCRETE	= 1,
 	V4L2_FRMIVAL_TYPE_CONTINUOUS	= 2,
@@ -1176,32 +1273,32 @@ struct v4l2_plane {
  * I/O methods.
  */
 struct v4l2_buffer {
-	__u32			index;
-	__u32			type;
-	__u32			bytesused;
-	__u32			flags;
-	__u32			field;
+	__u32			index;      // 缓冲区索引 (0 到 count-1)，QBUF 时用于标识
+	__u32			type;       // 缓冲区类型 (V4L2_BUF_TYPE_*), 必须与 REQBUFS 时一致
+	__u32			bytesused;  // 有效数据字节数 (采集模式由驱动填写)
+	__u32			flags;      // 缓冲区标志: V4L2_BUF_FLAG_MAPPED, KEYFRAME, ERROR, ...
+	__u32			field;      // 场序: V4L2_FIELD_NONE (逐行), INTERLACED (隔行), ...
 #ifdef __KERNEL__
-	struct __kernel_v4l2_timeval timestamp;
+	struct __kernel_v4l2_timeval timestamp; // 帧时间戳
 #else
-	struct timeval		timestamp;
+	struct timeval		timestamp;   // 帧时间戳 (用户空间兼容版本)
 #endif
-	struct v4l2_timecode	timecode;
-	__u32			sequence;
+	struct v4l2_timecode	timecode;    // SMPTE 时间码 (仅视频输出)
+	__u32			sequence;    // 帧序号: 每成功采集一帧递增
 
 	/* memory location */
-	__u32			memory;
+	__u32			memory;      // 内存模型: V4L2_MEMORY_MMAP, USERPTR, DMABUF
 	union {
-		__u32           offset;
-		unsigned long   userptr;
-		struct v4l2_plane *planes;
-		__s32		fd;
+		__u32           offset;    // MMAP 模式: 缓冲区在 mmap 区域中的偏移
+		unsigned long   userptr;   // USERPTR 模式: 用户空间缓冲区地址
+		struct v4l2_plane *planes; // MPLANE 模式: 多平面数据数组 (用户空间指针)
+		__s32		fd;          // DMABUF 模式: dma-buf 文件描述符
 	} m;
-	__u32			length;
-	__u32			reserved2;
+	__u32			length;      // 缓冲区/平面数据长度 (填充的字节数)
+	__u32			reserved2;   // 保留字段
 	union {
-		__s32		request_fd;
-		__u32		reserved;
+		__s32		request_fd;  // Request API: 关联的 request 文件描述符
+		__u32		reserved;    // 保留字段 (当不使用 Request API 时)
 	};
 };
 
@@ -1941,6 +2038,8 @@ struct v4l2_ext_controls {
 #define V4L2_CTRL_WHICH_MIN_VAL   0x0f020000
 #define V4L2_CTRL_WHICH_MAX_VAL   0x0f030000
 
+/* v4l2_ctrl_type - V4L2 控制类型枚举，定义控制参数的数据类型 */
+/* 基础类型包括整数/布尔/菜单/按钮/位掩码等，复合类型(>=0x100)用于编解码参数 */
 enum v4l2_ctrl_type {
 	V4L2_CTRL_TYPE_INTEGER	     = 1,
 	V4L2_CTRL_TYPE_BOOLEAN	     = 2,
@@ -2519,16 +2618,16 @@ struct v4l2_meta_format {
  *			@meta and @raw_data
  */
 struct v4l2_format {
-	__u32	 type;
+	__u32	 type;  // 缓冲区类型 (V4L2_BUF_TYPE_*)，决定 union 中哪个成员有效
 	union {
-		struct v4l2_pix_format		pix;     /* V4L2_BUF_TYPE_VIDEO_CAPTURE */
-		struct v4l2_pix_format_mplane	pix_mp;  /* V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE */
-		struct v4l2_window		win;     /* V4L2_BUF_TYPE_VIDEO_OVERLAY */
-		struct v4l2_vbi_format		vbi;     /* V4L2_BUF_TYPE_VBI_CAPTURE */
-		struct v4l2_sliced_vbi_format	sliced;  /* V4L2_BUF_TYPE_SLICED_VBI_CAPTURE */
-		struct v4l2_sdr_format		sdr;     /* V4L2_BUF_TYPE_SDR_CAPTURE */
-		struct v4l2_meta_format		meta;    /* V4L2_BUF_TYPE_META_CAPTURE */
-		__u8	raw_data[200];                   /* user-defined */
+		struct v4l2_pix_format		pix;     // 单平面视频: width/height, pixelformat, bytesperline
+		struct v4l2_pix_format_mplane	pix_mp;  // 多平面视频: 每个平面独立 width/height/bytesperline
+		struct v4l2_window		win;     // 视频叠加: overlay 坐标、裁剪、格式
+		struct v4l2_vbi_format		vbi;     // 原始 VBI (图文电视/字幕)
+		struct v4l2_sliced_vbi_format	sliced;  // 切片 VBI (结构化图文数据)
+		struct v4l2_sdr_format		sdr;     // 软件无线电: 采样率、格式
+		struct v4l2_meta_format		meta;    // 元数据: 数据格式、缓冲区大小
+		__u8	raw_data[200];                   // 自定义格式 (驱动私有)
 	} fmt;
 };
 
@@ -2723,6 +2822,26 @@ struct v4l2_remove_buffers {
 	__u32			reserved[13];
 };
 
+/*
+ * ================================================================
+ * ioctl 命令定义 -- 所有 V4L2 命令使用 'V' 作为魔术字
+ * ================================================================
+ *
+ * 核心分类：
+ *   能力查询：    VIDIOC_QUERYCAP                  (cmd 0)
+ *   格式操作：    VIDIOC_ENUM_FMT/G_FMT/S_FMT/TRY_FMT (cmd 2,4,5,64)
+ *   缓冲区管理：  VIDIOC_REQBUFS/QUERYBUF/QBUF/DQBUF (cmd 8,9,15,17)
+ *   流控制：      VIDIOC_STREAMON/STREAMOFF         (cmd 18,19)
+ *   控制接口：    VIDIOC_G/S_CTRL                   (cmd 27,28)
+ *                VIDIOC_G/S_EXT_CTRLS              (cmd 71,72)
+ *   输入/输出：   VIDIOC_G/S_INPUT/OUTPUT           (cmd 38,39,46,47)
+ *   调谐器：      VIDIOC_G/S_TUNER/FREQUENCY        (cmd 29,30,56,57)
+ *   视频标准：    VIDIOC_G/S_STD/ENUMSTD            (cmd 23,24,25)
+ *   裁剪/选择：   VIDIOC_CROPCAP/G/S_CROP/SELECTION (cmd 58,59,60,94,95)
+ *   编解码：      VIDIOC_ENCODER_CMD/DECODER_CMD    (cmd 77,96)
+ *   事件：        VIDIOC_DQEVENT/SUBSCRIBE_EVENT    (cmd 89,90)
+ *   调试：        VIDIOC_DBG_G/S_REGISTER           (cmd 79,80)
+ */
 /*
  *	I O C T L   C O D E S   F O R   V I D E O   D E V I C E S
  *

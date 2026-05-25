@@ -25,6 +25,9 @@ MODULE_DESCRIPTION("Mem to mem device framework for vb2");
 MODULE_AUTHOR("Pawel Osciak, <pawel@osciak.com>");
 MODULE_LICENSE("GPL");
 
+// v4l2-mem2mem: M2M 框架为编解码器/缩放器/格式转换器等内存到内存设备提供抽象。
+// 管理两个 vb2_queue（OUTPUT 源和 CAPTURE 目标），提供 job 调度、超时管理等。
+
 static bool debug;
 module_param(debug, bool, 0644);
 
@@ -113,6 +116,8 @@ struct v4l2_m2m_dev {
 
 	struct kref kref;
 };
+
+// === 缓冲区管理 (buffer management) ===
 
 static struct v4l2_m2m_queue_ctx *get_queue_ctx(struct v4l2_m2m_ctx *m2m_ctx,
 						enum v4l2_buf_type type)
@@ -222,6 +227,8 @@ v4l2_m2m_buf_remove_by_idx(struct v4l2_m2m_queue_ctx *q_ctx, unsigned int idx)
 }
 EXPORT_SYMBOL_GPL(v4l2_m2m_buf_remove_by_idx);
 
+// === Job 调度 (job scheduling) ===
+
 /*
  * Scheduling handlers
  */
@@ -248,6 +255,27 @@ EXPORT_SYMBOL(v4l2_m2m_get_curr_priv);
  *
  * Note that this function can run on a given v4l2_m2m_ctx context,
  * but call .device_run for another context.
+ */
+/*
+ * v4l2_m2m_try_run() — M2M job 调度的核心函数
+ *
+ * 从 job_queue 中选择下一个待处理的 job 并执行。
+ *
+ * 调度策略（三个前置条件，任一不满足则放弃本次调度）：
+ *   1. curr_ctx 必须为空 — 同一时刻只能有一个 job 在运行
+ *      (硬件是独占资源，不支持并发)
+ *   2. job_queue 必须非空 — 没有待处理 job 时无需调度
+ *   3. 队列不能处于 PAUSED 状态 — STREAMOFF 期间暂停调度
+ *
+ * 若条件满足：
+ *   - 从 job_queue 头部取出 m2m_ctx
+ *   - 调用 job_ready 回调（驱动判断是否有足够的输入/输出缓冲区）
+ *   - job_ready 返回 true → 设置 curr_ctx → 调用 device_run
+ *   - device_run 在 workqueue 上下文中执行，驱动在其中启动硬件处理
+ *
+ * 调用时机：
+ *   - v4l2_m2m_try_schedule() (由 QBUF 或 STREAMON 触发)
+ *   - v4l2_m2m_device_run_work() (前一个 job 完成后重新调度)
  */
 static void v4l2_m2m_try_run(struct v4l2_m2m_dev *m2m_dev)
 {
@@ -392,6 +420,8 @@ void v4l2_m2m_try_schedule(struct v4l2_m2m_ctx *m2m_ctx)
 }
 EXPORT_SYMBOL_GPL(v4l2_m2m_try_schedule);
 
+// === 设备运行 (device run) ===
+
 /**
  * v4l2_m2m_device_run_work() - run pending jobs for the context
  * @work: Work structure used for scheduling the execution of this function.
@@ -466,6 +496,21 @@ static void v4l2_m2m_schedule_next_job(struct v4l2_m2m_dev *m2m_dev,
  * Assumes job_spinlock is held, called from v4l2_m2m_job_finish() or
  * v4l2_m2m_buf_done_and_job_finish().
  */
+/*
+ * _v4l2_m2m_job_finish() — 完成当前 job 的内部实现
+ *
+ * 在 job_spinlock 持有下调用（由 v4l2_m2m_job_finish 或
+ * v4l2_m2m_buf_done_and_job_finish 调用）。
+ *
+ * 执行步骤：
+ *   1. 验证调用者是当前运行的 ctx（防御性检查）
+ *   2. 从 job_queue 中移除 ctx
+ *   3. 清除 TRANS_QUEUED 和 TRANS_RUNNING 标志
+ *   4. 唤醒等待此 ctx 完成的线程（finished 等待队列）
+ *   5. 清空 curr_ctx，释放硬件资源
+ *
+ * 返回值：true = 可以调度下一个 job
+ */
 static bool _v4l2_m2m_job_finish(struct v4l2_m2m_dev *m2m_dev,
 				 struct v4l2_m2m_ctx *m2m_ctx)
 {
@@ -481,23 +526,28 @@ static bool _v4l2_m2m_job_finish(struct v4l2_m2m_dev *m2m_dev,
 	return true;
 }
 
+/*
+ * v4l2_m2m_job_finish() — 驱动完成当前 job 的标准入口
+ *
+ * 驱动在 device_run 中启动硬件后，在 ISR 或工作线程中检测到处理完成时调用。
+ *
+ * 注意：不支持 M2M_HOLD_CAPTURE_BUF 的驱动使用此函数。
+ * 支持的驱动应使用 v4l2_m2m_buf_done_and_job_finish() 以正确处理
+ * capture buffer 保持逻辑（在 v4l2_m2m_buf_done_and_job_finish 中完成）。
+ */
 void v4l2_m2m_job_finish(struct v4l2_m2m_dev *m2m_dev,
 			 struct v4l2_m2m_ctx *m2m_ctx)
 {
 	unsigned long flags;
 	bool schedule_next;
 
-	/*
-	 * This function should not be used for drivers that support
-	 * holding capture buffers. Those should use
-	 * v4l2_m2m_buf_done_and_job_finish() instead.
-	 */
 	WARN_ON(m2m_ctx->out_q_ctx.q.subsystem_flags &
 		VB2_V4L2_FL_SUPPORTS_M2M_HOLD_CAPTURE_BUF);
 	spin_lock_irqsave(&m2m_dev->job_spinlock, flags);
 	schedule_next = _v4l2_m2m_job_finish(m2m_dev, m2m_ctx);
 	spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags);
 
+	/* 释放硬件资源后，尝试调度下一个等待的 job */
 	if (schedule_next)
 		v4l2_m2m_schedule_next_job(m2m_dev, m2m_ctx);
 }
@@ -1182,6 +1232,8 @@ err_rel_entity0:
 }
 EXPORT_SYMBOL_GPL(v4l2_m2m_register_media_controller);
 #endif
+
+// === 设备初始化 (device init) ===
 
 struct v4l2_m2m_dev *v4l2_m2m_init(const struct v4l2_m2m_ops *m2m_ops)
 {

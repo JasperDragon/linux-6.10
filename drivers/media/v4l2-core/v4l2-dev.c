@@ -12,6 +12,48 @@
  *		- Added procfs support
  */
 
+/*
+ * ============================================================================
+ * v4l2-dev.c — V4L2 设备节点管理核心
+ * ============================================================================
+ *
+ * 本文件实现了 /dev/videoX 设备节点的完整生命周期管理。
+ *
+ * 【核心职责】
+ *   1. 设备节点分配/释放 — video_device_alloc/release
+ *   2. 设备注册/注销   — __video_register_device/video_unregister_device
+ *   3. 文件操作转发     — v4l2_read/write/mmap/poll/open/release
+ *                        将 VFS 层调用转发到驱动的 v4l2_file_operations
+ *   4. 优先级仲裁       — 多进程访问同一设备时的资源竞争管理
+ *   5. sysfs 属性       — name, index, dev_debug 可读写属性
+ *
+ * 【全局设备表】
+ *   video_devices[] — 全局数组，以 minor 号为索引，存储所有已注册的
+ *   video_device 指针。通过 videodev_lock 互斥锁保护。
+ *   devnode_nums[] — 位图跟踪各类型已使用的设备节点号。
+ *
+ * 【设备注册流程】 __video_register_device()
+ *   1. 分配 minor 号（从 devnode_nums 位图中查找空闲位）
+ *   2. 初始化 cdev（字符设备）并添加到内核
+ *   3. 创建 sysfs 设备节点（/sys/class/video4linux/）
+ *   4. 调用 device_register 注册 struct device
+ *   5. 设置 V4L2_FL_REGISTERED 标志
+ *   6. 在 Media Controller 中注册 entity 和 interface（如启用）
+ *
+ * 【设备注销流程】 v4l2_device_release()
+ *   1. 从 video_devices[] 中移除
+ *   2. 删除 cdev
+ *   3. 回收设备节点号到 devnode_nums 位图
+ *   4. 从 Media Controller 移除 entity 和 interface
+ *   5. 调用驱动的 release() 回调释放资源
+ *   6. 释放 v4l2_device 引用
+ *
+ * 【文件操作转发层】
+ *   v4l2_read/write/mmap/poll 等函数在调用驱动的对应函数前，
+ *   会检查 video_is_registered() 确保设备未脱离。
+ *   同时支持 dev_debug 调试打印（通过 sysfs dev_debug 属性控制）。
+ */
+
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/debugfs.h>

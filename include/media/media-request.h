@@ -9,6 +9,31 @@
  * Author: Sakari Ailus <sakari.ailus@linux.intel.com>
  */
 
+/*
+ * ============================================================================
+ * Media Request API 头文件
+ * ============================================================================
+ *
+ * Request API 允许将多个操作原子化提交到驱动。核心概念：
+ *
+ * - media_request: 一次原子操作请求，由 fd 表示
+ *   - 状态机: IDLE → VALIDATING → QUEUED → COMPLETE → CLEANING
+ *   - 通过 kref 管理引用计数
+ *   - objects 链表绑定所有参与此请求的操作对象
+ *
+ * - media_request_object: 绑定到请求的操作对象
+ *   - vb2_buffer: 视频缓冲区
+ *   - v4l2_ctrl_handler: 控制设置
+ *   - 每个对象通过 bind/unbind 加入/离开请求
+ *
+ * 典型流程（用户空间）：
+ *   fd = ioctl(MEDIA_IOC_REQUEST_ALLOC)
+ *   ioctl(VIDIOC_S_EXT_CTRLS, request_fd=fd)
+ *   ioctl(VIDIOC_QBUF, request_fd=fd)
+ *   ioctl(MEDIA_REQUEST_IOC_QUEUE, fd)
+ *   close(fd)
+ */
+
 #ifndef MEDIA_REQUEST_H
 #define MEDIA_REQUEST_H
 

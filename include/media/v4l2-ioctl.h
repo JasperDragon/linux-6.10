@@ -10,6 +10,40 @@
 #ifndef _V4L2_IOCTL_H
 #define _V4L2_IOCTL_H
 
+/*
+ * 中文概述：
+ *
+ * 本文件是 V4L2 ioctl 处理的核心接口，定义了将 VIDIOC_* 用户空间命令
+ * 映射到驱动回调函数的关键数据结构 v4l2_ioctl_ops。
+ *
+ * 核心机制：
+ *  - v4l2_ioctl_ops：一个大型函数指针结构体，每个字段对应一个
+ *    VIDIOC_* ioctl 的驱动实现。驱动只需填充自己支持的操作，
+ *    未使用的字段保持 NULL。
+ *  - video_ioctl2()：通用的 V4L2 ioctl 分发入口。驱动将其注册为
+ *    unlocked_ioctl 回调。该函数根据命令号在 def_ioctl 表中查找
+ *    对应的处理函数，然后调用 v4l2_ioctl_ops 中的驱动回调。
+ *  - v4l2_disable_ioctl()：通过操作 video_device 的 valid_ioctls
+ *    位图来禁用特定的 ioctl 命令。
+ *
+ * 覆盖的 ioctl 类别包括：
+ *   - 设备能力查询 (QUERYCAP)
+ *   - 格式枚举与获取/设置/尝试 (ENUM_FMT, G/S/TRY_FMT)
+ *   - 缓冲区管理 (REQBUFS, QUERYBUF, QBUF, DQBUF, EXPBUF, CREATE_BUFS, PREPARE_BUF)
+ *   - 流控制 (STREAMON, STREAMOFF)
+ *   - 视频标准 (G/S_STD, QUERYSTD)
+ *   - 输入/输出选择 (ENUM/G/S_INPUT, ENUM/G/S_OUTPUT)
+ *   - 控制处理 (QUERY_EXT_CTRL, G/S/TRY_EXT_CTRLS)
+ *   - 音视频输入输出 (AUDIO, AUDOUT)
+ *   - 裁剪/选择 (G/S_SELECTION)
+ *   - 压缩相关 (JPEGCOMP, ENC_INDEX, ENCODER_CMD, DECODER_CMD)
+ *   - 调谐器/频率 (TUNER, FREQUENCY, FREQ_BANDS)
+ *   - DV 时序 (DV_TIMINGS, EDID)
+ *   - 事件订阅 (SUBSCRIBE_EVENT, UNSUBSCRIBE_EVENT)
+ *   - 调试接口 (DBG_G/S_REGISTER, DBG_G_CHIP_INFO)
+ *   - 私有 ioctl 扩展 (default)
+ */
+
 #include <linux/poll.h>
 #include <linux/fs.h>
 #include <linux/mutex.h>
