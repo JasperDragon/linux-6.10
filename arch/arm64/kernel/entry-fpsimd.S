@@ -6,6 +6,42 @@
  * Author: Catalin Marinas <catalin.marinas@arm.com>
  */
 
+/*
+ * ============================================================================
+ * entry-fpsimd.S — ARM64 FP/SIMD/SVE/SME 状态保存/恢复
+ * ============================================================================
+ *
+ * 本文件提供浮点和向量扩展的上下文切换底层汇编函数。
+ * 实际指令由 asm/fpsimdmacros.h 中的宏生成。
+ *
+ * 支持的处理扩展：
+ * ┌───────────────────────────────────────────────────────────────┐
+ * │ 扩展   │ 寄存器                  │ VL (向量长度)               │
+ * ├───────────────────────────────────────────────────────────────┤
+ * │ FPSIMD │ V0-V31 (128-bit)       │ 固定 128-bit               │
+ * │ SVE    │ Z0-Z31 + P0-P15 + FFR  │ 128~2048-bit (VQ×128)     │
+ * │ SME    │ ZA (矩阵存储) + ZT0     │ 同上                       │
+ * └───────────────────────────────────────────────────────────────┘
+ *
+ * fpsimd_save_state / fpsimd_load_state:
+ *   基础 FPSIMD/NEON 上下文切换，每次上下文切换都调用。
+ *
+ * sve_save_state / sve_load_state:
+ *   SVE (Scalable Vector Extension) 上下文保存/恢复。
+ *   参数 x2 控制 FFR (First Fault Register) 的保存。
+ *
+ * sve_get_vl / sve_set_vq:
+ *   读取/设置 SVE 向量长度（VL = (VQ+1) × 16 字节）。
+ *
+ * sve_flush_live:
+ *   将 Z 寄存器（除低 128-bit 外）和 P 寄存器清零。
+ *   用于 exec() 时确保新进程不会泄漏前任的 SVE 数据。
+ *
+ * sme_save_state / sme_load_state:
+ *   SME (Scalable Matrix Extension) ZA 和 ZT 状态保存/恢复。
+ *   SME 新增 ZA 存储（2D 寄存器矩阵）和 ZT0（LUT 加速）。
+ */
+
 #include <linux/linkage.h>
 
 #include <asm/assembler.h>

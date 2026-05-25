@@ -7,6 +7,24 @@
 
 	.text
 /*
+ * ARM64 CPU 挂起与恢复底层汇编
+ *
+ * 本文件实现了 CPU 挂起 (suspend) 和恢复 (resume) 的关键底层逻辑:
+ *   1. __cpu_suspend_enter — 挂起前保存被调用方寄存器到 sleep_stack_data
+ *   2. cpu_resume — 恢复时恒等映射入口, 重新初始化并开启 MMU
+ *   3. _cpu_resume — MMU 开启后, 恢复上下文并返回
+ *
+ * 挂起流程:
+ *   __cpu_suspend_enter 保存 x19~x28, x29, lr, sp
+ *   → MPIDR 哈希找到 per-CPU 槽位
+ *   → 调用 cpu_do_suspend (SoC 特定) → 返回 1
+ *
+ * 恢复流程:
+ *   cpu_resume (idmap) → init_kernel_el → __cpu_setup
+ *   → enable_mmu → _cpu_resume → 恢复上下文 → 返回 0
+ */
+
+/*
  * Implementation of MPIDR_EL1 hash algorithm through shifting
  * and OR'ing.
  *
@@ -51,16 +69,25 @@
 	orr	\dst, \dst, \mask		// dst|=(aff3>>rs3)
 	.endm
 /*
- * Save CPU state in the provided sleep_stack_data area, and publish its
- * location for cpu_resume()'s use in sleep_save_stash.
+ * __cpu_suspend_enter: 挂起前保存 CPU 上下文
  *
- * cpu_resume() will restore this saved state, and return. Because the
- * link-register is saved and restored, it will appear to return from this
- * function. So that the caller can tell the suspend/resume paths apart,
- * __cpu_suspend_enter() will always return a non-zero value, whereas the
- * path through cpu_resume() will return 0.
+ * 将当前 CPU 的被调用方保存寄存器保存到提供的 sleep_stack_data 区域，
+ * 并将其位置发布到 sleep_save_stash (按 MPIDR 哈希索引)，供 cpu_resume 使用。
  *
- *  x0 = struct sleep_stack_data area
+ * 关键设计: 挂起/恢复路径的返回区分
+ *   cpu_resume 恢复保存的状态后"返回"，由于 lr 也被保存/恢复了，
+ *   看起来就像是从这个函数返回。调用者通过返回值区分:
+ *     非零 → 正常挂起路径
+ *     零   → 恢复路径
+ *
+ * 参数:
+ *   x0 = struct sleep_stack_data 指针
+ *
+ * 保存顺序:
+ *   SLEEP_STACK_DATA_CALLEE_REGS:
+ *     x29, lr, x19~x28 (被调用方保存寄存器)
+ *   SLEEP_STACK_DATA_SYSTEM_REGS:
+ *     sp (栈指针)
  */
 SYM_FUNC_START(__cpu_suspend_enter)
 	stp	x29, lr, [x0, #SLEEP_STACK_DATA_CALLEE_REGS]
@@ -70,11 +97,11 @@ SYM_FUNC_START(__cpu_suspend_enter)
 	stp	x25, x26, [x0,#SLEEP_STACK_DATA_CALLEE_REGS+64]
 	stp	x27, x28, [x0,#SLEEP_STACK_DATA_CALLEE_REGS+80]
 
-	/* save the sp in cpu_suspend_ctx */
+	/* 将 SP (栈指针) 保存到 cpu_suspend_ctx 中 */
 	mov	x2, sp
 	str	x2, [x0, #SLEEP_STACK_DATA_SYSTEM_REGS + CPU_CTX_SP]
 
-	/* find the mpidr_hash */
+	/* 读取 mpidr_hash 结构: 计算本 CPU 在 sleep_save_stash 中的索引 */
 	ldr_l	x1, sleep_save_stash
 	mrs	x7, mpidr_el1
 	adr_l	x9, mpidr_hash
@@ -103,7 +130,7 @@ SYM_CODE_START(cpu_resume)
 	bl	init_kernel_el
 	mov	x19, x0			// preserve boot mode
 	bl	__cpu_setup
-	/* enable the MMU early - so we can access sleep_save_stash by va */
+	/* 提前开启 MMU, 以便通过虚拟地址访问 sleep_save_stash */
 	adrp	x1, swapper_pg_dir
 	adrp	x2, idmap_pg_dir
 	bl	__enable_mmu
@@ -118,32 +145,33 @@ SYM_FUNC_START(_cpu_resume)
 	bl	finalise_el2
 
 	mrs	x1, mpidr_el1
-	adr_l	x8, mpidr_hash		// x8 = struct mpidr_hash virt address
+	adr_l	x8, mpidr_hash		/* x8 = struct mpidr_hash 虚拟地址 */
 
-	/* retrieve mpidr_hash members to compute the hash */
+	/* 读取 mpidr_hash 的各位成员 (掩码 + 4 个移位量) */
 	ldr	x2, [x8, #MPIDR_HASH_MASK]
 	ldp	w3, w4, [x8, #MPIDR_HASH_SHIFTS]
 	ldp	w5, w6, [x8, #(MPIDR_HASH_SHIFTS + 8)]
 	compute_mpidr_hash x7, x3, x4, x5, x6, x1, x2
 
-	/* x7 contains hash index, let's use it to grab context pointer */
+	/* x7 = 哈希索引, 用于从 sleep_save_stash 数组中取出上下文指针 */
 	ldr_l	x0, sleep_save_stash
 	ldr	x0, [x0, x7, lsl #3]
 	add	x29, x0, #SLEEP_STACK_DATA_CALLEE_REGS
 	add	x0, x0, #SLEEP_STACK_DATA_SYSTEM_REGS
-	/* load sp from context */
+	/* 从挂起时保存的上下文中恢复栈指针 SP */
 	ldr	x2, [x0, #CPU_CTX_SP]
 	mov	sp, x2
 	/*
-	 * cpu_do_resume expects x0 to contain context address pointer
+	 * cpu_do_resume 期望 x0 指向上下文地址 (包含 SoC 特定的系统寄存器)
 	 */
 	bl	cpu_do_resume
 
 #if defined(CONFIG_KASAN) && defined(CONFIG_KASAN_STACK)
 	mov	x0, sp
-	bl	kasan_unpoison_task_stack_below
+	bl	kasan_unpoison_task_stack_below	// KASAN: 取消栈底区域的毒化标记
 #endif
 
+	/* 从保存的上下文恢复被调用方保存寄存器 x19~x28, x29, lr */
 	ldp	x19, x20, [x29, #16]
 	ldp	x21, x22, [x29, #32]
 	ldp	x23, x24, [x29, #48]

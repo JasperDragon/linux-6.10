@@ -5,6 +5,28 @@
  * Copyright (C) 2014 Linaro Ltd <ard.biesheuvel@linaro.org>
  */
 
+/*
+ * SHA-224/SHA-256 哈希计算核心 —— ARMv8 密码学扩展实现
+ *
+ * 本文件实现 SHA-256 和 SHA-224 的单消息摘要计算核心变换，
+ * 使用 ARMv8.2 架构定义的 SHA256 密码学扩展指令（SHA256H、SHA256H2、
+ * SHA256SU0、SHA256SU1），在 NEON 寄存器上并行处理消息调度和轮函数。
+ *
+ * 导出的函数：
+ *   sha256_ce_transform()   - 标准 SHA-256 核心变换（处理一个或多个 64 字节块）
+ *   sha256_ce_finup2x()     - 双消息交织 SHA-256（同时对两个消息计算摘要，
+ *                             利用 CPU 的 SHA-256 指令吞吐能力达到接近 2 倍性能）
+ *
+ * 依赖 .arch armv8-a+crypto，需要 CPU 支持 SHA256 扩展（ARMv8.0 起可选，
+ * ARMv8.2 起广泛部署）。
+ *
+ * 内核用例：文件完整性校验（dm-verity, fs-verity, IMA）、
+ *           数字签名验证、模块签名、随机数生成、
+ *           以及 Crypto API 的 shash 模板。
+ *
+ * 这是一个架构优化的哈希原语，位于 lib/crypto/sha256.c 上层，
+ * 被 crypto/sha256_generic 模块调用。
+ */
 #include <linux/linkage.h>
 #include <asm/assembler.h>
 

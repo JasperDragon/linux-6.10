@@ -5,6 +5,22 @@
  * Copyright (C) 2017 Linaro Ltd <ard.biesheuvel@linaro.org>
  */
 
+/*
+ * AES加/解密核心轮函数 —— 标量实现
+ *
+ * 本文件实现 AES-128/AES-192/AES-256 的加密和解密轮变换。
+ * 它使用查表法（T-table / inverse S-box）在标量（通用）寄存器上执行 SubBytes、
+ * ShiftRows、MixColumns 及其逆操作，不依赖任何 SIMD 或加密扩展指令，因此
+ * 可在所有 AArch64 CPU 上运行。
+ *
+ * 导出的函数：
+ *   __aes_arm64_encrypt()  - AES 单块加密
+ *   __aes_arm64_decrypt()  - AES 单块解密
+ *
+ * 这些是库级别的底层原语，供 AES 库模块 (crypto/aes_generic) 使用，
+ * 当平台不支持 AES NEON 或 ARMv8 密码学扩展时作为回退路径。
+ * 典型消费者：dm-crypt、IPSEC、fscrypt 等内核加密子系统的通用 AES 路径。
+ */
 #include <linux/linkage.h>
 #include <asm/assembler.h>
 #include <asm/cache.h>

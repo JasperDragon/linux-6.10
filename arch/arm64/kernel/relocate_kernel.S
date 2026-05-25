@@ -8,7 +8,43 @@
  * Pasha Tatashin <pasha.tatashin@soleen.com>
  */
 
-#include <linux/kexec.h>
+/*
+ * ============================================================================
+ * relocate_kernel.S — ARM64 kexec 内核重定位
+ * ============================================================================
+ *
+ * 本文件实现 kexec 的核心：将新内核镜像复制到目标物理地址并跳转执行。
+ *
+ * arm64_relocate_new_kernel() 执行流程：
+ *
+ *   1. 加载 kimage 关键参数：
+ *      - x28 = KIMAGE_START (新内核入口物理地址)
+ *      - x27 = EL2 向量表地址 (存在则跳 EL2，否则跳 EL1)
+ *      - x26 = DTB 物理地址
+ *      - x18 = zero page (用于 Break-Before-Make TTBR 切换)
+ *      - x17 = 线性映射页表副本
+ *      - x16 = kimage_head (重定位列表头)
+ *      - x22 = phys_offset (物理地址偏移)
+ *      - x15 = dcache line size
+ *
+ *   2. 遍历 kimage 的重定位条目链表（IND_* 标志位）：
+ *      ┌─────────────────────┬──────────────────────────────┐
+ *      │ IND_SOURCE          │ 将源页复制到 dest 页         │
+ *      │ IND_INDIRECTION     │ 更新链表指针 (ptr = addr)    │
+ *      │ IND_DESTINATION     │ 设置目标地址 (dest = addr)   │
+ *      │ IND_DONE            │ 链表结束                     │
+ *      └─────────────────────┴──────────────────────────────┘
+ *
+ *   3. 复制完毕后：
+ *      - DSB + IC IALLU：保证 I-cache 一致性
+ *      - 关闭 MMU（turn_off_mmu）
+ *      - 若 EL2 向量表存在：通过 HVC_SOFT_RESTART 跳转
+ *      - 否则：直接 br x28 跳转到新内核
+ *
+ * 关键安全保证：
+ *   本函数自身会被复制到 "kexec safe memory" 区域后再执行，
+ *   确保在覆盖旧内核内存时不会破坏自身代码。
+ */
 #include <linux/linkage.h>
 
 #include <asm/assembler.h>

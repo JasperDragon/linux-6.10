@@ -6,6 +6,14 @@
  *
  *  32-bit debugging code
  */
+
+//
+// 文件: arch/arm/kernel/debug.S
+// 描述: 内核早期调试输出例程
+// 功能: 提供 printhex8/printhex4/printhex2、printascii、printch 等调试函数，
+//       用于在 MMU/printk 尚未就绪时输出调试信息
+// 注意: 仅供调试使用，不应包含在生产内核中
+//
 #include <linux/linkage.h>
 #include <asm/assembler.h>
 
@@ -41,16 +49,19 @@
  * Useful debugging routines
  */
 ENTRY(printhex8)
+// 以 8 位十六进制格式打印 r0 的值
 		mov	r1, #8
 		b	printhex
 ENDPROC(printhex8)
 
 ENTRY(printhex4)
+// 以 4 位十六进制格式打印 r0 的值
 		mov	r1, #4
 		b	printhex
 ENDPROC(printhex4)
 
 ENTRY(printhex2)
+// 以 2 位十六进制格式打印 r0 的值
 		mov	r1, #2
 printhex:	adr	r2, hexbuf_rel
 		ldr	r3, [r2]
@@ -81,6 +92,9 @@ hexbuf_rel:	.long	hexbuf_addr - .
 #ifndef CONFIG_DEBUG_SEMIHOSTING
 
 ENTRY(printascii)
+// 通过串口输出以 NULL 结尾的 ASCII 字符串
+// 参数: r0 = 字符串指针
+// 自动将 \n 转换为 \r\n
 		addruart_current r3, r1, r2
 1:		teq	r0, #0
 		ldrbne	r1, [r0], #1
@@ -107,6 +121,8 @@ ENTRY(printascii)
 ENDPROC(printascii)
 
 ENTRY(printch)
+// 通过串口输出单个字符
+// 参数: r0 = 要输出的字符
 		addruart_current r3, r1, r2
 		mov	r1, r0
 		mov	r0, #0
@@ -115,6 +131,8 @@ ENDPROC(printch)
 
 #ifdef CONFIG_MMU
 ENTRY(debug_ll_addr)
+// 获取底层调试串口的 MMIO 物理/虚拟地址
+// 参数: r0 = 物理地址存储指针, r1 = 虚拟地址存储指针
 		addruart r2, r3, ip
 		str	r2, [r0]
 		str	r3, [r1]
@@ -125,6 +143,8 @@ ENDPROC(debug_ll_addr)
 #else
 
 ENTRY(printascii)
+// 使用半主机 (Semihosting) 方式输出字符串
+// 通过 SYS_WRITE0 (0x04) 请求调试器代为输出
 		mov	r1, r0
 		mov	r0, #0x04		@ SYS_WRITE0
 	ARM(	svc	#0x123456	)
@@ -137,6 +157,7 @@ ENTRY(printascii)
 ENDPROC(printascii)
 
 ENTRY(printch)
+// 使用半主机方式输出单个字符 (SYS_WRITEC = 0x03)
 		adr	r1, hexbuf_rel
 		ldr	r2, [r1]
 		add	r1, r1, r2
@@ -152,6 +173,7 @@ ENTRY(printch)
 ENDPROC(printch)
 
 ENTRY(debug_ll_addr)
+// 半主机模式下不支持 LL debug，返回空地址
 		mov	r2, #0
 		str	r2, [r0]
 		str	r2, [r1]

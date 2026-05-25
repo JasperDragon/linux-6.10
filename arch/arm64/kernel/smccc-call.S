@@ -2,7 +2,29 @@
 /*
  * Copyright (c) 2015, Linaro Limited
  */
-#include <linux/linkage.h>
+
+/*
+ * ============================================================================
+ * smccc-call.S — ARM64 SMCCC (SMC/HVC Calling Convention) 调用包装器
+ * ============================================================================
+ *
+ * 本文件封装了 ARM SMCCC API 的底层汇编调用。
+ *
+ * SMCCC 是 ARM 固件接口标准，用于内核与 TrustZone/EL3 或 Hypervisor/EL2
+ * 安全通信。两种调用机制：
+ *   - SMC (Secure Monitor Call): 进入 EL3 (TrustZone)
+ *   - HVC (Hypervisor Call):      进入 EL2 (Hypervisor)
+ *
+ * SMCCC v1 — __arm_smccc_smc / __arm_smccc_hvc:
+ *   参数寄存器: x0-x7 = a0-a7
+ *   返回值: x0-x3 存入 arm_smccc_res 结构体
+ *   Qualcomm 变通: 某些 QCOM 平台需保存 x6 到 quirk state
+ *
+ * SMCCC v1.2+ — arm_smccc_1_2_smc / arm_smccc_1_2_hvc:
+ *   支持多达 18 个参数寄存器 (x0-x17)
+ *   参数和返回值通过 arm_smccc_1_2_regs 结构体传递
+ *   x19 用作临时寄存器（通过栈保存/恢复）
+ */
 #include <linux/arm-smccc.h>
 
 #include <asm/asm-offsets.h>

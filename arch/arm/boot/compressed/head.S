@@ -5,6 +5,14 @@
  *  Copyright (C) 1996-2002 Russell King
  *  Copyright (C) 2004 Hyok S. Choi (MPU support)
  */
+//
+// 文件: arch/arm/boot/compressed/head.S
+// 描述: zImage 解压缩器入口代码，ARM Linux 内核启动的第一阶段
+// 功能: 负责解压压缩的内核镜像 (zImage)，包含自举、缓存/MMU 初始化、
+//       内存重定位、设备树 (DTB) 处理以及最终解压缩调用
+// 入口: start (_start) — 由引导加载程序 (bootloader) 跳入
+// 注意: 所有代码必须是位置无关的 (PIC)，因为解压前可能在任意地址执行
+//
 #include <linux/linkage.h>
 #include <asm/assembler.h>
 #include <asm/v7m.h>
@@ -27,6 +35,8 @@
  * 100% relocatable.  Any attempt to do so will result in a crash.
  * Please select one of the following when turning on debugging.
  */
+// 调试输出宏定义，所有代码必须是 100% 位置无关的
+// 支持三种调试方式：ICE DCC (内嵌仿真器)、SA1100 串口、通用串口
 #ifdef DEBUG
 
 #if defined(CONFIG_DEBUG_ICEDCC)
@@ -78,11 +88,13 @@
 #endif
 
 		.macro	kputc,val
+// 调试宏：向串口输出一个字符
 		mov	r0, \val
 		bl	putc
 		.endm
 
 		.macro	kphex,val,len
+// 调试宏：以十六进制格式输出一个数值
 		mov	r0, \val
 		mov	r1, #\len
 		bl	phex
@@ -115,6 +127,8 @@
 #endif
 		.endm
 
+// 调试宏：打印附加 DTB 的位置和大小信息
+
 		/*
 		 * Debug print of the final appended DTB location
 		 */
@@ -138,6 +152,8 @@
 		.endm
 
 		.macro	enable_cp15_barriers, reg
+// 启用 CP15 屏障指令：检查并设置 SCTLR 的 CP15BEN 位
+// 确保 ARMv7 及以上处理器可使用 CP15 屏障操作
 		mrc	p15, 0, \reg, c1, c0, 0	@ read SCTLR
 		tst	\reg, #(1 << 5)		@ CP15BEN bit set?
 		bne	.L_\@
@@ -153,6 +169,9 @@
 		 * decompressed kernel at the end of the compressed data
 		 * in little-endian form.
 		 */
+	// 获取解压后内核镜像的大小
+// 构建系统以 little-endian 格式将解压大小附加在压缩数据末尾
+// 返回: \res = 解压后的镜像大小 (字节)
 		.macro	get_inflated_image_size, res:req, tmp1:req, tmp2:req
 		adr	\res, .Linflated_image_size_offset
 		ldr	\tmp1, [\res]
@@ -167,6 +186,7 @@
 		orr	\res, \res, \tmp1, lsl #24
 		.endm
 
+	// 将 32 位大端格式值转换为主机 CPU 字节序
 		.macro	be32tocpu, val, tmp
 #ifndef __ARMEB__
 		/* convert to little endian */
@@ -175,6 +195,11 @@
 		.endm
 
 		.section ".start", "ax"
+//
+// zImage 入口点 — 引导加载程序 (bootloader) 从此处跳入
+// 处理不同的调用约定，完成模式切换和基本初始化
+// 入口条件: r1 = 架构 ID, r2 = ATAGS/DTB 指针
+//
 /*
  * sort out different calling conventions
  */
@@ -186,6 +211,8 @@
 		 */
  AR_CLASS(	.arm	)
 start:
+// zImage 解压器的真正入口地址 (start 标签)
+// 引导加载程序跳转到此地址开始执行解压流程
 		.type	start,#function
 		/*
 		 * These 7 nops along with the 1 nop immediately below for
@@ -242,6 +269,8 @@ start:
  ARM(		swi	0x123456	)	@ angel_SWI_ARM
  THUMB(		svc	0xab		)	@ angel_SWI_THUMB
 not_angel:
+// 切换到 SVC (超级用户) 模式并屏蔽所有中断 (FIQ/IRQ)
+// 保存启动模式到 SPSR，用于后续的判断 (如 HYP 模式检测)
 		safe_svcmode_maskall r0
 		msr	spsr_cxsf, r9		@ Save the CPU boot mode in
 						@ SPSR
@@ -328,6 +357,11 @@ not_angel:
 		orrcc	r4, r4, #1		@ remember we skipped cache_on
 		blcs	cache_on
 
+//
+// restart — 解压缩流程的主入口点
+// 经过可能的自重定位后，代码会重新从这里开始执行
+// 设置栈指针、获取解压后镜像大小，准备解压环境
+//
 restart:	adr	r0, LC1
 		ldr	sp, [r0]
 		ldr	r6, [r0, #4]
@@ -349,6 +383,11 @@ restart:	adr	r0, LC1
 #endif
 
 		mov	r5, #0			@ init dtb size to 0
+//
+// 附加 DTB (设备树) 处理
+// 检查 zImage 末尾是否附加了 DTB，如果是则将其纳入内存管理
+// 支持将 ATAGS 转换为 FDT，处理 DTB 与内核的边界对齐
+//
 #ifdef CONFIG_ARM_APPENDED_DTB
 /*
  *   r4  = final kernel address (possibly with LSB set)
@@ -446,6 +485,13 @@ restart:	adr	r0, LC1
 dtb_check_done:
 #endif
 
+//
+// 检查解压后的内核是否会覆盖当前正在执行的代码
+// 如果会覆盖，则需要先进行自我重定位
+// 判断条件:
+//   r4 - 16K 页表目录 >= r10  → 安全 (足够空间)
+//   r4 + 镜像长度 <= wont_overwrite 地址 → 安全 (不会覆盖)
+//
 /*
  * Check to see if we will overwrite ourselves.
  *   r4  = final kernel address (possibly with LSB set)
@@ -464,6 +510,10 @@ dtb_check_done:
 		cmp	r10, r9
 		bls	wont_overwrite
 
+//
+// 自我重定位：将代码自身拷贝到解压后内核的末尾之后
+// 因为总是向前拷贝，当源和目标重叠时需要从末尾开始反向拷贝
+//
 /*
  * Relocate ourselves past the end of the decompressed kernel.
  *   r6  = _edata
@@ -538,6 +588,11 @@ dtb_check_done:
 		add	r0, r0, r6
 		mov	pc, r0
 
+//
+// 不会覆盖自身 — 进入解压前的最后准备工作
+// 计算运行时地址与链接地址的偏移 (delta)
+// 如果 delta 为 0, 则运行在链接地址处，无需重定位
+//
 wont_overwrite:
 		adr	r0, LC0
 		ldmia	r0, {r1, r2, r3, r11, r12}
@@ -603,6 +658,10 @@ wont_overwrite:
 		blo	1b
 #endif
 
+//
+// BSS 段清零 — 运行时环境初始化完毕
+// 如果之前跳过了缓存设置 (r4 的 LSB 为 1)，现在执行
+//
 not_relocated:	mov	r0, #0
 1:		str	r0, [r2], #4		@ clear bss
 		str	r0, [r2], #4
@@ -627,6 +686,11 @@ not_relocated:	mov	r0, #0
  *   r7  = architecture ID
  *   r8  = atags pointer
  */
+//
+// C 运行时环境已就绪 — 调用内核解压缩函数
+// 参数: r0 = 解压后的内核地址, r1 = malloc 起始,
+//       r2 = malloc 结束, r3 = 架构 ID
+//
 		mov	r0, r4
 		mov	r1, sp			@ malloc space above stack
 		add	r2, sp, #MALLOC_SIZE	@ 64k max
@@ -701,6 +765,12 @@ params:		ldr	r0, =0x10000100		@ params_phys for RPC
 		mov	\reg, \reg, lsl \tmp		@ actual cache line size
 		.endm
 
+//
+// 启用缓存 (Cache) 和 MMU
+// 需要设置页表以同时启用 I-Cache 和 D-Cache
+// 页表放置在解压地址下方 16K 处
+// 通过 call_cache_fn 根据当前 CPU ID 查找对应的 cache_on 函数
+//
 /*
  * Turn on the cache.  We need to setup some page tables so that we
  * can have both the I and D caches on.
@@ -790,6 +860,12 @@ __armv3_mpu_cache_on:
 #define CB_BITS 0x0c
 #endif
 
+//
+// 初始化一级页表 (段映射)
+// 在解压地址下方 16K 处创建 1:1 映射的页表
+// 仅对 RAM 区域设置可缓存 (C) 和可缓冲 (B) 位
+// 非 RAM 区域标记为 XN (不可执行) + 不可缓存
+//
 __setup_mmu:	sub	r3, r4, #16384		@ Page directory size
 		bic	r3, r3, #0xff		@ Align the pointer
 		bic	r3, r3, #0x3f00
@@ -934,6 +1010,12 @@ __common_mmu_cache_on:
 
 #define PROC_ENTRY_SIZE (4*5)
 
+//
+// 可重定位的缓存操作函数分发器
+// 根据 CPU ID 在 proc_types 表中查找匹配的处理器类型，
+// 然后跳转到指定的操作函数 (cache_on/cache_off/cache_flush)
+// 偏移由 r3 指定: 8 = cache_on, 12 = cache_off, 16 = cache_flush
+//
 /*
  * Here follow the relocatable cache support functions for the
  * various processors.  This is a generic hook for locating an
@@ -988,6 +1070,12 @@ call_cache_fn:	adr	r12, proc_types
  * methods.  Writeback caches _must_ have the flush method
  * defined.
  */
+//
+// 处理器类型匹配表: 每个条目 20 字节 (PROC_ENTRY_SIZE)
+// 匹配公式: ((实际 ID ^ 匹配值) & 掩码) == 0
+// 写通 (Writethrough) 缓存只需 on/off 方法
+// 写回 (Writeback) 缓存必须有 flush 方法
+//
 		.align	2
 		.type	proc_types,#object
 proc_types:
@@ -1143,6 +1231,10 @@ proc_types:
 		.error "The size of one or more proc_types entries is wrong."
 		.endif
 
+//
+// 关闭 Cache 和 MMU
+// 通过 call_cache_fn 根据 CPU ID 查找对应的 cache_off 函数
+//
 /*
  * Turn off the Cache and MMU.  ARMv3 does not support
  * reading the control register, but ARMv4 does.
@@ -1186,6 +1278,8 @@ __armv4_mmu_cache_off:
 		mov	pc, lr
 
 __armv7_mmu_cache_off:
+// ARMv7 关闭 MMU 和缓存的优化版本
+// 保存并清除 SCTLR 的控制位，然后执行完整的流水线同步
 		mrc	p15, 0, r0, c1, c0
 #ifdef CONFIG_MMU
 		bic	r0, r0, #0x0005
@@ -1202,6 +1296,11 @@ __armv7_mmu_cache_off:
 		mcr	p15, 0, r0, c7, c5, 4	@ ISB
 		mov	pc, lr
 
+//
+// 缓存清理和刷新 — 保证内存一致性
+// 在解压完成后、关闭缓存前调用
+// 通过 call_cache_fn 根据 CPU ID 执行对应的缓存刷新操作
+//
 /*
  * Clean and flush the cache to maintain consistency.
  *
@@ -1335,6 +1434,12 @@ __armv3_mpu_cache_flush:
 		mcr	p15, 0, r1, c7, c0, 0	@ invalidate whole cache v3
 		mov	pc, lr
 
+//
+// 调试输出例程 (仅在 DEBUG 配置下编译)
+// 包括: phex (打印十六进制)、puts (打印字符串)、
+//       putc (打印单个字符)、memdump (内存转储)
+// 注意: 所有代码必须是位置无关的 (PIC)
+//
 /*
  * Various debugging routines for printing hex characters and
  * memory, which again must be relocatable.
@@ -1416,6 +1521,11 @@ memdump:	mov	r12, r0
 
 #ifdef CONFIG_ARM_VIRT_EXT
 .align 5
+//
+// HYP 模式重入向量表
+// 当从 HYP 模式启动并需要跳入内核时使用
+// 所有未使用的异常向量指向自身 (死循环)
+//
 __hyp_reentry_vectors:
 		W(b)	.			@ reset
 		W(b)	.			@ undef
@@ -1431,6 +1541,11 @@ __hyp_reentry_vectors:
 		W(b)	.			@ fiq
 #endif /* CONFIG_ARM_VIRT_EXT */
 
+//
+// 跳转到解压后的内核入口
+// r0 = 0 (必须为 0)，r1 = 架构 ID，r2 = ATAGS/DTB 指针
+// 最终跳转到 r4 指向的解压后内核地址
+//
 __enter_kernel:
 		mov	r0, #0			@ must be 0
 		mov	r1, r7			@ restore architecture number
@@ -1439,9 +1554,17 @@ __enter_kernel:
  M_CLASS(	add	r4, r4, #1	)	@ enter in Thumb mode for M class
  THUMB(		bx	r4		)	@ entry point is always ARM for A/R classes
 
+//
+// reloc_code_end — 自重定位代码的结束标记
+// 用于计算需要拷贝的代码大小
+//
 reloc_code_end:
 
 #ifdef CONFIG_EFI_STUB
+//
+// EFI 固件从 HYP 模式进入内核的入口
+// 需要关闭 HYP 模式的 MMU 和缓存
+//
 __enter_kernel_from_hyp:
 		mrc	p15, 4, r0, c1, c0, 0	@ read HSCTLR
 		bic	r0, r0, #0x5		@ disable MMU and caches
@@ -1449,6 +1572,11 @@ __enter_kernel_from_hyp:
 		isb
 		b	__enter_kernel
 
+//
+// EFI 存根入口 — 由 UEFI 固件直接调用
+// 参数: r0 = 镜像基址, r1 = DT 指针
+// 处理: 缓存刷新、HYP/SVC 模式判断、最终跳转到 wont_overwrite
+//
 ENTRY(efi_enter_kernel)
 		mov	r4, r0			@ preserve image base
 		mov	r8, r1			@ preserve DT pointer

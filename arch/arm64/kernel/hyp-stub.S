@@ -6,6 +6,70 @@
  * Author:	Marc Zyngier <marc.zyngier@arm.com>
  */
 
+/*
+ * ============================================================================
+ * hyp-stub.S — ARM64 Hypervisor Stub（管理程序桩代码）
+ * ============================================================================
+ *
+ * 本文件实现内核启动早期安装在 EL2 的 "桩" 异常向量表。
+ * 在 KVM 正式接管之前，此桩代码处理所有 EL2 异常。
+ *
+ * 【架构角色】
+ *
+ *   内核启动时运行在 EL2（如果 CPU 支持 EL2），通过此桩代码：
+ *   1. 设置最小化的 EL2 异常向量表（大部分向量为 infinite loop）
+ *   2. 仅处理 HVC 调用（通过 elx_sync 向量）
+ *   3. 支持切换到 VHE（Virtualization Host Extensions）模式
+ *   4. 最终被 KVM 的完整异常向量表替换
+ *
+ * 【异常向量表布局】：.align 11（2KB 对齐，硬件要求）
+ *
+ *   VBAR_EL2 地址     SP    目标异常级别    向量
+ *   ─────────────  ─────  ─────────────  ─────
+ *   +0x000         EL2t  当前 EL (SP0)   el2_sync_invalid   — 无效（无限循环）
+ *   +0x080         EL2t  当前 EL (SP0)   el2_irq_invalid
+ *   +0x100         EL2t  当前 EL (SP0)   el2_fiq_invalid
+ *   +0x180         EL2t  当前 EL (SP0)   el2_error_invalid
+ *   +0x200         EL2h  当前 EL (SPx)   elx_sync            — 唯一有效的HVC入口！
+ *   +0x280         EL2h  当前 EL (SPx)   el2_irq_invalid
+ *   +0x300         EL2h  当前 EL (SPx)   el2_fiq_invalid
+ *   +0x380         EL2h  当前 EL (SPx)   el2_error_invalid
+ *   +0x400         EL1   低 EL (AArch64) elx_sync
+ *   +0x480         EL1   低 EL (AArch64) el1_irq_invalid
+ *   +0x500         EL1   低 EL (AArch64) el1_fiq_invalid
+ *   +0x580         EL1   低 EL (AArch64) el1_error_invalid
+ *   +0x600         EL1   低 EL (AArch32) 全部 invalid
+ *   +0x700         EL1   低 EL (AArch32) 全部 invalid
+ *
+ * 【elx_sync — HVC 服务调度器】
+ *
+ *   根据 x0 中的命令码执行不同操作：
+ *   ┌──────────────────────┬─────────────────────────────────────────┐
+ *   │ HVC_SET_VECTORS      │ 设置 VBAR_EL2（安装 KVM 向量表）       │
+ *   │ HVC_FINALISE_EL2     │ 切换到 VHE 模式（见 __finalise_el2）    │
+ *   │ HVC_GET_ICH_VTR_EL2  │ 读取 GIC 虚拟化能力寄存器              │
+ *   │ HVC_SOFT_RESTART     │ 软重启 CPU（kexec 使用）               │
+ *   │ HVC_RESET_VECTORS    │ 重置向量表（目前为空操作）             │
+ *   │ 其他                 │ 返回 HVC_STUB_ERR（kvm_call_hyp 滥用）│
+ *   └──────────────────────┴─────────────────────────────────────────┘
+ *
+ * 【__finalise_el2 — VHE 启用流程】
+ *
+ *   1. 开启 EL2 stage-1 MMU（使用 EL1 的页表/MAIR/TCR 映射）
+ *   2. 将 CPACR_EL1 (FP)、VBAR_EL1 (EL1 异常向量) 传递到 EL2
+ *   3. 保持 SPE/TRBE 在 EL2 运行，禁止 EL1 访问
+ *   4. 禁用 EL1 stage-1 MMU（EL1 不再需要，因为 host 运行在 EL2）
+ *   5. 通过修改 SPSR_EL1 的 mode 位 hack 异常返回，从 EL2 继续执行
+ *
+ *   VHE 模式下 Host 运行在 EL2，Guest 运行在 EL1/EL0，
+ *   避免了传统的 nVHE 模式中 Host ↔ Guest 切换的开销。
+ *
+ * 【__hyp_set_vectors / __hyp_reset_vectors】
+ *
+ *   这两个函数通过 HVC_SET_VECTORS / HVC_RESET_VECTORS 从 EL1 发起
+ *   对 VBAR_EL2 的操作（EL1 不能直接写 EL2 系统寄存器）。
+ */
+
 #include <linux/init.h>
 #include <linux/linkage.h>
 

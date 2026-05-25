@@ -3,6 +3,57 @@
  * ARM64 最底层 CPU 初始化入口
  * 基于 arch/arm/kernel/head.S 演化而来
  *
+ * ============================================================================
+ *  文件概述
+ * ============================================================================
+ *
+ * 本文件是 ARM64 Linux 内核的第一个执行点，负责从 bootloader 接手后
+ * 完成最基础的系统初始化，包括:
+ *
+ *   1. 主核 (primary CPU) 启动路径:
+ *      - 保存 bootloader 参数 (FDT 地址等)
+ *      - 在物理地址空间创建初始恒等映射 (identity map)
+ *      - 确定并初始化异常级别 (EL1/EL2)
+ *      - 配置 MMU (TCR, MAIR, 页表)
+ *      - 开启 MMU, 映射内核到虚拟地址空间
+ *      - 跳转到 start_kernel() (init/main.c)
+ *
+ *   2. 从核 (secondary CPU) 启动路径:
+ *      - SMP 轮询等待释放 (holding pen)
+ *      - 或 CPU hotplug 直接上线 (secondary_entry)
+ *      - 复用主核已建立的页表
+ *      - 开启 MMU 后进入 secondary_start_kernel()
+ *
+ *   3. 关键工具函数:
+ *      - __enable_mmu: MMU 开启核心逻辑
+ *      - init_kernel_el: 异常级别初始化
+ *      - 52位 VA 检查、内存颗粒大小检查等
+ *
+ * ============================================================================
+ *  启动阶段的内存视图
+ * ============================================================================
+ *
+ *   阶段1 (MMU=off):
+ *     所有地址均为物理地址 (PA)。代码位于 .idmap.text 和 .head.text。
+ *     栈使用 early_init_stack (物理地址)。
+ *     页表创建通过 __pi_create_init_idmap 完成。
+ *
+ *   阶段2 (MMU=刚开启):
+ *     恒等映射 (VA==PA) 保证代码继续执行。
+ *     PC 仍在 .idmap.text 范围内。
+ *
+ *   阶段3 (完整映射):
+ *     内核通过 swapper_pg_dir 映射到高地址虚拟空间。
+ *     PC 跳转到 __primary_switched, 进入稳定的虚拟地址世界。
+ *
+ * ============================================================================
+ *  寄存器约定 (启动期间)
+ * ============================================================================
+ *
+ *   x19  — primary_entry ~ start_kernel:   MMU 初始状态 (0=off)
+ *   x20  — primary_entry ~ __primary_switch: CPU 启动模式 (EL1/EL2)
+ *   x21  — primary_entry ~ start_kernel:    FDT 物理地址 (来自 x0)
+ *
  * Copyright (C) 1994-2002 Russell King
  * Copyright (C) 2003-2012 ARM Ltd.
  * Authors:	Catalin Marinas <catalin.marinas@arm.com>

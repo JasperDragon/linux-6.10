@@ -5,6 +5,34 @@
  * Copyright (C) 2016 Linaro Ltd <ard.biesheuvel@linaro.org>
  */
 
+// ============================================================================
+// 比特切片 AES (Bitsliced AES, NEON 优化实现)
+// ============================================================================
+// 算法: 比特切片 AES (Bitsliced AES), 同时并行加密/解密 8 个块。
+//       将 AES S-box 和 MixColumns 分解为布尔逻辑运算,
+//       在比特级别上组织数据, 消除查表法的缓存时间侧信道攻击。
+//       基于论文:
+//       'Faster and Timing-Attack Resistant AES-GCM'
+//       by Emilia Kaesper and Peter Schwabe
+//       (https://eprint.iacr.org/2009/129.pdf)
+// CPU 特性: ARMv8 NEON (Advanced SIMD), 利用 128 位 NEON 寄存器
+//           进行位运算 (and, orr, eor, bsl, tbl 等),
+//           不依赖 Crypto Extensions (AESE/AESMC) 指令
+// 内核子系统: dm-crypt (XTS 模式用于全盘加密)、
+//             fscrypt (XTS 和 CBC 模式)、
+//             IPSec (CTR 和 CBC 模式)、
+//             需要时间侧信道攻击防护的场景
+// 说明: 提供:
+//       - aesbs_ecb_encrypt/decrypt: ECB 模式, 8 块并行
+//       - aesbs_cbc_decrypt: CBC 解密, 8 块并行 (CBC 加密不能并行)
+//       - aesbs_ctr_encrypt: CTR 模式, 8 块并行
+//       - aesbs_xts_encrypt/decrypt: XTS 模式, 8 块并行
+//       - aesbs_convert_key: 将普通 AES 轮密钥转换为比特切片格式
+//       比特切片核心使用 8 个 NEON 寄存器 (v0-v7) 分别保存每个字节的
+//       8 个比特位, 配合 sbox/inv_sbox 宏实现 S-box 的布尔逻辑运算。
+//       支持 AES-128/192/256 所有密钥长度。
+// ============================================================================
+
 /*
  * The algorithm implemented here is described in detail by the paper
  * 'Faster and Timing-Attack Resistant AES-GCM' by Emilia Kaesper and

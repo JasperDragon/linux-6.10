@@ -5,6 +5,29 @@
  * Copyright (C) 2014 - 2018 Linaro Ltd. <ard.biesheuvel@linaro.org>
  */
 
+// ============================================================================
+// GHASH 认证算法 + AES-GCM 加密/解密 (ARMv8 Crypto Extensions 实现)
+// ============================================================================
+// 算法: AES-GCM (Galois/Counter Mode) 认证加密。
+//       GHASH 部分在 GF(2^128) 上进行多项式乘法累加,
+//       AES 部分使用 ARMv8 CE 的 AESE/AESMC 指令加速。
+// CPU 特性: ARMv8 Crypto Extensions:
+//           - PMULL/PMULL2: 64 位多项式乘法 (p64 变体)
+//           - AESE/AESMC: AES 加密轮和 MixColumns
+//           - .arch armv8-a+crypto
+// 内核子系统: IPsec (ESP 的 AES-GCM)、
+//             TLS 1.2/1.3 (AES-GCM)、
+//             MACsec (IEEE 802.1AE)、
+//             fscrypt (AES-256-GCM)
+// 说明: 提供:
+//       - pmull_ghash_update_p64: GHASH 域乘法累加, 使用 p64 乘法,
+//         单块和 4 块批量处理两种路径
+//       - pmull_gcm_encrypt / pmull_gcm_decrypt: 完整的 AES-GCM 加密/解密,
+//         使用 pmull_gcm_enc_4x 并行生成 4 个密钥流块,
+//         使用 pmull_gcm_ghash_4x 并行处理 4 块 GHASH 认证
+//       - 支持 128/192/256 位 AES 密钥
+// ============================================================================
+
 #include <linux/linkage.h>
 #include <asm/assembler.h>
 

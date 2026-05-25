@@ -31,6 +31,30 @@
  */
 
 /*
+ * ============================================================================
+ * ARM64 Xen Hypercall 包装器
+ * ============================================================================
+ *
+ * 本文件为每个 Xen hypercall 生成轻量级包装函数。每个 hypercall
+ * 由两个参数定义：hypercall 编号（mov x16, #__HYPERVISOR_*）和
+ * XEN_IMM=0xEA1 立即数（hvc 指令的 ISS 编码，标识此为 Xen hypercall）。
+ *
+ * ARM64 调用约定：
+ *   参数:  x0~x4（第1~5 参数，符合 ARM64 PCS）
+ *   编号:  x16（hypercall 编号，区别于 ARM32 的 r12）
+ *   返回:  x0（返回值）
+ *   指令:  hvc XEN_IMM（ARM64 使用 hvc 而非 ARM32 的 __HVC 宏）
+ *
+ * privcmd_call 特殊处理：
+ *   用户空间通过 privcmd 驱动发起 hypercall 时，需临时启用
+ *   TTBR0_EL1 的用户空间访问权限（uaccess_ttbr0_enable），
+ *   因为 hypervisor 可能通过 AT 指令访问用户空间页表进行
+ *   stage-1 地址翻译（ATT 指令不受 PAN 影响）。
+ *
+ * HYPERCALL_SIMPLE 宏为 0~5 参数的 hypercall 生成统一模板。
+ * HYPERVISOR_dm_op 单独实现，因其需要额外的 uaccess 控制。
+ */
+/*
  * The Xen hypercall calling convention is very similar to the procedure
  * call standard for the ARM 64-bit architecture: the first parameter is
  * passed in x0, the second in x1, the third in x2, the fourth in x3 and

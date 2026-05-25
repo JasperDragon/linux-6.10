@@ -7,6 +7,25 @@
  * Copyright (C) 2015 Huawei Futurewei Technologies.
  */
 
+/*
+ * ============================================================================
+ * cpu-reset.S — ARM64 CPU 软复位（kexec 使用）
+ * ============================================================================
+ *
+ * cpu_soft_restart(el2_switch, entry, arg0, arg1, arg2)：
+ *   将 CPU 恢复到类似硬件复位的状态，然后跳转到新的内核入口。
+ *
+ * 执行流程（运行在 idmap 映射下，因为将关闭 MMU）：
+ *   1. 关闭 MMU：写 INIT_SCTLR_EL1_MMU_OFF 到 SCTLR_EL1
+ *      （禁用 EL1/EL0 stage-1 地址翻译，或 EL2 的 E2H=1 时禁用 EL2/EL0）
+ *   2. ISB 同步：确保 MMU 关闭操作完成
+ *   3. 若 el2_switch=1：通过 HVC_SOFT_RESTART 进入 EL2 再复位
+ *      （hyp-stub.S 的 elx_sync 处理此 HVC，直接跳转到 entry）
+ *   4. 若 el2_switch=0：直接 br x8 跳转到 entry(arg0, arg1, arg2)
+ *
+ * 典型使用场景：kexec 跳转到新内核时，需要 CPU 处于"刚复位"状态。
+ */
+
 #include <linux/linkage.h>
 #include <linux/cfi_types.h>
 #include <asm/assembler.h>

@@ -9,6 +9,24 @@
  * for details of the synchronisation algorithms used here.
  */
 
+/*
+ * ============================================================================
+ * MCPM (Multi-Cluster Power Management) 次级 CPU 启动入口
+ * ============================================================================
+ *
+ * 用于 ARM big.LITTLE 等多 cluster 系统的从核启动和电源管理。
+ *
+ * mcpm_entry_point:
+ *   每个 CPU 在被唤醒后执行的第一段代码。PEN (Power Entry Notification)
+ *   锁用于避免多 cluster 同时上电时的竞态条件。
+ *
+ * mcpm_secondary_startup:
+ *   从 PEN 锁释放后的公共路径，最终跳转到 secondary_start_kernel()。
+ *
+ * PEN 锁流程: CPU 唤醒 → 查 PEN地址 → 若0则 WFE等待 → 读到入口地址 → 跳转
+ * 参考: Documentation/arch/arm/cluster-pm-race-avoidance.rst
+ */
+
 #include <linux/linkage.h>
 #include <asm/mcpm.h>
 #include <asm/assembler.h>

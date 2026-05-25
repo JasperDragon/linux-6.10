@@ -18,6 +18,30 @@
  * (at your option) any later version.
  */
 
+/*
+ * ChaCha20 流密码 / HChaCha20 —— ARM NEON SIMD 实现
+ *
+ * 本文件实现 ChaCha20 流密码和 HChaCha20 哈希的核心运算，
+ * 利用 ARM NEON (SIMD) 指令集进行单块和批量并行加密。
+ *
+ * 导出的函数：
+ *   chacha_block_xor_neon()   - ChaCha20 单块（64 字节）加密/解密（XOR 模式）
+ *   hchacha_block_neon()       - HChaCha20 哈希（产生 256 位子密钥，用于 XChaCha）
+ *   chacha_4block_xor_neon()  - ChaCha20 四块并行加密（同时用标量寄存器计算第 5 块，
+ *                                合计每个调用处理最多 320 字节）
+ *
+ * 特点：
+ *   - 四块并行实现使用 ld4r 指令将同一状态字广播到四个 NEON 通道，
+ *     通过 SIMD 并行执行四路 ChaCha 轮函数，大幅提升吞吐量。
+ *   - 同时使用标量寄存器计算第五路，在 NEON 和标量执行单元之间实现指令级并行。
+ *   - 使用 tbl/tbx 指令实现 8 位循环移位。
+ *
+ * 内核用例：WireGuard (VPN)、内核 CSPRNG (随机数生成)、
+ *           以及通用 Crypto API 的 skcipher 模板。
+ *
+ * 这是一个架构优化的底层原语，被 crypto/chacha_generic 模块和
+ * lib/crypto/chacha20.c 库函数调用。
+ */
 #include <linux/linkage.h>
 #include <asm/assembler.h>
 #include <asm/cache.h>

@@ -6,6 +6,37 @@
  *
  *  This is the "shell" of the ARMv7 processor support.
  */
+// ============================================================================
+// 文件概述: ARMv7 处理器初始化与设置汇编实现
+// 该文件是 ARMv7 架构处理器支持的"核心外壳"，负责 CPU 的初始化、
+// 缓存/TLB/MMU 的设置、勘误表(Errata)工作区修复以及处理器功能表定义。
+// 这是内核 MM 子系统的关键组成部分。
+// 主要内容:
+//   1. 处理器生命周期管理: init/fin(初始化/关闭)、reset(软重启)、
+//      do_idle(空闲)、do_suspend/do_resume(挂起/恢复)
+//   2. MM 相关操作: switch_mm(地址空间切换)、set_pte_ext(页表设置)、
+//      dcache_clean_area(D-cache 区域清理)
+//   3. // ============================================================================
+// __v7_setup: ARMv7 处理器核心初始化（主入口）
+//   1. 刷新 L1 数据缓存
+//   2. 读取 MIDR 识别处理器型号/版本
+//   3. 根据主部件号跳转到对应 Errata 修复
+//   4. 最终配置: I-cache/BTB/TLB 失效, 设置 TTBCR/TTBRx/MAIR
+// 保留: r1,r2,r4,r5,r9,r13; r4/r5=TTBR0, r8=TTBR1, r9=MIDR
+// ============================================================================
+__v7_setup: 核心初始化函数, 配置 TLB、缓存、MMU 状态,
+//      写入 MAIR0/MAIR1(PRRR/NMRR)内存属性寄存器
+//   4. 各 ARM 内核的 Errata 修复:
+//      - Cortex-A8/Cortex-A9/Cortex-A15/Cortex-A12/Cortex-A17
+//      - Marvell PJ4B
+//   5. __v7_proc 宏: 定义处理器信息结构(proc info list)
+// 分支预测硬化:
+//   - 提供 bpiall/iciallu 变体的 switch_mm 用于 Spectre 修复
+//   - PSCI SMC/HVC 调用实现固件级别的分支预测管理
+//   - 在 big.Little 系统中函数表保存在 .rodata 段
+// 关键寄存器配置: SCTLR(系统控制)、ACTLR(辅助控制)、
+// PRRR/NMRR(内存属性)、TTBCR/TTBRx(页表基址)
+// ============================================================================
 #include <linux/arm-smccc.h>
 #include <linux/cfi_types.h>
 #include <linux/init.h>
@@ -31,6 +62,11 @@ SYM_TYPED_FUNC_START(cpu_v7_proc_init)
 	ret	lr
 SYM_FUNC_END(cpu_v7_proc_init)
 
+// --------------------------------------------------------------------------
+// cpu_v7_proc_fin: 处理器关闭/清理
+// 关闭 MMU 和缓存（I-cache + D-cache）为软重启做准备。
+// 清除 SCTLR 的 I 位（bit 12, I-cache）和 C/A 位（bit 2/1, D-cache/对齐）。
+// --------------------------------------------------------------------------
 SYM_TYPED_FUNC_START(cpu_v7_proc_fin)
 	mrc	p15, 0, r0, c1, c0, 0		@ ctrl register
 	bic	r0, r0, #0x1000			@ ...i............
@@ -81,6 +117,12 @@ SYM_TYPED_FUNC_START(cpu_v7_do_idle)
 	ret	lr
 SYM_FUNC_END(cpu_v7_do_idle)
 
+// --------------------------------------------------------------------------
+// cpu_v7_dcache_clean_area: 清理 D-cache 指定区域（用于页表修改后）
+// SMP: MP 扩展意味着硬件页表遍历(PTW)能自动维护缓存一致性，无需操作。
+// UP:  需要逐缓存行 clean D-cache，确保页表修改写回内存。
+// 参数: r0=地址, r1=大小
+// --------------------------------------------------------------------------
 SYM_TYPED_FUNC_START(cpu_v7_dcache_clean_area)
 	ALT_SMP(W(nop))			@ MP extensions imply L1 PTW
 	ALT_UP_B(1f)
@@ -94,6 +136,15 @@ SYM_TYPED_FUNC_START(cpu_v7_dcache_clean_area)
 	ret	lr
 SYM_FUNC_END(cpu_v7_dcache_clean_area)
 
+// ============================================================================
+// 分支预测硬化（Spectre Variant 2 缓解措施）
+// 通过 PSCI SMC/HVC 调用固件进行分支预测器维护，
+// 在进程切换时刷新分支预测器（BTB/BPD）。
+// cpu_v7_smc_switch_mm: 使用 SMC 调用（安全监视器）进行切换
+// cpu_v7_hvc_switch_mm: 使用 HVC 调用（虚拟化扩展）进行切换
+// cpu_v7_iciallu_switch_mm: 仅 ICIALLU（用于 Cortex-A15）
+// cpu_v7_bpiall_switch_mm: 仅 BPIALL（用于 Cortex-A8/A9）
+// ============================================================================
 #if defined(CONFIG_ARM_PSCI) && defined(CONFIG_HARDEN_BRANCH_PREDICTOR)
 	.arch_extension sec
 SYM_TYPED_FUNC_START(cpu_v7_smc_switch_mm)
@@ -115,11 +166,22 @@ SYM_TYPED_FUNC_START(cpu_v7_hvc_switch_mm)
 SYM_FUNC_END(cpu_v7_hvc_switch_mm)
 #endif
 
+// --------------------------------------------------------------------------
+// cpu_v7_iciallu_switch_mm: 通过 ICIALLU 刷新分支预测器后切换地址空间
+// 用于 Cortex-A15 的分支预测硬化，先使整个 I-cache 失效，
+// 再跳转到 cpu_v7_switch_mm 设置新页表。
+// --------------------------------------------------------------------------
 SYM_TYPED_FUNC_START(cpu_v7_iciallu_switch_mm)
 	mov	r3, #0
 	mcr	p15, 0, r3, c7, c5, 0		@ ICIALLU
 	b	cpu_v7_switch_mm
 SYM_FUNC_END(cpu_v7_iciallu_switch_mm)
+
+// --------------------------------------------------------------------------
+// cpu_v7_bpiall_switch_mm: 通过 BPIALL 刷新分支预测器后切换地址空间
+// 用于 Cortex-A8/A9 的分支预测硬化，先使整个 BTAC/BTB 失效，
+// 再跳转到 cpu_v7_switch_mm 设置新页表。
+// --------------------------------------------------------------------------
 SYM_TYPED_FUNC_START(cpu_v7_bpiall_switch_mm)
 	mov	r3, #0
 	mcr	p15, 0, r3, c7, c5, 6		@ flush BTAC/BTB
@@ -129,6 +191,22 @@ SYM_FUNC_END(cpu_v7_bpiall_switch_mm)
 	string	cpu_v7_name, "ARMv7 Processor"
 	.align
 
+// ============================================================================
+// CPU 挂起/恢复支持
+// 派生自 arch/arm/mach-s5pv210/sleep.S
+// 挂起时保存以下 CPU 关键状态到内存:
+//   - FCSE/PID (r4, CP15 c13)
+//   - 用户只读线程 ID (r5, CP15 c13)
+//   - 域 ID (r6, CP15 c3)
+//   - TTB 0/1 (r5/r7, CP15 c2) - 页表基址
+//   - TTB 控制寄存器 (r11, CP15 c2)
+//   - 系统控制寄存器 (r8, CP15 c1)
+//   - 辅助控制寄存器 (r9, CP15 c1)
+//   - 协处理器访问控制 (r10, CP15 c1)
+// 恢复时逆序恢复, 最后跳转到 cpu_resume_mmu 重新使能 MMU。
+// Cortex-A9 MP 额外保存诊断和电源管理寄存器。
+// Marvell PJ4B 额外保存功能模式/调试模式控制寄存器。
+// ============================================================================
 /* Suspend/resume support: derived from arch/arm/mach-s5pv210/sleep.S */
 .globl	cpu_v7_suspend_size
 .equ	cpu_v7_suspend_size, 4 * 9
@@ -264,6 +342,9 @@ SYM_FUNC_END(cpu_pj4b_do_resume)
 	@ Invoke the v7_invalidate_l1() function, which adheres to the AAPCS
 	@ rules, and so it may corrupt registers that we need to preserve.
 	@
+	// do_invalidate_l1: 安全的 L1 缓存失效宏
+	// 保存 r1/r2/lr 后调用 v7_invalidate_l1（会破坏 r0-r3/ip/lr），
+	// 调用后恢复原始值，避免影响上层调用者。
 	.macro	do_invalidate_l1
 	mov	r6, r1
 	mov	r7, r2
@@ -291,6 +372,15 @@ SYM_FUNC_END(cpu_pj4b_do_resume)
  *	It is assumed that:
  *	- cache type register is implemented
  */
+// ============================================================================
+// __v7_ca5mp/ca9mp/cr7mp/cr8mp_setup: Cortex-A5/A9/R7/R8 初始化入口
+// 这些核心需要使 Cache/TLB 操作广播到所有核心(ACTLR[0]=1)
+// 然后使能 SMP 模式(ACTLR[6]=1)
+// ----------------------------------------------------------------------------
+// __v7_ca7mp/ca12mp/ca15mp/b15mp/ca17mp_setup: 新一代 Cortex 初始化入口
+// 这些核心不依赖软件广播(硬件维护一致性)
+// 只需刷新 L1 缓存并使能 SMP 模式
+// ============================================================================
 __v7_ca5mp_setup:
 __v7_ca9mp_setup:
 __v7_cr7mp_setup:
@@ -324,6 +414,12 @@ __v7_ca17mp_setup:
  *  r6: contains MIDR rXpY as 8-bit XY number
  *  r9: MIDR
  */
+// ============================================================================
+// Cortex-A8 勘误表工作区
+//   Errata 430973: 在 r1p* 设置 IBE(Imprecise Bus Error)位
+//   Errata 458693: 在 r2p0 设置 L1NEON 和 PLDNOP 位
+//   Errata 460075: 在 r2p0 禁止 L2 缓存的 Write Allocate
+// ============================================================================
 __ca8_errata:
 #if defined(CONFIG_ARM_ERRATA_430973) && !defined(CONFIG_ARCH_MULTIPLATFORM)
 	teq	r3, #0x00100000			@ only present in r1p*
@@ -347,6 +443,13 @@ __ca8_errata:
 #endif
 	b	__errata_finish
 
+// ============================================================================
+// Cortex-A9 勘误表工作区
+//   Errata 742230: r2p2 之前, 设置诊断寄存器 bit 4（L2 缓存问题）
+//   Errata 742231: r2p0-r2p2, 设置诊断寄存器 bit 12/22（L2 缓存问题）
+//   Errata 743622: r2p*, 设置诊断寄存器 bit 6（L2 缓存问题）
+//   Errata 751472: r3p0 之前（SMP）, 设置诊断寄存器 bit 11（延时加载问题）
+// ============================================================================
 __ca9_errata:
 #ifdef CONFIG_ARM_ERRATA_742230
 	cmp	r6, #0x22			@ only present up to r2p2
@@ -379,6 +482,10 @@ __ca9_errata:
 #endif
 	b	__errata_finish
 
+// ============================================================================
+// Cortex-A15 勘误表工作区
+//   Errata 773022: r0p4 之前(UP), 在 ACTLR 中禁用循环缓冲器(bit 1)
+// ============================================================================
 __ca15_errata:
 #ifdef CONFIG_ARM_ERRATA_773022
 	cmp	r6, #0x4			@ only present up to r0p4
@@ -388,6 +495,13 @@ __ca15_errata:
 #endif
 	b	__errata_finish
 
+// ============================================================================
+// Cortex-A12 勘误表工作区
+//   Errata 818325/852422: 设置诊断寄存器 bit 12（处理器上电/复位问题）
+//   Errata 821420: 设置内部特性寄存器 bit 1（数据一致性问题）
+//   Errata 825619: 设置诊断寄存器 bit 24（AWCACHE 问题）
+//   Errata 857271: 设置诊断寄存器 bit 10/11（TLB 问题）
+// ============================================================================
 __ca12_errata:
 #ifdef CONFIG_ARM_ERRATA_818325_852422
 	mrc	p15, 0, r10, c15, c0, 1		@ read diagnostic register
@@ -411,6 +525,12 @@ __ca12_errata:
 #endif
 	b	__errata_finish
 
+// ============================================================================
+// Cortex-A17 勘误表工作区
+//   Errata 852421: r1p2 之前, 设置诊断寄存器 bit 24（上电复位问题）
+//   Errata 852423: r1p2 之前, 设置诊断寄存器 bit 12（AWCACHE 问题）
+//   Errata 857272: 设置诊断寄存器 bit 10/11（TLB 问题，与 A12 相同）
+// ============================================================================
 __ca17_errata:
 #ifdef CONFIG_ARM_ERRATA_852421
 	cmp	r6, #0x12			@ only present up to r1p2
@@ -431,6 +551,14 @@ __ca17_errata:
 #endif
 	b	__errata_finish
 
+// ============================================================================
+// Marvell PJ4B 处理器初始化
+// PJ4B 是 Marvell 的 ARMv7 兼容处理器核心, 需要配置多个辅助调试/功能寄存器:
+//   1. 禁用静态分支预测、启用内部奇偶校验、禁止 Clean Line 数据传输
+//   2. 禁用快速 LDR、不交错写和监听数据、禁止 Critical Word First
+//   3. 设置 SMP 模式(加入一致性域)、L1 奇偶校验、广播缓存/TLB 维护
+//   4. 配置 WFI/WFE 响应 DVM 请求
+// ============================================================================
 __v7_pj4b_setup:
 #ifdef CONFIG_CPU_PJ4B
 
@@ -485,6 +613,14 @@ __v7_pj4b_setup:
 
 #endif /* CONFIG_CPU_PJ4B */
 
+// ============================================================================
+// __v7_setup: ARMv7 处理器核心初始化（主入口）
+//   1. 刷新 L1 数据缓存
+//   2. 读取 MIDR 识别处理器型号/版本
+//   3. 根据主部件号跳转到对应 Errata 修复
+//   4. 最终配置: I-cache/BTB/TLB 失效, 设置 TTBCR/TTBRx/MAIR
+// 保留: r1,r2,r4,r5,r9,r13; r4/r5=TTBR0, r8=TTBR1, r9=MIDR
+// ============================================================================
 __v7_setup:
 	do_invalidate_l1
 
@@ -522,6 +658,16 @@ __v7_setup_cont:
 	teq	r0, r10
 	beq	__ca15_errata
 
+// ============================================================================
+// __errata_finish: Errata 修复完成后的统一处理
+//   1. 使 I-cache + BTB 失效
+//   2. 使 I + D TLBs 失效（MMU 开启时）
+//   3. 设置 TTBCR + TTBRx（v7_ttb_setup 宏）
+//   4. 写入 MAIR0/MAIR1（PRRR/NMRR）
+//   5. DSB 等待所有维护操作完成
+//   6. 配置 ThumbEE（如果硬件支持且未禁用）
+//   7. 读取 v7_crval 确定 SCTLR 的控制位掩码，返回给调用者
+// ============================================================================
 __errata_finish:
 	mov	r10, #0
 	mcr	p15, 0, r10, c7, c5, 0		@ I+BTB cache invalidate
@@ -650,6 +796,20 @@ ENDPROC(__v7_setup)
 	/*
 	 * Standard v7 proc info content
 	 */
+// ============================================================================
+// __v7_proc 宏: 定义 ARMv7 处理器信息结构体
+// 为每个支持的 ARMv7 处理器生成 proc_info_list 条目, 内核启动时由链接脚本
+// 遍历 .proc.info.init 段来匹配当前 CPU 并调用对应的初始化函数。
+// 该结构体包含 MMU 页表属性、处理器能力标志、以及各种函数表指针。
+// 各参数:
+//   name: 结构体名称
+//   initfunc: CPU 初始化入口(__v7_setup 或特定核心版本)
+//   mm_mmuflags: 内存区域页表附加标志
+//   io_mmuflags: I/O 区域页表附加标志
+//   hwcaps: 硬件能力(HWCAP_*)标志位
+//   proc_fns: 处理器函数表
+//   cache_fns: 缓存函数表(默认为 v7_cache_fns, B15 使用 b15_cache_fns)
+// ============================================================================
 .macro __v7_proc name, initfunc, mm_mmuflags = 0, io_mmuflags = 0, hwcaps = 0, proc_fns = v7_processor_functions, cache_fns = v7_cache_fns
 	ALT_SMP(.long	PMD_TYPE_SECT | PMD_SECT_AP_WRITE | PMD_SECT_AP_READ | \
 			PMD_SECT_AF | PMD_FLAGS_SMP | \mm_mmuflags)
@@ -674,6 +834,12 @@ ENDPROC(__v7_setup)
 	 * ARM Ltd. Cortex A5 processor.
 	 */
 	.type   __v7_ca5mp_proc_info, #object
+// ============================================================================
+// 处理器信息列表: 每个条目定义处理器 ID 匹配掩码和对应的初始化函数。
+// 匹配规则: CPU 的 MIDR 值 & mask == required_id。
+// 内核启动时从 __proc_info_begin 到 __proc_info_end 遍历匹配。
+// 涵盖的处理器: A5, A9, A8, PJ4B, R7, R8, A7, A12, A15, B15, A17, A73, A75, Krait
+// ============================================================================
 __v7_ca5mp_proc_info:
 	.long	0x410fc050
 	.long	0xff0ffff0
@@ -804,6 +970,11 @@ __v7_ca75_proc_info:
 	 * Qualcomm Inc. Krait processors.
 	 */
 	.type	__krait_proc_info, #object
+// ------------------------------------------------------------------------
+// Qualcomm Krait 处理器（高通定制 ARMv7 核心）
+// Krait 的 MIDR 不报告 SDIV/UDIV 和 fused multiply 支持位，
+// 但硬件实际支持。手动添加 HWCAP_IDIV 和 HWCAP_VFPv4。
+// ------------------------------------------------------------------------
 __krait_proc_info:
 	.long	0x510f0400		@ Required ID value
 	.long	0xff0ffc00		@ Mask for ID
@@ -820,6 +991,11 @@ __krait_proc_info:
 	 * Match any ARMv7 processor core.
 	 */
 	.type	__v7_proc_info, #object
+// ------------------------------------------------------------------------
+// 通用 ARMv7 处理器匹配条目（兜底匹配）
+// 匹配规则: MIDR & 0x000f0000 == 0x000f0000
+// 作为最后的手段, 匹配所有未被具体条目匹配的 ARMv7 核心。
+// ------------------------------------------------------------------------
 __v7_proc_info:
 	.long	0x000f0000		@ Required ID value
 	.long	0x000f0000		@ Mask for ID

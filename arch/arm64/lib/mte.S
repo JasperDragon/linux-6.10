@@ -2,6 +2,16 @@
 /*
  * Copyright (C) 2020 ARM Ltd.
  */
+// 中文说明：
+// MTE（Memory Tagging Extension）相关汇编函数。
+// 功能：提供页级别 MTE 标签的清除、复制、保存、恢复，
+//   以及用户空间与内核空间之间的标签传输。
+// 主要指令：
+//   STGM/LDGM：多标签存储/加载，在单次操作中传输多个标签
+//   STZ2G/DZ GZVA：清零数据并同时设置标签
+//   STG/LDG：单标签存储/加载
+// 标签粒度：（MTE_GRANULE_SIZE）每 16 字节一个 4 位标签
+
 #include <linux/linkage.h>
 
 #include <asm/asm-uaccess.h>
@@ -15,6 +25,8 @@
 /*
  * multitag_transfer_size - set \reg to the block size that is accessed by the
  * LDGM/STGM instructions.
+ * 中文：宏 — 获取 LDGM/STGM 指令的单次传输块大小，
+ * 从 GMID_EL1 系统寄存器读取粒度，计算为 4 << BS（默认 64 字节）。
  */
 	.macro	multitag_transfer_size, reg, tmp
 	mrs_s	\reg, SYS_GMID_EL1
@@ -26,6 +38,7 @@
 /*
  * Clear the tags in a page
  *   x0 - address of the page to be cleared
+ * 中文：清除整个页面的 MTE 标签。使用 STGM xzr 将零标签写入每个传输块。
  */
 SYM_FUNC_START(mte_clear_page_tags)
 	multitag_transfer_size x1, x2
@@ -41,6 +54,8 @@ SYM_FUNC_END(mte_clear_page_tags)
  *
  * Parameters:
  *	x0 - address to the beginning of the page
+ * 中文：同时清零一页的数据和 MTE 标签。优先使用 DC GZVA 指令，
+ * 不支持时使用 STZ2G 软件回退路径。
  */
 SYM_FUNC_START(mte_zero_clear_page_tags)
 	and	x0, x0, #(1 << MTE_TAG_SHIFT) - 1	// clear the tag
@@ -66,6 +81,7 @@ SYM_FUNC_END(mte_zero_clear_page_tags)
  * Copy the tags from the source page to the destination one
  *   x0 - address of the destination page
  *   x1 - address of the source page
+ * 中文：将源页面的 MTE 标签复制到目标页面。使用 LDGM/STGM 逐块传输。
  */
 SYM_FUNC_START(mte_copy_page_tags)
 	mov	x2, x0
@@ -88,6 +104,7 @@ SYM_FUNC_END(mte_copy_page_tags)
  *   x2 - number of tags/bytes (n)
  * Returns:
  *   x0 - number of tags read/set
+ * 中文：从用户缓冲区读取标签值设置到内核地址。每字节一标签，PTRACE_POKEMTETAGS 使用。
  */
 SYM_FUNC_START(mte_copy_tags_from_user)
 	mov	x3, x1
@@ -113,6 +130,7 @@ SYM_FUNC_END(mte_copy_tags_from_user)
  *   x2 - number of tags/bytes (n)
  * Returns:
  *   x0 - number of tags read/set
+ * 中文：从内核地址读取标签值写入用户缓冲区。每字节一标签，PTRACE_PEEKMTETAGS 使用。
  */
 SYM_FUNC_START(mte_copy_tags_to_user)
 	mov	x3, x0
@@ -135,6 +153,8 @@ SYM_FUNC_END(mte_copy_tags_to_user)
  * Save the tags in a page
  *   x0 - page address
  *   x1 - tag storage, MTE_PAGE_TAG_STORAGE bytes
+ * 中文：将整个页面的 MTE 标签保存到缓冲区。
+ * 每 16 个标签（覆盖 256 字节）合并为一个 64 位值存入缓冲区。
  */
 SYM_FUNC_START(mte_save_page_tags)
 	multitag_transfer_size x7, x5
@@ -159,6 +179,8 @@ SYM_FUNC_END(mte_save_page_tags)
  * Restore the tags in a page
  *   x0 - page address
  *   x1 - tag storage, MTE_PAGE_TAG_STORAGE bytes
+ * 中文：从缓冲区恢复整个页面的 MTE 标签。
+ * 每 64 位值包含 16 个标签，用 STGM 逐一写入每个传输块。
  */
 SYM_FUNC_START(mte_restore_page_tags)
 	multitag_transfer_size x7, x5

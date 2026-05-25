@@ -5,6 +5,26 @@
  * Copyright (C) 2014 - 2018 Linaro Ltd. <ard.biesheuvel@linaro.org>
  */
 
+/*
+ * GHASH 多项式哈希 —— ARM NEON (PMULL) 实现
+ *
+ * 本文件实现 GHASH 算法的核心运算 —— 在 GF(2^128) 有限域上的多项式乘法，
+ * 使用 ARMv8 的 PMULL (多项式乘法) 指令在 NEON SIMD 寄存器上并行执行。
+ * GHASH 是 AES-GCM 认证加密模式中用于消息完整性认证的哈希函数。
+ *
+ * 导出的函数：
+ *   pmull_ghash_update_p8() - 更新 GHASH 累加器（处理一个或多个 16 字节块）
+ *
+ * 实现策略：
+ *   采用 Karatsuba 乘法分解，将 128 位乘法拆分为三个 64 位乘法，
+ *   并通过预计算的查表加速 8 位多项式乘法（PMULL 的 8 位变体）。
+ *
+ * 内核用例：AES-GCM 认证加密（用于 IPSEC、TLS 内核处理、WireGuard 等）、
+ *           以及通用 Crypto API 的 aead 模板。
+ *
+ * 这是一个架构优化的底层原语，作为 GHASH 库函数被调用。
+ * 当 CPU 支持 PMULL 指令时，该实现显著优于通用 C 版本。
+ */
 #include <linux/linkage.h>
 #include <asm/assembler.h>
 

@@ -2,7 +2,26 @@
 /*
  * Copyright (c) 2015, Linaro Limited
  */
-#include <linux/linkage.h>
+
+/*
+ * ============================================================================
+ * smccc-call.S — ARM32 SMCCC (SMC Calling Convention) 调用包装器
+ * ============================================================================
+ *
+ * ARM32 的 SMCCC 实现与 ARM64 类似，但调用约定不同：
+ *   - 参数: r0-r3 = 寄存器传递，r4-r7 = 栈传递（通过 push/pop 管理）
+ *   - 前4个参数 (a0-a3) 在 r0-r3 中
+ *   - 后4个参数 (a4-a7) 在 r4-r7 中（从栈上加载）
+ *   - 返回值 r0-r3 存入 *res (r12 指向)
+ *
+ * SMC (__SMC(0)): 进入 Secure Monitor (ARM32 安全扩展)
+ * HVC (__HVC(0)): 进入 Hypervisor (ARM32 虚拟化扩展)
+ *
+ * 关键差异于 ARM64:
+ *   - ARM32 只有 4 个参数寄存器 (r0-r3)，额外参数需从栈加载
+ *   - 使用 bx lr 返回而非 ret
+ *   - 需要显式 .save 展开表注释（UNWIND）
+ */
 #include <linux/arm-smccc.h>
 
 #include <asm/asm-offsets.h>

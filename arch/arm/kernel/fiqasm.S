@@ -8,6 +8,26 @@
  *  Copyright (C) 2011, Linaro Limited
  *
  *  FIQ support written by Philip Blundell <philb@gnu.org>, 1998.
+ */
+
+/*
+ * ============================================================================
+ * FIQ (Fast Interrupt reQuest) 底层汇编支持
+ * ============================================================================
+ *
+ * FIQ 是 ARM 的快速中断，具有专用的 r8-r12 寄存器（banked），
+ * 相比 IRQ 更快速，因为无需保存这些寄存器。
+ *
+ * __set_fiq_regs / __get_fiq_regs:
+ *   设置/读取 FIQ 模式下 banked 寄存器 (r8-r13) 的值。
+ *   通过 SPSR 切换模式后直接访问 banked 寄存器，然后恢复原模式。
+ *
+ * __set_fiq_handler:
+ *   设置 FIQ 处理函数入口地址，复制到 FIQ 向量的跳转地址处。
+ *
+ * FIQ vs IRQ: FIQ 有独立的 banked r8-r12 和 sp (r13), lr (r14)，
+ *   无需栈帧操作即可瞬时进入处理函数，适合极低延迟场景。
+ */
  *
  *  FIQ support re-written by Russell King to be more generic
  *

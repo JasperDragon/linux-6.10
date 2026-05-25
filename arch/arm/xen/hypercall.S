@@ -31,6 +31,27 @@
  */
 
 /*
+ * ============================================================================
+ * ARM32 Xen Hypercall 包装器
+ * ============================================================================
+ *
+ * 每个 hypercall 定义为：mov r12, #__HYPERVISOR_* + __HVC(XEN_IMM)。
+ *
+ * ARM32 调用约定（与 ARM32 PCS 略有不同）：
+ *   第1~4 参数: r0~r3（与 PCS 相同）
+ *   第5 参数:   r4（而 PCS 使用栈传递第5参数！这是关键区别）
+ *   编号:       r12（保存 hypercall 编号）
+ *   返回:       r0
+ *
+ * HYPERCALL5 的特殊处理：
+ *   需要额外的栈帧操作：stmdb sp!, {r4} + ldr r4, [sp, #4] + ldm sp!, {r4}
+ *   因为用 r4 传第5参数，必须保存/恢复原始 r4 值。
+ *
+ * privcmd_call：
+ *   用户空间 hypercall，需要在调用前后切换用户空间内存访问权限
+ *   （uaccess_enable / uaccess_disable）。
+ */
+/*
  * The Xen hypercall calling convention is very similar to the ARM
  * procedure calling convention: the first paramter is passed in r0, the
  * second in r1, the third in r2 and the fourth in r3. Considering that

@@ -23,6 +23,21 @@
  *	x2 - n
  * Returns:
  *	x0 - buf
+ *
+ * 中文说明：
+ * 功能：将内存缓冲区填充为指定字符（标准 C 库 memset 函数）。
+ * 参数：x0 - 缓冲区起始地址，x1 - 填充字符（取低 8 位），x2 - 填充字节数。
+ * 返回：x0 - 缓冲区起始地址（不变）。
+ * 算法：分为五层优化路径：
+ *   (1) 小量填充（<=15 字节）：按 8/4/2/1 字节递次处理，无需对齐。
+ *   (2) 对齐调整：对于 >=16 字节的填充，先将目标地址 16 字节对齐。
+ *   (3) 中等填充（<64 字节）：按 48/32/16 字节递减处理，
+ *       最后用 stp 从结尾写入 16 字节处理尾部。
+ *   (4) 大量填充（>=64 字节）：主循环每次 64 字节，使用 stp 指令对。
+ *   (5) 清零优化：当填充字符为 0 时，使用 DC ZVA（Data Cache Zero
+ *       by Virtual Address）按缓存行高效清零。
+ *   (6) MOPS 指令扩展（ARMv8.8+）：使用 setp/setm/sete 三条顺序指令
+ *       由硬件高效完成填充。
  */
 
 dstin		.req	x0
@@ -45,14 +60,16 @@ tmp3		.req	x9
 
 SYM_FUNC_START_LOCAL(__pi_memset_generic)
 	mov	dst, dstin	/* Preserve return value.  */
-	and	A_lw, val, #255
+	// 中文：将 val 的低 8 位扩展到 64 位，使整个寄存器充满相同的字节值
+and	A_lw, val, #255
 	orr	A_lw, A_lw, A_lw, lsl #8
 	orr	A_lw, A_lw, A_lw, lsl #16
-	orr	A_l, A_l, A_l, lsl #32
+	orr	A_l, A_l, A_l, lsl #32	// 64 位填充值准备完成，A_l 中每个字节都是 val
 
 	cmp	count, #15
 	b.hi	.Lover16_proc
 	/*All store maybe are non-aligned..*/
+// 中文：以下小量填充支持非对齐地址，使用 str/strh/strb 逐级处理
 	tbz	count, #3, 1f
 	str	A_l, [dst], #8
 1:
@@ -69,6 +86,7 @@ SYM_FUNC_START_LOCAL(__pi_memset_generic)
 
 .Lover16_proc:
 	/*Whether  the start address is aligned with 16.*/
+// 中文：检查目标地址是否已 16 字节对齐，若未对齐则先写入前 16 字节并调整
 	neg	tmp2, dst
 	ands	tmp2, tmp2, #15
 	b.eq	.Laligned
@@ -76,6 +94,7 @@ SYM_FUNC_START_LOCAL(__pi_memset_generic)
 * The count is not less than 16, we can use stp to store the start 16 bytes,
 * then adjust the dst aligned with 16.This process will make the current
 * memory address at alignment boundary.
+* 中文：写入前 16 字节（可能非对齐），然后调整 dst 到 16 字节对齐
 */
 	stp	A_l, A_l, [dst] /*non-aligned store..*/
 	/*make the dst aligned..*/

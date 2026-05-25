@@ -13,6 +13,26 @@
  *
  * ARMv8-a, AArch64, unaligned accesses.
  *
+ * 中文说明：
+ * 功能：内存复制（memcpy）和内存移动（memmove，支持重叠区域）。
+ *       同时支持 memcpy 和 memmove 两个标准 C 库函数。
+ * 参数：x0 - 目标地址（dstin），x1 - 源地址（src），x2 - 复制字节数（count）。
+ * 返回：x0 - 目标地址（与标准 memcpy/memmove 语义一致）。
+ * 算法：按复制大小分为三个主要路径：
+ *   (1) 小量（0-32 字节）：使用无分支（branchless）序列，通过 ldp/stp 组合
+ *       从两端同时加载/存储，避免分支预测失败。
+ *   (2) 中等（33-128 字节）：一次性加载所有数据到寄存器再写入，
+ *       通过成对加载（ldp）和存储（stp）最大化吞吐量。
+ *   (3) 大量（>128 字节）：使用软件流水线循环，每次处理 64 字节。
+ *       目标地址 16 字节对齐以减少非对齐访问。
+ *       重叠检测后选择正向或反向复制。
+ *   (4) MOPS 指令扩展（ARMv8.8+）：使用 cpyp/cpym/cpye 三条顺序指令，
+ *       硬件高效完成复制。
+ *
+ * 关键优化：通过 ldp/stp 指令对和预加载技术隐藏内存延迟，
+ *   循环中交错执行加载和存储以实现流水线并行。
+ *
+ * 注意：此实现也作为 memmove 使用，通过检测 dst-src 重叠自动选择复制方向。
  */
 
 #define L(label) .L ## label
@@ -66,6 +86,7 @@ SYM_FUNC_START_LOCAL(__pi_memcpy_generic)
 	b.hi	L(copy32_128)
 
 	/* Small copies: 0..32 bytes.  */
+// 中文：0-32 字节小量复制 — 从两端同时加载/存储，避免分支预测失败
 	cmp	count, 16
 	b.lo	L(copy16)
 	ldp	A_l, A_h, [src]
@@ -75,6 +96,7 @@ SYM_FUNC_START_LOCAL(__pi_memcpy_generic)
 	ret
 
 	/* Copy 8-15 bytes.  */
+// 中文：8-15 字节复制 — 同样从两端加载/存储，无分支
 L(copy16):
 	tbz	count, 3, L(copy8)
 	ldr	A_l, [src]
@@ -85,6 +107,7 @@ L(copy16):
 
 	.p2align 3
 	/* Copy 4-7 bytes.  */
+// 中文：4-7 字节复制 — 从两端加载 32 位值再写入
 L(copy8):
 	tbz	count, 2, L(copy4)
 	ldr	A_lw, [src]
@@ -94,6 +117,7 @@ L(copy8):
 	ret
 
 	/* Copy 0..3 bytes using a branchless sequence.  */
+// 中文：0-3 字节复制 — 无分支序列，通过 lsr 计算中间偏移一次性加载三个字节
 L(copy4):
 	cbz	count, L(copy0)
 	lsr	tmp1, count, 1
@@ -108,6 +132,7 @@ L(copy0):
 
 	.p2align 4
 	/* Medium copies: 33..128 bytes.  */
+// 中文：33-128 字节中等复制 — 一次性加载所有数据到寄存器，再全部写入
 L(copy32_128):
 	ldp	A_l, A_h, [src]
 	ldp	B_l, B_h, [src, 16]
@@ -123,6 +148,7 @@ L(copy32_128):
 
 	.p2align 4
 	/* Copy 65..128 bytes.  */
+// 中文：65-128 字节复制 — 额外加载中间 64 字节，拼接成完整的 128 字节传输
 L(copy128):
 	ldp	E_l, E_h, [src, 32]
 	ldp	F_l, F_h, [src, 48]
@@ -143,14 +169,17 @@ L(copy96):
 
 	.p2align 4
 	/* Copy more than 128 bytes.  */
+// 中文：超过 128 字节的大块复制 — 使用软件流水线循环，每次 64 字节
 L(copy_long):
 	/* Use backwards copy if there is an overlap.  */
+// 中文：如果 dst 和 src 有重叠且 dst > src，使用反向复制避免数据被覆盖
 	sub	tmp1, dstin, src
 	cbz	tmp1, L(copy0)
 	cmp	tmp1, count
 	b.lo	L(copy_long_backwards)
 
 	/* Copy 16 bytes and then align dst to 16-byte alignment.  */
+// 中文：先复制 16 字节，然后将目标地址对齐到 16 字节边界以优化后续访问
 
 	ldp	D_l, D_h, [src]
 	and	tmp1, dstin, 15
@@ -166,6 +195,7 @@ L(copy_long):
 	b.ls	L(copy64_from_end)
 
 L(loop64):
+	// 中文：主流水线循环 — 交错执行 64 字节的存储和加载（软件流水线技术，隐藏内存延迟）
 	stp	A_l, A_h, [dst, 16]
 	ldp	A_l, A_h, [src, 16]
 	stp	B_l, B_h, [dst, 32]
@@ -178,6 +208,8 @@ L(loop64):
 	b.hi	L(loop64)
 
 	/* Write the last iteration and copy 64 bytes from the end.  */
+// 中文：当剩余不足 64 字节时，将上次循环的数据写入并额外从末尾复制 64 字节
+// 这样既处理了尾部数据，又避免了对剩余长度进行逐字节检查
 L(copy64_from_end):
 	ldp	E_l, E_h, [srcend, -64]
 	stp	A_l, A_h, [dst, 16]
@@ -196,6 +228,7 @@ L(copy64_from_end):
 	.p2align 4
 
 	/* Large backwards copy for overlapping copies.
+	// 中文：反向复制 — 当 dst 在 src 之后且区域重叠时，从尾到头复制避免覆盖 */
 	   Copy 16 bytes and then align dst to 16-byte alignment.  */
 L(copy_long_backwards):
 	ldp	D_l, D_h, [srcend, -16]
@@ -248,9 +281,9 @@ alternative_if_not ARM64_HAS_MOPS
 alternative_else_nop_endif
 
 	mov	dst, dstin
-	cpyp	[dst]!, [src]!, count!
-	cpym	[dst]!, [src]!, count!
-	cpye	[dst]!, [src]!, count!
+	cpyp	[dst]!, [src]!, count!	// MOPS 复制前向探针：准备复制操作
+	cpym	[dst]!, [src]!, count!	// MOPS 复制主循环：硬件自动完成大块复制
+	cpye	[dst]!, [src]!, count!	// MOPS 复制收尾：处理剩余字节
 	ret
 SYM_FUNC_END(__pi_memcpy)
 #else

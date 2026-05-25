@@ -2,6 +2,17 @@
 #include <linux/linkage.h>
 #include <asm/assembler.h>
 #include "abort-macro.S"
+// ============================================================================
+// 文件概述: ARMv6 早期数据中止异常处理
+// 该文件实现了 ARMv6 架构的数据中止(Data Abort)早期处理函数。
+// 与 ARMv7 相比，ARMv6 需要额外的 Errata 修复:
+//   ARM Errata 326103: ARM1136 的 SWP 指令故障不设置 DFSR 的 bit 11。
+// 修复方法: 读取故障指令并解码，判断是否为写操作，手动设置 bit 11。
+// 核心流程:
+//   1. 读取 DFSR 和 FAR
+//   2. (可选 Errata 修复) 修正故障状态码
+//   3. 禁用用户空间访问后转发到通用 do_DataAbort
+// ============================================================================
 /*
  * Function: v6_early_abort
  *
@@ -24,6 +35,8 @@ ENTRY(v6_early_abort)
 /*
  * Faulty SWP instruction on 1136 doesn't set bit 11 in DFSR.
  */
+// ARM Errata 326103: ARM1136 的 SWP 指令故障不设置 DFSR bit 11
+// 修复: 若是 ARM1136 且非 Java/Thumb 模式, 读取故障指令并解码
 #ifdef CONFIG_ARM_ERRATA_326103
 	ldr	ip, =0x4107b36
 	mrc	p15, 0, r3, c0, c0, 0		@ get processor id

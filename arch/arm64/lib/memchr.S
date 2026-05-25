@@ -15,6 +15,17 @@
  *	x2 - n
  * Returns:
  *	x0 - address of first occurrence of 'c' or 0
+ *
+ * 中文说明：
+ * 功能：在内存区域中查找第一个匹配的字符（标准 C 库 memchr 函数）。
+ * 参数：x0 - 内存起始地址，x1 - 要查找的字符，x2 - 检查的字节数。
+ * 返回：x0 - 第一个匹配字符的地址，若未找到则返回 0。
+ * 算法：核心使用字级并行 NUL 检测技巧（也适用于字符匹配）：
+ *   通过 (X - 0x01010101...) & ~(X | 0x7f7f7f7f...) 检测每个字节，
+ *   先以 8 字节为单位在字循环中快速扫描，
+ *   然后逐字节检查剩余部分。
+ * 关键优化：使用 eor/and/orr 等位操作在一条指令内同时比较 8 个字节，
+ *   大幅减少循环次数。
  */
 
 #define L(label) .L ## label
@@ -43,12 +54,14 @@ SYM_FUNC_START(__pi_memchr)
 	lsr	wordcnt, cntin, #3
 	cbz	wordcnt, L(byte_loop)
 	mov	rep01, #REP8_01
-	mul	repchr, x1, rep01
+	// 中文：将要查找的字符值复制到 64 位寄存器的每个字节中
+mul	repchr, x1, rep01
 	and	cntin, cntin, #7
 L(word_loop):
 	ldr	cur_word, [srcin], #8
 	sub	wordcnt, wordcnt, #1
-	eor	cur_word, cur_word, repchr
+	// 中文：异或操作 — 匹配的字节变为 0x00，非匹配字节非零
+eor	cur_word, cur_word, repchr
 	sub	tmp, cur_word, rep01
 	orr	tmp2, cur_word, #REP8_7f
 	bics	tmp, tmp, tmp2

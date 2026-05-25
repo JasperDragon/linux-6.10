@@ -10,6 +10,45 @@
  * files/head:/src/aarch64/
  */
 
+/*
+ * ============================================================================
+ * copy_template.S — arm64 内存拷贝模板（copy_from_user / copy_to_user / memcpy 共用）
+ * ============================================================================
+ *
+ * 本文件是 arm64 内存拷贝的通用汇编模板，通过 C 预处理器宏参数化实现代码复用。
+ *
+ * 文件本身不定义函数，而是提供通用的拷贝算法。调用方（copy_from_user.S、
+ * copy_to_user.S、memcpy.S）通过 #define 不同宏后 #include 本文件来生成
+ * 各自的实现：
+ *
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │ 调用方            │ ldr 指令      │ str 指令      │ 额外宏    │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ copy_from_user.S  │ ldr1=ldtr     │ str1=str      │ USER()    │
+ * │ copy_to_user.S    │ ldr1=ldr      │ str1=sttr     │ USER()    │
+ * │ memcpy.S          │ ldr1=ldr      │ str1=str      │ (无)      │
+ * └─────────────────────────────────────────────────────────────┘
+ *
+ * copy_from_user 使用 LDTR（非特权加载）：当源地址是非法用户地址时触发
+ * 缺页异常，通过异常表（__ex_table）安全返回 -EFAULT，而非内核崩溃。
+ * copy_to_user 使用 STTR（非特权存储）：对非法目标地址的处理同理。
+ * memcpy 使用标准 LDR/STR，假设源和目标的虚拟地址均有效（内核态）。
+ *
+ * 算法概要（按数据大小选择不同策略）：
+ *
+ *   count < 16  → .Ltiny15:  按 8/4/2/1 字节逐次拷贝（尾部处理）
+ *   16 ≤ count < 64 → .Ltail63: 先对齐源地址，然后 ldp/stp 16字节批量拷贝
+ *   64 ≤ count < 128 → 展开 4× ldp + 2× stp interleaved + 2× stp + 跳尾
+ *   count ≥ 128 → .Lcpy_body_large: 预取 64B → 交错 load/store 循环
+ *      每轮: 存储上一轮 64B + 加载下一轮 64B（流水线优化）
+ *
+ * 关键优化技巧：
+ *   - .Lcpy_body_large 对齐到 L1_CACHE_SHIFT（64B），确保循环在一行 I-cache 内
+ *   - load 和 store 交错：利用 AArch64 的乱序执行和存储转发
+ *   - MOPS 替代方案：ARMv8.8+ FEAT_MOPS 提供硬件加速的 cpy1 指令
+ *   - memmove 友好：始终以递增地址顺序访问，避免 src/dst 重叠时覆盖源数据
+ */
+
 
 /*
  * Copy a buffer from src to dest (alignment handled by the hardware)

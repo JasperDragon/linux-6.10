@@ -5,6 +5,31 @@
  * Copyright (C) 2013 - 2017 Linaro Ltd <ard.biesheuvel@linaro.org>
  */
 
+/*
+ * AES 分组密码工作模式 —— NEON SIMD 实现
+ *
+ * 本文件实现 AES 在多种常用分组工作模式下的加解密操作，利用 ARM NEON
+ * (SIMD) 指令集并行处理多个数据块（批量大小为 4 或 5 块），以提升吞吐量。
+ *
+ * 实现的模式：
+ *   - ECB (电子密码本模式)
+ *   - CBC (密码分组链接模式, 含 ESSIV 变体)
+ *   - CBC-CTS (密文窃取, 处理非对齐尾部)
+ *   - CTR (计数器模式)
+ *   - XCTR (XOR 计数器模式)
+ *   - XTS (基于 tweak 的密文窃用模式, 含 CTS 尾部处理)
+ *   - CBC-MAC (消息认证码更新, 由 CONFIG_CRYPTO_LIB_AES_CBC_MACS 控制)
+ *
+ * 本文件不直接编译，而是被 aes-ce.S（使用 ARMv8 AES 加密扩展）和
+ * aes-neon.S（使用纯 NEON AES 实现）包含。通过宏 AES_FUNC_START/END
+ * 和条件编译 (MAX_STRIDE) 适配不同的底层 AES 加密原语。
+ *
+ * 内核用例：dm-crypt（磁盘加密）、fscrypt（文件系统加密）、IPSEC、
+ *            以及通用 Crypto API 的 skcipher 模板。
+ *
+ * 这是一个架构优化的 SIMD 加速层，编译为 arch/arm64/crypto/ 中的
+ * 内核模块，位于 AES 库之上。
+ */
 /* included by aes-ce.S and aes-neon.S */
 
 	.text
