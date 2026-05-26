@@ -10,7 +10,59 @@
  * Released under the GPLv2 only.
  */
 
-#include <linux/kernel.h>
+/*
+ * hub.c -- USB Hub Driver 与设备枚举引擎
+ *
+ * 本文件是 USB 子系统中最大的单个文件 (~6500 行), 集成了三个核心功能:
+ *
+ * 1) HUB 驱动 (Hub Driver)
+ *    - hub_probe() / hub_disconnect(): Hub 设备的热插拔与生命周期管理
+ *    - hub_configure(): 读取 HUB 描述符, 配置端口属性, 注册中断 URB
+ *    - hub_irq() / hub_event(): 中断处理与工作队列事件循环
+ *
+ * 2) 设备枚举引擎 (Device Enumeration Engine)
+ *    - hub_port_connect(): 新设备接入的完整枚举流程
+ *    - hub_port_init():  端口复位 -> 读设备描述符 -> SET_ADDRESS -> 获取完整描述符
+ *    - hub_port_reset(): USB2/USB3 端口复位 (含 warm reset)
+ *    - usb_new_device():  通告新设备到 USB 核心与驱动层
+ *
+ * 3) 热插拔与电源管理 (Hotplug & Power Management)
+ *    - hub_event() 是核心事件循环, 处理所有端口状态变化
+ *    - port_event()  分析单端口变化位并分发处理
+ *    - hub_suspend() / hub_resume(): 系统挂起/恢复
+ *    - usb_port_disable(): 端口电源控制
+ *
+ * == 设备枚举完整流程 ==
+ *
+ *   hub_event() 检测到端口变化
+ *       -> port_event(): 分析 USB_PORT_STAT_C_* 变化位
+ *       -> hub_port_connect_change(): 判断连接/断开
+ *       -> hub_port_connect(): 枚举入口 (最多 PORT_INIT_TRIES=4 次重试)
+ *           -> hub_port_debounce(): 消除信号抖动 (最多 2000ms)
+ *           -> usb_alloc_dev(): 分配 usb_device 结构
+ *           -> hub_port_init(): 设备初始化
+ *               -> hub_port_reset(): 端口复位 (USB2: ~50ms, USB3: ~200ms)
+ *               -> 读前 8 字节设备描述符 (获取 bMaxPacketSize0)
+ *               -> SET_ADDRESS: 分配 USB 地址
+ *               -> 读完整 18 字节设备描述符
+ *               -> BOS 描述符读取 / LPM 参数设置
+ *           -> usb_new_device(): 通告设备
+ *               -> usb_enumerate_device(): 读配置/字符串/OTG 描述符
+ *               -> device_add(): 注册到设备模型
+ *               -> usb_choose_configuration(): 选择最佳配置
+ *               -> usb_set_configuration(): 激活配置, 绑定驱动
+ *
+ * == HUB 描述符与数据结构 ==
+ *   - struct usb_hub: 每个 hub 实例的运行时数据 (端口位图, 中断 URB, TT)
+ *   - struct usb_port: 每个端口的设备模型表示 (child, power, LPM)
+ *   - struct usb_hub_descriptor: 硬件描述符 (wHubCharacteristics, 端口数)
+ *
+ * == USB2 HUB vs USB3 HUB 关键差异 ==
+ *   - USB2: 使用 Transaction Translator (TT) 支持低速/全速设备
+ *   - USB3: 无需 TT, 使用 warm reset (BH_PORT_RESET), 支持 LPM U1/U2
+ *   - USB3: 端口状态位不同 (USB_SS_PORT_STAT_*), 复位时间更长
+ *   - USB3: 支持 Function Wake Device Notification 远程唤醒
+ */
 #include <linux/errno.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -611,8 +663,100 @@ static int get_port_status(struct usb_device *hdev, int port1,
 	return status;
 }
 
+/*
+ * hub_ext_port_status -- 读取 HUB 端口状态寄存器
+ *
+ * 这是所有端口状态查询的底层函数. 通过控制 URB 发送 GET_PORT_STATUS 请求,
+ * 读取端口的 wPortStatus(当前状态) 和 wPortChange(变化位).
+ *
+ * 参数:
+ *   @hub: 目标 HUB
+ *   @port1: 端口号 (基于 1)
+ *   @type: 请求类型, HUB_PORT_STATUS(4 字节) 或 HUB_EXT_PORT_STATUS(8 字节, USB3+)
+ *   @status: 输出, wPortStatus 位图 (如 USB_PORT_STAT_CONNECTION 等)
+ *   @change: 输出, wPortChange 位图 (如 USB_PORT_STAT_C_CONNECTION 等)
+ *   @ext_status: 输出, dwExtPortStatus (USB3 SSP 速率/通道信息)
+ *
+ * USB_PORT_STAT_* 关键标志:
+ *   - USB_PORT_STAT_CONNECTION:   设备连接状态
+ *   - USB_PORT_STAT_ENABLE:       端口使能状态
+ *   - USB_PORT_STAT_SUSPEND:      挂起状态
+ *   - USB_PORT_STAT_OVERCURRENT:  过流状态
+ *   - USB_PORT_STAT_RESET:        复位进行中
+ *   - USB_PORT_STAT_LOW_SPEED:    低速设备
+ *   - USB_PORT_STAT_HIGH_SPEED:   高速设备
+ *
+ * USB_PORT_STAT_C_* 变化位 (读后自动清除):
+ *   - C_CONNECTION: 连接状态变化
+ *   - C_ENABLE:     使能状态变化
+ *   - C_OVERCURRENT: 过流状态变化
+ *   - C_RESET:       复位完成
+ *   - C_BH_RESET:    warm reset 完成 (USB3)
+ *   - C_LINK_STATE:  链路状态变化 (USB3)
+ *   - C_CONFIG_ERROR: 配置错误 (USB3)
+ */
 static int hub_ext_port_status(struct usb_hub *hub, int port1, int type,
 			       u16 *status, u16 *change, u32 *ext_status)
+{
+	int ret;
+	int len = 4;
+
+	if (type != HUB_PORT_STATUS)
+		len = 8;
+
+	mutex_lock(&hub->status_mutex);
+	ret = get_port_status(hub->hdev, port1, &hub->status->port, type, len);
+	if (ret < len) {
+		if (ret != -ENODEV)
+			dev_err(hub->intfdev,
+				"%s failed (err = %d)\n", __func__, ret);
+		if (ret >= 0)
+			ret = -EIO;
+	} else {
+		*status = le16_to_cpu(hub->status->port.wPortStatus);
+		*change = le16_to_cpu(hub->status->port.wPortChange);
+		if (type != HUB_PORT_STATUS && ext_status)
+			*ext_status = le32_to_cpu(
+				hub->status->port.dwExtPortStatus);
+		ret = 0;
+	}
+	mutex_unlock(&hub->status_mutex);
+
+	/*
+	 * There is no need to lock status_mutex here, because status_mutex
+	 * protects hub->status, and the phy driver only checks the port
+	 * status without changing the status.
+	 */
+	if (!ret) {
+		struct usb_device *hdev = hub->hdev;
+
+		/*
+		 * Only roothub will be notified of connection changes,
+		 * since the USB PHY only cares about changes at the next
+		 * level.
+		 */
+		if (is_root_hub(hdev)) {
+			struct usb_hcd *hcd = bus_to_hcd(hdev->bus);
+			bool connect;
+			bool connect_change;
+
+			connect_change = *change & USB_PORT_STAT_C_CONNECTION;
+			connect = *status & USB_PORT_STAT_CONNECTION;
+			if (connect_change && connect)
+				usb_phy_roothub_notify_connect(hcd->phy_roothub, port1 - 1);
+			else if (connect_change)
+				usb_phy_roothub_notify_disconnect(hcd->phy_roothub, port1 - 1);
+		}
+	}
+
+	return ret;
+}
+
+/*
+ * usb_hub_port_status -- 封装 hub_ext_port_status, 请求标准 4 字节端口状态
+ */
+int usb_hub_port_status(struct usb_hub *hub, int port1,
+			u16 *status, u16 *change)
 {
 	int ret;
 	int len = 4;
@@ -705,6 +849,15 @@ static void hub_retry_irq_urb(struct timer_list *t)
 }
 
 
+/*
+ * kick_hub_wq -- 调度 hub_event() 到全局工作队列 hub_wq
+ *
+ * 去重机制:
+ *   - 如果 hub 已断开或有 pending 工作, 直接返回 (不重复调度)
+ *   - 通过 usb_autopm_get_interface_no_resume() 抑制自动挂起,
+ *     确保 hub_event() 执行期间 hub 不会被挂起
+ *   - 如果 queue_work() 返回 false (工作已在队列中), 则撤销引用计数
+ */
 static void kick_hub_wq(struct usb_hub *hub)
 {
 	struct usb_interface *intf;
@@ -769,6 +922,20 @@ void usb_wakeup_notification(struct usb_device *hdev,
 }
 EXPORT_SYMBOL_GPL(usb_wakeup_notification);
 
+/*
+ * hub_irq -- 中断 URB 完成回调函数
+ *
+ * 当 HUB 的中断 IN 端点有数据到达时调用. 这是整个 HUB 事件处理的入口:
+ *
+ * 1. 解析 urb->buffer 中的端口状态变化位图, 存入 hub->event_bits
+ * 2. 调用 kick_hub_wq() 调度 hub_event() 在进程上下文处理事件
+ * 3. 连续 10 次错误触发 hub->error 标记, 由 hub_event() 执行 HUB 复位
+ *
+ * 注意:
+ *   - 该函数在软中断上下文执行, 仅做最轻量的位图设置
+ *   - URB 重提交由 hub_resubmit_irq_urb() 完成, 保持中断轮询连续性
+ *   - event_bits 的 bit0 表示 HUB 自身状态变化, bitN (N>=1) 表示端口 N 变化
+ */
 /* completion function, fires on port status changes and various faults */
 static void hub_irq(struct urb *urb)
 {
@@ -959,6 +1126,12 @@ int usb_hub_clear_tt_buffer(struct urb *urb)
 }
 EXPORT_SYMBOL_GPL(usb_hub_clear_tt_buffer);
 
+/*
+ * hub_power_on -- 控制 HUB 所有端口的电源
+ *
+ * 遍历 power_bits 位图, 为标记的端口供电, 未标记的端口断电.
+ * 供电后按 HUB 描述符的 bPwrOn2PwrGood 等待电压稳定 (最少 100ms).
+ */
 static void hub_power_on(struct usb_hub *hub, bool do_delay)
 {
 	int port1;
@@ -2950,6 +3123,21 @@ static bool hub_port_warm_reset_required(struct usb_hub *hub, int port1,
 		|| link_state == USB_SS_PORT_LS_COMP_MOD;
 }
 
+/*
+ * hub_port_wait_reset -- 等待端口复位完成并检测设备速度
+ *
+ * 轮询端口状态, 等待 RESET 位清除且 CONNECTION 位建立.
+ * 复位完成后确定设备速度:
+ *   - USB3 SSP: 通过 dwExtPortStatus 解析 lane count 与 speed ID
+ *   - USB3 SS:  由 hub_is_superspeed() 推断
+ *   - USB2:     根据 PORT_STAT_HIGH_SPEED / LOW_SPEED 判断
+ *
+ * 返回:
+ *   0           成功, udev->speed 已设置
+ *   -EBUSY      复位超时或端口未使能
+ *   -ENOTCONN   设备断开或需要 warm reset
+ *   -EAGAIN     连接变化, 需重试 (仅 USB2)
+ */
 static int hub_port_wait_reset(struct usb_hub *hub, int port1,
 			struct usb_device *udev, unsigned int delay, bool warm)
 {
@@ -3046,6 +3234,21 @@ static int hub_port_wait_reset(struct usb_hub *hub, int port1,
 	return 0;
 }
 
+/*
+ * hub_port_reset -- 端口复位核心函数
+ *
+ * USB2 vs USB3 复位差异:
+ *   USB2: SET_FEATURE(PORT_RESET), 约 50ms, 阻塞 EHCI CF
+ *   USB3: 热复位或 warm reset (BH_PORT_RESET), 约 200ms
+ *
+ * USB3 特殊处理:
+ *   - 如果端口处于 SS.Inactive 或 Compliance Mode, 自动从热复位降级为 warm reset
+ *   - 清除 C_BH_PORT_RESET / C_PORT_LINK_STATE / C_CONNECTION 变化位
+ *   - 复位后可能设备处于 SS.Disable, 需再次 warm reset
+ *
+ * 成功后在设备进入 USB_STATE_DEFAULT 状态,
+ * 失败则进入 USB_STATE_NOTATTACHED.
+ */
 /* Handle port reset and port warm(BH) reset (for USB3 protocol ports) */
 static int hub_port_reset(struct usb_hub *hub, int port1,
 			struct usb_device *udev, unsigned int delay, bool warm)
@@ -4897,6 +5100,42 @@ static int get_bMaxPacketSize0(struct usb_device *udev,
  * must be non-NULL.  The device descriptor will be stored there,
  * not in @udev->descriptor, because descriptors for registered
  * devices are meant to be immutable.
+ *
+ * == 设备初始化流程详解 ==
+ *
+ * 1. hub_port_reset() -- 端口复位, 确定设备速度
+ *    复位后 udev->speed 被设置 (LOW/FULL/HIGH/SUPER/SUPER_PLUS)
+ *
+ * 2. 设置 ep0 的 wMaxPacketSize 初始值:
+ *    - SUPER/SUPER_PLUS: 512 字节
+ *    - HIGH:             64 字节 (固定)
+ *    - FULL:             64 字节 (但实际可能是 8/16/32/64, 之后通过读取描述符校正)
+ *    - LOW:              8 字节 (固定)
+ *
+ * 3. 建立 TT (Transaction Translator) 记录:
+ *    如果父 HUB 是高速 HUB 而设备不是高速, 需要 TT 转发
+ *
+ * 4. 初始化方案选择 (use_new_scheme):
+ *    "new scheme": 先发 64 字节 GET_DESCRIPTOR, 再 SET_ADDRESS (Windows 方式)
+ *    "old scheme": 先 SET_ADDRESS, 再读 8 字节设备描述符获取 maxpacket0
+ *    可通过 old_scheme_first/use_both_schemes 模块参数控制
+ *
+ * 5. 主循环 (最多 GET_DESCRIPTOR_TRIES 次):
+ *    a) new scheme: hub_enable_device() -> GET_DESCRIPTOR/64 -> hub_port_reset()
+ *    b) 重试 SET_ADDRESS (最多 SET_ADDRESS_TRIES 次)
+ *    c) 读取 8 字节设备描述符确认 maxpacket0
+ *
+ * 6. 验证 ep0 maxpacket 猜测值:
+ *    从设备描述符中读取 bMaxPacketSize0, 与内核猜测值比较,
+ *    如有差异则修正 udev->ep0.desc.wMaxPacketSize
+ *
+ * 7. 读取完整 18 字节设备描述符 (usb_get_device_descriptor)
+ *    检查是否为真正的 SuperSpeed 设备 (bcdUSB >= 0x0300)
+ *    如果不是, 执行 warm reset 修复
+ *
+ * 8. USB 2.1+ 设备: 读取 BOS 描述符, 设置 LPM 参数
+ *
+ * 9. 通知 HCD 设备已连接和寻址 (hcd->driver->update_device)
  */
 static int
 hub_port_init(struct usb_hub *hub, struct usb_device *udev, int port1,
@@ -5387,6 +5626,34 @@ static int descriptors_changed(struct usb_device *udev,
 	return changed;
 }
 
+/*
+ * hub_port_connect -- 新设备连接枚举主流程
+ *
+ * 这是设备枚举的核心入口, 执行完整的设备发现与初始化流程:
+ *
+ *   1. 断开已有设备: 如果有旧设备, 调用 usb_disconnect() 断开
+ *   2. 消抖稳定: hub_port_debounce_be_stable() 等待信号稳定 (最多 2000ms)
+ *   3. 重试循环: 最多 PORT_INIT_TRIES (4) 次枚举尝试
+ *
+ * 每次尝试:
+ *   a) usb_alloc_dev() 分配新的 usb_device 结构
+ *   b) choose_devnum() 分配 USB 地址编号
+ *   c) hub_port_init() 执行完整的设备初始化 (复位 + 寻址 + 描述符)
+ *   d) 检查总线供电的 HUB 是否可靠 (不能级联总线供电 HUB)
+ *   e) check_highspeed() 检查全速设备是否应运行在高速模式
+ *   f) 将子设备注册到父 HUB 的 children[] 数组
+ *   g) usb_new_device() 通告设备到驱动层
+ *
+ * 重试策略:
+ *   - 失败时释放设备 (hub_free_dev + usb_put_dev)
+ *   - -ENOTCONN 或 -ENOTSUPP: 立即停止重试
+ *   - 枚举到一半 (i == (PORT_INIT_TRIES-1)/2) 时: 执行电源循环
+ *     (断电 2*bPwrOn2PwrGood 再上电), 修复某些顽固设备
+ *
+ * 最终失败处理:
+ *   - hub_port_disable() 关闭端口电源
+ *   - 根 HUB 调用 relinquish_port() 将端口交还给 HCD
+ */
 static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
 		u16 portchange)
 {
@@ -5626,6 +5893,22 @@ done:
 	}
 }
 
+/*
+ * hub_port_connect_change -- 处理端口连接状态变化 (枚举调度中心)
+ *
+ * 调用场景:
+ *   - 端口 C_CONNECTION (物理连接/断开) 变化
+ *   - 端口 C_ENABLE (使能) 变化 (常由 EMI 引起)
+ *   - usb_reset_and_verify_device() 发现描述符变化 (如固件升级)
+ *
+ * 处理策略:
+ *   1. 尝试复苏已有设备:
+ *      - USB3: 读取描述符, 比较 descriptors_changed()
+ *      - USB2 SUSPENDED + persist_enabled: 视为远程唤醒
+ *   2. 复苏失败则调用 hub_port_connect() 完整重新枚举
+ *
+ * 调用者已持有 port_dev->status_lock
+ */
 /* Handle physical or logical connection change events.
  * This routine is called when:
  *	a port connection-change occurs;
@@ -5743,6 +6026,27 @@ exit:
 	kfree(port_dev_path);
 }
 
+/*
+ * port_event -- 处理单个端口的事件 (由 hub_event 遍历调用)
+ *
+ * 这是端口事件的分发中心, 依次检查所有 USB_PORT_STAT_C_* 变化位:
+ *
+ *   1. C_CONNECTION:  连接状态变化 -> 设置 connect_change=1
+ *   2. C_ENABLE:      使能变化 -> EMI 导致端口关闭时重新使能
+ *   3. C_OVERCURRENT: 过流 -> 记录次数, 通知用户态, 清除后重新供电
+ *   4. C_RESET:       复位完成 (USB2) -> 清除标志
+ *   5. C_BH_RESET:    Warm reset 完成 (USB3) -> 清除标志
+ *   6. C_LINK_STATE:  链路状态变化 (USB3) -> 清除标志
+ *   7. C_CONFIG_ERROR: 配置错误 (USB3) -> 清除标志
+ *
+ * 端口在线 (pm_runtime_active) 时的附加处理:
+ *   - hub_handle_remote_wakeup(): 处理远程唤醒
+ *   - hub_port_warm_reset_required(): USB3 SS.Inactive -> warm reset 恢复
+ *     最多 DETECT_DISCONNECT_TRIES 次等待设备断开检测, 然后执行 warm reset
+ *     或 usb_reset_device() 完整复位
+ *
+ * 如果 connect_change 为 true, 最后调用 hub_port_connect_change()
+ */
 static void port_event(struct usb_hub *hub, int port1)
 		__must_hold(&port_dev->status_lock)
 {

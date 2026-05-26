@@ -23,6 +23,43 @@
  * with no callbacks.  Callbacks are evil.
  */
 
+/*
+ * usb.c - USB 子系统的核心初始化和清理入口
+ *
+ * 本文件是 USB 主机侧子系统的初始化和清理入口点，提供了 USB 子系统
+ * 运行所需的核心基础设施，不实现具体的设备驱动逻辑。
+ *
+ * 主要职责包括:
+ *
+ * 1. 模块初始化/退出 (usb_init / usb_exit):
+ *    - 注册 USB 总线类型 (usb_bus_type) 到内核驱动模型
+ *    - 初始化 USB 文件系统 (usbfs) 和设备节点接口
+ *    - 初始化 Hub 驱动子系统 (usb_hub_init)
+ *    - 注册通用 USB 设备驱动 (usb_generic_driver)
+ *    - 步骤间严格依赖关系，失败时精确回滚
+ *
+ * 2. USB 设备生命周期管理:
+ *    - usb_alloc_dev:   分配并初始化 usb_device 结构体
+ *    - usb_release_dev: 释放 usb_device 结构体及其所有子资源
+ *    - usb_get_dev / usb_put_dev: 引用计数管理
+ *
+ * 3. 设备授权机制:
+ *    - usb_dev_authorized: 根据主机控制器策略判断设备默认授权状态
+ *      支持三种策略: 全部授权、全部不授权、仅内部端口授权
+ *
+ * 4. 辅助函数:
+ *    - usb_find_common_endpoints: 查找批量/中断端点
+ *    - usb_ifnum_to_if:          按接口号查找 usb_interface
+ *    - usb_altnum_to_altsetting: 按备用设置号查找备用设置
+ *    - usb_find_interface:       按次设备号查找 usb_interface
+ *    - 各种 DMA 缓冲区分配/释放函数
+ *
+ * 5. USB 设备电源管理:
+ *    - 系统睡眠/唤醒 (suspend/resume/freeze/thaw/poweroff/restore)
+ *    - 运行时电源管理 (runtime_suspend/runtime_resume/runtime_idle)
+ *    - 由 usb_device_pm_ops 统一管理
+ */
+
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/of.h>
@@ -483,6 +520,19 @@ EXPORT_SYMBOL_GPL(usb_for_each_dev);
  * Will be called only by the device core when all users of this usb device are
  * done.
  */
+/*
+ * usb_release_dev - USB 设备释放函数（设备核心回调）
+ * @dev: 被释放的 USB device
+ *
+ * 当 usb_device 的最后一个引用计数归零时，由设备核心自动调用。
+ * 执行以下完整的清理操作:
+ *   1. usb_destroy_configuration()    - 销毁所有 USB 配置描述符
+ *   2. usb_release_bos_descriptor()   - 释放 BOS (Bonded Device Status) 描述符
+ *   3. of_node_put()                  - 释放设备树节点引用
+ *   4. usb_put_hcd()                  - 释放主机控制器驱动的引用计数
+ *   5. kfree(product/manufacturer/serial) - 释放缓存的字符串描述符
+ *   6. kfree(dev)                     - 释放 usb_device 结构体内存
+ */
 static void usb_release_dev(struct device *dev)
 {
 	struct usb_device *udev;
@@ -603,6 +653,21 @@ const struct device_type usb_device_type = {
 #endif
 };
 
+/*
+ * usb_dev_authorized - 判断 USB 设备是否需要默认授权
+ * @dev: 待判断的 USB 设备
+ * @hcd: 该设备所属的主机控制器驱动
+ *
+ * 根据 hcd->dev_policy 决定新接入设备的默认授权状态：
+ *   - USB_DEVICE_AUTHORIZE_NONE:     不授权，所有新接入设备需用户空间显式授权
+ *   - USB_DEVICE_AUTHORIZE_ALL:      全部授权，所有新接入设备默认可用
+ *   - USB_DEVICE_AUTHORIZE_INTERNAL: 仅授权硬接线端口（如内置摄像头、键盘）
+ *                                    上的设备，外部端口需显式授权
+ *
+ * 根集线器始终返回 true（始终授权），因为根集线器是主机的内部组件。
+ * 此函数是 USB 安全策略（USB 设备授权控制）的核心决策点，
+ * 调用时机在 usb_alloc_dev() 中，决定设备的初始 authorized 标志。
+ */
 static bool usb_dev_authorized(struct usb_device *dev, struct usb_hcd *hcd)
 {
 	struct usb_hub *hub;
@@ -624,6 +689,27 @@ static bool usb_dev_authorized(struct usb_device *dev, struct usb_hcd *hcd)
 				USB_PORT_CONNECT_TYPE_HARD_WIRED;
 	}
 }
+
+/*
+ * usb_alloc_dev - USB 设备构造函数
+ * @parent: 设备连接的父集线器（NULL 表示分配根集线器）
+ * @bus: 设备所在的总线
+ * @port1: 端口号（从 1 开始，根集线器忽略此参数）
+ *
+ * 分配并初始化一个 usb_device 结构体，这是 USB 设备枚举的第一步。
+ * 初始化内容包括:
+ *   - 设置设备状态为 USB_STATE_ATTACHED（已连接但尚未寻址）
+ *   - 初始化端点 0（默认控制端点）
+ *   - 生成设备路径标识 (devpath)，用于拓扑定位
+ *   - 设置设备名称格式为 "busnum-devpath"（如 "1-2.3"）
+ *   - 初始化电源管理字段（自动挂起延迟、连接时间等）
+ *   - 根据 hcd 授权策略设置设备的初始授权状态
+ *   - 初始化 URB 列表、文件列表等内部数据结构
+ *
+ * 返回: 成功返回 usb_device 指针，失败返回 NULL。
+ * 注意: 此函数可能睡眠，只能在进程上下文中调用。
+ * 仅 Hub 驱动（包括虚拟根 Hub 驱动）调用此函数。
+ */
 
 /**
  * usb_alloc_dev - usb device constructor (usbcore-internal)
@@ -1206,7 +1292,26 @@ static void usb_debugfs_cleanup(void)
 }
 
 /*
- * Init
+ * usb_init - USB 子系统初始化入口
+ *
+ * 这是 USB 子系统的初始化函数，通过 subsys_initcall 在内核启动早期调用。
+ * 按严格的依赖顺序执行以下初始化步骤：
+ *
+ *   1. usb_init_pool_max()        - 初始化 URB 内存池上限配置
+ *   2. usb_debugfs_init()         - 创建 debugfs 接口（/sys/kernel/debug/usb/devices）
+ *   3. usb_acpi_register()        - 注册 ACPI 通知链（处理电源管理事件）
+ *   4. bus_register()             - 注册 USB 总线类型到内核驱动模型（核心步骤）
+ *   5. bus_register_notifier()    - 注册总线通知器（自动创建/删除 sysfs 文件）
+ *   6. usb_major_init()           - 注册 USB 主设备号（USB 设备节点）
+ *   7. class_register()           - 注册 usbmisc 类（次设备号管理）
+ *   8. usb_register()             - 注册 usbfs 驱动
+ *   9. usb_devio_init()           - 初始化 USB 设备节点接口（/dev/usb/*）
+ *  10. usb_hub_init()             - 初始化 Hub 子系统（核心步骤，启动 Hub 线程）
+ *  11. usb_register_device_driver() - 注册通用 USB 设备驱动
+ *
+ * 任何步骤失败都会跳转到对应的错误处理标签（如 hub_init_failed、
+ * driver_register_failed 等），确保所有已成功初始化的资源被正确回滚。
+ * 如果 nousb 参数被设置（如内核启动参数 "nousb"），则跳过所有初始化。
  */
 static int __init usb_init(void)
 {
@@ -1220,6 +1325,21 @@ static int __init usb_init(void)
 	usb_debugfs_init();
 
 	usb_acpi_register();
+	/*
+	 * usb_bus_type - USB 总线类型
+	 *
+	 * usb_bus_type 是 USB 子系统在内核驱动模型中注册的总线类型。
+	 * 定义于 drivers/usb/core/driver.c，包含以下关键回调：
+	 *   - match: usb_device_match() - 负责 USB 设备和驱动的匹配。
+	 *     匹配规则: 先尝试接口驱动匹配（usb_device_id 表），
+	 *     再尝试设备驱动匹配。
+	 *   - uevent: 设备事件通知，生成环境变量供 udev 使用。
+	 *   - probe/remove: 设备发现和移除的默认行为。
+	 *
+	 * bus_register() 将 usb_bus_type 注册到内核驱动模型中，
+	 * 使其出现在 /sys/bus/usb/ 目录下，同时初始化总线内部的
+	 * 设备列表和驱动列表。这是 USB 子系统初始化的核心步骤之一。
+	 */
 	retval = bus_register(&usb_bus_type);
 	if (retval)
 		goto bus_register_failed;
@@ -1266,7 +1386,25 @@ out:
 }
 
 /*
- * Cleanup
+ * usb_exit - USB 子系统清理退出函数
+ *
+ * 在模块卸载时调用，是 usb_init() 的精确逆向操作。
+ * 按初始化的严格逆序执行清理，确保不会留下未释放的资源：
+ *
+ *   1. usb_release_quirk_list()          - 释放 quirk 列表
+ *   2. usb_deregister_device_driver()    - 注销通用 USB 设备驱动
+ *   3. usb_major_cleanup()               - 注销 USB 主设备号
+ *   4. usb_deregister()                  - 注销 usbfs 驱动
+ *   5. usb_devio_cleanup()               - 清理 USB 设备节点接口
+ *   6. usb_hub_cleanup()                 - 清理 Hub 子系统
+ *   7. class_unregister()                - 注销 usbmisc 类
+ *   8. bus_unregister_notifier()         - 注销总线通知器
+ *   9. bus_unregister()                  - 注销 USB 总线类型
+ *  10. usb_acpi_unregister()             - 注销 ACPI 通知链
+ *  11. usb_debugfs_cleanup()             - 清理 debugfs 接口
+ *  12. idr_destroy()                     - 销毁总线 IDR
+ *
+ * 如果 nousb 参数被设置，跳过所有清理操作。
  */
 static void __exit usb_exit(void)
 {

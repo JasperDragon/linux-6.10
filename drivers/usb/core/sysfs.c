@@ -11,6 +11,37 @@
  * Released under the GPLv2 only.
  */
 
+/*
+ * sysfs.c - USB 设备和接口的 sysfs 属性文件实现
+ *
+ * 本文件实现了 USB 子系统中所有 sysfs 属性文件的显示/存储回调函数。
+ * 这些属性文件暴露在 /sys/bus/usb/devices/ 和 /sys/class/usb/ 目录下，
+ * 用户空间可以通过读写这些文件来查询和控制 USB 设备的状态。
+ * 属性通过 attribute_group 组织，由驱动核心在设备/接口注册时自动创建。
+ *
+ * 设备级属性 (dev_attrs) 包括:
+ *   - 基本信息: speed, devnum, busnum, devpath, version, maxchild
+ *   - 设备身份: idVendor, idProduct, bcdDevice, bDeviceClass 等
+ *   - 配置信息: bConfigurationValue, bNumInterfaces, bMaxPower, configuration
+ *   - 电源管理: persist, autosuspend, connected_duration, active_duration
+ *   - 链路电源管理: usb2_hardware_lpm, usb3_hardware_lpm_u1/u2
+ *   - 授权控制: authorized, authorized_default
+ *   - 诊断信息: quirks, avoid_reset_quirk, urbnum, ltm_capable
+ *   - 字符串描述符: manufacturer, product, serial
+ *   - 二进制描述符: descriptors, bos_descriptors
+ *
+ * 接口级属性 (intf_attrs) 包括:
+ *   - bInterfaceNumber, bAlternateSetting, bNumEndpoints
+ *   - bInterfaceClass, bInterfaceSubClass, bInterfaceProtocol
+ *   - modalias, interface, supports_autosuspend, authorized
+ *   - 接口关联描述符 (IAD): iad_bFirstInterface 等
+ *   - wireless_status
+ *
+ * 属性组通过 usb_device_groups[] 和 usb_interface_groups[] 组织，
+ * 分别在 usb_device_type 和 usb_if_device_type 中注册，
+ * 由驱动核心在设备/接口注册时自动创建。
+ */
+
 
 #include <linux/kernel.h>
 #include <linux/kstrtox.h>
@@ -49,6 +80,12 @@ static ssize_t field##_show(struct device *dev,				\
 usb_actconfig_attr(bNumInterfaces, "%2d\n");
 usb_actconfig_attr(bmAttributes, "%2x\n");
 
+/*
+ * bMaxPower - 显示当前配置的最大总线供电电流
+ * 返回设备当前配置所需的最大总线供电电流（单位 mA）。
+ * 该值来自 USB 配置描述符的 bMaxPower 字段（每个单位代表 2mA）。
+ * 对于总线供电的设备，此值反映了设备从 USB 总线获取的最大电流。
+ */
 static ssize_t bMaxPower_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -68,6 +105,11 @@ static ssize_t bMaxPower_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(bMaxPower);
 
+/*
+ * configuration - 显示当前配置的描述字符串
+ * 返回当前激活配置的描述字符串，该字符串从配置描述符的 iConfiguration 字段
+ * 指向的字符串描述符中读取。配置字符串描述了该配置的用途（如"高功耗模式"等）。
+ */
 static ssize_t configuration_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -90,6 +132,13 @@ static DEVICE_ATTR_RO(configuration);
 /* configuration value is always present, and r/w */
 usb_actconfig_show(bConfigurationValue, "%u\n");
 
+/*
+ * bConfigurationValue - 读取/设置当前激活的配置值
+ * 读取时返回当前激活配置的 bConfigurationValue。
+ * 写入时切换设备到指定的配置（值为 -1 表示使设备进入未配置状态）。
+ * 这是 sysfs 中少数的可写属性之一，允许用户空间动态切换 USB 设备的配置，
+ * 从而改变设备的功能和行为（如切换电源模式或启用/禁用某些接口）。
+ */
 static ssize_t bConfigurationValue_store(struct device *dev,
 					 struct device_attribute *attr,
 					 const char *buf, size_t count)
@@ -138,10 +187,29 @@ static ssize_t  name##_show(struct device *dev,				\
 }									\
 static DEVICE_ATTR_RO(name)
 
+/*
+ * manufacturer / product / serial - USB 字符串描述符属性
+ * 显示从 USB 设备读取的 iManufacturer、iProduct 和 iSerial 字符串。
+ * 字符串在设备枚举时从设备固件中读取并缓存在 udev 结构体中。
+ * 如果设备未提供相应字符串描述符，对应的 sysfs 文件将自动隐藏
+ * （通过 dev_string_attrs_are_visible() 控制可见性）。
+ * 这些字符串是设备识别和 udev 规则匹配的重要依据。
+ */
 usb_string_attr(product);
 usb_string_attr(manufacturer);
 usb_string_attr(serial);
 
+/*
+ * speed - 显示 USB 设备的连接速度
+ * 返回设备当前协商的 USB 速度等级（单位 Mbps）：
+ *   - 1.5   (USB 1.x Low-Speed)
+ *   - 12    (USB 1.x Full-Speed / USB 2.0 兼容)
+ *   - 480   (USB 2.0 High-Speed)
+ *   - 5000  (USB 3.x SuperSpeed / SuperSpeedPlus Gen 1)
+ *   - 10000 (USB 3.1 SuperSpeedPlus Gen 2)
+ *   - 20000 (USB 3.2 SuperSpeedPlus Gen 2x2)
+ * 速度取决于主机控制器、线缆质量和设备能力三方的协商结果。
+ */
 static ssize_t speed_show(struct device *dev, struct device_attribute *attr,
 			  char *buf)
 {
@@ -207,6 +275,12 @@ static ssize_t busnum_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(busnum);
 
+/*
+ * devnum - 显示 USB 设备地址编号
+ * 返回该设备在 USB 总线上的地址编号（范围 1-127）。
+ * 地址编号由 USB 子系统在设备枚举时动态分配，每次枚举可能不同。
+ * 每个 USB 设备在一条总线上有唯一的地址，主机通过此地址与设备通信。
+ */
 static ssize_t devnum_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
@@ -259,6 +333,14 @@ static ssize_t quirks_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(quirks);
 
+/*
+ * avoid_reset_quirk - 复位变通标志
+ * 读取时返回设备是否已设置 USB_QUIRK_RESET 标志。
+ * 写入 1 设置该标志，写入 0 清除该标志。
+ * 设置此标志后，USB 核心将避免对该设备执行复位操作，
+ * 用于解决某些存在复位兼容性问题的设备（复位后无法正常工作）。
+ * 此属性为可读写，允许用户空间根据需要动态调整。
+ */
 static ssize_t avoid_reset_quirk_show(struct device *dev,
 				      struct device_attribute *attr, char *buf)
 {
@@ -290,6 +372,14 @@ static ssize_t avoid_reset_quirk_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(avoid_reset_quirk);
 
+/*
+ * urbnum - 显示当前活跃 URB 数量
+ * 返回该 USB 设备当前未完成的 URB（USB Request Block）数量。
+ * URB 是 USB 核心与主机控制器驱动之间传输数据的基本单位，
+ * 每个 URB 代表一次或一组 USB 数据传输事务。
+ * 该计数器可用于诊断设备是否处于繁忙状态、是否存在 URB 泄漏
+ * 或驱动是否正确提交和回收了 URB。
+ */
 static ssize_t urbnum_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
@@ -700,6 +790,15 @@ field##_show(struct device *dev, struct device_attribute *attr,	\
 }									\
 static DEVICE_ATTR_RO(field)
 
+/*
+ * idVendor / idProduct / bcdDevice - 设备身份标识
+ * 这些属性直接来自 USB 设备描述符，分别表示：
+ *   - idVendor:  USB-IF 分配的厂商 ID（16 位，十六进制）
+ *   - idProduct: 厂商定义的产品 ID（16 位，十六进制）
+ *   - bcdDevice: 设备版本号（BCD 编码，如 0x0100 表示 1.00）
+ * 用户空间通过这些属性唯一识别 USB 设备类型，
+ * 是 udev 规则匹配、设备分类和权限控制的重要依据。
+ */
 usb_descriptor_attr_le16(idVendor, "%04x\n");
 usb_descriptor_attr_le16(idProduct, "%04x\n");
 usb_descriptor_attr_le16(bcdDevice, "%04x\n");
@@ -716,6 +815,16 @@ field##_show(struct device *dev, struct device_attribute *attr,	\
 }									\
 static DEVICE_ATTR_RO(field)
 
+/*
+ * bDeviceClass / bDeviceSubClass / bDeviceProtocol - USB 标准设备分类
+ * 这些属性来自 USB 设备描述符，用于标识设备所属的标准类别：
+ *   - bDeviceClass:     基类代码（0x00 表示由接口描述符定义，0x09 表示 Hub）
+ *   - bDeviceSubClass:  子类代码（进一步细分设备类型）
+ *   - bDeviceProtocol:  协议代码（指定设备使用的协议）
+ *
+ * bNumConfigurations - 设备支持的配置描述符数量
+ * bMaxPacketSize0 - 端点 0 的最大包大小（字节）
+ */
 usb_descriptor_attr(bDeviceClass, "%02x\n");
 usb_descriptor_attr(bDeviceSubClass, "%02x\n");
 usb_descriptor_attr(bDeviceProtocol, "%02x\n");
@@ -723,7 +832,19 @@ usb_descriptor_attr(bNumConfigurations, "%d\n");
 usb_descriptor_attr(bMaxPacketSize0, "%d\n");
 
 
-/* show if the device is authorized (1) or not (0) */
+/*
+ * authorized - 设备授权状态控制
+ *
+ * 读取时返回设备的授权状态（1 = 已授权，0 = 未授权）。
+ * 写入 0 使设备去授权（deauthorize），设备将不可用且不会响应任何驱动；
+ * 写入 1 授权设备，使其可被 USB 驱动正常绑定。
+ *
+ * 这是 USB 安全机制的核心接口：
+ *   - 未授权的设备不会被任何 USB 驱动绑定或访问
+ *   - 可用于实现 USB 设备白名单/黑名单（USB 防火墙）
+ *   - 默认授权策略由 authorized_default 控制
+ *   - 典型应用: 在授权前检查设备身份，阻止未识别的 USB 设备
+ */
 static ssize_t authorized_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
@@ -1065,6 +1186,20 @@ static void remove_default_authorized_attributes(struct device *dev)
 	}
 }
 
+/*
+ * usb_create_sysfs_dev_files - 创建 USB 设备的 sysfs 属性文件
+ * @udev: 要创建 sysfs 文件的 USB 设备
+ *
+ * 在设备注册时由 usb_bus_notify 通知处理器调用。
+ * 创建该设备所需的额外 sysfs 属性组（核心通用属性由
+ * usb_device_groups[] 通过驱动模型自动创建）：
+ *   - 持久化属性（persist）：控制系统挂起后是否保留设备配置
+ *   - 电源管理属性（power）：autosuspend、connected_duration 等
+ *   - 根集线器授权默认值（authorized_default / interface_authorized_default）：
+ *     控制后续接入该根集线器端口的设备的默认授权策略
+ *
+ * 返回 0 表示成功，负值表示错误。失败时自动回滚已创建的属性。
+ */
 int usb_create_sysfs_dev_files(struct usb_device *udev)
 {
 	struct device *dev = &udev->dev;
@@ -1090,6 +1225,17 @@ error:
 	return retval;
 }
 
+/*
+ * usb_remove_sysfs_dev_files - 移除 USB 设备的 sysfs 属性文件
+ * @udev: 要移除 sysfs 文件的 USB 设备
+ *
+ * 在设备注销时由 usb_bus_notify 通知处理器调用。
+ * 移除 usb_create_sysfs_dev_files() 创建的所有属性组，
+ * 与创建顺序相反（后创建的先移除）：
+ *   1. 根集线器的授权默认属性
+ *   2. 电源管理属性组（含 LPM 子组）
+ *   3. 持久化属性
+ */
 void usb_remove_sysfs_dev_files(struct usb_device *udev)
 {
 	struct device *dev = &udev->dev;
@@ -1340,6 +1486,20 @@ const struct attribute_group *usb_interface_groups[] = {
 	NULL
 };
 
+/*
+ * usb_create_sysfs_intf_files - 创建 USB 接口的 sysfs 属性文件
+ * @intf: 要创建 sysfs 文件的 USB 接口
+ *
+ * 在 USB 接口注册时由 usb_bus_notify 通知处理器调用。
+ * 本函数主要检查并创建 interface 字符串属性（来自接口描述符的 iInterface 字段）。
+ *
+ * 如果设备未提供接口描述字符串，或标记有 USB_QUIRK_CONFIG_INTF_STRINGS 标志，
+ * 则不会尝试读取字符串描述符，也不会创建 interface 属性文件。
+ * 接口的标准属性（bInterfaceNumber、modalias 等）由 usb_interface_groups[]
+ * 自动创建，无需在此处理。
+ *
+ * 如果 intf 已经在注销过程中（unregistering 标志已设置），则跳过创建。
+ */
 void usb_create_sysfs_intf_files(struct usb_interface *intf)
 {
 	struct usb_device *udev = interface_to_usbdev(intf);
@@ -1357,6 +1517,14 @@ void usb_create_sysfs_intf_files(struct usb_interface *intf)
 	intf->sysfs_files_created = 1;
 }
 
+/*
+ * usb_remove_sysfs_intf_files - 移除 USB 接口的 sysfs 属性文件
+ * @intf: 要移除 sysfs 文件的 USB 接口
+ *
+ * 在 USB 接口注销时由 usb_bus_notify 通知处理器调用。
+ * 移除 usb_create_sysfs_intf_files() 创建的 interface 字符串属性文件。
+ * 如果 intf 的 sysfs_files_created 标志未设置，说明从未创建过，则直接返回。
+ */
 void usb_remove_sysfs_intf_files(struct usb_interface *intf)
 {
 	if (!intf->sysfs_files_created)

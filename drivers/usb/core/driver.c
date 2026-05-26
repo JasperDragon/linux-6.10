@@ -25,6 +25,72 @@
  *
  */
 
+/*
+ * driver.c -- USB 设备/接口驱动绑定核心
+ *
+ * 本文件实现了 USB 子系统与 Linux 设备驱动模型 (device driver model)
+ * 之间的核心桥接层。它不是一个真正的驱动，而是一组辅助例程的集合，
+ * 负责处理 USB 设备/接口与驱动之间的匹配(matching)、探测(probe)、
+ * 断开(disconnect)、挂起/恢复(suspend/resume)以及运行时 PM 管理。
+ *
+ * ==================== 两层匹配架构 ====================
+ * USB 驱动模型在 Linux 设备模型中存在两个层次的匹配:
+ *
+ *   [1] 设备级匹配 (struct usb_device_driver)
+ *      匹配目标是 struct usb_device 本身。设备级驱动注册时其 probe
+ *      回调被设为 usb_probe_device。匹配通过 usb_device_match_id()
+ *      比较 usb_device_id 表中的 idVendor/idProduct/bcdDevice/
+ *      bDeviceClass 等设备描述符字段。关键的特殊设备级驱动是
+ *      usb_generic_driver, 它不匹配特定 VID/PID, 而是作为"万能回退"
+ *      驱动, 负责为每个 USB 设备创建 usbfs 设备节点、管理配置选择
+ *      以及协调接口级驱动的绑定。
+ *
+ *   [2] 接口级匹配 (struct usb_driver)
+ *      匹配目标是 struct usb_interface。绝大多数 USB 功能驱动
+ *      (HID、Mass Storage、CDC ACM、音频、视频等)都属于这一层。
+ *      接口级匹配通过 usb_match_id() 比较接口描述符中的
+ *      bInterfaceClass/bInterfaceSubClass/bInterfaceProtocol 等字段。
+ *      接口级驱动的 probe 回调被设为 usb_probe_interface。
+ *
+ *  调用路径: 当 Linux 设备核心注册新设备或新驱动时, bus_type.match
+ *  回调(即 usb_device_match())被自动调用。它根据 dev 的类型分派:
+ *    - dev 是 usb_device     → 走设备级匹配(usb_device_driver)
+ *    - dev 是 usb_interface  → 走接口级匹配(usb_driver)
+ *
+ * ==================== probe 生命周期 ====================
+ *   usb_new_device()
+ *     → usb_probe_device()             [设备级 probe]
+ *       → usb_generic_driver_probe()   [通用层: 配置解析 + 接口注册]
+ *         → usb_probe_interface()      [接口级 probe, 对每个接口]
+ *           → driver->probe(intf, id)  [具体驱动 probe 回调]
+ *
+ *   usb_disconnect() 和 usb_unbind_interface() 完成对称的清理流程。
+ *
+ * ==================== 关键子系统 ====================
+ *  - unbind/bind sysfs: 通过 new_id / remove_id sysfs 属性文件,
+ *    用户空间可动态添加或移除 USB 设备 ID, 触发 driver_attach()
+ *    重新探测, 实现无需重启的热插拔驱动绑定。
+ *
+ *  - 接口声明(claim): usb_driver_claim_interface() 允许一个驱动
+ *    在 probe() 中"认领"同一设备上的多个接口(如音频设备需要同时
+ *    绑定控制接口和数据接口), 绕过标准 match→probe 流程直接绑定。
+ *
+ *  - autosuspend 集成: probe 时根据驱动是否声明 supports_autosuspend
+ *    来决定如何初始化运行时 PM。支持 autosuspend 的驱动启用 runtime
+ *    PM 并允许设备在空闲时自动挂起; 不支持的则保持设备活跃以防止
+ *    意外挂起。
+ *
+ *  - 强制解绑与重绑定: 当 reset_resume 或 suspend/resume 不被支持时,
+ *    usb_forced_unbind_intf() + usb_rebind_intf() 机制先解绑接口,
+ *    然后在系统 resume 完成后重新探测驱动。
+ *
+ * ==================== 相关文件 ====================
+ *  - drivers/usb/core/generic.c : usb_generic_driver 的具体实现
+ *  - drivers/usb/core/usb.h     : USB 核心内部头文件
+ *  - include/linux/usb.h        : USB 子系统公共头文件
+ *  - include/linux/device.h     : Linux 设备模型核心接口
+ */
+
 #include <linux/device.h>
 #include <linux/slab.h>
 #include <linux/export.h>
@@ -242,6 +308,31 @@ static const struct usb_device_id *usb_match_dynamic_id(struct usb_interface *in
 }
 
 
+/*
+ * usb_probe_device - USB 设备级 probe 入口
+ *
+ * 由 Linux 设备模型核心在驱动匹配成功后调用。这是 USB 设备级驱动
+ * (usb_device_driver) 的 probe 分发点。
+ *
+ * 处理流程:
+ *   1) 如果驱动不支持 autosuspend, 先调用 usb_autoresume_device()
+ *      增加设备的引用计数, 防止设备在 probe 过程中被意外挂起。
+ *   2) 如果驱动设置了 generic_subclass 标志(即它是 usb_generic_driver
+ *      的子类), 先调用 usb_generic_driver_probe() 执行通用 probe 逻辑
+ *      (配置解析、接口注册等)。
+ *   3) 调用驱动特定的 udriver->probe(udev) 回调。
+ *   4) 如果特定驱动返回 -ENODEV, 且该驱动拥有 id_table 或 match 函数,
+ *      则标记 use_generic_driver = 1 并返回 -EPROBE_DEFER, 以便后续
+ *      由 usb_generic_driver 重新探测。
+ *
+ * 关键设计: usb_generic_driver 是 USB 子系统的"万能回退"驱动。当所有
+ * 专用设备级驱动都无法匹配时, 系统会最终尝试 usb_generic_driver。该
+ * 驱动负责创建设备文件系统节点 (usbfs) 和进行基本的配置管理。
+ *
+ * 注意: usb_generic_driver 本身也是一个 usb_device_driver, 它的 probe
+ * 回调也是 usb_probe_device, 但它的 generic_subclass 标志为 false,
+ * 因此不会递归调用 usb_generic_driver_probe。
+ */
 /* called from driver core with dev locked */
 static int usb_probe_device(struct device *dev)
 {
@@ -299,6 +390,18 @@ static int usb_probe_device(struct device *dev)
 	return error;
 }
 
+/*
+ * usb_unbind_device - USB 设备级解绑
+ *
+ * 由 Linux 设备模型核心在驱动断开时调用。是 usb_probe_device 的逆操作。
+ *
+ * 处理流程:
+ *   1) 调用 udriver->disconnect(udev) 通知驱动设备已断开。
+ *   2) 如果驱动是 generic_subclass (如 usb_generic_driver 的子类),
+ *      调用 usb_generic_driver_disconnect() 执行通用清理。
+ *   3) 如果驱动不支持 autosuspend, 调用 usb_autosuspend_device()
+ *      减少设备的引用计数, 恢复正常的 autosuspend 状态。
+ */
 /* called from driver core with dev locked */
 static int usb_unbind_device(struct device *dev)
 {
@@ -314,6 +417,28 @@ static int usb_unbind_device(struct device *dev)
 	return 0;
 }
 
+/*
+ * usb_probe_interface - USB 接口级 probe 入口
+ *
+ * 由 Linux 设备模型核心在 usb_driver 匹配接口成功后调用。这是绝大多数
+ * USB 功能驱动(HID、Mass Storage、CDC ACM等)的 probe 分发点。
+ *
+ * 处理流程:
+ *   1) 检查设备/接口的授权状态, 未授权的接口拒绝绑定。
+ *   2) 通过 usb_match_dynamic_id() 和 usb_match_id() 查找匹配的
+ *      usb_device_id 条目。
+ *   3) 调用 usb_autoresume_device() 防止 probe 过程中设备被挂起。
+ *   4) 设置接口状态为 USB_INTERFACE_BINDING, 初始化运行时 PM。
+ *   5) 如果驱动要求禁用 LPM(disable_hub_initiated_lpm), 则尝试禁用之。
+ *   6) 如果之前有延迟的 altsetting 0 切换请求(intf->needs_altsetting0),
+ *      在此执行 usb_set_interface()。
+ *   7) 调用 driver->probe(intf, id) 执行具体的驱动 probe。
+ *   8) 成功后接口状态设为 USB_INTERFACE_BOUND, 失败则回退到
+ *      USB_INTERFACE_UNBOUND。
+ *
+ * 授权检查: USB 核心支持设备级和接口级的授权控制。未授权的设备或接口
+ * 不会被任何驱动绑定, 这是 USB 安全模型的一部分(Linux USB 授权框架)。
+ */
 /* called from driver core with dev locked */
 static int usb_probe_interface(struct device *dev)
 {
@@ -424,6 +549,31 @@ static int usb_probe_interface(struct device *dev)
 	return error;
 }
 
+/*
+ * usb_unbind_interface - USB 接口级解绑
+ *
+ * 由 Linux 设备模型核心在驱动与接口断开时调用。是 usb_probe_interface
+ * 的逆操作, 执行完整的接口清理流程。
+ *
+ * 处理流程:
+ *   1) 设置接口状态为 USB_INTERFACE_UNBINDING, 防止并发操作。
+ *   2) 调用 usb_autoresume_device() 确保设备在解绑过程中处于活跃状态。
+ *   3) 如果驱动要求禁用 LPM, 尝试禁用。
+ *   4) 除非驱动声明了 soft_unbind 且设备仍存在, 否则终止接口上所有
+ *      未完成的 URB (usb_disable_interface) --- 这是为了防止驱动
+ *      在 disconnect 后还有未完成的 URB 回调访问已释放的数据。
+ *   5) 调用 driver->disconnect(intf) 通知驱动执行清理。
+ *   6) 释放流资源(usb_free_streams), 每个关联了 USB 流(批量流)的端点
+ *      都需要单独释放。
+ *   7) 恢复 altsetting 0: 如果接口已在 altsetting 0 则重新使能;
+ *      否则执行 Set-Interface 回退。如果设备处于挂起状态或正在
+ *      系统休眠转换中, 则延迟切换 (needs_altsetting0 = 1)。
+ *   8) 清理接口数据, 设置接口状态为 USB_INTERFACE_UNBOUND。
+ *   9) 重新使能 LPM, 恢复运行时 PM 状态。
+ *
+ * soft_unbind: 支持 soft_unbind 的驱动允许在设备仍存在时跳过 URB 终止,
+ * 这对于某些需要优雅断开、不丢失数据的场景(如 usbnet)非常有用。
+ */
 /* called from driver core with dev locked */
 static int usb_unbind_interface(struct device *dev)
 {
@@ -527,6 +677,26 @@ static void usb_shutdown_interface(struct device *dev)
 		driver->shutdown(intf);
 }
 
+/*
+ * usb_driver_claim_interface - 驱动声明(claim)绑定一个接口
+ *
+ * 这是接口声明机制的实现。允许一个驱动在 probe() 中主动"认领"
+ * 同一个 USB 设备上的额外接口, 绕过标准 match→probe 流程。
+ *
+ * 典型用例: 音频设备 (audio) 和 CDC ACM 设备, 它们的一个物理功能
+ * 需要跨多个接口配合工作。驱动 probe 第一个接口时, 通过此函数
+ * 主动绑定附加接口。
+ *
+ * 与标准 probe 的区别:
+ *   - 标准流程: 设备核心发现接口 → 调用 usb_device_match() →
+ *     usb_probe_interface() → driver->probe()
+ *   - Claim 流程: 驱动主动调用 → device_bind_driver() 直接绑定
+ *
+ * 调用者必须持有设备锁 (device lock)。在驱动 probe() 中调用时
+ * 锁已被持有, 无需额外操作; 在其他上下文中调用时需显式获取锁。
+ *
+ * 返回: 0 表示成功, -EBUSY 表示接口已被其他驱动绑定
+ */
 /**
  * usb_driver_claim_interface - bind a driver to an interface
  * @driver: the driver to be bound
@@ -605,6 +775,23 @@ int usb_driver_claim_interface(struct usb_driver *driver,
 }
 EXPORT_SYMBOL_GPL(usb_driver_claim_interface);
 
+/*
+ * usb_driver_release_interface - 驱动释放(release)一个接口
+ *
+ * 与 usb_driver_claim_interface 对应的逆操作。允许驱动在无需等待
+ * disconnect() 调用的情况下主动释放之前声明的接口。
+ *
+ * 处理流程:
+ *   1) 检查接口是否确实被本驱动持有, 防止错误释放。
+ *   2) 检查接口状态是否为 USB_INTERFACE_BOUND, 防止在 disconnect()
+ *      中重复释放。
+ *   3) 如果接口已注册到设备模型, 通过 device_release_driver() 走
+ *      标准驱动核心释放路径(会调用 usb_unbind_interface)。
+ *   4) 如果接口尚未注册, 直接调用 usb_unbind_interface() 手动清理。
+ *
+ * 注意: 此调用是同步的, 不能在中断上下文中使用。调用者必须持有
+ * 设备锁。
+ */
 /**
  * usb_driver_release_interface - unbind a driver from an interface
  * @driver: the driver to be unbound
@@ -647,6 +834,27 @@ void usb_driver_release_interface(struct usb_driver *driver,
 }
 EXPORT_SYMBOL_GPL(usb_driver_release_interface);
 
+/*
+ * usb_match_device - 用 usb_device_id 匹配 USB 设备描述符
+ *
+ * 这是设备级匹配的核心函数。它将 usb_device_id 中的各个字段与
+ * USB 设备描述符(device descriptor)中的对应字段逐项比较。
+ *
+ * 匹配通过 match_flags 位掩码控制:
+ *  - USB_DEVICE_ID_MATCH_VENDOR   : 比较 idVendor
+ *  - USB_DEVICE_ID_MATCH_PRODUCT  : 比较 idProduct
+ *  - USB_DEVICE_ID_MATCH_DEV_LO   : 比较 bcdDevice 下限
+ *  - USB_DEVICE_ID_MATCH_DEV_HI   : 比较 bcdDevice 上限
+ *  - USB_DEVICE_ID_MATCH_DEV_CLASS: 比较 bDeviceClass
+ *  - 等等
+ *
+ * 每个匹配标志位独立控制对应的字段比较。只有当 match_flags 中
+ * 设置了某标志位时, 相应的字段比较才会执行。如果任何已启用的
+ * 比较失败, 函数立即返回 0 (不匹配)。所有已启用的比较都通过
+ * 则返回 1 (匹配)。
+ *
+ * 返回: 0 = 不匹配, 1 = 匹配
+ */
 /* returns 0 if no match, 1 if match */
 int usb_match_device(struct usb_device *dev, const struct usb_device_id *id)
 {
@@ -683,6 +891,26 @@ int usb_match_device(struct usb_device *dev, const struct usb_device_id *id)
 	return 1;
 }
 
+/*
+ * usb_match_one_id_intf - 用 usb_device_id 匹配 USB 接口描述符
+ *
+ * 这是接口级匹配的第二步, 在 usb_match_device() 通过之后被调用,
+ * 用于匹配合适的接口描述符字段。
+ *
+ * 本函数实现了一条重要的 USB 规范规则:
+ *   如果设备的 bDeviceClass 是 USB_CLASS_VENDOR_SPEC (0xFF),
+ *   则接口的 class/subclass/protocol 匹配将被跳过, 除非匹配记录
+ *   同时指定了 Vendor ID。这是因为厂商特定设备的接口类含义也是
+ *   厂商定义的, 不能按标准类解释。
+ *
+ * 匹配字段包括:
+ *  - USB_DEVICE_ID_MATCH_INT_CLASS     : bInterfaceClass
+ *  - USB_DEVICE_ID_MATCH_INT_SUBCLASS  : bInterfaceSubClass
+ *  - USB_DEVICE_ID_MATCH_INT_PROTOCOL  : bInterfaceProtocol
+ *  - USB_DEVICE_ID_MATCH_INT_NUMBER    : bInterfaceNumber
+ *
+ * 返回: 0 = 不匹配, 1 = 匹配
+ */
 /* returns 0 if no match, 1 if match */
 int usb_match_one_id_intf(struct usb_device *dev,
 			  struct usb_host_interface *intf,
@@ -718,6 +946,17 @@ int usb_match_one_id_intf(struct usb_device *dev,
 	return 1;
 }
 
+/*
+ * usb_match_one_id - 组合设备级 + 接口级匹配
+ *
+ * 这是接口级匹配的主要入口, 按顺序执行两级匹配:
+ *   1) usb_match_device() - 匹配设备描述符(Vendor/Product/DeviceClass等)
+ *   2) usb_match_one_id_intf() - 匹配接口描述符(InterfaceClass/Protocol等)
+ *
+ * 只有两级都通过才返回匹配成功。
+ *
+ * 返回: 0 = 不匹配, 1 = 匹配
+ */
 /* returns 0 if no match, 1 if match */
 int usb_match_one_id(struct usb_interface *interface,
 		     const struct usb_device_id *id)
@@ -739,6 +978,20 @@ int usb_match_one_id(struct usb_interface *interface,
 }
 EXPORT_SYMBOL_GPL(usb_match_one_id);
 
+/*
+ * usb_match_id - 遍历 usb_device_id 表, 寻找第一个匹配项
+ *
+ * 在驱动的静态 id_table 中顺序查找, 对每个条目调用
+ * usb_match_one_id() 进行匹配。第一条匹配的条目被返回。
+ *
+ * 查找终止条件: 当遇到 id->idVendor == 0 && id->idProduct == 0
+ * && id->bDeviceClass == 0 && id->bInterfaceClass == 0 &&
+ * id->driver_info == 0 的全零条目时停止。
+ *
+ * 特殊的"全零+driver_info"条目: 如果只有 driver_info 非零,
+ * 则表示驱动希望检查所有设备和接口, 通常用于使用额外逻辑
+ * 来确定是否绑定的场景。
+ */
 /**
  * usb_match_id - find first usb_device_id matching device or interface
  * @interface: the interface of interest
@@ -865,6 +1118,34 @@ bool usb_driver_applicable(struct usb_device *udev,
 	return false;
 }
 
+/*
+ * usb_device_match - USB bus_type.match 回调, 两层匹配分发器
+ *
+ * 这是 USB 总线注册到 Linux 设备模型核心的 match 回调函数。
+ * 每当系统中注册了新的设备或新的驱动时, 设备核心会遍历所有
+ * 未匹配的设备-驱动对, 调用此函数判断是否匹配。
+ *
+ * 这是 USB 两层匹配架构的核心分发点:
+ *
+ *   1) 当 dev 是 usb_device (设备级):
+ *       - 首先检查 drv 是否为 usb_device_driver (即 probe 回调是
+ *         usb_probe_device 的驱动)。接口级驱动(usb_driver) 不会
+ *         被考虑。
+ *       - 如果驱动没有 id_table 和 match 函数, 则无条件返回 1,
+ *         让驱动的 probe 函数自行决定是否绑定。
+ *       - 否则通过 usb_driver_applicable() 检查设备是否在该驱动
+ *         的 id_table 中或通过 match 函数。
+ *
+ *   2) 当 dev 是 usb_interface (接口级):
+ *       - 检查 drv 是否是接口级驱动(非 usb_device_driver)。
+ *       - 通过 usb_match_id() 在驱动的静态 id_table 中查找匹配项。
+ *       - 如果没有静态匹配, 再通过 usb_match_dynamic_id() 检查
+ *         动态添加的 ID (通过 sysfs new_id 接口)。
+ *
+ * 这种设计使得一个 USB 设备的多个接口可以由不同的驱动分别绑定,
+ * 实现了接口级的功能复用。例如, 一个复合 USB 设备可以同时拥有
+ * HID 接口(由 usbhid 驱动)和 Mass Storage 接口(由 usb-storage 驱动)。
+ */
 static int usb_device_match(struct device *dev, const struct device_driver *drv)
 {
 	/* devices and interfaces are handled separately */
@@ -979,6 +1260,26 @@ bool is_usb_device_driver(const struct device_driver *drv)
 	return drv->probe == usb_probe_device;
 }
 
+/*
+ * usb_register_device_driver - 注册 USB 设备级驱动
+ *
+ * 在 USB 核心中注册一个 usb_device_driver。设备级驱动匹配的是
+ * USB 设备本身, 而非接口。
+ *
+ * 注册流程:
+ *   1) 设置 driver.bus = &usb_bus_type (指向 USB 总线)
+ *   2) 设置 driver.probe = usb_probe_device (统一 probe 入口)
+ *   3) 设置 driver.remove = usb_unbind_device (统一 remove 入口)
+ *   4) 调用 driver_register() 注册到 Linux 设备模型核心
+ *   5) 注册完成后立即遍历所有已有设备, 调用 __usb_bus_reprobe_drivers
+ *      检查是否有设备可以更好地由这个新驱动服务(即替代当前绑定的
+ *      usb_generic_driver)。
+ *
+ * usb_generic_driver 是在 USB 核心初始化时注册的一个特殊设备级驱动,
+ * 它不匹配特定 VID/PID, 而是作为万能回退驱动。当新的专用设备级驱动
+ * 注册时, 核心会检查哪些设备目前由 usb_generic_driver 服务且更适合
+ * 由新驱动接管, 触发重新探测。
+ */
 /**
  * usb_register_device_driver - register a USB device (not interface) driver
  * @new_udriver: USB operations for the device driver
@@ -1025,6 +1326,12 @@ int usb_register_device_driver(struct usb_device_driver *new_udriver,
 }
 EXPORT_SYMBOL_GPL(usb_register_device_driver);
 
+/*
+ * usb_deregister_device_driver - 注销 USB 设备级驱动
+ *
+ * usb_register_device_driver 的逆操作。通过 driver_unregister()
+ * 从 Linux 设备模型核心中移除该驱动。
+ */
 /**
  * usb_deregister_device_driver - unregister a USB device (not interface) driver
  * @udriver: USB operations of the device driver to unregister
@@ -1041,6 +1348,29 @@ void usb_deregister_device_driver(struct usb_device_driver *udriver)
 }
 EXPORT_SYMBOL_GPL(usb_deregister_device_driver);
 
+/*
+ * usb_register_driver - 注册 USB 接口级驱动
+ *
+ * 在 USB 核心中注册一个 usb_driver(接口级驱动)。这是绝大多数
+ * USB 驱动使用的注册函数, 被 usb_register() 宏所封装。
+ *
+ * 注册流程:
+ *   1) 设置 driver.bus = &usb_bus_type (指向 USB 总线)
+ *   2) 设置 driver.probe = usb_probe_interface (接口级 probe 入口)
+ *   3) 设置 driver.remove = usb_unbind_interface (接口级 remove 入口)
+ *   4) 设置 driver.shutdown = usb_shutdown_interface (关机回调)
+ *   5) 初始化 dynids 链表(用于 sysfs new_id 动态添加 ID)
+ *   6) 调用 driver_register() 注册到 Linux 设备模型核心
+ *   7) 创建 new_id 和 remove_id sysfs 属性文件, 允许用户空间
+ *      动态管理该驱动支持的设备 ID 列表
+ *
+ * 与 usb_register_device_driver 的区别:
+ *   - 本函数注册的是接口级驱动(匹配接口)
+ *   - usb_register_device_driver 注册的是设备级驱动(匹配设备)
+ *
+ * 注意: 在大多数情况下, USB 驱动应使用 usb_register() 宏,
+ * 它会自动处理 module 所有权和模块名。
+ */
 /**
  * usb_register_driver - register a USB interface driver
  * @new_driver: USB operations for the interface driver
@@ -1097,6 +1427,17 @@ out:
 }
 EXPORT_SYMBOL_GPL(usb_register_driver);
 
+/*
+ * usb_deregister - 注销 USB 接口级驱动
+ *
+ * usb_register_driver 的逆操作。执行清理:
+ *   1) 删除 new_id / remove_id sysfs 属性文件
+ *   2) 通过 driver_unregister() 从设备模型核心中移除驱动
+ *   3) 释放动态添加的设备 ID 列表 (dynids)
+ *
+ * 注意: 如果驱动之前调用了 usb_register_dev() 注册了 USB 主设备号,
+ * 还需要额外调用 usb_deregister_dev() 进行清理。
+ */
 /**
  * usb_deregister - unregister a USB interface driver
  * @driver: USB operations of the interface driver to unregister

@@ -3,6 +3,53 @@
  * Released under the GPLv2 only.
  */
 
+/*
+ * config.c -- USB 配置描述符解析器
+ *
+ * 本文件实现了 USB 配置描述符(configuration descriptor)的读取和解析
+ * 功能。它将 USB 设备返回的扁平二进制描述符流解析为层次化的
+ * struct usb_host_config 树形结构, 供 USB 核心和驱动使用。
+ *
+ * ==================== 解析层次结构 ====================
+ * 一个 USB 设备的描述符按如下层次组织:
+ *
+ *   struct usb_host_config          (一个配置)
+ *     +-- struct usb_interface_cache (接口缓存, 每个接口一个)
+ *     |     +-- struct usb_host_interface (备选设置, altsetting)
+ *     |           +-- struct usb_host_endpoint (端点描述符)
+ *     |           +-- extra (类/厂商特定描述符)
+ *     +-- extra                     (配置级类/厂商特定描述符)
+ *     +-- intf_assoc[]              (接口关联描述符, IAD)
+ *
+ * 解析流程:
+ *   usb_get_configuration()
+ *     → 读取原始描述符二进制数据
+ *     → usb_parse_configuration()   [配置级解析]
+ *         → 前向扫描: 统计接口和备选设置数量
+ *         → 分配 intf_cache + altsetting 数组
+ *         → 解析 IAD (接口关联描述符)
+ *         → usb_parse_interface()   [接口级解析]
+ *             → usb_parse_endpoint() [端点级解析]
+ *                 → usb_parse_ss_endpoint_companion()    [SuperSpeed 扩展]
+ *                 → usb_parse_ssp_isoc_endpoint_companion() [SuperSpeedPlus 扩展]
+ *                 → usb_parse_eusb2_isoc_endpoint_companion() [eUSB2 扩展]
+ *
+ * ==================== 功能要点 ====================
+ *  - 容错解析: 对描述符长度错误、字段越界、重复端点等异常情况
+ *    进行容错处理, 尽可能使设备可用而非直接拒绝。
+ *  - 最大值限制: 接口数(USB_MAXINTERFACES=32)、备选设置数
+ *    (USB_MAXALTSETTING=128)、端点数(USB_MAXENDPOINTS=30)、
+ *    配置数(USB_MAXCONFIG=8)等均有硬限制。
+ *  - 速度适配: 根据设备速度(Low/Full/High/Super/SuperSpeedPlus)
+ *    校验 wMaxPacketSize 的合法性。
+ *  - 描述符类型识别: 识别并跳过类/厂商特定描述符, 同时保留
+ *    它们的原始数据供驱动使用(保存在 extra/extralen 字段)。
+ *  - BOS 解析: usb_get_bos_descriptor() 解析 BOS (Binary Object
+ *    Store) 描述符集, 包含 USB 3.0 及更高版本的能力描述。
+ *  - SuperSpeed 扩展: 解析 SS Endpoint Companion、SSP Isoc Endpoint
+ *    Companion 和 eUSB2 Isoc Endpoint Companion 描述符。
+ */
+
 #include <linux/usb.h>
 #include <linux/usb/ch9.h>
 #include <linux/usb/hcd.h>
@@ -19,6 +66,26 @@
 
 #define USB_MAXCONFIG			8	/* Arbitrary limit */
 
+/*
+ * find_next_descriptor - 在描述符流中查找下一个指定类型的描述符
+ *
+ * 这是解析器的核心辅助函数。它在原始二进制描述符缓冲区中顺序扫描,
+ * 寻找类型为 dt1 或 dt2 的下一个描述符, 跳过所有其他类型的描述符。
+ *
+ * @buffer: 描述符缓冲区的起始位置
+ * @size:   缓冲区剩余大小
+ * @dt1:    要查找的第一个描述符类型(如 USB_DT_ENDPOINT)
+ * @dt2:    要查找的第二个描述符类型(如 USB_DT_INTERFACE),
+ *          可以与 dt1 相同(用于跳过同一类型间的其他描述符)
+ * @num_skipped: [输出] 跳过的描述符数量
+ *
+ * 返回: 从 buffer 到找到的描述符之间的字节偏移量。
+ * 如果未找到匹配类型, 返回 buffer - buffer + size。
+ *
+ * 典型用例:
+ *   解析完一个端点描述符后, 使用此函数跳过类/厂商特定描述符,
+ *   定位到下一个端点或接口描述符。
+ */
 static int find_next_descriptor(unsigned char *buffer, int size,
     int dt1, int dt2, int *num_skipped)
 {
@@ -43,6 +110,17 @@ static int find_next_descriptor(unsigned char *buffer, int size,
 	return buffer - buffer0;
 }
 
+/*
+ * usb_parse_ssp_isoc_endpoint_companion - 解析 SuperSpeedPlus 同步端点伴生描述符
+ *
+ * SuperSpeedPlus (USB 3.1+) 引入了额外的同步端点伴生描述符
+ * (USB_DT_SSP_ISOC_ENDPOINT_COMP), 紧跟在 SuperSpeed 端点伴生
+ * 描述符(USB_DT_SS_ENDPOINT_COMP)之后。仅当 SS 伴生描述符的
+ * bmAttributes 中标记了 SSP 同步补偿(SSP_ISOC_COMP)时才存在。
+ *
+ * 该描述符提供了更精细的同步端点带宽管理信息, 如每个服务间隔的
+ * 最大字节数等(用于替代 SS 伴生描述符中的 wBytesPerInterval)。
+ */
 static void usb_parse_ssp_isoc_endpoint_companion(struct device *ddev,
 		int cfgno, int inum, int asnum, struct usb_host_endpoint *ep,
 		unsigned char *buffer, int size)
@@ -64,6 +142,20 @@ static void usb_parse_ssp_isoc_endpoint_companion(struct device *ddev,
 	memcpy(&ep->ssp_isoc_ep_comp, desc, USB_DT_SSP_ISOC_EP_COMP_SIZE);
 }
 
+/*
+ * usb_parse_eusb2_isoc_endpoint_companion - 解析 eUSB2 同步端点伴生描述符
+ *
+ * eUSB2 (embedded USB 2.0) 规范定义了一个同步端点伴生描述符
+ * (USB_DT_EUSB2_ISOC_ENDPOINT_COMP), 用于 eUSB2 设备在高带宽
+ * 同步传输时的额外配置。
+ *
+ * 该描述符应出现在端点描述符之后、下一个端点或接口描述符之前。
+ * 本函数在缓冲区中搜索该描述符类型, 找到则复制到 endpoint 的
+ * eusb2_isoc_ep_comp 字段。
+ *
+ * eUSB2 是 USB-IF 为嵌入式设备定义的低功耗、高集成度 USB 标准,
+ * 主要用于手机、IoT 等嵌入式场景。
+ */
 static void usb_parse_eusb2_isoc_endpoint_companion(struct device *ddev,
 		int cfgno, int inum, int asnum, struct usb_host_endpoint *ep,
 		unsigned char *buffer, int size)
@@ -95,6 +187,35 @@ static void usb_parse_eusb2_isoc_endpoint_companion(struct device *ddev,
 		   ep->desc.bEndpointAddress, cfgno, inum, asnum);
 }
 
+/*
+ * usb_parse_ss_endpoint_companion - 解析 SuperSpeed 端点伴生描述符
+ *
+ * USB 3.0 (SuperSpeed) 引入了一个新的端点伴生描述符
+ * (USB_DT_SS_ENDPOINT_COMP), 紧跟在每个端点描述符之后。
+ * 该描述符提供了 SuperSpeed 特有的端点属性:
+ *
+ *   - bMaxBurst: 最大突发包数(0-15), 决定每个服务间隔可发送的
+ *     最大数据包数量
+ *   - bmAttributes:
+ *       - Bulk 端点: 位 0-4 表示流能力(最多 65536 个流)
+ *       - Isoch 端点: 位 0-1 表示 Mult (每个微帧的突发次数)
+ *       - 位 7 表示 SSP 同步补偿(SSP_ISOC_COMP)
+ *   - wBytesPerInterval: 每个服务间隔传输的字节数
+ *
+ * 如果缺少 USB_DT_SS_ENDPOINT_COMP 描述符, 函数使用默认值填充
+ * (单包传输), 确保设备仍然可用。
+ *
+ * 验证逻辑:
+ *   - Control 端点不允许 bMaxBurst > 0
+ *   - 所有端点的 bMaxBurst 不能超过 15
+ *   - Control/Interrupt 端点的 bmAttributes 必须为 0
+ *   - Bulk 端点的流数不能超过 65536 (bmAttributes > 16)
+ *   - Isoch 端点的 Mult 不能超过 3
+ *   - wBytesPerInterval 不能超过计算的理论最大值
+ *
+ * 解析完成后, 如果设备是 SuperSpeedPlus 且端点标记了 SSP 同步补偿,
+ * 继续解析 SSP Isochronous Endpoint Companion 描述符。
+ */
 static void usb_parse_ss_endpoint_companion(struct device *ddev, int cfgno,
 		int inum, int asnum, struct usb_host_endpoint *ep,
 		unsigned char *buffer, int size)
@@ -283,6 +404,34 @@ static bool config_endpoint_is_duplicate(struct usb_host_config *config,
 	return false;
 }
 
+/*
+ * usb_parse_endpoint - 解析单个端点描述符
+ *
+ * 从描述符流中解析一个 USB 端点描述符, 执行以下处理:
+ *
+ *   1) 长度校验: 检查描述符长度是否至少为 USB_DT_ENDPOINT_SIZE,
+ *      如果是 USB 音频端点则接受 USB_DT_ENDPOINT_AUDIO_SIZE。
+ *   2) 端点号校验: 端点 0 不允许出现在非默认配置中。
+ *   3) 数量限制: 不超过 ifp->desc.bNumEndpoints 声明的数量。
+ *   4) 复制描述符并清理 bEndpointAddress 的保留位。
+ *   5) 重复检查: 通过 config_endpoint_is_duplicate() 检查是否与
+ *      其他接口或其他备选设置中的端点地址重复。
+ *   6) 忽略检查: 如果设备有 USB_QUIRK_ENDPOINT_IGNORE, 检查此
+ *      端点是否应被忽略。
+ *   7) bInterval 修正: 根据传输类型和速度修复超出合法范围的
+ *      bInterval 值。
+ *       - 高速中断端点: 修正厂商误用的全速 bInterval
+ *       - 低速设备的批量端点: 改为中断端点(USB 规范禁止低速批量)
+ *   8) wMaxPacketSize 校验: 根据速度级别检查最大包大小。
+ *       - 高速批量端点必须为 512 字节, 否则发出警告
+ *       - 低速/全速/高速各有不同的最大包大小表
+ *   9) 解析伴生描述符:
+ *       - 高速且 bcdUSB == 0x0220 (eUSB2): 解析 eUSB2 同步伴生
+ *       - SuperSpeed/SuperSpeedPlus: 解析 SS 端点伴生描述符
+ *   10) 跳过类/厂商特定描述符: 使用 find_next_descriptor() 定位
+ *       到下一个端点或接口描述符, 并将这些附加描述符保存在
+ *       endpoint->extra / endpoint->extralen 中供驱动使用。
+ */
 static int usb_parse_endpoint(struct device *ddev, int cfgno,
 		struct usb_host_config *config, int inum, int asnum,
 		struct usb_host_interface *ifp, int num_ep,
@@ -549,6 +698,27 @@ void usb_release_interface_cache(struct kref *ref)
 	kfree(intfc);
 }
 
+/*
+ * usb_parse_interface - 解析单个接口描述符及所有备选设置
+ *
+ * 从描述符流中解析一个 USB 接口描述符及其所有端点。
+ *
+ * 处理流程:
+ *   1) 校验接口描述符长度(至少 USB_DT_INTERFACE_SIZE)。
+ *   2) 通过 inums[] 映射找到对应的 intf_cache 条目。
+ *   3) 检查备选设置编号(asnum)是否重复。
+ *   4) 复制接口描述符到缓存, 递增 num_altsetting。
+ *   5) 跳过类/厂商特定描述符(保存在 alt->extra), 定位到第一个
+ *      端点或下一个接口描述符。
+ *   6) 分配端点数组(struct usb_host_endpoint), 数量为接口描述符
+ *      中声明的 bNumEndpoints (但不超过 USB_MAXENDPOINTS)。
+ *   7) 循环调用 usb_parse_endpoint() 解析所有端点。
+ *   8) 检查实际解析的端点数是否与 bNumEndpoints 声明的数量一致,
+ *      不一致时发出通知但继续使用。
+ *
+ * 错误处理: 如果跳过类/厂商特定描述符后发现下一个描述符类型为
+ * USB_DT_INTERFACE, 说明当前接口没有端点, 这是合法的。
+ */
 static int usb_parse_interface(struct device *ddev, int cfgno,
     struct usb_host_config *config, unsigned char *buffer, int size,
     u8 inums[], u8 nalts[])
@@ -656,6 +826,44 @@ skip_to_next_interface_descriptor:
 	return buffer - buffer0 + i;
 }
 
+/*
+ * usb_parse_configuration - 解析 USB 配置描述符集(核心解析器)
+ *
+ * 这是配置描述符解析的核心函数。它将属于一个配置的所有原始描述符
+ * 数据解析为 struct usb_host_config 树形结构。
+ *
+ * 描述符类型识别 (在遍历过程中处理的类型):
+ *
+ *   USB_DT_CONFIG (0x02)
+ *     配置描述符头, 包含 bNumInterfaces、bConfigurationValue、
+ *     bmAttributes、bMaxPower 等信息。
+ *
+ *   USB_DT_INTERFACE (0x04)
+ *     接口描述符, 包含 bInterfaceNumber、bAlternateSetting、
+ *     bNumEndpoints、bInterfaceClass/SubClass/Protocol 等。
+ *     接口关联描述符 (IAD, USB_DT_INTERFACE_ASSOCIATION, 0x0B)
+ *     用于将多个接口分组为一个功能(如视频设备的控制+数据接口)。
+ *
+ *   USB_DT_ENDPOINT (0x05)
+ *     端点描述符, 在 usb_parse_interface() 中被进一步解析。
+ *     类/厂商特定描述符(Class/Vendor Specific)
+ *     不直接解析, 但被保留在 extra/extralen 字段中供驱动访问。
+ *
+ *   意外的 USB_DT_DEVICE (0x01) 和 USB_DT_CONFIG 会被记录并跳过。
+ *
+ * 解析步骤:
+ *   第一遍扫描(forward scan):
+ *     - 遍历所有描述符, 统计每个接口的备选设置数量(nalts[])
+ *     - 收集 IAD (接口关联描述符)
+ *     - 验证描述符格式正确性
+ *   第二遍:
+ *     - 根据扫描结果分配 intf_cache 和 altsetting 数组
+ *     - 跳过配置级类/厂商特定描述符
+ *     - 逐个调用 usb_parse_interface() 解析接口
+ *   收尾:
+ *     - 检查缺失的备选设置编号
+ *     - 验证配置中的接口数是否与声明一致
+ */
 static int usb_parse_configuration(struct usb_device *dev, int cfgidx,
     struct usb_host_config *config, unsigned char *buffer, int size)
 {
@@ -873,6 +1081,20 @@ static int usb_parse_configuration(struct usb_device *dev, int cfgidx,
 	return 0;
 }
 
+/*
+ * usb_destroy_configuration - 销毁 USB 设备的配置信息
+ *
+ * 释放通过 usb_get_configuration() 和 usb_parse_configuration()
+ * 分配的所有配置相关资源, 包括:
+ *   - rawdescriptors: 每个配置的原始描述符数据
+ *   - config[] 中的每个 usb_host_config
+ *   - intf_cache 和 altsetting 数组
+ *   - 端点数据
+ *   - 描述符字符串
+ *
+ * 此函数仅在复位/重新初始化路径中由 hub 驱动调用, 或在断开/销毁
+ * 路径内部使用。
+ */
 /* hub-only!! ... and only exported for reset/reinit path.
  * otherwise used internally on disconnect/destroy path
  */
@@ -906,6 +1128,29 @@ void usb_destroy_configuration(struct usb_device *dev)
 }
 
 
+/*
+ * usb_get_configuration - 读取并解析 USB 设备的所有配置描述符
+ *
+ * 这是配置解析的最高层入口。为 USB 设备读取所有配置(configuration)
+ * 的描述符, 并逐一调用 usb_parse_configuration() 解析。
+ *
+ * 处理流程:
+ *   1) 读取设备描述符中的 bNumConfigurations, 确定配置数量。
+ *   2) 为 dev->config[] 和 dev->rawdescriptors[] 分配内存。
+ *   3) 对每个配置编号(cfgno):
+ *      a) 先读取 USB_DT_CONFIG_SIZE 字节获取 wTotalLength。
+ *      b) 根据 wTotalLength 分配缓冲区, 读取完整的配置描述符集。
+ *      c) 保存原始数据到 dev->rawdescriptors[cfgno]。
+ *      d) 调用 usb_parse_configuration() 解析。
+ *   4) 如果读取某个配置失败(返回 -EPIPE), 截断配置列表。
+ *
+ * 注意: 此函数仅由 hub 驱动在复位路径或 usb_new_device() 中调用。
+ * rawdescriptors 保存原始二进制数据, 供驱动通过
+ * usb_get_raw_descriptor() 访问。
+ *
+ * 延迟初始化: 支持 USB_QUIRK_DELAY_INIT  quirks, 在读取某些需要
+ * 启动延迟的设备的配置描述符前插入 200ms 等待。
+ */
 /*
  * Get the USB config descriptors, cache and parse'em
  *
@@ -1014,6 +1259,13 @@ err:
 	return result;
 }
 
+/*
+ * usb_release_bos_descriptor - 释放 BOS 描述符
+ *
+ * 释放通过 usb_get_bos_descriptor() 分配的 BOS (Binary Object Store)
+ * 描述符资源。BOS 是 USB 3.0 引入的扩展描述符机制, 用于描述设备
+ * 的额外能力(如 SuperSpeed、容器 ID 等)。
+ */
 void usb_release_bos_descriptor(struct usb_device *dev)
 {
 	if (dev->bos) {
@@ -1023,6 +1275,22 @@ void usb_release_bos_descriptor(struct usb_device *dev)
 	}
 }
 
+/*
+ * bos_desc_len - BOS 设备能力描述符的最小长度表
+ *
+ * BOS (Binary Object Store) 描述符集包含多个设备能力描述符
+ * (Device Capability Descriptor)。此表定义了各种已知能力类型
+ * 的最小合法长度:
+ *
+ *   USB_CAP_TYPE_WIRELESS_USB (0x01): 无线 USB 能力
+ *   USB_CAP_TYPE_EXT          (0x02): USB 扩展能力 (支持 LPM 等)
+ *   USB_SS_CAP_TYPE           (0x03): SuperSpeed 能力
+ *   USB_SSP_CAP_TYPE          (0x04): SuperSpeedPlus 能力
+ *   CONTAINER_ID_TYPE         (0x05): 容器 ID (用于识别同一物理设备)
+ *   USB_PTM_CAP_TYPE          (0x0B): PTM (精确时间测量) 能力
+ *
+ * 如果某个能力描述符的长度小于对应表项的值, 则该能力描述符被忽略。
+ */
 static const __u8 bos_desc_len[256] = {
 	[USB_CAP_TYPE_WIRELESS_USB] = USB_DT_USB_WIRELESS_CAP_SIZE,
 	[USB_CAP_TYPE_EXT]          = USB_DT_USB_EXT_CAP_SIZE,
@@ -1032,6 +1300,33 @@ static const __u8 bos_desc_len[256] = {
 	[USB_PTM_CAP_TYPE]          = USB_DT_USB_PTM_ID_SIZE,
 };
 
+/*
+ * usb_get_bos_descriptor - 获取并解析 BOS (Binary Object Store) 描述符集
+ *
+ * BOS 是 USB 3.0 规范引入的扩展描述符机制, 用于在标准配置描述符
+ * 之外描述设备的额外能力。它包含一个 BOS 头描述符和多个设备能力
+ * 描述符(Device Capability Descriptors)。
+ *
+ * 解析流程:
+ *   1) 先读取 USB_DT_BOS_SIZE 字节的 BOS 头, 获取 wTotalLength
+ *      和 bNumDeviceCaps。
+ *   2) 分配 total_len 大小的缓冲区, 读取完整的 BOS 描述符集。
+ *   3) 遍历每个设备能力描述符, 根据 bDevCapabilityType 识别:
+ *      - USB_CAP_TYPE_EXT (0x02): 扩展能力 → dev->bos->ext_cap
+ *        (包含 BESL/LPM 信息)
+ *      - USB_SS_CAP_TYPE (0x03): SuperSpeed 能力 → dev->bos->ss_cap
+ *        (包含 U1/U2 退出延迟等)
+ *      - USB_SSP_CAP_TYPE (0x04): SuperSpeedPlus 能力 → dev->bos->ssp_cap
+ *        (包含子链路速度属性)
+ *      - CONTAINER_ID_TYPE (0x05): 容器 ID → dev->bos->ss_id
+ *        (用于设备身份识别)
+ *      - USB_PTM_CAP_TYPE (0x0B): PTM 能力 → dev->bos->ptm_cap
+ *        (精确时间测量)
+ *   4) 每个能力描述符都用 bos_desc_len[] 表验证最小长度。
+ *   5) 更新 wTotalLength 为实际处理的字节数。
+ *
+ * 注意: 如果设备有 USB_QUIRK_NO_BOS quirk, 则跳过 BOS 解析。
+ */
 /* Get BOS descriptor set */
 int usb_get_bos_descriptor(struct usb_device *dev)
 {
