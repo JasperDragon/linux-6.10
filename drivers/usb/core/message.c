@@ -5,6 +5,93 @@
  * Released under the GPLv2 only.
  */
 
+/*
+ * 中文注释集 - USB 同步消息处理与标准请求
+ *
+ * 本文件实现了 Linux USB 核心中的同步（synchronous）传输 API 和标准 USB 设备请求。
+ * 所谓"同步"，是指调用者发起传输后阻塞等待，直到传输完成或超时才会返回。
+ * 所有导出的函数都可以在进程上下文中安全调用（可能会睡眠），但不能在中断上下文中使用。
+ *
+ * === 核心架构 ===
+ * 所有同步传输最终都归结为以下流程：
+ *   usb_alloc_urb()          -- 分配 URB（USB Request Block）
+ *   usb_fill_*_urb()         -- 填充 URB 各字段（控制/批量/中断）
+ *   usb_submit_urb()         -- 将 URB 提交给主机控制器驱动程序
+ *   wait_for_completion()    -- 阻塞等待传输完成
+ *   usb_free_urb()           -- 释放 URB
+ *
+ * 完成回调 usb_api_blocking_completion() 是连接异步 URB 机制与同步等待的桥梁，
+ * 它在 URB 完成时调用 complete() 唤醒等待的任务。
+ *
+ * === 导出的主要 API ===
+ *
+ * [1] usb_control_msg()        -- 通用控制传输。调用者需手动构造 SETUP 包的
+ *                                  request/requesttype/value/index 字段。
+ *                                 返回实际传输的字节数（正数）或错误码（负数）。
+ *
+ * [2] usb_control_msg_send()   -- usb_control_msg() 的"发送"简化版。
+ *                                 自动处理数据拷贝，成功时返回 0。
+ *                                 适合只需要发送数据、不需要接收响应的场景。
+ *
+ * [3] usb_control_msg_recv()   -- usb_control_msg() 的"接收"简化版。
+ *                                 自动分配接收缓冲区并要求数据量严格匹配。
+ *                                 若设备返回的数据少于预期则返回 -EREMOTEIO。
+ *
+ * [4] usb_bulk_msg()           -- 同步批量传输。若目标端点为中断类型，
+ *                                 会自动创建中断 URB 而非批量 URB。
+ *
+ * [5] usb_interrupt_msg()      -- 同步中断传输。当前实现直接调用 usb_bulk_msg()。
+ *
+ * [6] usb_bulk_msg_killable()  -- 可被 kill 的同步批量传输版本，
+ *                                 使用 wait_for_completion_killable_timeout() 等待。
+ *
+ * [7] usb_sg_init() / usb_sg_wait() / usb_sg_cancel()
+ *                              -- 散列-聚集（scatter/gather）批量/中断传输。
+ *                                 将多个缓冲区组织成一条传输链，提高高带宽传输效率。
+ *
+ * === 标准 USB 设备请求（Chapter 9）===
+ *
+ * [8] usb_get_descriptor()     -- 读取任意类型的描述符（GET_DESCRIPTOR）。
+ *                                 内部重试 3 次以应对不稳定设备。
+ *
+ * [9] usb_get_string()         -- 读取字符串描述符（内部函数）。
+ *                                 使用 UTF-16LE 编码。
+ *
+ * [10] usb_string()             -- 读取并将 UTF-16LE 字符串描述符转换为 UTF-8。
+ *                                  自动获取设备的语言 ID（第一个支持的语言）。
+ *
+ * [11] usb_get_status()         -- 获取设备/接口/端点的状态（GET_STATUS）。
+ *                                  支持标准状态（2 字节）和 PTM 状态（4 字节）。
+ *
+ * [12] usb_set_interface()      -- 选择接口的备用设置（SET_INTERFACE）。
+ *                                  用于切换同一接口的不同带宽模式。
+ *
+ * [13] usb_set_configuration()  -- 选择设备的配置（SET_CONFIGURATION）。
+ *                                  改变配置会销毁旧接口、创建新接口并触发驱动绑定。
+ *
+ * [14] usb_clear_halt()         -- 清除端点的停止（STALL）条件。
+ *
+ * [15] usb_reset_configuration()-- 轻量级设备复位：重新设置当前配置，
+ *                                  将所有接口的备用设置重置为 0。
+ *
+ * === 内部辅助函数 ===
+ *
+ * usb_start_wait_urb()        -- 核心等待函数：提交 URB 并等待完成。
+ *                                支持可中断等待和不可中断等待两种模式。
+ *                                超时值受 USB_MAX_SYNCHRONOUS_TIMEOUT（5 秒）限制。
+ *
+ * usb_internal_control_msg()  -- 内部控制传输函数，是 usb_control_msg() 的底层实现。
+ *                                完成 URB 分配、填充、提交、等待和释放的完整生命周期。
+ *
+ * sg_complete() / sg_clean()  -- 散列-聚集传输的完成回调和资源清理函数。
+ *
+ * === 注意事项 ===
+ * - 所有同步 API 都不能在中断上下文中使用，必须使用 usb_submit_urb() 的异步方式。
+ * - 驱动程序的 disconnect() 方法必须能够等待正在进行的同步调用完成。
+ * - 对于控制传输的 data 缓冲区，usb_control_msg() 要求使用可 DMA 的内存
+ *   （即不能是栈上的局部变量），而 usb_control_msg_send/recv() 没有此限制。
+ */
+
 #include <linux/acpi.h>
 #include <linux/pci.h>	/* for scatterlist macros */
 #include <linux/usb.h>
@@ -97,6 +184,58 @@ out:
 }
 
 /*-------------------------------------------------------------------*/
+/*
+ * 中文注释: usb_internal_control_msg() -- 同步控制传输的核心实现
+ *
+ * 这是整个同步控制传输机制的"发动机"。它将一个构造好的 SETUP 包
+ * （struct usb_ctrlrequest）通过 URB 提交给主机控制器，并同步等待完成。
+ *
+ === 执行流程 ===
+ *   (1) usb_alloc_urb(0, GFP_NOIO)
+ *       -- 分配 URB 结构体。参数 '0' 表示不分配额外的 ISO 包描述符，
+ *          因为控制传输最多只需要一个 URB 即可完成（SETUP+DATA+STATUS 阶段
+ *          都在同一个 URB 内由 HCD 管理）。
+ *
+ *   (2) usb_fill_control_urb(urb, usb_dev, pipe, cmd, data, len,
+ *                             usb_api_blocking_completion, NULL)
+ *       -- 填充 URB 的控制传输相关字段:
+ *         - pipe:      目标端点管道（含方向、端点号、设备地址）
+ *         - cmd:       SETUP 数据包 (8 字节，包含 bmRequestType/bRequest/wValue/wIndex/wLength)
+ *         - data:      DATA 阶段的数据缓冲区指针
+ *         - len:       DATA 阶段的数据长度
+ *         - complete:  完成回调函数 usb_api_blocking_completion
+ *         - context:   回调上下文（此处传 NULL，因为 usb_start_wait_urb 会覆盖它）
+ *       usb_fill_control_urb 还会自动设置 URB 的 transfer_flags，确保
+ *       SETUP 包被正确 DMA 映射。
+ *
+ *   (3) usb_start_wait_urb(urb, timeout, &length, false)
+ *       -- 提交 URB 并等待完成。内部调用链:
+ *         usb_submit_urb()              将 URB 放入 HCD 的调度队列
+ *         wait_for_completion_timeout() 阻塞当前进程，等待 URB 完成
+ *         usb_kill_urb()                若超时则强制终止 URB
+ *         usb_free_urb()                释放 URB
+ *       -- 第四个参数 false 表示使用不可杀死的等待模式，
+ *          超时值被限制在 USB_MAX_SYNCHRONOUS_TIMEOUT (5 秒) 内。
+ *
+ === 完成回调机制 ===
+ * usb_api_blocking_completion() 是连接异步 URB 完成事件与同步等待的关键:
+ *   static void usb_api_blocking_completion(struct urb *urb)
+ *   {
+ *       struct api_context *ctx = urb->context;
+ *       ctx->status = urb->status;     // 保存 URB 的完成状态
+ *       complete(&ctx->done);          // 唤醒在 wait_for_completion 上睡眠的进程
+ *   }
+ * -- 注意: 当 URB 被 usb_kill_urb() 强制终止时，urb->status 被设置为 -ENOENT，
+ *     usb_start_wait_urb 会据此判断是超时还是被杀死。
+ *
+ === pending_flag 机制 ===
+ * 本函数没有显式的 pending_flag，因为这里通过 usb_start_wait_urb 内部的
+ * 完成量（completion）来同步。每次调用都会分配新的 URB，因此不存在 URB 复用问题。
+ * 而在其他更复杂的场景（如连续的控制传输）中，pending_flag 用于防止在
+ * 前一个 URB 尚未完成时重用同一个 URB 结构体。
+ *
+ * 返回值: 正数表示实际传输的字节数，负数表示错误码。
+ */
 /* returns status (negative) or length (positive) */
 static int usb_internal_control_msg(struct usb_device *usb_dev,
 				    unsigned int pipe,
@@ -121,6 +260,49 @@ static int usb_internal_control_msg(struct usb_device *usb_dev,
 		return length;
 }
 
+/*
+ * 中文注释: usb_control_msg() -- 经典的控制传输封装
+ *
+ * 这是 Linux USB 子系统最常用的同步控制传输接口。调用者传入 USB 规范
+ * 定义的 SETUP 包各字段，函数构造完整的 SETUP 包并通过内部控制函数发送。
+ *
+ === SETUP 包的构造 ===
+ * USB 控制传输的第一个阶段是 SETUP 阶段，主机向设备发送一个 8 字节的
+ * 建立包（struct usb_ctrlrequest），包含以下字段:
+ *
+ *   bmRequestType (1 byte) -- 请求类型:
+ *     bit 7:     方向 (0=Host-to-Device, 1=Device-to-Host)
+ *     bit 6-5:   类型 (0=标准, 1=类, 2=厂商)
+ *     bit 4-0:   接收者 (0=设备, 1=接口, 2=端点, 3=其他)
+ *   bRequest      (1 byte) -- 具体请求号，如 USB_REQ_GET_DESCRIPTOR
+ *   wValue        (2 bytes)-- 请求参数，对 GET_DESCRIPTOR 是高字节存描述符类型、
+ *                             低字节存描述符索引
+ *   wIndex        (2 bytes)-- 请求参数，对 GET_DESCRIPTOR 存语言 ID（字符串描述符），
+ *                             对接口/端点请求存接口号/端点号
+ *   wLength       (2 bytes)-- DATA 阶段的数据长度
+ *
+ * 函数将这些参数填入 struct usb_ctrlrequest，并通过 cpu_to_le16() 将
+ * 多字节字段转换为 USB 要求的小端字节序。
+ *
+ === 内部调用链 ===
+ * usb_control_msg()
+ *   -> kmalloc(struct usb_ctrlrequest)  分配 SETUP 包内存
+ *   -> 填充 bRequestType/bRequest/wValue/wIndex/wLength
+ *   -> usb_internal_control_msg()       执行核心传输
+ *      -> usb_alloc_urb()              分配 URB
+ *      -> usb_fill_control_urb()       填充 URB
+ *      -> usb_start_wait_urb()         提交并等待
+ *         -> usb_submit_urb()
+ *         -> wait_for_completion_timeout()
+ *   -> kfree(dr)                       释放 SETUP 包内存
+ *
+ === 注意事项 ===
+ * - data 缓冲区必须位于可 DMA 的内存区域（不能是栈变量）！
+ *   如果无法保证，请使用 usb_control_msg_send/recv() 替代。
+ * - 若设备有 USB_QUIRK_DELAY_CTRL_MSG 标志，传输完成后会额外延迟 200ms，
+ *   这是为了兼容某些需要控制命令间间隔的 USB 设备。
+ * - 返回值为正数表示实际传输的字节数，为负数表示错误码。
+ */
 /**
  * usb_control_msg - Builds a control urb, sends it off and waits for completion
  * @dev: pointer to the usb device to send the message to
@@ -176,6 +358,27 @@ int usb_control_msg(struct usb_device *dev, unsigned int pipe, __u8 request,
 }
 EXPORT_SYMBOL_GPL(usb_control_msg);
 
+/*
+ * 中文注释: usb_control_msg_send() -- 现代控制传输接口（发送方向）
+ *
+ * 这是 usb_control_msg() 的简化封装，专门用于"只发送不接收"的控制传输。
+ * 与老版本相比有以下改进:
+ *
+ *   (1) 自动处理数据拷贝
+ *       -- 内部使用 kmemdup() 将 driver_data 拷贝到可 DMA 的缓冲区，
+ *          调用者可以传递栈上的局部变量或 const 数据，无需担心 DMA 限制。
+ *
+ *   (2) 简化的返回值
+ *       -- 成功时返回 0，失败时返回负错误码。
+ *          usb_control_msg() 返回正数表示字节数容易引起混淆。
+ *
+ *   (3) 显式的 memflags 参数
+ *       -- 调用者可通过 gfp_t 参数控制内存分配行为，
+ *          例如在原子上下文中传递 GFP_ATOMIC。
+ *
+ * 适用场景: 只需要向设备发送数据、不需要读取响应的控制命令，
+ * 如 SET_FEATURE、SET_CONFIGURATION、SET_INTERFACE 等。
+ */
 /**
  * usb_control_msg_send - Builds a control "send" message, sends it off and waits for completion
  * @dev: pointer to the usb device to send the message to
@@ -233,6 +436,28 @@ int usb_control_msg_send(struct usb_device *dev, __u8 endpoint, __u8 request,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(usb_control_msg_send);
+
+/*
+ * 中文注释: usb_control_msg_recv() -- 现代控制传输接口（接收方向）
+ *
+ * 这是 usb_control_msg() 的简化封装，专门用于"接收数据"的控制传输。
+ * 与 usb_control_msg_send() 对称设计，但有额外的保护措施:
+ *
+ *   (1) 自动分配接收缓冲区
+ *       -- 内部使用 kmalloc() 分配可 DMA 的缓冲区，调用者的 driver_data
+ *          可以是任意可写内存（包括栈变量）。
+ *
+ *   (2) 严格的数据量检查
+ *       -- 如果设备返回的数据不等于请求的 size，返回 -EREMOTEIO。
+ *          这可以防止驱动程序在未收到完整数据时错误地处理部分数据。
+ *          因此，本函数不适合用于返回可变长度数据的请求。
+ *
+ *   (3) 零长度保护
+ *       -- 明确拒绝 size == 0 或 driver_data == NULL 的情况，返回 -EINVAL。
+ *
+ * 适用场景: 需要从设备读取确定长度数据的控制命令，
+ * 如 GET_DESCRIPTOR（但需注意描述符长度可能小于请求值）、GET_STATUS 等。
+ */
 
 /**
  * usb_control_msg_recv - Builds a control "receive" message, sends it off and waits for completion
@@ -307,6 +532,28 @@ exit:
 }
 EXPORT_SYMBOL_GPL(usb_control_msg_recv);
 
+/*
+ * 中文注释: usb_interrupt_msg() -- 同步中断传输
+ *
+ * 注意: 本函数的当前实现仅仅是 usb_bulk_msg() 的别名:
+ *   return usb_bulk_msg(usb_dev, pipe, data, len, actual_length, timeout);
+ *
+ * 这意味着它实际上是通过 usb_bulk_msg() 内的自动检测机制来创建中断 URB。
+ * usb_bulk_msg() 内部会检查目标端点的描述符:
+ *   如果 bmAttributes 指示为中断端点 (USB_ENDPOINT_XFER_INT)，
+ *   则使用 usb_fill_int_urb() 创建中断 URB；
+ *   否则使用 usb_fill_bulk_urb() 创建批量 URB。
+ *
+ * 使用场景: 中断传输适用于小数据量、周期性轮询的传输场景。
+ * USB 规范保证中断传输的最大延迟（轮询间隔由端点描述符的 bInterval 字段指定）。
+ * 典型应用: HID 设备（键盘、鼠标）、USB 音频设备的同步反馈端点等。
+ *
+ * 与批量传输的区别:
+ * - 中断传输有固定的轮询间隔，保证及时性但吞吐量较低。
+ * - 批量传输没有实时性保证，但可以充分利用带宽。
+ * - 中断传输在低速设备上最大包长为 8 字节，全速为 64 字节，
+ *   高速为 1024 字节（每次微帧最多 3 笔事务）。
+ */
 /**
  * usb_interrupt_msg - Builds an interrupt urb, sends it off and waits for completion
  * @usb_dev: pointer to the usb device to send the message to
@@ -339,6 +586,43 @@ int usb_interrupt_msg(struct usb_device *usb_dev, unsigned int pipe,
 }
 EXPORT_SYMBOL_GPL(usb_interrupt_msg);
 
+/*
+ * 中文注释: usb_bulk_msg() -- 同步批量传输的完整实现
+ *
+ * 这是同步批量/中断传输的"主力"函数。usb_interrupt_msg() 和
+ * usb_bulk_msg_killable() 都基于此实现。
+ *
+ === 自动端点类型检测 ===
+ * 函数首先通过 usb_pipe_endpoint() 获取目标端点的描述符，然后检查
+ * bmAttributes 字段:
+ *
+ *   if ((ep->desc.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) ==
+ *           USB_ENDPOINT_XFER_INT) {
+ *       // 中断端点: 创建中断 URB
+ *       pipe = (pipe & ~(3 << 30)) | (PIPE_INTERRUPT << 30);
+ *       usb_fill_int_urb(urb, usb_dev, pipe, data, len,
+ *                        usb_api_blocking_completion, NULL,
+ *                        ep->desc.bInterval);
+ *   } else {
+ *       // 批量端点: 创建批量 URB
+ *       usb_fill_bulk_urb(urb, usb_dev, pipe, data, len,
+ *                         usb_api_blocking_completion, NULL);
+ *   }
+ *
+ * 注意 pipe 的转换: pipe 的高 2 位编码了传输类型（PIPE_CONTROL/PIPE_BULK/
+ * PIPE_INTERRUPT/PIPE_ISOCHRONOUS），这里将批量管道强制转换为中断管道，
+ * 以确保 HCD 按照中断传输的调度规则处理。
+ *
+ === 完成回调 ===
+ * 与控制传输使用相同的完成回调 usb_api_blocking_completion()。
+ * 回调在 URB 完成（成功/失败/取消）时被 HCD 调用，保存状态并唤醒等待进程。
+ *
+ === 适用场景 ===
+ * 批量传输适用于大块数据的可靠传输，具有以下特点:
+ * - 无固定带宽保证，利用空闲总线带宽传输
+ * - 硬件自动重传错误的数据包（通过 ACK/NAK 握手协议）
+ * - 典型应用: USB 存储设备（U 盘、移动硬盘）、USB 网卡、打印机等
+ */
 /**
  * usb_bulk_msg - Builds a bulk urb, sends it off and waits for completion
  * @usb_dev: pointer to the usb device to send the message to
@@ -813,6 +1097,48 @@ EXPORT_SYMBOL_GPL(usb_sg_cancel);
 
 /*-------------------------------------------------------------------*/
 
+/*
+ * 中文注释: usb_get_descriptor() -- 读取 USB 描述符的通用接口
+ *
+ * 这是用户空间和内核空间读取 USB 描述符最常用的底层函数之一。
+ * USB 描述符是 USB 设备的"身份证"，包含了设备的所有关键信息。
+ *
+ === 描述符类型 ===
+ * USB 规范定义了多种标准描述符类型（通过 USB_DT_* 常量区分）:
+ *   USB_DT_DEVICE       (1)  -- 设备描述符: 包含 VID/PID、USB 版本、设备类等
+ *   USB_DT_CONFIG       (2)  -- 配置描述符: 包含供电方式、接口数量、最大电流等
+ *   USB_DT_STRING       (3)  -- 字符串描述符: 可读的厂商/产品/序列号信息
+ *   USB_DT_INTERFACE    (4)  -- 接口描述符: 描述一个功能接口
+ *   USB_DT_ENDPOINT     (5)  -- 端点描述符: 描述一个端点的类型和最大包长
+ *   USB_DT_DEVICE_QUAL  (6)  -- 设备限定符（USB 2.0 高速设备）
+ *   USB_DT_OTHER_SPEED  (7)  -- 其他速度配置
+ *   USB_DT_INTERFACE_POWER (8) -- 接口电源
+ *   此外还有类特定（class-specific）和厂商特定（vendor-specific）描述符。
+ *
+ === 重试机制 ===
+ * 函数内部最多重试 3 次（for 循环 i < 3）:
+ *   - 若 result <= 0 且非 -ETIMEDOUT（超时），继续重试
+ *   - 若接收到的描述符类型（buf[1]）与请求的类型不匹配，返回 -ENODATA
+ *   - 否则跳出循环
+ * 这种重试是因为一些 USB 设备在首次上电时可能无法立即返回描述符，
+ * 需要额外的延迟或重试。这是处理 USB 规范中"设备就绪延迟"的经典方式。
+ *
+ === SETUP 包的构造 ===
+ * 发送的控制请求:
+ *   bmRequestType = USB_DIR_IN (Device-to-Host)
+ *   bRequest      = USB_REQ_GET_DESCRIPTOR (0x06)
+ *   wValue        = (type << 8) + index  -- 高字节: 描述符类型, 低字节: 索引
+ *   wIndex        = 0                    -- 对非字符串描述符为 0
+ *   wLength       = size                 -- 请求读取的字节数
+ *
+ === 调用链 ===
+ * usb_get_descriptor()
+ *   -> usb_control_msg()
+ *      -> usb_internal_control_msg()
+ *         -> usb_start_wait_urb()
+ *
+ * 返回值: 成功时返回接收到的字节数，失败时返回负错误码。
+ */
 /**
  * usb_get_descriptor - issues a generic GET_DESCRIPTOR request
  * @dev: the device whose descriptor is being retrieved
@@ -865,6 +1191,42 @@ int usb_get_descriptor(struct usb_device *dev, unsigned char type,
 }
 EXPORT_SYMBOL_GPL(usb_get_descriptor);
 
+/*
+ * 中文注释: usb_get_string() -- 读取 USB 字符串描述符
+ *
+ * 字符串描述符是 USB 设备以 UTF-16LE（Unicode 小端序）编码的人类可读信息，
+ * 通常包含厂商名称、产品名称和序列号。
+ *
+ === 语言 ID 机制 ===
+ * USB 设备可以支持多种语言的字符串描述符。语言 ID 的获取流程:
+ *
+ *   (1) 首先读取字符串描述符 0（索引为 0），它不是一个真正的字符串，
+ *       而是一个语言 ID 数组（每个语言 ID 占 2 字节）。
+ *       例如: 0x0409 表示英语（美国），0x0804 表示中文（简体）。
+ *
+ *   (2) 使用第一个语言 ID 作为后续字符串读取的 langid 参数。
+ *       设备通常将首选语言列在第一位。
+ *
+ *   (3) 然后使用选定的语言 ID 和字符串索引读取实际的字符串描述符。
+ *
+ === SETUP 包 ===
+ * 与 usb_get_descriptor() 类似，但 wIndex 被设置为语言 ID:
+ *   bmRequestType = USB_DIR_IN
+ *   bRequest      = USB_REQ_GET_DESCRIPTOR (0x06)
+ *   wValue        = (USB_DT_STRING << 8) + index
+ *   wIndex        = langid     -- 语言 ID
+ *   wLength       = size
+ *
+ === 重试机制 ===
+ * 与 usb_get_descriptor() 一样最多重试 3 次:
+ *   - 若 result == 0 或 result == -EPIPE（端点停止），继续重试
+ *   - 若接收到的描述符类型不是 USB_DT_STRING，返回 -ENODATA
+ *
+ * 返回值: 成功时返回原始 UTF-16LE 字节数，失败时返回负错误码。
+ *
+ * 注意: 外部驱动的入口点通常使用 usb_string()，它会自动处理语言 ID 获取
+ * 和 UTF-16LE 到 UTF-8 的转换。usb_get_string() 是内部函数，返回原始编码。
+ */
 /**
  * usb_get_string - gets a string descriptor
  * @dev: the device whose string descriptor is being retrieved
@@ -1157,6 +1519,42 @@ int usb_set_isoch_delay(struct usb_device *dev)
 			GFP_NOIO);
 }
 
+/*
+ * 中文注释: usb_get_status() -- 获取 USB 设备/接口/端点状态
+ *
+ * 对应 USB 规范第 9.4.5 节的 GET_STATUS 请求。这是一个标准 USB 请求，
+ * 用于查询设备、接口或端点的当前状态。
+ *
+ === 接收者和状态类型 ===
+ * 根据接收者（recip）的不同，返回的状态含义也不同:
+ *
+ *   USB_RECIP_DEVICE (0x00) -- 设备状态（2 字节）:
+ *     bit 0: Self Powered（自供电）
+ *     bit 1: Remote Wakeup（远程唤醒已使能）
+ *     bit 2-15: 保留
+ *
+ *   USB_RECIP_INTERFACE (0x01) -- 接口状态（2 字节）:
+ *     目前所有位保留，始终返回 0
+ *
+ *   USB_RECIP_ENDPOINT (0x02) -- 端点状态（2 字节）:
+ *     bit 0: Halt（端点已停止/STALL）
+ *     bit 1-15: 保留
+ *
+ * 状态类型（type）参数支持:
+ *   USB_STATUS_TYPE_STANDARD (0) -- 标准状态，2 字节
+ *   USB_STATUS_TYPE_PTM (1)      -- PTM（精确时间测量）状态，4 字节
+ *                                  仅用于 USB_RECIP_DEVICE
+ *
+ === 使用场景 ===
+ * - 检查设备是否自供电（用于电源管理决策）
+ * - 检查远程唤醒是否使能
+ * - 检查端点是否处于 HALT 状态（用于从 STALL 中恢复）
+ * - 支持 PTM 的 USB 设备获取精确时间测量状态
+ *
+ * 状态位通过 SET_FEATURE 请求设置，通过 CLEAR_FEATURE 请求清除。
+ * 对于端点 HALT 状态的清除，推荐使用 usb_clear_halt() 函数，
+ * 它会在发送 CLEAR_FEATURE 后自动重置端点的数据切换位（DATA0/DATA1）。
+ */
 /**
  * usb_get_status - issues a GET_STATUS call
  * @dev: the device whose status is being checked
@@ -1544,6 +1942,56 @@ void usb_enable_interface(struct usb_device *dev,
 		usb_enable_endpoint(dev, &alt->endpoint[i], reset_eps);
 }
 
+/*
+ * 中文注释: usb_set_interface() -- 选择接口的备用设置（Alternate Setting）
+ *
+ * USB 规范允许一个接口（Interface）拥有多个备用设置（Alternate Setting）。
+ * 每个备用设置可以有不同的端点配置和带宽需求。这是 USB 设备实现
+ * 动态带宽管理的关键机制。
+ *
+ === 备用设置的作用 ===
+ * 典型场景: USB 视频设备（UVC）
+ *   - 备用设置 0: 无等时端点，消耗 0 带宽（设备的"空闲"模式）
+ *   - 备用设置 1: 一个等时端点，最大包长 256 字节
+ *   - 备用设置 2: 一个等时端点，最大包长 512 字节
+ *   - 备用设置 3: 一个等时端点，最大包长 1024 字节
+ * 当应用程序开始视频流时，驱动选择更高的备用设置以获得更多带宽；
+ * 当视频流停止时，切换回备用设置 0 以释放 USB 总线带宽。
+ *
+ === 执行流程 ===
+ *   (1) 参数验证
+ *       -- 检查设备是否挂起，接口号和备用设置号是否有效
+ *
+ *   (2) 刷新旧端点
+ *       -- 调用 usb_disable_interface() 禁用当前接口的所有端点，
+ *          清除所有待处理的 URB。这对 xHCI 主机控制器尤其重要，
+ *          因为需要在释放带宽前刷新端点。
+ *
+ *   (3) 带宽分配
+ *       -- 在 hcd->bandwidth_mutex 保护下:
+ *         a) 调用 usb_disable_lpm() 禁用 LPM（链路电源管理）
+ *         b) 清除旧备用设置的 streams 计数
+ *         c) 调用 usb_hcd_alloc_bandwidth() 移除旧端点并添加新端点
+ *            如果带宽不足，此调用会失败
+ *         d) 发送 USB_REQ_SET_INTERFACE 控制请求给设备
+ *
+ *   (4) 特殊情况: 设备不支持 SET_INTERFACE
+ *       -- 如果接口只有一个备用设置，USB 规范允许设备 STALL
+ *          SET_INTERFACE 请求。此时函数进入"manual"模式:
+ *          不切换备用设置，但手动清除新设置中所有端点的 HALT 状态。
+ *
+ *   (5) 状态切换
+ *       -- 更新 iface->cur_altsetting 指向新设置
+ *       -- 调用 usb_enable_interface() 启用新端点到 HCD
+ *       -- 创建新的 sysfs 文件和端点设备节点
+ *
+ === 内部操作详见 ===
+ * 函数大量依赖 usb_hcd_alloc_bandwidth()，它由 HCD（主机控制器驱动）
+ * 实现。对于 xHCI，该函数负责:
+ *   - 配置端点上下文（Endpoint Context）
+ *   - 分配或释放传输环（Transfer Ring）
+ *   - 计算和预留 U1/U2 超时值
+ */
 /**
  * usb_set_interface - Makes a particular alternate setting be current
  * @dev: the device whose interface is being updated
@@ -2007,6 +2455,65 @@ int usb_set_wireless_status(struct usb_interface *iface,
 }
 EXPORT_SYMBOL_GPL(usb_set_wireless_status);
 
+/*
+ * 中文注释: usb_set_configuration() -- 选择设备配置（SET_CONFIGURATION）
+ *
+ * 这是 USB 子系统中最关键、最复杂的操作之一。改变配置意味着销毁所有
+ * 现有接口、创建新接口、重新绑定驱动程序——相当于"热插拔"多个虚拟设备。
+ *
+ === 配置（Configuration）vs 接口备用设置（Interface Alternate Setting）===
+ * USB 设备有两个层次的配置:
+ *   配置层:   usb_set_configuration() -- 切换整个设备的功能集
+ *             例如: 一个复合设备可能有配置 1（CDC 以太网）和配置 2（USB 串口）
+ *   接口层:   usb_set_interface()     -- 切换同一接口的带宽模式
+ *             例如: UVC 摄像头在空闲和高带宽模式之间切换
+ *
+ === 执行流程 ===
+ *   (1) 参数处理
+ *       -- 若 dev->authorized == 0 或 configuration == -1，强制设为 0（未配置）
+ *       -- 遍历 dev->config[] 数组查找匹配的配置描述符
+ *
+ *   (2) 为新接口预分配内存
+ *       -- 提前分配所有 struct usb_interface 和接口数组，
+ *          这样一旦后续步骤失败，旧状态不受影响
+ *
+ *   (3) 电源唤醒
+ *       -- 调用 usb_autoresume_device() 唤醒设备（如果设备已挂起）
+ *
+ *   (4) 销毁旧配置
+ *       -- 调用 usb_disable_device(dev, 1) 禁用所有非 ep0 端点
+ *       -- 这会卸载所有已绑定的接口驱动（unbind drivers）
+ *       -- 取消所有待处理的异步 Set-Config 请求
+ *
+ *   (5) 带宽重新分配
+ *       -- 在 hcd->bandwidth_mutex 保护下
+ *       -- 调用 usb_hcd_alloc_bandwidth(dev, cp, NULL, NULL)
+ *         * cp 为新配置: 分配带宽并添加端点
+ *         * cp 为 NULL: 释放所有带宽（设置配置 0）
+ *
+ *   (6) 初始化新接口
+ *       -- 遍历所有接口，设置:
+ *         * cur_altsetting = 备用设置 0（或第一个可用设置）
+ *         * intf_assoc = 对应的 IAD（接口关联描述符）
+ *         * dev 设备模型父节点、ACPI/OF 节点等
+ *       -- 注意: 此时接口尚未注册到设备模型，因此不会触发 probe()
+ *
+ *   (7) 发送 SET_CONFIGURATION 请求
+ *       -- 若失败，释放所有已分配的接口资源，设备可能处于无法使用的状态
+ *
+ *   (8) 注册接口
+ *       -- 调用 device_add() 将每个接口注册到 Linux 设备模型
+ *       -- 这会触发 USB 总线驱动匹配，调用对应驱动的 probe() 方法
+ *       -- probe() 可能进一步调用 usb_set_interface() 选择备用设置
+ *
+ === 重要注意事项 ===
+ * - 调用者必须持有设备锁（device lock），且不能持有 USB 总线互斥锁
+ *   （否则会导致死锁，因为 probe() 需要获取总线锁）。
+ * - 接口驱动的 probe() 方法不能直接调用此函数。
+ * - 改变配置后，所有旧接口的处理程序（drivers）都已被卸载，
+ *   新接口的处理程序在 device_add() 时绑定。
+ * - 非授权设备（authorized == 0）只能被置于未配置状态。
+ */
 /*
  * usb_set_configuration - Makes a particular device setting be current
  * @dev: the device whose configuration is being updated

@@ -2,6 +2,71 @@
 #ifndef __LINUX_USB_H
 #define __LINUX_USB_H
 
+/*
+ * ============================================================================
+ * usb.h — Linux USB 子系统核心头文件（Host 端）
+ * ============================================================================
+ *
+ * 【本文件在 USB 架构中的位置】
+ *   这是 USB 子系统最重要的单个头文件。每个 USB 设备驱动都会 #include <linux/usb.h>。
+ *   它定义了 USB 驱动开发所需的全部核心数据结构、API 声明和宏。
+ *
+ * 【USB 设备层次结构（描述符树）】
+ *
+ *   一个 USB 设备的描述符按层次组织：
+ *
+ *   设备 (usb_device)
+ *   │
+ *   ├── 设备描述符 (usb_device_descriptor)
+ *   │   bLength=18, bDescriptorType=DEVICE(1)
+ *   │   字段: idVendor, idProduct, bcdUSB, bMaxPacketSize0,
+ *   │         bDeviceClass, bNumConfigurations, ...
+ *   │
+ *   ├── 配置 1..N (usb_host_config)
+ *   │   ├── 配置描述符 (usb_config_descriptor)
+ *   │   │   bLength=9, bDescriptorType=CONFIG(2)
+ *   │   │   bConfigurationValue, bmAttributes, bMaxPower
+ *   │   │
+ *   │   ├── 接口 0..N (usb_host_interface)
+ *   │   │   ├── 接口描述符 (usb_interface_descriptor)
+ *   │   │   │   bLength=9, bDescriptorType=INTERFACE(4)
+ *   │   │   │   bInterfaceNumber, bAlternateSetting, bNumEndpoints,
+ *   │   │   │   bInterfaceClass, bInterfaceSubClass, bInterfaceProtocol
+ *   │   │   │   (这三个是驱动匹配的关键!)
+ *   │   │   │
+ *   │   │   └── 端点 1..N (usb_host_endpoint)
+ *   │   │       ├── 端点描述符 (usb_endpoint_descriptor)
+ *   │   │       │   bLength=7, bDescriptorType=ENDPOINT(5)
+ *   │   │       │   bEndpointAddress(bit7=方向:0=OUT/1=IN, bits0-3=端点号),
+ *   │   │       │   bmAttributes(bits0-1=传输类型:控制0/同步1/批量2/中断3),
+ *   │   │       │   wMaxPacketSize, bInterval
+ *   │   │       └── USB3: ep_companion 描述符
+ *   │   │
+ *   │   └── (可选)HID/音频/视频/厂商特定描述符
+ *   │
+ *   └── 字符串描述符 (通过 usb_get_string() 获取)
+ *       iManufacturer, iProduct, iSerialNumber
+ *
+ * 【API 类别速查】
+ *
+ *   ┌────────────────┬──────────────────────────────────────────┐
+ *   │ 类别            │ 函数                                     │
+ *   ├────────────────┼──────────────────────────────────────────┤
+ *   │ 控制传输        │ usb_control_msg(), usb_control_msg_send()│
+ *   │ 批量传输        │ usb_bulk_msg()                          │
+ *   │ URB 提交        │ usb_submit_urb(), usb_fill_*_urb()      │
+ *   │ 设备发现        │ usb_register_driver(), usb_driver.probe │
+ *   │ 描述符解析      │ usb_get_descriptor(), usb_get_string()  │
+ *   │ 端点查找        │ usb_find_bulk_in_endpoint() 等          │
+ *   │ 电源管理        │ usb_autopm_*, usb_autosuspend()        │
+ *   │ 复位/配置       │ usb_reset_device(), usb_set_configuration│
+ *   └────────────────┴──────────────────────────────────────────┘
+ *
+ * 【与 Gadget 端的关系】
+ *   本文件定义 HOST 端 API。Gadget 端（设备模式）使用
+ *   include/linux/usb/gadget.h（不同的 struct 和 API）。
+ */
+
 #include <linux/mod_devicetable.h>
 #include <linux/usb/ch9.h>
 
@@ -276,6 +341,15 @@ struct usb_interface {
 
 #define to_usb_interface(__dev)	container_of_const(__dev, struct usb_interface, dev)
 
+/*
+ * usb_get_intfdata / usb_set_intfdata — 获取/设置接口关联的驱动私有数据
+ *
+ * 这是 USB 驱动的标准模式:
+ *   probe() 中分配私有 struct → usb_set_intfdata(intf, priv)
+ *   后续通过 usb_get_intfdata(intf) 取回
+ *
+ * 底层使用 dev_get_drvdata/dev_set_drvdata，数据存储于 intf->dev.driver_data。
+ */
 static inline void *usb_get_intfdata(struct usb_interface *intf)
 {
 	return dev_get_drvdata(&intf->dev);
@@ -297,15 +371,19 @@ static inline void usb_set_intfdata(struct usb_interface *intf, void *data)
 	dev_set_drvdata(&intf->dev, data);
 }
 
+// usb_get_intf / usb_put_intf — 接口引用计数管理
+// 获取引用防止接口在操作期间被释放。必须配对调用。
 struct usb_interface *usb_get_intf(struct usb_interface *intf);
 void usb_put_intf(struct usb_interface *intf);
 
-/* Hard limit */
-#define USB_MAXENDPOINTS	30
+// USB 规范硬限制
+#define USB_MAXENDPOINTS	30     // 每个接口最多 30 个端点 (含 ep0)
 /* this maximum is arbitrary */
-#define USB_MAXINTERFACES	32
-#define USB_MAXIADS		(USB_MAXINTERFACES/2)
+#define USB_MAXINTERFACES	32     // 每个配置最多 32 个接口
+#define USB_MAXIADS		(USB_MAXINTERFACES/2) // 最多 16 个 IAD (Interface Association Descriptor)
 
+// usb_check_bulk_endpoints / usb_check_int_endpoints
+// 验证接口是否包含指定的批量/中断端点集合, 常用于驱动 probe() 的完整性检查
 bool usb_check_bulk_endpoints(
 		const struct usb_interface *intf, const u8 *ep_addrs);
 bool usb_check_int_endpoints(
@@ -659,90 +737,110 @@ struct usb3_lpm_parameters {
  * usb_set_device_state().
  */
 struct usb_device {
-	int		devnum;
-	char		devpath[16];
-	u32		route;
-	enum usb_device_state	state;
-	enum usb_device_speed	speed;
-	unsigned int		rx_lanes;
-	unsigned int		tx_lanes;
-	enum usb_ssp_rate	ssp_rate;
+	// === 设备标识与路由 ===
+	int		devnum;       // USB 设备地址 (1-127), 由 SET_ADDRESS 分配
+	char	devpath[16];   // 设备拓扑路径 (如 "1-2.1" = bus1, port2, subport1)
+	u32		route;         // USB3 路由字符串 (4位×5层=20位, 用于 SS HUB)
 
-	struct usb_tt	*tt;
-	int		ttport;
+	// === 状态与速度 ===
+	enum usb_device_state	state; // 设备状态: ATTACHED→POWERED→DEFAULT→ADDRESS→CONFIGURED
+	enum usb_device_speed	speed; // 速度: USB_SPEED_LOW/FULL/HIGH/SUPER/SUPER_PLUS
+	unsigned int		rx_lanes; // USB3.2/4 接收通道数 (1 或 2)
+	unsigned int		tx_lanes; // USB3.2/4 发送通道数
+	enum usb_ssp_rate	ssp_rate; // SuperSpeedPlus 速率: 5G/10G/20G
 
-	unsigned int toggle[2];
+	// === Transaction Translator (USB2 HUB 接 LS/FS 设备时使用) ===
+	struct usb_tt	*tt;       	// 指向 HUB 的 TT (如果此设备接在 HS HUB 下游的 LS/FS 端口)
+	int				ttport;     // TT 端口号
 
-	struct usb_device *parent;
-	struct usb_bus *bus;
-	struct usb_host_endpoint ep0;
+	// === 数据触发位 (Toggle Bit) ===
+	unsigned int toggle[2];     // [0]=IN, [1]=OUT 端点的 data toggle 位
+	                            // 批量/中断/控制传输使用, 同步传输不使用
 
-	struct device dev;
+	// === 拓扑与总线关联 ===
+	struct usb_device *parent;   // 父设备 (若为根 HUB 则为 NULL)
+	struct usb_bus *bus;         // 所属 USB 总线 (struct usb_bus 关联到 struct usb_hcd)
+	struct usb_host_endpoint ep0; // 端点 0 (控制端点, 唯一保证存在的双向端点)
 
-	struct usb_device_descriptor descriptor;
-	struct usb_host_bos *bos;
-	struct usb_host_config *config;
+	// === Linux 设备模型集成 ===
+	struct device dev;           // 内嵌 struct device (用于 sysfs, 电源管理, 驱动绑定)
+	                             // 通过 to_usb_device() 可从 dev 反查 usb_device
 
-	struct usb_host_config *actconfig;
-	struct usb_host_endpoint *ep_in[16];
-	struct usb_host_endpoint *ep_out[16];
+	// === 描述符缓存 ===
+	struct usb_device_descriptor descriptor; // 设备描述符 (18 字节, 含 VID/PID/bcdUSB)
+	struct usb_host_bos *bos;                // BOS 描述符 (USB 2.1+, 含 LPM/SS capability)
+	struct usb_host_config *config;          // 所有已解析配置的数组
 
-	char **rawdescriptors;
+	// === 当前活动配置 ===
+	struct usb_host_config *actconfig;       // 当前激活的配置 (由 SET_CONFIGURATION 选定)
+	struct usb_host_endpoint *ep_in[16];     // IN 端点快速查找表 (按端点号索引)
+	struct usb_host_endpoint *ep_out[16];    // OUT 端点快速查找表 (按端点号索引)
+	                                         // 注意: ep0 不在这些数组中!
 
-	unsigned short bus_mA;
-	u8 portnum;
-	u8 level;
-	u8 devaddr;
+	// === 原始描述符 ===
+	char **rawdescriptors;                   // 原始二进制描述符 (每个配置一个 char*)
 
-	unsigned can_submit:1;
-	unsigned persist_enabled:1;
-	unsigned reset_in_progress:1;
-	unsigned have_langid:1;
-	unsigned authorized:1;
-	unsigned authenticated:1;
-	unsigned lpm_capable:1;
-	unsigned lpm_devinit_allow:1;
-	unsigned usb2_hw_lpm_capable:1;
-	unsigned usb2_hw_lpm_besl_capable:1;
-	unsigned usb2_hw_lpm_enabled:1;
-	unsigned usb2_hw_lpm_allowed:1;
-	unsigned usb3_lpm_u1_enabled:1;
-	unsigned usb3_lpm_u2_enabled:1;
-	int string_langid;
+	// === HUB 相关信息 ===
+	unsigned short bus_mA;                   // 总线可用电流 (mA), 用于电源预算
+	u8 portnum;                              // 在父 HUB 上的端口号 (1-based)
+	u8 level;                                // USB 树层级 (根 HUB=0, 逐级+1)
+	u8 devaddr;                              // 设备地址 (与 devnum 相同, 用于 XHCI slot)
 
-	/* static strings from the device */
-	char *product;
-	char *manufacturer;
-	char *serial;
+	// === 设备状态标志位 ===
+	unsigned can_submit:1;           // 允许提交 URB (设备至少已初始化)
+	unsigned persist_enabled:1;      // USB persist 启用 (设备关闭期间保持 /dev 节点)
+	unsigned reset_in_progress:1;    // 正在复位中
+	unsigned have_langid:1;          // 已知语言 ID (用于获取字符串描述符)
+	unsigned authorized:1;           // 已授权 (用户空间通过 usbfs 控制)
+	unsigned authenticated:1;        // 已认证 (无线 USB)
+	// === Link Power Management (LPM) 相关 ===
+	unsigned lpm_capable:1;          // 设备支持 LPM (Link Power Management)
+	unsigned lpm_devinit_allow:1;    // 设备启动期间允许 LPM
+	unsigned usb2_hw_lpm_capable:1;  // 硬件支持 USB2 LPM
+	unsigned usb2_hw_lpm_besl_capable:1; // 支持 BESL (Best Effort Service Latency)
+	unsigned usb2_hw_lpm_enabled:1;  // USB2 HW LPM 已启用
+	unsigned usb2_hw_lpm_allowed:1;  // USB2 HW LPM 允许
+	unsigned usb3_lpm_u1_enabled:1;  // USB3 U1 状态已启用
+	unsigned usb3_lpm_u2_enabled:1;  // USB3 U2 状态已启用
+	int string_langid;               // 字符串描述符的语言 ID (0x0409 = 英语)
 
-	struct list_head filelist;
+	// === 设备字符串 (来自描述符) ===
+	char *product;                   // iProduct 字符串
+	char *manufacturer;              // iManufacturer 字符串
+	char *serial;                    // iSerialNumber 字符串
 
-	int maxchild;
+	// === usbfs (用户空间驱动) 相关 ===
+	struct list_head filelist;       // usbfs 打开的 file 链表 (用于设备移除时通知)
 
-	u32 quirks;
-	atomic_t urbnum;
+	// === 如果此设备是 HUB ===
+	int maxchild;                    // 下游端口数量 (0 = 非 HUB)
 
-	unsigned long active_duration;
+	// === 不常见/变通 ===
+	u32 quirks;                      // USB_QUIRK_* 标志 (设备特定变通方案)
+	atomic_t urbnum;                 // 活跃 URB 计数 (用于调试和 driver unbind)
 
-	unsigned long connect_time;
+	// === 计时与电源管理 ===
+	unsigned long active_duration;   // 累计活跃时间 (ms, 用于 autosuspend)
+	unsigned long connect_time;      // 连接时间戳
 
-	unsigned do_remote_wakeup:1;
-	unsigned reset_resume:1;
-	unsigned port_is_suspended:1;
-	unsigned offload_pm_locked:1;
-	int offload_usage;
-	spinlock_t offload_lock;
-	enum usb_link_tunnel_mode tunnel_mode;
-	struct device_link *usb4_link;
+	unsigned do_remote_wakeup:1;     // 启用远程唤醒
+	unsigned reset_resume:1;         // 使用复位-恢复 (而非正常恢复)
+	unsigned port_is_suspended:1;    // 端口已挂起
+	unsigned offload_pm_locked:1;    // 卸载电源管理已锁定
+	int offload_usage;               // 卸载 PM 使用计数
+	spinlock_t offload_lock;         // 卸载 PM 自旋锁
+	enum usb_link_tunnel_mode tunnel_mode; // USB4 隧道模式 (USB3/DP/PCIe)
+	struct device_link *usb4_link;   // USB4 设备链接
 
-	int slot_id;
-	struct usb2_lpm_parameters l1_params;
-	struct usb3_lpm_parameters u1_params;
-	struct usb3_lpm_parameters u2_params;
-	unsigned lpm_disable_count;
+	// === XHCI 特定 ===
+	int slot_id;                     // XHCI 控制器分配的设备槽 (Device Slot)
+	struct usb2_lpm_parameters l1_params; // USB2 L1 LPM 参数
+	struct usb3_lpm_parameters u1_params; // USB3 U1 LPM 参数
+	struct usb3_lpm_parameters u2_params; // USB3 U2 LPM 参数
+	unsigned lpm_disable_count;      // LPM 禁用引用计数 (>0 = LPM 禁用)
 
-	u16 hub_delay;
-	unsigned use_generic_driver:1;
+	u16 hub_delay;                   // HUB 延迟值 (从 USB3 HUB 描述符获取)
+	unsigned use_generic_driver:1;   // 使用通用驱动 (usb_generic_driver)
 };
 
 #define to_usb_device(__dev)	container_of_const(__dev, struct usb_device, dev)
@@ -761,8 +859,22 @@ static inline const struct usb_device *__intf_to_usbdev_const(const struct usb_i
 		 const struct usb_interface *: __intf_to_usbdev_const,	\
 		 struct usb_interface *: __intf_to_usbdev)(intf)
 
+/*
+ * usb_get_dev / usb_put_dev — USB 设备引用计数管理
+ *
+ * 每获取一个 usb_device 指针，调用 usb_get_dev() 增加引用计数；
+ * 使用完毕后调用 usb_put_dev() 减少引用。当引用归零时释放 usb_device。
+ * 这对函数防止在驱动仍持有设备指针时设备被热拔出释放。
+ *
+ * 典型用法:
+ *   struct usb_device *udev = usb_get_dev(intf_to_usbdev(intf));
+ *   ... 使用 udev ...
+ *   usb_put_dev(udev);
+ */
 extern struct usb_device *usb_get_dev(struct usb_device *dev);
 extern void usb_put_dev(struct usb_device *dev);
+
+// usb_hub_find_child — 在 HUB 的指定端口查找子设备
 extern struct usb_device *usb_hub_find_child(struct usb_device *hdev,
 	int port1);
 
@@ -771,6 +883,9 @@ extern struct usb_device *usb_hub_find_child(struct usb_device *hdev,
  * @hdev:  USB device belonging to the usb hub
  * @port1: portnum associated with child device
  * @child: child device pointer
+ *
+ * 遍历 HUB 所有下游端口连接的子设备。
+ * continue 会自动跳过空端口。
  */
 #define usb_hub_for_each_child(hdev, port1, child) \
 	for (port1 = 1,	child =	usb_hub_find_child(hdev, port1); \
@@ -778,7 +893,22 @@ extern struct usb_device *usb_hub_find_child(struct usb_device *hdev,
 			child = usb_hub_find_child(hdev, ++port1)) \
 		if (!child) continue; else
 
-/* USB device locking */
+/*
+ * USB 设备锁 — 保护 usb_device 的并发访问
+ *
+ * usb_lock_device/unlock_device:
+ *   对 usb_device 内嵌的 struct device->mutex 加锁。
+ *   任何需要原子化执行的操作（如配置选择、接口操作）都应持有此锁。
+ *
+ * usb_lock_device_interruptible:
+ *   可中断版本的锁（允许信号唤醒）。
+ *
+ * usb_trylock_device:
+ *   非阻塞尝试加锁，失败立即返回。
+ *
+ * usb_lock_device_for_reset:
+ *   为设备复位获取锁（比普通锁更复杂，涉及 pre_reset/post_reset 回调）。
+ */
 #define usb_lock_device(udev)			device_lock(&(udev)->dev)
 #define usb_unlock_device(udev)			device_unlock(&(udev)->dev)
 #define usb_lock_device_interruptible(udev)	device_lock_interruptible(&(udev)->dev)
@@ -786,10 +916,19 @@ extern struct usb_device *usb_hub_find_child(struct usb_device *hdev,
 extern int usb_lock_device_for_reset(struct usb_device *udev,
 				     const struct usb_interface *iface);
 
-/* USB port reset for device reinitialization */
+/*
+ * usb_reset_device — 复位 USB 设备
+ *
+ * 执行 USB 端口复位，恢复设备到默认状态。成功后设备的所有配置/接口
+ * 驱动会被重新 probe。失败则设备被移除。这是设备错误恢复的最后手段。
+ *
+ * usb_queue_reset_device — 从原子上下文调度设备复位
+ *   将复位请求入队到 workqueue，避免在中断处理程序中直接复位。
+ */
 extern int usb_reset_device(struct usb_device *dev);
 extern void usb_queue_reset_device(struct usb_interface *dev);
 
+// usb_intf_get_dma_device — 获取接口的 DMA 设备 (通常 = udev->dev, USB4 可能不同)
 extern struct device *usb_intf_get_dma_device(struct usb_interface *intf);
 
 #ifdef CONFIG_ACPI
@@ -806,21 +945,48 @@ static inline int usb_acpi_port_lpm_incapable(struct usb_device *hdev, int index
 	{ return 0; }
 #endif
 
-/* USB autosuspend and autoresume */
+/*
+ * USB autosuspend / autoresume — 自动电源管理 API
+ *
+ * 启用 autosuspend 后，USB Core 会在设备空闲一段时间后自动将其挂起
+ * (节省电源)。当有 URB 提交或驱动调用 autopm_get 时自动恢复。
+ *
+ * usb_enable_autosuspend / usb_disable_autosuspend:
+ *   启用/禁用设备的自动挂起。
+ *   注意: 如果驱动的 supports_autosuspend=0, USB Core 也不会允许 autosuspend。
+ *
+ * usb_autopm_get_interface / usb_autopm_put_interface (同步):
+ *   获取/释放接口的 runtime PM 引用。get 确保设备处于活跃状态 (可能触发 resume)；
+ *   put 允许设备在空闲后重新 autosuspend。必须配对调用！
+ *
+ *   probe() 期间设备自动处于活跃状态, 不需要调用 get。
+ *
+ * _async 变体 (中断上下文安全):
+ *   不等待 resume 完成, 而是启动异步 resume 后立即返回。
+ *   适用于中断上下文或持有自旋锁的场景。
+ *
+ * _no_resume 变体:
+ *   get_no_resume: 仅增加计数, 不触发 resume (假设设备已经是活跃的)。
+ *   put_no_suspend: 仅减少计数, 不触发 suspend。
+ *   用于精确控制电源转换时机的特殊场景。
+ *
+ * usb_mark_last_busy:
+ *   重置空闲计时器。在每次完成 I/O 操作后调用, 延迟 autosuspend。
+ */
 #ifdef CONFIG_PM
 extern void usb_enable_autosuspend(struct usb_device *udev);
 extern void usb_disable_autosuspend(struct usb_device *udev);
 
-extern int usb_autopm_get_interface(struct usb_interface *intf);
-extern void usb_autopm_put_interface(struct usb_interface *intf);
-extern int usb_autopm_get_interface_async(struct usb_interface *intf);
-extern void usb_autopm_put_interface_async(struct usb_interface *intf);
-extern void usb_autopm_get_interface_no_resume(struct usb_interface *intf);
-extern void usb_autopm_put_interface_no_suspend(struct usb_interface *intf);
+extern int usb_autopm_get_interface(struct usb_interface *intf);    // 获取 PM 引用 (同步恢复)
+extern void usb_autopm_put_interface(struct usb_interface *intf);   // 释放 PM 引用 (允许挂起)
+extern int usb_autopm_get_interface_async(struct usb_interface *intf); // 异步恢复 (IRQ 安全)
+extern void usb_autopm_put_interface_async(struct usb_interface *intf);// 异步释放
+extern void usb_autopm_get_interface_no_resume(struct usb_interface *intf); // 仅增计数
+extern void usb_autopm_put_interface_no_suspend(struct usb_interface *intf); // 仅减计数
 
 static inline void usb_mark_last_busy(struct usb_device *udev)
 {
-	pm_runtime_mark_last_busy(&udev->dev);
+	pm_runtime_mark_last_busy(&udev->dev);  // 重置空闲计时器
 }
 
 #else
@@ -986,6 +1152,25 @@ static inline int usb_make_path(struct usb_device *dev, char *buf, size_t size)
 			  dev->devpath);
 	return (actual >= (int)size) ? -1 : actual;
 }
+
+/*
+ * ==========================================================================
+ * USB 设备 ID 匹配宏 — struct usb_device_id 构建器
+ * ==========================================================================
+ *
+ * 每个 USB 驱动必须定义 usb_device_id 数组。USB Core 在设备插入时
+ * 遍历所有已注册驱动的 id_table, 找到匹配项后调用 probe()。
+ *
+ * 常用匹配宏:
+ *   USB_DEVICE(vid, pid)              — 精确 VID+PID
+ *   USB_DEVICE_VER(vid, pid, lo, hi)  — VID+PID + 设备版本范围
+ *   USB_DEVICE_INTERFACE_CLASS(...)   — VID+PID + 接口 class
+ *   USB_INTERFACE_INFO(cl,sc,pr)      — 仅接口 class/subclass/protocol
+ *                                      (用于标准 USB 类驱动: HID/audio/storage)
+ *
+ * 必须配合 MODULE_DEVICE_TABLE(usb, table) 导出, 使 udev 能自动加载模块。
+ * 省略 MODULE_DEVICE_TABLE 将导致驱动仅在手动加载时工作 (无热插拔)。
+ */
 
 /*-------------------------------------------------------------------------*/
 
@@ -1242,16 +1427,31 @@ extern ssize_t usb_show_dynids(struct usb_dynids *dynids, char *buf);
  * well as forcing all pending I/O requests to complete (by unlinking
  * them as necessary, and blocking until the unlinks complete).
  */
+/*
+ * struct usb_driver — 接口级 USB 驱动 (最常用的驱动类型)
+ *
+ * 这是 USB 驱动开发中最常用的注册结构。每个 USB 接口驱动 (如 usb-storage,
+ * usbhid, usbserial) 都通过此结构与 USB Core 交互。
+ *
+ * probe() 被调用时机: 当 USB 设备的某个接口的 class/subclass/protocol
+ * 与 id_table 中的条目匹配时被调用。此时设备已配置好，端点可用。
+ *
+ * 生命周期:
+ *   probe(intf, id) → 端点操作 → disconnect(intf)
+ *   suspend(intf) / resume(intf) / reset_resume(intf) (可选, 电源管理)
+ */
 struct usb_driver {
-	const char *name;
+	const char *name;               // 驱动名称 (须唯一, 通常与模块名相同)
 
+	// === 热插拔回调 (必须实现) ===
 	int (*probe) (struct usb_interface *intf,
-		      const struct usb_device_id *id);
+		      const struct usb_device_id *id); // 设备插入时调用
+	void (*disconnect) (struct usb_interface *intf); // 设备拔出时调用
+	                                                 // 必须等待所有 URB 完成!
 
-	void (*disconnect) (struct usb_interface *intf);
-
+	// === 可选回调 ===
 	int (*unlocked_ioctl) (struct usb_interface *intf, unsigned int code,
-			void *buf);
+			void *buf);      // 驱动私有 ioctl (通过 usbfs)
 
 	int (*suspend) (struct usb_interface *intf, pm_message_t message);
 	int (*resume) (struct usb_interface *intf);
@@ -1386,32 +1586,44 @@ extern int usb_disabled(void);
  */
 
 /*
- * urb->transfer_flags:
+ * urb->transfer_flags — 传输行为控制标志
+ *
+ * 驱动可设置的标志:
+ *   URB_SHORT_NOT_OK — 若实际传输 < 预期长度, 报告为错误 (非零 status)
+ *   URB_ZERO_PACKET   — 批量 OUT: 若传输长度是端点 maxpacket 的倍数,
+ *                       追加一个 zero-length packet 表示数据结束
+ *   URB_NO_INTERRUPT  — 仅当出错时才产生中断 (优化: 减少中断开销)
+ *   URB_FREE_BUFFER   — URB 释放时自动 kfree(transfer_buffer)
+ *   URB_NO_TRANSFER_DMA_MAP — 驱动已自行 DMA 映射 transfer_dma, 无需 HCD 映射
+ *   URB_ISO_ASAP      — 同步传输: 使用第一个未过期的调度槽
+ *
+ * 内部标志 (驱动不应设置):
+ *   URB_DIR_IN/OUT    — 传输方向, 由 usb_submit_urb() 自动设置
+ *   URB_DMA_MAP_*     — DMA 映射方式, HCD 内部使用
+ *   URB_SETUP_MAP_*   — setup packet 的 DMA 映射状态
  *
  * Note: URB_DIR_IN/OUT is automatically set in usb_submit_urb().
  */
-#define URB_SHORT_NOT_OK	0x0001	/* report short reads as errors */
-#define URB_ISO_ASAP		0x0002	/* iso-only; use the first unexpired
-					 * slot in the schedule */
-#define URB_NO_TRANSFER_DMA_MAP	0x0004	/* urb->transfer_dma valid on submit */
-#define URB_ZERO_PACKET		0x0040	/* Finish bulk OUT with short packet */
-#define URB_NO_INTERRUPT	0x0080	/* HINT: no non-error interrupt
-					 * needed */
-#define URB_FREE_BUFFER		0x0100	/* Free transfer buffer with the URB */
+#define URB_SHORT_NOT_OK	0x0001	// 短包当作错误 (不是 -EREMOTEIO)
+#define URB_ISO_ASAP		0x0002	// 同步: 尽快调度
+#define URB_NO_TRANSFER_DMA_MAP	0x0004	// 驱动已自行 DMA 映射
+#define URB_ZERO_PACKET		0x0040	// 批量OUT: 追加 ZLP 结束传输
+#define URB_NO_INTERRUPT	0x0080	// 仅错误时产生中断
+#define URB_FREE_BUFFER		0x0100	// 释放 URB 时自动 kfree transfer_buffer
 
 /* The following flags are used internally by usbcore and HCDs */
-#define URB_DIR_IN		0x0200	/* Transfer from device to host */
-#define URB_DIR_OUT		0
+#define URB_DIR_IN		0x0200	// 设备→主机 (读)
+#define URB_DIR_OUT		0       // 主机→设备 (写)
 #define URB_DIR_MASK		URB_DIR_IN
 
-#define URB_DMA_MAP_SINGLE	0x00010000	/* Non-scatter-gather mapping */
-#define URB_DMA_MAP_PAGE	0x00020000	/* HCD-unsupported S-G */
-#define URB_DMA_MAP_SG		0x00040000	/* HCD-supported S-G */
-#define URB_MAP_LOCAL		0x00080000	/* HCD-local-memory mapping */
-#define URB_SETUP_MAP_SINGLE	0x00100000	/* Setup packet DMA mapped */
-#define URB_SETUP_MAP_LOCAL	0x00200000	/* HCD-local setup packet */
-#define URB_DMA_SG_COMBINED	0x00400000	/* S-G entries were combined */
-#define URB_ALIGNED_TEMP_BUFFER	0x00800000	/* Temp buffer was alloc'd */
+#define URB_DMA_MAP_SINGLE	0x00010000	// 无 scatter-gather 的 DMA 映射
+#define URB_DMA_MAP_PAGE	0x00020000	// 逐页映射 (HCD 不做 SG)
+#define URB_DMA_MAP_SG		0x00040000	// HCD 做了 SG 映射
+#define URB_MAP_LOCAL		0x00080000	// HCD 本地内存
+#define URB_SETUP_MAP_SINGLE	0x00100000	// setup_packet DMA 已映射
+#define URB_SETUP_MAP_LOCAL	0x00200000	// setup_packet 在 HCD 本地内存
+#define URB_DMA_SG_COMBINED	0x00400000	// SG 条目已合并
+#define URB_ALIGNED_TEMP_BUFFER	0x00800000	// 临时对齐缓冲区已分配
 
 struct usb_iso_packet_descriptor {
 	unsigned int offset;
@@ -1627,45 +1839,79 @@ typedef void (*usb_complete_t)(struct urb *);
  * when the urb is owned by the hcd, that is, since the call to
  * usb_submit_urb() till the entry into the completion routine.
  */
+/*
+ * struct urb — USB Request Block (USB 请求块)
+ *
+ * URB 是 USB 传输的基本单元。一次 USB 传输 = 一个 URB。
+ * 驱动通过 usb_submit_urb() 提交，传输完成后调用 urb->complete 回调。
+ *
+ * 字段标注: (in)=输入参数 (驱动填写), (return)=输出参数 (HCD 填写)
+ *
+ * 生命周期: alloc → fill → submit → [complete callback] → free/重用
+ */
 struct urb {
-	/* private: usb core and host controller only fields in the urb */
-	struct kref kref;		/* reference count of the URB */
-	int unlinked;			/* unlink error code */
-	void *hcpriv;			/* private data for host controller */
-	atomic_t use_count;		/* concurrent submissions counter */
-	atomic_t reject;		/* submissions will fail */
+	// ===== 私有字段 (HCD/USB Core 内部使用) =====
+	struct kref kref;		// 引用计数 (usb_get_urb/usb_free_urb)
+	int unlinked;			// 已 unlink 标志 + 错误码
+	void *hcpriv;			// HCD 私有数据 (XHCI: 指向 TD 等)
+	atomic_t use_count;		// 并发提交计数器
+	atomic_t reject;		// 标记: 此 URB 将被拒绝提交
 
-	/* public: documented fields in the urb that can be used by drivers */
-	struct list_head urb_list;	/* list head for use by the urb's
-					 * current owner */
-	struct list_head anchor_list;	/* the URB may be anchored */
-	struct usb_anchor *anchor;
-	struct usb_device *dev;		/* (in) pointer to associated device */
-	struct usb_host_endpoint *ep;	/* (internal) pointer to endpoint */
-	unsigned int pipe;		/* (in) pipe information */
-	unsigned int stream_id;		/* (in) stream ID */
-	int status;			/* (return) non-ISO status */
-	unsigned int transfer_flags;	/* (in) URB_SHORT_NOT_OK | ...*/
-	void *transfer_buffer;		/* (in) associated data buffer */
-	dma_addr_t transfer_dma;	/* (in) dma addr for transfer_buffer */
-	struct scatterlist *sg;		/* (in) scatter gather buffer list */
-	struct sg_table *sgt;		/* (in) scatter gather table for noncoherent buffer */
-	int num_mapped_sgs;		/* (internal) mapped sg entries */
-	int num_sgs;			/* (in) number of entries in the sg list */
-	u32 transfer_buffer_length;	/* (in) data buffer length */
-	u32 actual_length;		/* (return) actual transfer length */
-	unsigned char *setup_packet;	/* (in) setup packet (control only) */
-	dma_addr_t setup_dma;		/* (in) dma addr for setup_packet */
-	int start_frame;		/* (modify) start frame (ISO) */
-	int number_of_packets;		/* (in) number of ISO packets */
-	int interval;			/* (modify) transfer interval
-					 * (INT/ISO) */
-	int error_count;		/* (return) number of ISO errors */
-	void *context;			/* (in) context for completion */
-	usb_complete_t complete;	/* (in) completion routine */
+	// ===== 公共字段 (驱动使用) =====
+	struct list_head urb_list;	// URB 链表节点 (用于 enqueue/dequeue)
+	struct list_head anchor_list;	// Anchor 链表 (用于批量管理 URB)
+	struct usb_anchor *anchor;      // 指向所属的 URB anchor
+	struct usb_device *dev;		// (in) 目标 USB 设备
+	struct usb_host_endpoint *ep;	// (internal) 目标端点 (由 pipe 自动解析)
+	unsigned int pipe;		// (in) 管道编码: 类型+方向+设备地址+端点号
+	                                //   通过 usb_sndctrlpipe/rcvbulkpipe 等宏创建
+	unsigned int stream_id;		// (in) USB3 流 ID (0=不使用流)
+	int status;			// (return) 完成状态: 0=成功, 负数=错误码
+	unsigned int transfer_flags;	// (in) 传输标志: URB_SHORT_NOT_OK,
+	                               //   URB_NO_TRANSFER_DMA_MAP, URB_ZERO_PACKET...
+	void *transfer_buffer;		// (in) 数据缓冲区 (DMA 可用)
+	dma_addr_t transfer_dma;	// (in) 如果 URB_NO_TRANSFER_DMA_MAP 设置,
+	                               //   驱动提供预映射的 DMA 地址
+	struct scatterlist *sg;		// (in) scatter-gather 列表 (替代 transfer_buffer)
+	struct sg_table *sgt;		// (in) 非一致性缓冲区的 sg_table
+	int num_mapped_sgs;		// (internal) HCD 映射的 SG 条目数
+	int num_sgs;			// (in) SG 列表中条目数
+	u32 transfer_buffer_length;	// (in) 缓冲区总大小 (字节)
+	u32 actual_length;		// (return) 实际传输的字节数
+	unsigned char *setup_packet;	// (in) 控制传输的 SETUP 包 (8字节, 仅 CONTROL)
+	                               //   指向 struct usb_ctrlrequest
+	dma_addr_t setup_dma;		// (in) SETUP 包的 DMA 地址
+	// === 同步传输特有字段 ===
+	int start_frame;		// (modify) 起始帧号 (同步传输)
+	int number_of_packets;		// (in) 同步传输的包数量
+	// === 中断/同步传输 ===
+	int interval;			// (modify) 轮询间隔 (单位: USB 微帧)
+	                               //   高速: 2^(bInterval-1) × 125μs
+	                               //   USB3: 2^(bInterval-1) × 125μs
+	int error_count;		// (return) 同步传输错误计数
+	// === 完成回调 ===
+	void *context;			// (in) 传递给 complete() 的私有数据
+	usb_complete_t complete;	// (in) 完成回调: void (*)(struct urb *)
+	                               //   在 tasklet(软中断)上下文中调用, 可以睡眠
+	// === 同步传输帧描述符 ===
 	struct usb_iso_packet_descriptor iso_frame_desc[];
-					/* (in) ISO ONLY */
+					// (in) 变长数组, 每个同步包一个描述符
+	                               //   包含每个包的 offset, length, actual_length, status
 };
+
+/*
+ * ==========================================================================
+ * usb_fill_*_urb() — URB 初始化辅助宏
+ * ==========================================================================
+ *
+ * 在提交 URB 前, 必须用这些函数填充必要的字段。
+ * 每种传输类型有对应的 fill 函数:
+ *   usb_fill_control_urb — 控制传输 (Setup + Data + Status 三阶段)
+ *   usb_fill_bulk_urb    — 批量传输 (大数据量, 可靠)
+ *   usb_fill_int_urb     — 中断传输 (小数据量, 周期性轮询)
+ *
+ * 注意: transfer_buffer 必须是 DMA 安全的 (kmalloc 分配, 非栈变量!)
+ */
 
 /* ----------------------------------------------------------------------- */
 
@@ -1797,29 +2043,56 @@ static inline void usb_fill_int_urb(struct urb *urb,
 	urb->start_frame = -1;
 }
 
-extern void usb_init_urb(struct urb *urb);
-extern struct urb *usb_alloc_urb(int iso_packets, gfp_t mem_flags);
-extern void usb_free_urb(struct urb *urb);
-#define usb_put_urb usb_free_urb
-extern struct urb *usb_get_urb(struct urb *urb);
-extern int usb_submit_urb(struct urb *urb, gfp_t mem_flags);
-extern int usb_unlink_urb(struct urb *urb);
-extern void usb_kill_urb(struct urb *urb);
-extern void usb_poison_urb(struct urb *urb);
-extern void usb_unpoison_urb(struct urb *urb);
-extern void usb_block_urb(struct urb *urb);
-extern void usb_kill_anchored_urbs(struct usb_anchor *anchor);
-extern void usb_poison_anchored_urbs(struct usb_anchor *anchor);
-extern void usb_unpoison_anchored_urbs(struct usb_anchor *anchor);
-extern void usb_anchor_suspend_wakeups(struct usb_anchor *anchor);
-extern void usb_anchor_resume_wakeups(struct usb_anchor *anchor);
-extern void usb_anchor_urb(struct urb *urb, struct usb_anchor *anchor);
-extern void usb_unanchor_urb(struct urb *urb);
+/*
+ * ==========================================================================
+ * URB 生命周期管理 API
+ * ==========================================================================
+ *
+ * alloc → fill → submit → [complete callback] → free/重用
+ *
+ * usb_alloc_urb(iso_packets, gfp):
+ *   分配 URB + iso_packets 个同步帧描述符 (非同步传 0)。
+ *   返回的 URB 需要用 usb_free_urb() 释放。
+ *
+ * usb_submit_urb(urb, gfp):
+ *   提交 URB 到 USB 核心 → HCD → 硬件。异步操作，立即返回。
+ *   完成后调用 urb->complete(urb) 回调。
+ *
+ * usb_kill_urb / usb_unlink_urb:
+ *   kill: 同步取消 (阻塞等待 URB 完成并调用 complete 回调)。
+ *   unlink: 异步取消 (立即返回, URB 稍后完成)。
+ *   区别: kill 保证回调已执行完毕才返回; unlink 不保证。
+ *
+ * usb_poison_urb / usb_unpoison_urb:
+ *   poison: 标记 URB 为 "有毒" → 后续提交将失败。
+ *   用于 disconnect() 时阻止新的 URB 提交。
+ *
+ * usb_get_urb / usb_free_urb (≡ usb_put_urb):
+ *   引用计数管理。get 增加计数, free/put 减少并可能释放。
+ */
+extern void usb_init_urb(struct urb *urb);           // 初始化已分配的 URB 内存
+extern struct urb *usb_alloc_urb(int iso_packets, gfp_t mem_flags); // 分配 URB
+extern void usb_free_urb(struct urb *urb);            // 释放 URB (减少引用计数)
+#define usb_put_urb usb_free_urb                       // usb_free_urb 的别名
+extern struct urb *usb_get_urb(struct urb *urb);       // 增加 URB 引用计数
+extern int usb_submit_urb(struct urb *urb, gfp_t mem_flags); // 提交 URB (异步)
+extern int usb_unlink_urb(struct urb *urb);            // 异步取消
+extern void usb_kill_urb(struct urb *urb);             // 同步取消 (阻塞等待)
+extern void usb_poison_urb(struct urb *urb);           // 标记 URB 为 (阻止新提交)
+extern void usb_unpoison_urb(struct urb *urb);         // 解除 poisoned 状态
+extern void usb_block_urb(struct urb *urb);            // usb_poison_urb 的别名
+extern void usb_kill_anchored_urbs(struct usb_anchor *anchor); // 取消 anchor 中所有 URB
+extern void usb_poison_anchored_urbs(struct usb_anchor *anchor); // 毒化 anchor 中所有 URB
+extern void usb_unpoison_anchored_urbs(struct usb_anchor *anchor); // 解除毒化
+extern void usb_anchor_suspend_wakeups(struct usb_anchor *anchor); // URB 完成时暂停唤醒
+extern void usb_anchor_resume_wakeups(struct usb_anchor *anchor); // 恢复唤醒
+extern void usb_anchor_urb(struct urb *urb, struct usb_anchor *anchor); // 将 URB 加入 anchor
+extern void usb_unanchor_urb(struct urb *urb);         // 从 anchor 移除 URB
 extern int usb_wait_anchor_empty_timeout(struct usb_anchor *anchor,
-					 unsigned int timeout);
-extern struct urb *usb_get_from_anchor(struct usb_anchor *anchor);
-extern void usb_scuttle_anchored_urbs(struct usb_anchor *anchor);
-extern int usb_anchor_empty(struct usb_anchor *anchor);
+					 unsigned int timeout); // 等待 anchor 清空
+extern struct urb *usb_get_from_anchor(struct usb_anchor *anchor); // 取出一个完成的 URB
+extern void usb_scuttle_anchored_urbs(struct usb_anchor *anchor); // 强制清空 anchor
+extern int usb_anchor_empty(struct usb_anchor *anchor); // anchor 是否为空
 
 #define usb_unblock_urb	usb_unpoison_urb
 
@@ -1865,34 +2138,62 @@ void usb_free_noncoherent(struct usb_device *dev, size_t size,
 			  void *addr, enum dma_data_direction dir,
 			  struct sg_table *table);
 
-/*-------------------------------------------------------------------*
- *                         SYNCHRONOUS CALL SUPPORT                  *
- *-------------------------------------------------------------------*/
+/*
+ * ==========================================================================
+ * 同步 USB 传输 API (阻塞式, 简化接口)
+ * ==========================================================================
+ *
+ * 这些函数内部封装了 URB 的 alloc → fill → submit → wait → free 流程,
+ * 让简单的 USB 传输变得方便。但它们会阻塞调用线程, 不能用于中断上下文。
+ *
+ * 控制传输 (usb_control_msg):
+ *   发送 USB 控制请求 (Setup → Data → Status 三阶段)。
+ *   request + requesttype + value + index 组成 8 字节 SETUP 包。
+ *   返回值: ≥0 = 成功传输的字节数, <0 = 错误码。
+ *
+ * 批量传输 (usb_bulk_msg):
+ *   同步批量 IN 或 OUT 传输。阻塞等待完成或超时。
+ *   actual_length 返回实际传输字节数。
+ *   _killable 版本: 可被致命信号中断 (fatal_signal_pending)。
+ *
+ * 中断传输 (usb_interrupt_msg):
+ *   同步中断 IN 或 OUT 传输。类似 bulk 但端点类型是 INTERRUPT。
+ *
+ * usb_control_msg_send / usb_control_msg_recv (推荐的新接口):
+ *   相比 usb_control_msg() 的参数更清晰:
+ *   - endpoint 是 bEndpointAddress (如 0x81 表示 IN endpoint 1)
+ *   - data 有 const (send 不需要修改缓冲区)
+ *   - memflags 控制内存分配 (GFP_KERNEL / GFP_ATOMIC)
+ */
 
 /* Maximum value allowed for timeout in synchronous routines below */
-#define USB_MAX_SYNCHRONOUS_TIMEOUT		60000	/* ms */
+#define USB_MAX_SYNCHRONOUS_TIMEOUT		60000	/* ms 最大超时 = 60 秒 */
 
 extern int usb_control_msg(struct usb_device *dev, unsigned int pipe,
 	__u8 request, __u8 requesttype, __u16 value, __u16 index,
-	void *data, __u16 size, int timeout);
+	void *data, __u16 size, int timeout);  // 阻塞式控制传输
 extern int usb_interrupt_msg(struct usb_device *usb_dev, unsigned int pipe,
-	void *data, int len, int *actual_length, int timeout);
+	void *data, int len, int *actual_length, int timeout); // 阻塞式中断传输
 extern int usb_bulk_msg(struct usb_device *usb_dev, unsigned int pipe,
-	void *data, int len, int *actual_length, int timeout);
+	void *data, int len, int *actual_length, int timeout); // 阻塞式批量传输
 extern int usb_bulk_msg_killable(struct usb_device *usb_dev, unsigned int pipe,
-	void *data, int len, int *actual_length, int timeout);
+	void *data, int len, int *actual_length, int timeout); // 可被 signal 中断
 
-/* wrappers around usb_control_msg() for the most common standard requests */
+/* usb_control_msg 的现代包装 (推荐使用) */
 int usb_control_msg_send(struct usb_device *dev, __u8 endpoint, __u8 request,
 			 __u8 requesttype, __u16 value, __u16 index,
 			 const void *data, __u16 size, int timeout,
-			 gfp_t memflags);
+			 gfp_t memflags);  // 发送数据 (OUT)
 int usb_control_msg_recv(struct usb_device *dev, __u8 endpoint, __u8 request,
 			 __u8 requesttype, __u16 value, __u16 index,
 			 void *data, __u16 size, int timeout,
-			 gfp_t memflags);
+			 gfp_t memflags);  // 接收数据 (IN)
+
+// usb_get_descriptor — 获取 USB 描述符 (最常用的控制传输之一)
+// desctype: USB_DT_DEVICE(1)/USB_DT_CONFIG(2)/USB_DT_STRING(3)/...
 extern int usb_get_descriptor(struct usb_device *dev, unsigned char desctype,
 	unsigned char descindex, void *buf, int size);
+// usb_get_status — 获取设备/接口/端点状态
 extern int usb_get_status(struct usb_device *dev,
 	int recip, int type, int target, void *data);
 
@@ -2005,32 +2306,58 @@ void usb_sg_wait(struct usb_sg_request *io);
  * Given the device address and endpoint descriptor, pipes are redundant.
  */
 
+/*
+ * PIPE (管道) — USB 端点地址编码
+ *
+ * URB 通过一个 32-bit 的 "pipe" 字段编码目标端点:
+ *   bits 30-31: 传输类型 (PIPE_CONTROL/BULK/INTERRUPT/ISOCHRONOUS)
+ *   bits 15-18: 端点号 (0-15)
+ *   bits  8-14: 设备地址 (1-127)
+ *   bit     7:  方向 (USB_DIR_IN=0x80 表示 IN, 0 表示 OUT)
+ *
+ * 注意: PIPE_* 不同于 USB 描述符中的 USB_ENDPOINT_XFER_* 值!
+ *       PIPE_CONTROL=2  vs  USB_ENDPOINT_XFER_CONTROL=0
+ *       这是 usbfs 遗留的编码，不要混淆。
+ */
 /* NOTE:  these are not the standard USB_ENDPOINT_XFER_* values!! */
 /* (yet ... they're the values used by usbfs) */
-#define PIPE_ISOCHRONOUS		0
-#define PIPE_INTERRUPT			1
-#define PIPE_CONTROL			2
-#define PIPE_BULK			3
+#define PIPE_ISOCHRONOUS		0   // 同步传输
+#define PIPE_INTERRUPT			1   // 中断传输
+#define PIPE_CONTROL			2   // 控制传输
+#define PIPE_BULK			3   // 批量传输
 
+// 方向判断: bit7=1 → IN(设备→主机), bit7=0 → OUT(主机→设备)
 #define usb_pipein(pipe)	((pipe) & USB_DIR_IN)
 #define usb_pipeout(pipe)	(!usb_pipein(pipe))
 
+// 从 pipe 中提取设备地址 (bits 8-14) 和端点号 (bits 15-18)
 #define usb_pipedevice(pipe)	(((pipe) >> 8) & 0x7f)
 #define usb_pipeendpoint(pipe)	(((pipe) >> 15) & 0xf)
 
+// 从 pipe 中提取传输类型 (bits 30-31)
 #define usb_pipetype(pipe)	(((pipe) >> 30) & 3)
 #define usb_pipeisoc(pipe)	(usb_pipetype((pipe)) == PIPE_ISOCHRONOUS)
 #define usb_pipeint(pipe)	(usb_pipetype((pipe)) == PIPE_INTERRUPT)
 #define usb_pipecontrol(pipe)	(usb_pipetype((pipe)) == PIPE_CONTROL)
 #define usb_pipebulk(pipe)	(usb_pipetype((pipe)) == PIPE_BULK)
 
+// __create_pipe: 将设备地址和端点号编码到 pipe 的低位
 static inline unsigned int __create_pipe(struct usb_device *dev,
 		unsigned int endpoint)
 {
 	return (dev->devnum << 8) | (endpoint << 15);
 }
 
-/* Create various pipes... */
+/*
+ * Pipe 创建宏 — USB 传输管道的标准构建方式
+ *
+ * 命名规则: usb_{snd,rcv}{ctrl,bulk,int,isoc}pipe
+ *   snd = 发送 (OUT, 主机→设备)
+ *   rcv = 接收 (IN, 设备→主机)
+ *
+ * 用法: pipe = usb_rcvbulkpipe(udev, endpoint_addr);  // 读批量数据
+ *       pipe = usb_sndctrlpipe(udev, 0);              // 控制传输到端点0
+ */
 #define usb_sndctrlpipe(dev, endpoint)	\
 	((PIPE_CONTROL << 30) | __create_pipe(dev, endpoint))
 #define usb_rcvctrlpipe(dev, endpoint)	\
