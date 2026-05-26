@@ -3,6 +3,8 @@
  * Copyright (c) 2015, Linaro Limited
  */
 
+#include <linux/linkage.h>
+
 /*
  * ============================================================================
  * smccc-call.S — ARM64 SMCCC (SMC/HVC Calling Convention) 调用包装器

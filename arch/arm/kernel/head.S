@@ -31,6 +31,12 @@
 #include <asm/domain.h>
 #include <asm/ptrace.h>
 #include <asm/asm-offsets.h>
+#include <asm/thread_info.h>
+#include CONFIG_DEBUG_LL_INCLUDE
+#include "head-common.S"
+#include <asm/domain.h>
+#include <asm/ptrace.h>
+#include <asm/asm-offsets.h>
 #include <asm/page.h>
 #include <asm/thread_info.h>
 

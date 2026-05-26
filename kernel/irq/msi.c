@@ -23,11 +23,6 @@
  *   pci_free_irq_vectors()  — 释放
  *   底层通过 msi_domain_ops 回调操作具体的中断控制器
  */
- * This file is licensed under GPLv2.
- *
- * This file contains common code to support Message Signaled Interrupts for
- * PCI compatible and non PCI compatible devices.
- */
 #include <linux/device.h>
 #include <linux/irq.h>
 #include <linux/irqdomain.h>

@@ -45,6 +45,7 @@
  *   本函数自身会被复制到 "kexec safe memory" 区域后再执行，
  *   确保在覆盖旧内核内存时不会破坏自身代码。
  */
+#include <linux/kexec.h>
 #include <linux/linkage.h>
 
 #include <asm/assembler.h>

@@ -21,6 +21,10 @@
 #include <asm/ftrace.h>
 #include <asm/unwind.h>
 #include <asm/page.h>
+#include <asm/unistd-oabi.h>
+#include "entry-header.S"
+#include <calls-eabi.S>
+#include <calls-oabi.S>
 #ifdef CONFIG_AEABI
 #include <asm/unistd-oabi.h>
 #endif
