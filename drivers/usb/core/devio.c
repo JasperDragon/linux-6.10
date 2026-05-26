@@ -21,6 +21,101 @@
 
 /*****************************************************************************/
 
+/*
+ * devio.c 实现 usbfs —— 用户空间的 USB I/O 接口。
+ *
+ * ========== 概述 ==========
+ *
+ * usbfs 通过 /dev/bus/usb/BBB/DDD 设备节点向用户空间暴露 USB 设备的
+ * 原始访问能力，其中 BBB 是总线号，DDD 是设备号。用户空间程序
+ * （如 libusb）通过 open() 打开这些节点，然后通过 ioctl() 直接与
+ * USB 设备通信，无需内核驱动介入。
+ *
+ * ========== 核心 file_operations ==========
+ *
+ * open:     usbdev_open()    —— 创建每个 fd 对应的 usb_dev_state
+ * release:  usbdev_release() —— 释放状态，杀死所有待处理 URB
+ * read:     usbdev_read()    —— 阻塞读取设备描述符和配置描述符
+ * poll:     usbdev_poll()    —— 支持 POLLOUT（异步完成时）、
+ *                              POLLHUP/POLLERR（设备断开时）
+ * mmap:     usbdev_mmap()    —— 映射 DMA 缓冲区，支持零拷贝传输
+ * unlocked_ioctl: usbdev_ioctl() —— 主要的 ioctl 分发入口
+ *
+ * ========== 关键数据结构 ==========
+ *
+ * struct usb_dev_state: 每个 open fd 的私有上下文，保存在
+ *                       file->private_data 中。跟踪异步操作、
+ *                       接口声明、断开通知设置等。
+ *
+ * struct async: 每个提交的异步 URB 的包装结构。包含从用户空间
+ *               复制的传输参数、完成状态、信号通知设置等。
+ *               链接在 usb_dev_state 的 async_pending 或
+ *               async_completed 链表中。
+ *
+ * struct usb_memory: 跟踪通过 mmap 映射的 DMA 缓冲区。实现
+ *                    VMA 和 URB 双向引用计数，确保安全释放。
+ *
+ * ========== 异步 I/O 模型 ==========
+ *
+ * 异步传输是 usbfs 最重要的特性。工作流程:
+ *
+ *   1. 用户调用 ioctl(fd, USBDEVFS_SUBMITURB, &urb)
+ *   2. proc_submiturb() -> proc_do_submiturb():
+ *      copy_from_user 将 usbdevfs_urb 复制到内核，
+ *      分配内核 struct urb 和 struct async，填充传输参数
+ *   3. usb_submit_urb() 将 URB 提交到 USB 主机控制器
+ *   4. 传输完成后，async_completed() 回调被调用:
+ *      将 async 从 async_pending 移到 async_completed 链表，
+ *      唤醒等待队列 ps->wait
+ *   5. 用户调用 ioctl(fd, USBDEVFS_REAPURB, &reap) 收割结果:
+ *      将 actual_length、status、iso_frame_desc 等复制回用户空间
+ *   6. 用户也可以通过 REAPURBNDELAY 非阻塞收割，
+ *      或通过 poll/epoll 等待 URB 完成事件
+ *
+ * ========== 断开连接处理 ==========
+ *
+ * 当 USB 设备断开时:
+ *   1. usbdev_notify() 收到 USB_DEVICE_REMOVE 通知
+ *   2. usbdev_remove() 遍历该设备的所有 usb_dev_state 实例
+ *   3. destroy_all_async(): 杀死所有待处理的异步 URB
+ *   4. wake_up_all(&ps->wait): 使 poll 返回 POLLERR/POLLHUP
+ *   5. 如果用户设置 discsignr（通过 DISCSIGNAL ioctl），
+ *      发送实时信号 (SIGIO 等) 通知用户进程
+ *
+ * ========== 权限控制 ==========
+ *
+ * - 打开设备节点需要写权限 (FMODE_WRITE)
+ * - 接口操作前需通过 connected() 检查设备是否 authorized
+ *   （dev->state != USB_STATE_NOTATTACHED）
+ * - 接口操作需先声明接口 (CLAIMINTERFACE)，有 claim 位图保护
+ * - DROP_PRIVILEGES 是单向操作，丢弃后不可恢复，
+ *   与 interface_allowed_mask 配合限制可访问的接口
+ *
+ * ========== 内存管理 ==========
+ *
+ * - usbfs_memory_mb: 全局限制所有 usbfs 传输的总内存（默认 16 MB）
+ * - usbfs_increase_memory_usage()/decrease_memory_usage():
+ *   分配/释放时更新全局计数器，超过限制返回 -ENOMEM
+ * - usbdev_mmap(): 允许用户空间 mmap DMA 缓冲区，用于零拷贝
+ * - 支持两种缓冲区模式: kmalloc 普通缓冲区和 mmap DMA 缓冲区
+ * - SG (scatter-gather) 列表用于大数据批量传输，
+ *   自动拆分为 USB_SG_SIZE (16KB) 的块
+ *
+ * ========== 支持的同步传输 ==========
+ *
+ * USBDEVFS_CONTROL: 同步控制传输，最大数据段 PAGE_SIZE，
+ *                   支持方向由 bRequestType 的 USB_DIR_IN 位决定
+ * USBDEVFS_BULK:    同步批量传输，大数据量，
+ *                   支持中断端点回退 (USB_ENDPOINT_XFER_INT)
+ *
+ * ========== compat 支持 ==========
+ *
+ * 在 CONFIG_COMPAT 配置下，支持 32 位用户空间程序在 64 位内核上
+ * 运行。包括: CONTROL32、BULK32、SUBMITURB32、REAPURB32、
+ * REAPURBNDELAY32、IOCTL32、DISCSIGNAL32 等变体。
+ * 主要处理指针大小差异 (compat_ptr) 和结构体布局差异。
+ */
+
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/sched/signal.h>
@@ -58,6 +153,41 @@
 /* Mutual exclusion for ps->list in resume vs. release and remove */
 static DEFINE_MUTEX(usbfs_mutex);
 
+/*
+ * struct usb_dev_state —— 每个 open() 文件描述符的私有状态。
+ *
+ * 当用户空间通过 open() 打开 /dev/bus/usb/BBB/DDD 时，usbdev_open()
+ * 创建该结构的一个实例，保存在 file->private_data 中。
+ * 它跟踪该 fd 的所有异步操作、接口声明状态以及设备断开通知设置。
+ *
+ * @list:            链表节点，链接到 usb_device->filelist
+ *                   用于遍历所有打开该设备的文件描述符
+ * @dev:             指向 struct usb_device，代表底层的 USB 设备
+ * @file:            指向本文件描述符的 struct file
+ * @lock:            自旋锁，保护 async_pending / async_completed 链表
+ * @async_pending:   已提交但尚未完成的异步 URB 链表
+ * @async_completed: 已完成但尚未被用户 reap 的异步 URB 链表
+ * @memory_list:     通过 mmap 分配的 DMA 缓冲区链表
+ * @wait:            等待队列，异步 URB 完成时唤醒
+ *                   用户调用 REAPURB 时在此睡眠等待
+ * @wait_for_resume: 等待队列，设备恢复运行时唤醒
+ *                   用户调用 WAIT_FOR_RESUME 时在此睡眠
+ * @discsignr:       设备断开时发送给用户进程的信号编号
+ *                   0 表示不发送信号
+ * @disc_pid:        断开信号的目标进程 PID
+ * @cred:            打开设备时进程的安全凭证，用于信号权限检查
+ * @disccontext:     随断开信号一起发送的用户上下文数据
+ * @ifclaimed:       位图，每个 bit 对应一个已声明的接口编号
+ *                   最多支持 8*sizeof(long) 个接口
+ * @disabled_bulk_eps: 位图，记录因批量传输错误而被禁用的端点
+ * @interface_allowed_mask: 允许访问的接口掩码
+ *                   与 DROP_PRIVILEGES 配合使用
+ * @not_yet_resumed: 标记设备是否还在挂起状态
+ *                   用于 WAIT_FOR_RESUME 同步
+ * @suspend_allowed: 是否允许设备自动挂起
+ * @privileges_dropped: 是否已调用 DROP_PRIVILEGES 丢弃特权
+ *                   单向操作，不可逆
+ */
 struct usb_dev_state {
 	struct list_head list;      /* state list */
 	struct usb_device *dev;
@@ -80,6 +210,22 @@ struct usb_dev_state {
 	bool privileges_dropped;
 };
 
+/*
+ * struct usb_memory —— 通过 mmap 映射的 DMA 缓冲区跟踪结构。
+ *
+ * 当用户空间调用 mmap() 映射 USB 设备的 DMA 缓冲区时，创建此结构。
+ * 它实现了引用计数机制：VMA 和 URB 双向引用计数，
+ * 只有当两者都为 0 时才释放缓冲区。
+ *
+ * @memlist:      链表节点，链接到 usb_dev_state->memory_list
+ * @vma_use_count: 当前映射此缓冲区的 VMA（虚拟内存区域）数量
+ * @urb_use_count: 当前使用此缓冲区的 URB 数量
+ * @size:         缓冲区大小（字节）
+ * @mem:          内核虚拟地址
+ * @dma_handle:   DMA 总线地址（若 DMA 不可用则为 DMA_MAPPING_ERROR）
+ * @vm_start:     用户空间映射的起始虚拟地址
+ * @ps:           所属的 usb_dev_state
+ */
 struct usb_memory {
 	struct list_head memlist;
 	int vma_use_count;
@@ -91,6 +237,33 @@ struct usb_memory {
 	struct usb_dev_state *ps;
 };
 
+/*
+ * struct async —— 异步 URB 的包装结构。
+ *
+ * 每个通过 SUBMITURB 提交的异步传输都对应一个 async 实例。
+ * 它跟踪从用户空间复制到内核的传输参数，并在传输完成后
+ * 通过 REAPURB 将结果返回给用户空间。
+ *
+ * @asynclist:        链表节点，可链接到 async_pending 或 async_completed
+ * @ps:               所属的 usb_dev_state
+ * @pid:              提交此 URB 的进程 PID，用于完成信号
+ * @cred:             提交进程的安全凭证
+ * @signr:            传输完成时发送给进程的实时信号编号
+ * @ifnum:            目标接口编号
+ * @userbuffer:       用户空间数据缓冲区指针
+ *                   用于 IN 传输时将数据复制回用户
+ * @userurb:          用户空间 struct usbdevfs_urb 的指针
+ * @userurb_sigval:   随完成信号发送给用户的 sigval 数据
+ * @urb:              内核 struct urb，实际提交给 USB 核心的传输单元
+ * @usbm:             如果缓冲区来自 mmap，指向对应的 usb_memory
+ * @mem_usage:        此 async 占用的总内存
+ *                   用于 usbfs_memory_mb 限额计算
+ * @status:           传输完成状态码（如 0, -EPIPE, -ENOENT 等）
+ * @bulk_addr:        批量端点的地址（0-31 编码，用于取消操作）
+ * @bulk_status:      批量传输状态标记:
+ *                    0 = 普通, AS_CONTINUATION = 续传,
+ *                    AS_UNLINK = 正在取消
+ */
 struct async {
 	struct list_head asynclist;
 	struct usb_dev_state *ps;
@@ -227,6 +400,30 @@ static const struct vm_operations_struct usbdev_vm_ops = {
 	.close = usbdev_vm_close
 };
 
+/*
+ * usbdev_mmap() —— 将 USB DMA 缓冲区映射到用户空间。
+ *
+ * 实现 file_operations 的 mmap 方法。允许用户空间程序将 USB 主机
+ * 控制器的 DMA 缓冲区直接映射到其地址空间，实现零拷贝传输。
+ *
+ * 工作流程:
+ *   1. 检查文件是否以写模式打开（需要 FMODE_WRITE）
+ *   2. 通过 usbfs_increase_memory_usage() 检查全局内存限额
+ *   3. 分配 struct usb_memory 跟踪结构
+ *   4. 通过 hcd_buffer_alloc_pages() 分配 DMA 缓冲区
+ *   5. 如果 DMA 不可用 (dma_handle == DMA_MAPPING_ERROR)，
+ *      使用 remap_pfn_range() 映射普通页
+ *   6. 否则使用 dma_mmap_coherent() 映射 DMA 一致性缓冲区
+ *   7. 设置 VMA 标志: VM_IO | VM_DONTEXPAND | VM_DONTDUMP
+ *   8. 注册 vm_ops (usbdev_vm_ops) 用于 VMA 引用计数
+ *   9. 将 usb_memory 加入 ps->memory_list 链表
+ *
+ * 返回: 0 成功，负错误码失败。
+ *
+ * 注意: VMA 和 URB 使用双向引用计数 (vma_use_count/urb_use_count)。
+ * 只有当 VMA 关闭且所有使用该缓冲区的 URB 都完成时，
+ * 才真正释放 DMA 缓冲区。
+ */
 static int usbdev_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct usb_memory *usbm = NULL;
@@ -308,6 +505,25 @@ error:
 	return ret;
 }
 
+/*
+ * usbdev_read() —— 从 usbfs 设备节点读取描述符数据。
+ *
+ * 实现 file_operations 的 read 方法。提供设备描述符和配置描述符
+ * 的读取能力。这在某些旧的用户空间工具中用于枚举 USB 设备。
+ *
+ * 数据布局:
+ *   偏移 0:    struct usb_device_descriptor (18 字节)
+ *             注意: 多字节字段已转换为 CPU 字节序 (le16_to_cpus)
+ *   偏移 18+: 配置描述符数组 (struct usb_config_descriptor + 接口/端点描述符)
+ *
+ * 行为:
+ *   - 读取位置从 ppos 开始，支持 lseek 随机访问
+ *   - 自动跳过配置描述符中声明长度超过实际分配长度的部分
+ *   - 在 usb_lock_device 保护下执行，确保设备不被并发移除
+ *
+ * 返回: 实际读取的字节数，或负错误码。
+ * 当设备断开时返回 -ENODEV。
+ */
 static ssize_t usbdev_read(struct file *file, char __user *buf, size_t nbytes,
 			   loff_t *ppos)
 {
@@ -398,6 +614,14 @@ err:
  * async list handling
  */
 
+/*
+ * alloc_async() —— 分配异步 URB 包装结构。
+ *
+ * 为一次异步传输分配 struct async 和对应的内核 struct urb。
+ *
+ * @numisoframes: 等时传输的帧数（0 表示非等时传输）
+ * 返回: 指向 async 结构的指针，失败返回 NULL
+ */
 static struct async *alloc_async(unsigned int numisoframes)
 {
 	struct async *as;
@@ -413,6 +637,19 @@ static struct async *alloc_async(unsigned int numisoframes)
 	return as;
 }
 
+/*
+ * free_async() —— 释放异步 URB 包装结构及其所有相关资源。
+ *
+ * 在 URB 完成并被用户空间 reap 后调用，释放所有分配的资源:
+ *   - 释放进程 PID 引用和安全凭证 (put_pid/put_cred)
+ *   - 释放 SG 列表中的每个 scatterlist 缓冲区
+ *   - 释放 transfer_buffer（如果来自 kmalloc）
+ *     或递减 usb_memory 的 URB 引用计数（如果来自 mmap）
+ *   - 释放 setup_packet（控制传输的设置包）
+ *   - 释放内核 struct urb (usb_free_urb)
+ *   - 减少 usbfs 总内存占用量
+ *   - 释放 async 结构体本身
+ */
 static void free_async(struct async *as)
 {
 	int i;
@@ -437,6 +674,13 @@ static void free_async(struct async *as)
 	kfree(as);
 }
 
+/*
+ * async_newpending() —— 将 async 加入 pending 链表。
+ *
+ * 在 URB 成功提交后调用，将 async 加入 ps->async_pending 链表，
+ * 表示该 URB 正在等待完成。
+ * 在 ps->lock 保护下操作。
+ */
 static void async_newpending(struct async *as)
 {
 	struct usb_dev_state *ps = as->ps;
@@ -447,6 +691,12 @@ static void async_newpending(struct async *as)
 	spin_unlock_irqrestore(&ps->lock, flags);
 }
 
+/*
+ * async_removepending() —— 从 pending 链表移除 async。
+ *
+ * 在 URB 取消或提交失败后调用，将 async 从 ps->async_pending
+ * 链表中移除。在 ps->lock 保护下操作。
+ */
 static void async_removepending(struct async *as)
 {
 	struct usb_dev_state *ps = as->ps;
@@ -457,6 +707,13 @@ static void async_removepending(struct async *as)
 	spin_unlock_irqrestore(&ps->lock, flags);
 }
 
+/*
+ * async_getcompleted() —— 从 completed 链表取出一个已完成 URB。
+ *
+ * 被 proc_reapurb() 和 proc_reapurbnonblock() 调用，获取一个
+ * 已完成待收割的 async。如果 completed 链表为空，返回 NULL。
+ * 在 ps->lock 保护下操作。
+ */
 static struct async *async_getcompleted(struct usb_dev_state *ps)
 {
 	unsigned long flags;
@@ -472,6 +729,15 @@ static struct async *async_getcompleted(struct usb_dev_state *ps)
 	return as;
 }
 
+/*
+ * async_getpending() —— 根据用户空间地址查找待处理的 URB。
+ *
+ * 在 proc_unlinkurb() 中调用，遍历 ps->async_pending 链表，
+ * 查找 userurb 指针匹配的 async 结构。找到后将其从 pending
+ * 链表删除并返回。如果未找到，返回 NULL。
+ *
+ * 注意: 调用者必须持有 ps->lock，或者确保在该锁的保护下使用。
+ */
 static struct async *async_getpending(struct usb_dev_state *ps,
 					     void __user *userurb)
 {
@@ -582,6 +848,29 @@ static int copy_urb_data_to_user(u8 __user *userbuffer, struct urb *urb)
 #define AS_CONTINUATION	1
 #define AS_UNLINK	2
 
+/*
+ * cancel_bulk_urbs() —— 批量取消同一端点上标记为续传的 URB。
+ *
+ * 当批量传输出错误时调用，取消与错误 URB 相同端点上所有标记为
+ * AS_CONTINUATION 的后续 URB。
+ *
+ * 工作流程:
+ *   1. 遍历 async_pending 链表，查找与 bulk_addr 匹配的 URB
+ *   2. 将标记为 AS_CONTINUATION 的 URB 改为 AS_UNLINK
+ *   3. 如果遇到非续传 URB（表示新传输已经开始），停止扫描
+ *      （不需要禁用端点，因为新传输会重新启用它）
+ *   4. 如果没有找到非续传 URB，在 disabled_bulk_eps 中禁用该端点
+ *   5. 再次遍历链表，对标记为 AS_UNLINK 的 URB 调用 usb_unlink_urb()
+ *
+ * 为什么需要这个机制:
+ * libusb 等在批量传输中使用续传机制将大数据传输拆分为多个
+ * 连续的 URB。当一个 URB 失败时，后续的续传 URB 已经没有意义，
+ * 必须全部取消。但新传输的 URB（没有续传标记）不应被取消，
+ * 它们代表一个新的传输序列。
+ *
+ * 注意: 此函数会临时释放 ps->lock 以允许 URB 完成回调并发执行，
+ * 因此标注了 __releases/__acquires 来通知锁检查工具。
+ */
 static void cancel_bulk_urbs(struct usb_dev_state *ps, unsigned bulk_addr)
 __releases(ps->lock)
 __acquires(ps->lock)
@@ -620,6 +909,28 @@ __acquires(ps->lock)
 	}
 }
 
+/*
+ * async_completed() —— 异步 URB 完成回调函数。
+ *
+ * 当 USB 主机控制器完成 URB 传输后，此函数被 USB 核心调用。
+ * 它是异步 I/O 模型中连接"内核传输完成"和"用户空间收割"的桥梁。
+ *
+ * 工作流程:
+ *   1. 持有 ps->lock 自旋锁，将 async 从 async_pending 链表移到
+ *      async_completed 链表（list_move_tail）
+ *   2. 保存 urb->status 到 as->status
+ *   3. 如果用户设置了完成信号 (as->signr)，获取 PID 和 cred 引用
+ *      用于后续发送实时信号
+ *   4. 如果传输出错 (as->status < 0) 且是批量端点，
+ *      调用 cancel_bulk_urbs() 取消同一端点上标记为续传的 URB
+ *   5. wake_up(&ps->wait): 唤醒在 REAPURB 中睡眠的用户进程
+ *   6. 释放自旋锁后，如果设置了 signr，通过 kill_pid_usb_asyncio()
+ *      发送实时信号给用户进程
+ *
+ * 注意: 此函数在 USB 核心的 URB 完成上下文中调用（通常是在
+ * 中断上下文或 tasklet 中），因此必须使用自旋锁保护。
+ * wake_up() 可以在中断上下文中安全调用。
+ */
 static void async_completed(struct urb *urb)
 {
 	struct async *as = urb->context;
@@ -779,6 +1090,24 @@ struct usb_driver usbfs_driver = {
 	.supports_autosuspend = 1,
 };
 
+/*
+ * claimintf() —— 声明（抢占）一个 USB 接口。
+ *
+ * 供 CLAIMINTERFACE ioctl 和 checkintf() 内部调用。
+ * 将指定的接口绑定到 usbfs 驱动，使该接口由当前用户空间
+ * 程序独占使用。
+ *
+ * 工作流程:
+ *   1. 检查接口编号是否越界 (>= 8*sizeof(ifclaimed))
+ *   2. 检查是否已经声明（已声明则直接返回 0）
+ *   3. 如果特权已丢弃，检查该接口是否在允许掩码中
+ *   4. 通过 usb_ifnum_to_if() 找到 interface 结构
+ *   5. 调用 usb_driver_claim_interface() 绑定 usbfs 驱动
+ *   6. 成功后在 ifclaimed 位图中设置对应位
+ *
+ * 注意: 声明接口时会抑制 uevents，防止 udev 等用户空间
+ * 守护进程看到接口绑定/解绑事件。
+ */
 static int claimintf(struct usb_dev_state *ps, unsigned int ifnum)
 {
 	struct usb_device *dev = ps->dev;
@@ -812,6 +1141,14 @@ static int claimintf(struct usb_dev_state *ps, unsigned int ifnum)
 	return err;
 }
 
+/*
+ * releaseintf() —— 释放一个已声明的 USB 接口。
+ *
+ * 供 RELEASEINTERFACE ioctl 调用。将接口从 usbfs 驱动解绑，
+ * 使其他驱动或其他用户空间程序可以访问该接口。
+ *
+ * 同时销毁该接口上所有待处理的异步 URB。
+ */
 static int releaseintf(struct usb_dev_state *ps, unsigned int ifnum)
 {
 	struct usb_device *dev;
@@ -838,6 +1175,18 @@ static int releaseintf(struct usb_dev_state *ps, unsigned int ifnum)
 	return err;
 }
 
+/*
+ * checkintf() —— 检查并确保接口已被声明。
+ *
+ * 在大多数 URB 提交前调用，检查目标接口是否已被当前 fd 声明。
+ * 如果尚未声明，自动尝试声明（向后兼容旧版 libusb 行为）。
+ *
+ * 当设备未配置时返回 -EHOSTUNREACH。
+ * 当接口编号越界时返回 -EINVAL。
+ *
+ * 注意: 自动声明行为会发出内核警告，督促用户空间程序
+ * 显式调用 CLAIMINTERFACE。新代码应始终先声明接口再操作。
+ */
 static int checkintf(struct usb_dev_state *ps, unsigned int ifnum)
 {
 	if (ps->dev->state != USB_STATE_CONFIGURED)
@@ -1032,6 +1381,32 @@ static struct usb_device *usbdev_lookup_by_devt(dev_t devt)
 /*
  * file operations
  */
+/*
+ * usbdev_open() —— 打开 usbfs 设备节点。
+ *
+ * 当用户空间程序 open("/dev/bus/usb/BBB/DDD") 时调用。
+ * 为每个文件描述符创建一个独立的 usb_dev_state 实例。
+ *
+ * 工作流程:
+ *   1. 分配 struct usb_dev_state (kzalloc)
+ *   2. 通过 usbdev_lookup_by_devt() 根据 inode 的设备号查找 struct usb_device
+ *   3. 检查设备是否未断开 (state != USB_STATE_NOTATTACHED)
+ *   4. usb_autoresume_device(): 唤醒设备（防止设备挂起影响操作）
+ *   5. 初始化 usb_dev_state 的各个字段:
+ *      - lock 自旋锁
+ *      - async_pending/completed 链表
+ *      - memory_list 链表
+ *      - wait/wait_for_resume 等待队列
+ *      - disc_pid 设置为当前进程 PID（用于断开信号）
+ *      - cred 保存当前进程的安全凭证
+ *      - interface_allowed_mask 初始化为全 1（允许访问所有接口）
+ *   6. 将 state 加入 udev->filelist 链表，供断开通知时遍历
+ *   7. 保存到 file->private_data
+ *
+ * 返回: 0 成功，负错误码失败。
+ *
+ * 注意: 整个操作在 usb_lock_device() 保护下执行，确保设备不被并发移除。
+ */
 static int usbdev_open(struct inode *inode, struct file *file)
 {
 	struct usb_device *dev = NULL;
@@ -1089,6 +1464,26 @@ static int usbdev_open(struct inode *inode, struct file *file)
 	return ret;
 }
 
+/*
+ * usbdev_release() —— 关闭 usbfs 文件描述符。
+ *
+ * 当用户 close() usbfs 设备节点时调用，清理所有资源。
+ *
+ * 清理工作:
+ *   1. usb_hub_release_all_ports(): 释放所有已声明的集线器端口
+ *   2. 从 udev->filelist 中摘除该 state（在 usbfs_mutex 保护下）
+ *   3. 遍历 ifclaimed 位图，释放所有已声明的 USB 接口
+ *   4. destroy_all_async(): 杀死所有待处理的异步 URB
+ *      （遍历 async_pending 链表，对每个 URB 调用 usb_kill_urb）
+ *   5. 如果未禁止自动挂起，调用 usb_autosuspend_device()
+ *   6. 减少设备引用计数 (usb_put_dev)
+ *   7. 释放断开信号相关的 PID 和安全凭证
+ *   8. 清空 async_completed 链表中残留的已完成 URB
+ *   9. 释放 usb_dev_state 结构体本身
+ *
+ * 注意: 此函数与 usbdev_remove() 之间存在竞态 - 两者都可能操作
+ * ps->list，因此使用 usbfs_mutex 互斥保护。
+ */
 static int usbdev_release(struct inode *inode, struct file *file)
 {
 	struct usb_dev_state *ps = file->private_data;
@@ -1166,6 +1561,26 @@ static int usbfs_start_wait_urb(struct urb *urb, int timeout,
 	return urb->status;
 }
 
+/*
+ * do_proc_control() —— 同步控制传输的实现。
+ *
+ * 处理 USBDEVFS_CONTROL ioctl。执行同步控制传输（setup 阶段 + 数据阶段）。
+ *
+ * 工作流程:
+ *   1. 调用 check_ctrlrecip() 检查请求类型和目标是否合法
+ *   2. 分配 setup 包 (struct usb_ctrlrequest)、传输缓冲区和 URB
+ *   3. 填充 setup 包字段 (bRequestType/bRequest/wValue/wIndex/wLength)
+ *   4. 根据方向 (USB_DIR_IN) 决定 IN 或 OUT 传输:
+ *      - IN: 分配接收缓冲区，提交 URB，完成后将数据复制到用户空间
+ *      - OUT: 从用户空间复制数据到内核缓冲区，提交 URB
+ *   5. 对受 USB_QUIRK_DELAY_CTRL_MSG 影响的设备，
+ *      在控制传输后延迟 200ms
+ *   6. 通过 usbfs_start_wait_urb() 同步等待 URB 完成
+ *
+ * 注意: 数据传输过程中会暂时释放 usb_lock_device()，
+ * 以允许设备在传输期间被其他操作访问。传输完成后重新获取锁。
+ * 最大数据传输量为 PAGE_SIZE，防止内核栈溢出。
+ */
 static int do_proc_control(struct usb_dev_state *ps,
 		struct usbdevfs_ctrltransfer *ctrl)
 {
@@ -1280,6 +1695,25 @@ static int proc_control(struct usb_dev_state *ps, void __user *arg)
 	return do_proc_control(ps, &ctrl);
 }
 
+/*
+ * do_proc_bulk() —— 同步批量传输的实现。
+ *
+ * 处理 USBDEVFS_BULK ioctl。执行同步批量或中断传输。
+ *
+ * 工作流程:
+ *   1. 查找端点所属的接口并检查是否已声明
+ *   2. 分配传输缓冲区和 URB
+ *   3. 如果端点是中断类型 (USB_ENDPOINT_XFER_INT)，
+ *      使用中断管道并设置 bInterval
+ *   4. 根据方向:
+ *      - IN: 提交 URB，完成后将数据复制到用户空间
+ *      - OUT: 从用户空间复制数据到内核，提交 URB
+ *   5. 通过 usbfs_start_wait_urb() 同步等待完成
+ *
+ * 注意: 与 do_proc_control 类似，传输期间暂时释放
+ * usb_lock_device()。另外，如果传入的端点是中断端点，
+ * 函数会自动将其从批量转为中断传输。
+ */
 static int do_proc_bulk(struct usb_dev_state *ps,
 		struct usbdevfs_bulktransfer *bulk)
 {
@@ -1616,6 +2050,66 @@ find_memory_area(struct usb_dev_state *ps, const struct usbdevfs_urb *uurb)
 	return usbm;
 }
 
+/*
+ * proc_do_submiturb() —— 将用户空间的 URB 转换为内核 URB 并提交。
+ *
+ * 这是 usbfs 中最重要的核心函数。它将用户空间通过 SUBMITURB ioctl
+ * 提交的 usbdevfs_urb 转换为内核 struct urb，并调用 usb_submit_urb()
+ * 提交到 USB 主机控制器。
+ *
+ * ====== 工作流程 ======
+ *
+ * 1. 参数校验:
+ *    - 检查 URB 类型 (CONTROL/BULK/INTERRUPT/ISO) 和端点匹配性
+ *    - 检查接口是否已声明 (checkintf)
+ *    - 检查端点是否存在 (ep_to_host_endpoint)
+ *    - 检查缓冲区长度是否合理 (不能超过 USBFS_XFER_MAX)
+ *
+ * 2. 根据 URB 类型处理:
+ *    - CONTROL: 解析 8 字节 setup 包 (struct usb_ctrlrequest)，
+ *      校验请求类型/接收者/端点，调整 buffer 指针跳过 setup 包
+ *    - BULK: 支持 SG (scatter-gather) 列表以处理大数据传输，
+ *      支持流 (stream_id, USB 3.0)
+ *    - INTERRUPT: 允许单次中断传输，设置轮询间隔 (bInterval)
+ *    - ISO: 解析等时帧描述符 (iso_frame_desc)，检查每个包的长度限制
+ *      (最大 98304 字节，适配 USB 3.1 Gen2 的 96 个 DP)
+ *
+ * 3. 分配 async 结构和内核 URB:
+ *    - alloc_async() 分配 struct async 包装器 + struct urb
+ *    - 查找 mmap 缓冲区 (find_memory_area)，如果用户使用 mmap 映射，
+ *      则直接使用 DMA 缓冲区而非 kmalloc
+ *    - 对于 BULK 传输，如果启用了 SG 且未使用 mmap，创建 scatterlist
+ *    - 从用户空间复制数据 (copy_from_user) 到内核缓冲区（OUT 方向）
+ *    - 对于等时 IN 传输，清零缓冲区以防止泄漏内核数据
+ *
+ * 4. 填充 URB 字段:
+ *    设置 pipe (类型/端点/方向)、transfer_flags、setup_packet、
+ *    start_frame、interval、complete 回调 (async_completed) 等
+ *
+ * 5. 设置 bulk 续传机制:
+ *    - 如果设置了 USBDEVFS_URB_BULK_CONTINUATION，标记为续传 URB
+ *    - 否则启用端点（clear disabled_bulk_eps 位）
+ *    - 检查端点是否因错误被禁用，若是则拒绝提交
+ *
+ * 6. 提交 URB:
+ *    - usb_submit_urb() 将 URB 提交到 USB 主机控制器
+ *    - 对于批量端点，在持有自旋锁时提交 (GFP_ATOMIC)
+ *    - 提交失败时从 pending 链表移除 async 并释放
+ *
+ * ====== 内存管理 ======
+ *
+ * - 使用 usbfs_increase_memory_usage() 跟踪全局分配量
+ * - 支持两种缓冲区模式:
+ *   a) kmalloc 分配的普通内核缓冲区
+ *   b) usbdev_mmap 映射的 DMA 缓冲区（零拷贝）
+ * - SG 列表用于大数据批量传输，自动拆分为 USB_SG_SIZE (16KB) 的块
+ *
+ * ====== 异步完成 ======
+ *
+ * 提交成功后，async 被添加到 ps->async_pending 链表。
+ * 当 URB 完成时，async_completed() 回调将 async 移到
+ * ps->async_completed 链表并唤醒等待 reap 的用户进程。
+ */
 static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb,
 			struct usbdevfs_iso_packet_desc __user *iso_frame_desc,
 			void __user *arg, sigval_t userurb_sigval)
@@ -1988,6 +2482,20 @@ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb
 	return ret;
 }
 
+/*
+ * proc_submiturb() —— SUBMITURB ioctl 入口。
+ *
+ * 这是 usbfs 中最核心的 ioctl 之一。用户空间程序通过此调用提交
+ * 异步 URB 到 USB 设备。libusb 等库的底层实现。
+ *
+ * 工作流程:
+ *   1. copy_from_user: 从用户空间复制 struct usbdevfs_urb 到内核
+ *   2. 设置 userurb_sigval，用于传输完成后的信号通知
+ *   3. 调用 proc_do_submiturb() 完成实际的 URB 创建和提交
+ *
+ * 注意: 真正的 URB 创建和提交工作在 proc_do_submiturb() 中完成。
+ * 此函数主要负责从用户空间复制参数。
+ */
 static int proc_submiturb(struct usb_dev_state *ps, void __user *arg)
 {
 	struct usbdevfs_urb uurb;
@@ -2100,6 +2608,25 @@ static struct async *reap_as(struct usb_dev_state *ps)
 	return as;
 }
 
+/*
+ * proc_reapurb() —— 阻塞收割一个已完成的异步 URB（REAPURB）。
+ *
+ * 这是异步 I/O 模型的"收割"操作。用户提交 URB 后，调用此 ioctl 获取结果。
+ *
+ * 工作流程:
+ *   1. 调用 reap_as() 在 ps->wait 等待队列上睡眠，直到有 URB 完成
+ *   2. 通过 processcompl() 将 URB 结果 (status, actual_length,
+ *      等时帧描述符等) 复制到用户空间的 struct usbdevfs_urb
+ *   3. 释放 async 结构体
+ *
+ * 返回值:
+ *   0:                         成功收割（arg 指针被设置为完成的 userurb 地址）
+ *   -EINTR:                    等待时被信号中断
+ *   -ENODEV:                   设备已断开连接
+ *
+ * 注意: 即使设备断开，此函数仍然可以调用，会返回 -ENODEV。
+ * 用户空间程序可以通过此特性检测设备移除。
+ */
 static int proc_reapurb(struct usb_dev_state *ps, void __user *arg)
 {
 	struct async *as = reap_as(ps);
@@ -2117,6 +2644,17 @@ static int proc_reapurb(struct usb_dev_state *ps, void __user *arg)
 	return -ENODEV;
 }
 
+/*
+ * proc_reapurbnonblock() —— 非阻塞收割（REAPURBNDELAY）。
+ *
+ * 与 proc_reapurb() 的区别在于:
+ * - 不会阻塞等待 URB 完成
+ * - 如果没有已完成的 URB，立即返回 -EAGAIN（设备仍连接时）
+ *   或 -ENODEV（设备已断开时）
+ *
+ * 用户空间程序通常使用此函数轮询 URB 完成状态，
+ * 或在 epoll 返回 POLLOUT/POLLWRNORM 后调用此函数收割结果。
+ */
 static int proc_reapurbnonblock(struct usb_dev_state *ps, void __user *arg)
 {
 	int retval;
@@ -2596,6 +3134,76 @@ static int proc_wait_for_resume(struct usb_dev_state *ps)
  * are assuming that somehow the configuration has been prevented from
  * changing.  But there's no mechanism to ensure that...
  */
+/*
+ * usbdev_do_ioctl() —— usbfs ioctl 分发核心。
+ *
+ * 这是 usbfs 最主要的入口函数，处理所有通过 ioctl() 系统调用发起的
+ * USB 设备操作请求。函数根据 cmd 参数分发到对应的 proc_* 处理函数。
+ *
+ * ioctl 命令一览:
+ *
+ * == 异步 I/O ==
+ *   USBDEVFS_SUBMITURB       -> proc_submiturb()      提交 URB
+ *   USBDEVFS_DISCARDURB      -> proc_unlinkurb()      取消 URB
+ *   USBDEVFS_REAPURB         -> proc_reapurb()        阻塞收割完成 URB
+ *   USBDEVFS_REAPURBNDELAY   -> proc_reapurbnonblock() 非阻塞收割 URB
+ *
+ * == 同步传输 ==
+ *   USBDEVFS_CONTROL         -> proc_control()     同步控制传输
+ *   USBDEVFS_BULK            -> proc_bulk()         同步批量传输
+ *
+ * == 接口管理 ==
+ *   USBDEVFS_CLAIMINTERFACE   -> proc_claiminterface()   声明接口
+ *   USBDEVFS_RELEASEINTERFACE -> proc_releaseinterface() 释放接口
+ *   USBDEVFS_SETINTERFACE     -> proc_setintf()          设置备用接口
+ *
+ * == 端点操作 ==
+ *   USBDEVFS_RESETEP          -> proc_resetep()     复位端点
+ *   USBDEVFS_CLEAR_HALT       -> proc_clearhalt()   清除端点暂停
+ *
+ * == 设备控制 ==
+ *   USBDEVFS_RESET            -> proc_resetdevice()    复位设备
+ *   USBDEVFS_SETCONFIGURATION -> proc_setconfig()      设置配置
+ *   USBDEVFS_GETDRIVER        -> proc_getdriver()      查询接口驱动
+ *   USBDEVFS_CONNECTINFO      -> proc_connectinfo()    连接信息
+ *   USBDEVFS_GET_SPEED        -> 直接返回 dev->speed
+ *
+ * == 驱动交互 ==
+ *   USBDEVFS_IOCTL            -> proc_ioctl_default()  传递到接口驱动
+ *   USBDEVFS_DISCONNECT       -> 断开接口的内核驱动
+ *   USBDEVFS_CONNECT          -> 重新绑定内核驱动
+ *   USBDEVFS_DISCONNECT_CLAIM -> proc_disconnect_claim() 断开+声明原子操作
+ *
+ * == 信号通知 ==
+ *   USBDEVFS_DISCSIGNAL       -> proc_disconnectsignal() 设置断开信号
+ *
+ * == 端口管理 ==
+ *   USBDEVFS_CLAIM_PORT       -> proc_claim_port()
+ *   USBDEVFS_RELEASE_PORT     -> proc_release_port()
+ *
+ * == 流管理 (USB 3.0) ==
+ *   USBDEVFS_ALLOC_STREAMS    -> proc_alloc_streams()
+ *   USBDEVFS_FREE_STREAMS     -> proc_free_streams()
+ *
+ * == 权限 ==
+ *   USBDEVFS_DROP_PRIVILEGES  -> proc_drop_privileges() 单向丢弃特权
+ *   USBDEVFS_GET_CAPABILITIES -> proc_get_capabilities() 查询能力
+ *
+ * == 电源管理 ==
+ *   USBDEVFS_FORBID_SUSPEND   -> proc_forbid_suspend()
+ *   USBDEVFS_ALLOW_SUSPEND    -> proc_allow_suspend()
+ *   USBDEVFS_WAIT_FOR_RESUME  -> proc_wait_for_resume()
+ *
+ * == 扩展连接信息 ==
+ *   USBDEVFS_CONNINFO_EX      -> proc_conninfo_ex()
+ *
+ * 注意: REAPURB/REAPURBNDELAY 及其 compat 版本在设备断开后仍然允许调用。
+ * 其他操作需要设备处于 connected 状态（!USB_STATE_NOTATTACHED），
+ * 否则返回 -ENODEV。
+ *
+ * 所有成功的操作（ret >= 0）会更新文件的访问时间。
+ * 控制/批量/复位端点/提交 URB 还会更新文件的修改时间。
+ */
 static long usbdev_do_ioctl(struct file *file, unsigned int cmd,
 				void __user *p)
 {
@@ -2829,6 +3437,19 @@ static long usbdev_ioctl(struct file *file, unsigned int cmd,
 }
 
 /* No kernel lock - fine */
+/*
+ * usbdev_poll() —— poll/select/epoll 支持。
+ *
+ * 允许用户空间通过 poll/select/epoll 监视 usbfs 文件描述符的事件。
+ *
+ * 返回的掩码:
+ *   EPOLLOUT | EPOLLWRNORM: 有已完成的异步 URB 等待 reap（只当文件可写时）
+ *   EPOLLHUP:              设备已断开连接 (connected() 返回 false)
+ *   EPOLLERR:              state 不再链接到设备的 filelist（设备已移除）
+ *
+ * 注意: 断开连接通过 POLLHUP 或 POLLERR 通知用户空间，这是 usbfs
+ * 通知用户设备移除的主要机制之一（另一个是 DISCSIGNAL 实时信号）。
+ */
 static __poll_t usbdev_poll(struct file *file,
 				struct poll_table_struct *wait)
 {
@@ -2857,6 +3478,24 @@ const struct file_operations usbdev_file_operations = {
 	.release =	  usbdev_release,
 };
 
+/*
+ * usbdev_remove() —— USB 设备断开时的清理处理。
+ *
+ * 当 USB 设备从系统中断开时，此函数被 usbdev_notify() 调用。
+ * 它遍历所有通过 open() 打开了此设备的文件描述符，执行以下操作：
+ *
+ *   1. destroy_all_async(): 杀死所有待处理的异步 URB
+ *   2. wake_up_all(&ps->wait): 唤醒所有在 REAPURB 上睡眠的进程，
+ *      使其返回 -ENODEV
+ *   3. 重置 ps->not_yet_resumed 并唤醒等待恢复的进程
+ *   4. 从 udev->filelist 中摘除该 state
+ *   5. 如果用户通过 DISCSIGNAL 设置了断开信号 (ps->discsignr)，
+ *      通过 kill_pid_usb_asyncio() 发送实时信号给用户进程，
+ *      附带错误码 EPIPE 和用户上下文 (ps->disccontext)
+ *
+ * 注意: 此函数在 usbfs_mutex 保护下执行，防止与 usbdev_release()
+ * 并发执行导致竞态。
+ */
 static void usbdev_remove(struct usb_device *udev)
 {
 	struct usb_dev_state *ps;
@@ -2877,6 +3516,19 @@ static void usbdev_remove(struct usb_device *udev)
 	mutex_unlock(&usbfs_mutex);
 }
 
+/*
+ * usbdev_notify() —— USB 核心事件通知回调。
+ *
+ * 通过 usb_register_notify() 注册到 USB 核心的事件通知链。
+ * 当 USB 设备被添加或移除时，USB 核心会调用此函数。
+ *
+ * 处理的事件:
+ *   USB_DEVICE_ADD:    设备已添加，无需特殊处理
+ *   USB_DEVICE_REMOVE: 设备即将移除，调用 usbdev_remove()
+ *                       通知所有打开该设备的用户空间进程
+ *
+ * 返回 NOTIFY_OK 表示通知已处理。
+ */
 static int usbdev_notify(struct notifier_block *self,
 			       unsigned long action, void *dev)
 {

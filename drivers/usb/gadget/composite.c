@@ -5,6 +5,53 @@
  * Copyright (C) 2006-2008 David Brownell
  */
 
+/*
+ * Composite Gadget 框架 -- 将多个 USB Function 组合为一个复合 USB 设备
+ *
+ * 本文件是 Composite Gadget 框架的核心实现,提供将多个 USB 功能
+ * (USB Function) 组合成一个完整 USB 设备的基础设施。
+ *
+ * 1. 框架设计目标
+ *    - 将多个独立的 USB Function(如 mass_storage、ethernet、serial、acm)
+ *      组合到一个 USB 设备中,共享同一个 USB 设备地址
+ *    - 每个 Function 相当于一个 USB 接口(或接口集合),在枚举时被主机识别
+ *    - 支持多个 USB Configuration,允许设备在不同场景下呈现不同的功能集合
+ *
+ * 2. 核心数据结构
+ *    - usb_composite_driver: 顶层 Composite 驱动,提供 bind() 回调
+ *      来组装整个设备
+ *    - usb_composite_dev: 复合设备的内部状态,包含:
+ *      - 设备描述符(desc)
+ *      - 配置列表(configs)
+ *      - ep0 请求缓冲(req)
+ *      - 延迟状态(delayed_status)和暂停状态(suspended)
+ *    - usb_configuration: 一个 USB 配置,包含多个 Function
+ *    - usb_function: 单个 USB 功能,如 mass_storage 或 ethernet,
+ *      提供 bind/set_alt/disable/setup 等回调
+ *
+ * 3. ConfigFS 动态配置
+ *    - 除了代码级别的复合驱动,还支持通过 ConfigFS 动态组装:
+ *      /sys/kernel/config/usb_gadget/ 文件系统
+ *    - 用户可以在运行时创建 Gadget、添加配置、绑定 Function,
+ *      无需重新编译内核
+ *    - ConfigFS 的实现详见 drivers/usb/gadget/configfs.c
+ *
+ * 4. 关键处理流程
+ *    - usb_composite_probe(): 注册 composite 驱动,最终委托给
+ *      usb_gadget_register_driver()
+ *    - composite_setup(): 处理 USB 标准请求(SETUP 数据包),
+ *      包括 GET_DESCRIPTOR、SET_CONFIGURATION、SET_INTERFACE 等
+ *    - set_config(): 处理 SET_CONFIGURATION,激活指定配置,
+ *      调用各 Function 的 set_alt 进行初始化
+ *    - composite_disconnect/reset: 处理断开和总线复位
+ *
+ * 5. 标准请求分发策略
+ *    - 标准请求由复合框架的 composite_setup() 处理
+ *    - 非标准请求(类/厂商特定)优先路由到目标 Function 的 setup 回调
+ *    - 如果没有匹配的 Function,转发给当前 Configuration 的 setup 回调
+ *    - 同时支持 Microsoft OS 描述符和 WebUSB URL 描述符等扩展
+ */
+
 /* #define VERBOSE_DEBUG */
 
 #include <linux/kallsyms.h>
@@ -306,6 +353,33 @@ EXPORT_SYMBOL_GPL(config_ep_by_speed);
  *
  * This function returns the value of the function's bind(), which is
  * zero for success else a negative errno value.
+ */
+/*
+ * usb_add_function -- 添加 USB Function 到 Configuration
+ *
+ * 功能: 将一个 USB Function(如 mass_storage、ether、serial)
+ *       添加到一个 USB Configuration 中。
+ *
+ * 添加流程:
+ *   1. 校验: function 必须提供 set_alt 和 disable 回调
+ *   2. 关联: 设置 function->config = config,加入 config->functions 链表
+ *   3. 延迟枚举: 如果 bind_deactivated 标志置位,
+ *      则调用 usb_function_deactivate() 阻止主机枚举
+ *   4. 调用 bind(): function->bind(config, function) 分配资源
+ *      - 分配接口 ID(usb_interface_id)
+ *      - 分配端点(usb_ep_autoconfig)
+ *      - 分配字符串 ID(usb_string_id)
+ *   5. 速度支持: 根据 function 的描述符指针更新配置的速度能力
+ *      - fs_descriptors: 全速/低速
+ *      - hs_descriptors: 高速
+ *      - ss_descriptors: SuperSpeed
+ *      - ssp_descriptors: SuperSpeed Plus
+ *
+ * 注意事项:
+ *   - 如果 bind() 失败, 自动从配置的 function 列表中移除
+ *   - 同一个 Function 可以添加到多个配置中(但需要不同的描述符)
+ *
+ * 返回值: bind() 的返回值,成功为 0,失败为负的错误码
  */
 int usb_add_function(struct usb_configuration *config,
 		struct usb_function *function)
@@ -1102,6 +1176,38 @@ EXPORT_SYMBOL_GPL(usb_add_config_only);
  * assigns global resources including string IDs, and per-configuration
  * resources such as interface IDs and endpoints.
  */
+/*
+ * usb_add_config -- 添加 USB Configuration 到 Composite 设备
+ *
+ * 功能: 将一个 USB Configuration 添加到 Composite 设备中。
+ *       Composite 驱动的 bind() 回调通常调用此函数来注册其支持的配置。
+ *
+ * 添加流程:
+ *   1. usb_add_config_only(): 基础注册
+ *      - 校验 bConfigurationValue 非零
+ *      - 检查配置值唯一性,防止重复
+ *      - 设置 config->cdev,加入 cdev->configs 链表
+ *      - 初始化 function 链表和接口 ID 分配器
+ *   2. 调用 bind(config) 进行配置初始化:
+ *      - 在 bind 回调中添加 Function(usb_add_function)
+ *      - 分配所需资源和描述符
+ *   3. usb_gadget_check_config(): 检查 UDC 能否支持该配置
+ *      - 委托给 UDC 驱动的 check_config 回调
+ *   4. 失败回滚: 如果 bind 或 check_config 失败,
+ *      - 遍历并 unbind 所有已添加的 Function
+ *      - 从 configs 链表中移除配置
+ *   5. 成功收尾:
+ *      - 重置 autoconfig 状态(usb_ep_autoconfig_reset)
+ *      - 记录配置支持的速度等级
+ *
+ * USB 规范说明:
+ *   - 一个 USB 设备可以有多个 Configuration
+ *   - 主机通过 SET_CONFIGURATION 选择使用哪个配置
+ *   - 不同配置可以面向不同的使用场景(如高功耗 vs 低功耗)
+ *   - bConfigurationValue 用于主机选择配置,必须非零
+ *
+ * 返回值: bind() 的返回值,成功为 0,失败为负的错误码
+ */
 int usb_add_config(struct usb_composite_dev *cdev,
 		struct usb_configuration *config,
 		int (*bind)(struct usb_configuration *))
@@ -1750,6 +1856,43 @@ static int fill_ext_prop(struct usb_configuration *c, int interface, u8 *buf)
  * housekeeping for the gadget function we're implementing.  Most of
  * the work is in config and function specific setup.
  */
+/*
+ * composite_setup -- 处理 USB 标准请求的 SETUP 回调
+ *
+ * 功能: 这是 Composite 框架的 ep0 SETUP 处理入口,负责处理
+ *       主机发送的所有 USB 标准请求以及非标准请求的分发。
+ *
+ * 标准请求处理:
+ *   1. GET_DESCRIPTOR:
+ *      - USB_DT_DEVICE: 返回设备描述符,根据速度设置 bcdUSB
+ *      - USB_DT_CONFIG/OTHER_SPEED_CONFIG: 返回配置描述符集合
+ *      - USB_DT_STRING: 返回字符串描述符
+ *      - USB_DT_DEVICE_QUALIFIER: 返回设备限定符(双速设备)
+ *      - USB_DT_BOS: 返回 BOS 描述符(SuperSpeed/LPM/WebUSB)
+ *      - USB_DT_OTG: 返回 OTG 描述符
+ *   2. SET_CONFIGURATION: 设置激活的配置
+ *      - 委托给 set_config(),激活/禁用各 Function
+ *   3. SET_INTERFACE/GET_INTERFACE: 设置/查询接口的备用设置
+ *      - 路由到目标 Function 的 set_alt/get_alt 回调
+ *   4. GET_STATUS: 返回设备/接口/端点的状态
+ *   5. SET_FEATURE/CLEAR_FEATURE: 处理 FUNCTION_SUSPEND(USB 3.0)
+ *
+ * 非标准请求分发策略(unknown 标签):
+ *   - 首先尝试 OS 描述符处理(Microsoft 扩展)
+ *   - 然后尝试 WebUSB URL 描述符处理
+ *   - 接着检查各 Function 的 req_match 回调进行匹配
+ *   - 按 USB 请求接收者(Recipient)分类:
+ *     * USB_RECIP_INTERFACE: 路由到对应接口的 Function
+ *     * USB_RECIP_ENDPOINT: 路由到拥有该端点的 Function
+ *   - 如果上述都没有匹配:
+ *     * 尝试当前 Configuration 的 setup 回调
+ *     * 尝试当前 Configuration 中唯一 Function 的 setup 回调
+ *
+ * 返回值处理:
+ *   - value >= 0: 将数据通过 ep0 返回给主机
+ *   - value == USB_GADGET_DELAYED_STATUS: 延迟状态阶段
+ *   - value < 0: 协议 STALL(停止端点)
+ */
 int
 composite_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
 {
@@ -2298,12 +2441,56 @@ static void __composite_disconnect(struct usb_gadget *gadget)
 	spin_unlock_irqrestore(&cdev->lock, flags);
 }
 
+/*
+ * composite_disconnect -- USB 断开处理
+ *
+ * 功能: 处理 USB 断开事件。当主机断开连接或 VBUS 掉电时,
+ *       UDC 驱动调用此回调通知 Composite 框架。
+ *
+ * 处理流程:
+ *   1. usb_gadget_vbus_draw(0): 将 VBUS 电流消耗设为 0
+ *   2. __composite_disconnect():
+ *      a. 标记 cdev->suspended = 0,清除暂停状态
+ *      b. 如果当前处于配置状态,调用 reset_config():
+ *         - 遍历所有 Function 调用其 disable() 回调
+ *         - 清除各 Function 的端点位图
+ *         - 清除 func_wakeup_armed 状态
+ *         - 重置 cdev->config = NULL
+ *      c. 调用 Composite 驱动的 disconnect() 回调
+ *         (如果有定义的话)
+ *
+ * 注意事项:
+ *   - 由 UDC 驱动在检测到硬件断开时调用
+ *   - 调用时持有 cdev->lock 自旋锁,禁止睡眠
+ */
 void composite_disconnect(struct usb_gadget *gadget)
 {
 	usb_gadget_vbus_draw(gadget, 0);
 	__composite_disconnect(gadget);
 }
 
+/*
+ * composite_reset -- USB 总线复位处理
+ *
+ * 功能: 处理 USB 总线复位事件。当主机发起总线复位时,
+ *       UDC 驱动调用此回调。
+ *
+ * 与 composite_disconnect 的区别:
+ *   - 总线复位后设备保持在连接状态,但回到未配置状态
+ *   - 根据 USB 电池充电规范 1.2 第 1.4.13 节:
+ *     在连接但未配置的状态下,设备最多只能从 SDP 端口
+ *     消耗 100mA 电流
+ *
+ * 处理流程:
+ *   1. usb_gadget_vbus_draw(100): 设置 VBUS 电流消耗为
+ *      maximum 100mA (未配置状态的限制)
+ *   2. __composite_disconnect(): 与断开处理共享,
+ *      执行相同的配置重置和回调通知
+ *
+ * 注意事项:
+ *   - 复位后,设备等待主机重新枚举
+ *   - 复合框架会重新经历 GET_DESCRIPTOR -> SET_CONFIGURATION 流程
+ */
 void composite_reset(struct usb_gadget *gadget)
 {
 	/*
@@ -2681,6 +2868,45 @@ static const struct usb_gadget_driver composite_driver_template = {
  * the host, unless one of its components invokes usb_gadget_disconnect()
  * while it was binding.  That would usually be done in order to wait for
  * some userspace participation.
+ */
+/*
+ * usb_composite_probe -- 注册 Composite Gadget 驱动
+ *
+ * 功能: 注册一个 Composite Gadget 驱动到 UDC 框架,是编写
+ *       Composite Gadget 驱动的入口函数。
+ *
+ * 调用者(驱动开发者)需要提供的:
+ *   - usb_composite_driver 结构体,包含:
+ *     - name: 驱动名称
+ *     - dev: 设备描述符(idVendor, idProduct 等)
+ *     - strings: 字符串描述符(制造商、产品、序列号)
+ *     - max_speed: 支持的最高 USB 速度
+ *     - bind: 核心回调,用于组装设备(添加配置和功能)
+ *
+ * 注册流程:
+ *   1. 参数校验: driver、dev、bind 必须非空
+ *   2. 复制 composite_driver_template 模板:
+ *      - template 定义了 composite_bind/composite_unbind 作为
+ *        Gadget 驱动的 bind/unbind 回调
+ *      - 定义了 composite_setup/disconnect/reset/suspend/resume
+ *        作为标准回调
+ *   3. 设置驱动的 function 名称和 max_speed
+ *   4. 委托给 usb_gadget_register_driver():
+ *      - 最终调用 usb_gadget_register_driver_owner()
+ *      - 通过 gadget_bus_type 匹配 UDC
+ *      - 匹配后触发 composite_bind() 进行设备组装
+ *
+ * 典型用法:
+ *   static struct usb_composite_driver my_gadget_driver = {
+ *       .name       = "g_mygadget",
+ *       .dev        = &my_device_desc,
+ *       .strings    = my_device_strings,
+ *       .max_speed  = USB_SPEED_HIGH,
+ *       .bind       = my_gadget_bind,
+ *   };
+ *   module_usb_composite_driver(my_gadget_driver);
+ *
+ * 返回值: 成功返回 0,否则返回负的错误码
  */
 int usb_composite_probe(struct usb_composite_driver *driver)
 {

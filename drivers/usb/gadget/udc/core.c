@@ -6,6 +6,47 @@
  * Author: Felipe Balbi <balbi@ti.com>
  */
 
+/*
+ * UDC (USB Device Controller) 核心框架 -- Gadget 侧的 "HCD" 对等体
+ *
+ * 本文件是 UDC 核心框架的实现,负责管理 USB Gadget 一侧的核心资源:
+ *
+ * 1. 角色定位
+ *    - 在 USB 设备侧(Device Side),UDC 框架相当于主机侧(Host Side)HCD 的对等体
+ *    - 管理 usb_gadget (设备控制器)和 usb_ep (端点)两个核心抽象
+ *    - struct usb_request 是 Gadget 侧的 URB 对等体,代表一次数据传输请求
+ *
+ * 2. 关键数据结构
+ *    - usb_gadget: 表示一个 USB 设备控制器(如 DWC3、DWC2 等),每个 UDC
+ *      驱动对应一个 gadget 实例
+ *    - usb_ep: 表示一个 USB 端点,包括端点 0 (控制端点)和数据端点
+ *    - usb_request: 表示一个数据传输请求,由 Gadget 驱动创建并提交给端点
+ *    - usb_udc: 内部管理结构,将 usb_gadget 和 usb_gadget_driver 关联起来
+ *
+ * 3. 双端注册流程
+ *    - Gadget 驱动侧: 通过 usb_gadget_register_driver() 注册,提供 bind/setup/
+ *      disconnect/reset 等回调
+ *    - UDC 驱动侧: 通过 usb_add_gadget_udc() 注册,提供 udc_start/udc_stop/
+ *      pullup 等硬件操作接口
+ *    - 匹配成功后调用 gadget_bind_driver(),完成双方绑定
+ *
+ * 4. 核心 API
+ *    - usb_ep_enable/disable: 启用/禁用端点
+ *    - usb_ep_queue: 提交 I/O 请求(等价于 HCD 侧的 URB 提交),请求完成后
+ *      调用 completion 回调
+ *    - usb_ep_dequeue: 取消已提交的请求
+ *    - usb_gadget_connect/disconnect: 软连接控制(控制 D+/D- 的上拉电阻),
+ *      决定主机是否检测到设备
+ *    - usb_gadget_ep_match_desc: 端点匹配,用于 autoconfig 过程
+ *
+ * 5. 设计特点
+ *    - 使用 Linux 设备模型(bus_type/driver/device), Gadget 驱动注册为
+ *      gadget_bus_type 总线上的驱动
+ *    - 通过 sysfs 导出 soft_connect/state/function 等属性,支持用户态控制
+ *    - 支持 VBUS 检测、远程唤醒(Remote Wakeup)、自供电/总线供电切换
+ *    - 支持 deactivate/activate 机制,允许 Gadget 驱动延迟枚举
+ */
+
 #define pr_fmt(fmt)	"UDC core: " fmt
 
 #include <linux/kernel.h>
@@ -287,6 +328,31 @@ EXPORT_SYMBOL_GPL(usb_ep_free_request);
  * UDC are finished with the request.  When the completion function is called,
  * control of the request is returned to the device driver which submitted it.
  * The completion handler may then immediately free or reuse @req.
+ */
+/*
+ * usb_ep_queue -- Gadget 侧的 "URB 提交" 对等体
+ *
+ * 功能: 将一次 I/O 请求提交到指定端点,由 UDC 硬件执行数据传输。
+ *
+ * 与 URB 的对应关系:
+ *   - 在主机侧,驱动程序通过 usb_submit_urb() 提交 URB 给 HCD;
+ *   - 在设备侧,Gadget 驱动通过 usb_ep_queue() 提交 usb_request 给 UDC。
+ *   - usb_request.complete 回调等价于 URB 的完成回调。
+ *
+ * 行为特征:
+ *   1. 批量端点可以队列多个请求,按 FIFO 顺序完成
+ *   2. 每个请求被拆分为一个或多个 USB 数据包,自动进行包传输
+ *   3. 如果请求长度不是端点最大包大小的整数倍,最后一个包为短包
+ *   4. 请求的 'zero' 标志位控制是否发送零长度包(ZLP)以结束传输
+ *   5. 中断端点通常不支持队列,且数据包大小受限
+ *   6. 控制端点(ep0)在 setup 回调后只能队列一个响应
+ *
+ * 注意事项:
+ *   - 该函数可以在中断上下文中调用
+ *   - 请求的 complete 回调不能在 usb_ep_queue() 内部调用,
+ *     否则可能导致死锁
+ *   - 成功返回 0 后,complete 回调保证只会被调用恰好一次
+ *   - 如果端点未启用(且非 ep0),返回 -ESHUTDOWN
  */
 int usb_ep_queue(struct usb_ep *ep,
 			       struct usb_request *req, gfp_t gfp_flags)
@@ -743,6 +809,25 @@ out:
  *
  * Returns zero on success, else negative errno.
  */
+/*
+ * usb_gadget_connect -- 软件控制的 USB 连接(上拉 D+/D-)
+ *
+ * 功能: 使能 D+(或 D-)线上的上拉电阻,通知主机有 USB 设备连接。
+ *       主机检测到上拉信号后,将启动枚举过程。
+ *
+ * 软连接机制:
+ *   - 这是 Gadget 框架的"软连接"(Soft Connect/Pullup)控制
+ *   - 实际硬件操作委托给 UDC 驱动的 pullup() 回调
+ *   - 如果 gadget 处于 deactivated 状态或未启动,只保存状态,
+ *     实际连接操作延迟到激活/启动后自动执行
+ *   - 调用者的锁定由 connect_lock 保护
+ *
+ * 典型流程:
+ *   Gadget 驱动注册 -> gadget_bind_driver() -> usb_gadget_udc_start_locked()
+ *   -> usb_gadget_connect_locked() -> UDC pullup(1)
+ *
+ * 返回值: 成功返回 0,否则返回负的错误码
+ */
 int usb_gadget_connect(struct usb_gadget *gadget)
 {
 	int ret;
@@ -804,6 +889,25 @@ out:
  * for the current gadget driver so that UDC drivers don't need to.
  *
  * Returns zero on success, else negative errno.
+ */
+/*
+ * usb_gadget_disconnect -- 软件控制的 USB 断开(下拉 D+/D-)
+ *
+ * 功能: 禁用 D+/D- 上拉电阻,使主机检测到设备断开。
+ *
+ * 与 usb_gadget_connect 对称,用于软件控制的断开操作:
+ *   - 实际硬件操作委托给 UDC 驱动的 pullup(0) 回调
+ *   - 成功断开后自动调用 Gadget 驱动的 disconnect() 回调,
+ *     通知驱动层设备已断开
+ *   - 如果 gadget 处于 deactivated 状态,只保存断开状态,
+ *     实际断开由 deactivate 逻辑保证
+ *
+ * 典型场景:
+ *   - Gadget 驱动注销时自动断开
+ *   - VBUS 掉电时由 VBUS 事件处理触发断开
+ *   - 用户态通过 sysfs soft_connect 写入 "disconnect"
+ *
+ * 返回值: 成功返回 0,否则返回负的错误码
  */
 int usb_gadget_disconnect(struct usb_gadget *gadget)
 {
@@ -1026,6 +1130,26 @@ EXPORT_SYMBOL_GPL(gadget_find_ep_by_name);
 
 /* ------------------------------------------------------------------------- */
 
+/*
+ * usb_gadget_ep_match_desc -- 端点匹配(用于 autoconfig 分配)
+ *
+ * 功能: 检查一个端点是否满足给定 USB 端点描述符的要求。
+ *       这是 Gadget 框架在 autoconfig 过程中使用的匹配函数。
+ *
+ * 匹配规则(按优先级):
+ *   1. 端点未被 claimed (已分配)
+ *   2. 方向匹配: 端点支持 dir_in(dir_out) 与描述符要求一致
+ *   3. 最大包大小: 端点 maxpacket_limit >= 描述符要求的 maxpacket
+ *   4. 高速带宽: 全速设备不支持多倍最大包大小(mult > 1)
+ *   5. 传输类型匹配:
+ *      - CONTROL: 仅 ep0 支持,数据端点返回 0
+ *      - ISOCHRONOUS: 需要端点支持 type_iso,全速时 maxpacket <= 1023
+ *      - BULK: 需要端点支持 type_bulk,SuperSpeed 时检查流能力
+ *      - INTERRUPT: 需要端点支持 type_int 或 type_bulk,
+ *                   全速时 maxpacket <= 64
+ *
+ * 返回值: 1 = 匹配,0 = 不匹配
+ */
 int usb_gadget_ep_match_desc(struct usb_gadget *gadget,
 		struct usb_ep *ep, struct usb_endpoint_descriptor *desc,
 		struct usb_ss_ep_comp_descriptor *ep_comp)
@@ -1527,6 +1651,29 @@ EXPORT_SYMBOL_GPL(usb_get_gadget_udc_name);
  *
  * Returns zero on success, negative errno otherwise.
  */
+/*
+ * usb_add_gadget_udc -- UDC 驱动注册到框架
+ *
+ * 功能: UDC(USB Device Controller)驱动通过此函数将硬件控制器注册到
+ *       Gadget 框架,是 UDC 驱动侧的入口点。
+ *
+ * 注册流程(内部调用 usb_add_gadget_udc_release -> usb_initialize_gadget + usb_add_gadget):
+ *   1. usb_initialize_gadget(): 初始化 gadget 设备的嵌入式 struct device,
+ *      设置总线类型为 gadget_bus_type
+ *   2. usb_add_gadget(): 创建并初始化 usb_udc 内部管理结构
+ *      - 分配 usb_udc,设置其 device 属性(class=udc_class)
+ *      - gadget->udc 指向新创建的 udc
+ *      - 将 udc 加入全局 udc_list
+ *      - 添加 udc device 到驱动核心,触发 sysfs 创建
+ *      - 设置 gadget 状态为 USB_STATE_NOTATTACHED
+ *      - 分配 gadget id_number,添加 gadget device
+ *   3. 注册完成后:
+ *      - UDC 在 sysfs 中可见(/sys/class/udc/<name>/)
+ *      - 如果有匹配的 Gadget 驱动,将自动触发 probe 绑定
+ *      - VBUS 事件处理 workqueue 初始化完成
+ *
+ * 典型的 UDC 驱动(如 DWC3、DWC2、MV_U3D 等)在 probe 中调用此函数。
+ */
 int usb_add_gadget_udc(struct device *parent, struct usb_gadget *gadget)
 {
 	return usb_add_gadget_udc_release(parent, gadget, NULL);
@@ -1576,6 +1723,26 @@ EXPORT_SYMBOL_GPL(usb_del_gadget);
  * @gadget: the gadget to be unregistered.
  *
  * Calls usb_del_gadget() and does a final usb_put_gadget().
+ */
+/*
+ * usb_del_gadget_udc -- 从框架注销 UDC 驱动
+ *
+ * 功能: 从 Gadget 框架中注销一个 UDC 驱动,与 usb_add_gadget_udc 对称。
+ *
+ * 注销流程:
+ *   1. usb_del_gadget(): 核心注销工作
+ *      - 从 udc_list 中移除
+ *      - 发送 KOBJ_REMOVE uevent
+ *      - 删除 sysfs gadget 链接
+ *      - 删除 gadget device
+ *      - 设置 teardown 标志,刷新状态 work
+ *      - 释放 id_number
+ *      - 取消 VBUS 事件处理
+ *      - 注销 udc device
+ *   2. usb_put_gadget(): 释放 gadget 设备的引用计数
+ *
+ * 调用场景:
+ *   UDC 驱动的 remove() 回调中断开设备时调用。
  */
 void usb_del_gadget_udc(struct usb_gadget *gadget)
 {
@@ -1705,6 +1872,35 @@ static void gadget_unbind_driver(struct device *dev)
 
 /* ------------------------------------------------------------------------- */
 
+/*
+ * usb_gadget_register_driver_owner -- Gadget 驱动注册
+ *
+ * 功能: 将一个 Gadget 驱动注册到 UDC 核心框架,使其能够与 UDC 绑定。
+ *       这是 Gadget 驱动侧的入口点(如 composite 框架最终调用此函数)。
+ *
+ * 注册流程:
+ *   1. 参数校验: driver、bind、setup 回调不能为空
+ *   2. 准备驱动: 设置总线类型为 gadget_bus_type,标记同步 probe
+ *   3. driver_register(): 通过 Linux 设备模型注册驱动
+ *      - 这会触发 gadget_bus_type 的 match 过程
+ *      - gadget_match_driver() 检查 udc_name 是否匹配(可选)
+ *      - 匹配成功后调用 gadget_bind_driver()
+ *   4. gadget_bind_driver() 的执行流程:
+ *      a. 设置 UDC 支持的最高速度
+ *      b. 调用 Gadget 驱动的 bind() 回调进行初始化
+ *      c. 调用 usb_gadget_udc_start_locked() 启动 UDC 硬件
+ *      d. 启用异步回调(使能 IRQ)
+ *      e. 执行软连接(上拉 D+/D-),通知主机设备已就绪
+ *   5. 注册后处理:
+ *      - 检查是否成功绑定到 UDC,若未绑定则发出警告
+ *        (可能是没有可用的 UDC 控制器)
+ *
+ * 典型调用栈:
+ *   usb_composite_probe() -> usb_gadget_register_driver()
+ *   -> usb_gadget_register_driver_owner() -> driver_register()
+ *
+ * 返回值: 成功返回 0,否则返回负的错误码
+ */
 int usb_gadget_register_driver_owner(struct usb_gadget_driver *driver,
 		struct module *owner, const char *mod_name)
 {
@@ -1744,6 +1940,25 @@ int usb_gadget_register_driver_owner(struct usb_gadget_driver *driver,
 }
 EXPORT_SYMBOL_GPL(usb_gadget_register_driver_owner);
 
+/*
+ * usb_gadget_unregister_driver -- Gadget 驱动注销
+ *
+ * 功能: 从 UDC 核心框架注销一个 Gadget 驱动,与
+ *       usb_gadget_register_driver_owner 对称。
+ *
+ * 注销流程(通过驱动核心的 remove 回调触发):
+ *   1. gadget_unbind_driver() 执行反向操作:
+ *      a. 设置 allow_connect = false,阻止新的连接
+ *      b. 取消 VBUS 事件处理工作
+ *      c. 执行断开(下拉 D+/D-)
+ *      d. 禁用异步回调(禁止新的 IRQ)
+ *      e. 调用 Gadget 驱动的 unbind() 回调
+ *      f. 停止 UDC 硬件(usb_gadget_udc_stop_locked)
+ *      g. 清理绑定状态
+ *   2. driver_unregister(): 从 Linux 设备模型注销驱动
+ *
+ * 返回值: 成功返回 0,driver 或 unbind 回调为空返回 -EINVAL
+ */
 int usb_gadget_unregister_driver(struct usb_gadget_driver *driver)
 {
 	if (!driver || !driver->unbind)
