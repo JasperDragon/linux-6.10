@@ -8,6 +8,64 @@
  * Some code borrowed from the Linux EHCI driver.
  */
 
+/*
+ * xhci-mem.c -- XHCI 内存管理子系统
+ *
+ * 本文件负责 XHCI (eXtensible Host Controller Interface) 主机控制器驱动中
+ * 所有与内存相关的操作，包括 DMA 一致性内存的分配、初始化与释放。
+ * 核心任务是为硬件可见的数据结构提供内存支持，确保主机控制器可以正确
+ * 访问这些结构。
+ *
+ * 主要管理的数据结构包括:
+ *
+ * 1. Device Context Base Address Array (DCBAA):
+ *    设备上下文基地址数组，位于主机控制器可访问的 DMA 内存中。
+ *    每个已配置的 USB 设备对应一个槽位 (Slot ID)，DCBAA 条目指向
+ *    该设备的输出设备上下文 (Output Device Context)。
+ *    见 xHCI 规范 5.4.6 节。
+ *
+ * 2. Command Ring (命令环):
+ *    用于主机软件向 xHC 发送命令的环形队列，由多个 TRB (Transfer Request
+ *    Block) 段 (Segment) 构成环形链表。命令包括地址设备、配置端点、
+ *    复位端点等。
+ *    见 xHCI 规范 4.6.1 节。
+ *
+ * 3. Event Ring (事件环):
+ *    xHC 向主机软件报告事件完成情况的环形队列。每个中断器 (Interrupter)
+ *    拥有独立的事件环。事件环通过 Event Ring Segment Table (ERST) 映射。
+ *    见 xHCI 规范 4.9.4 节和 5.5.2.3.3 节。
+ *
+ * 4. Transfer Ring (传输环):
+ *    每个端点拥有自己的传输环，用于提交 USB 数据传输请求 (TRB)。
+ *    控制端点 (ep0) 使用 TYPE_CTRL 类型，批量/中断/等时端点使用
+ *    对应类型。传输环支持动态扩展 (xhci_ring_expansion)。
+ *    见 xHCI 规范 4.9.1 节。
+ *
+ * 5. Scratchpad Buffer (草稿缓冲区):
+ *    一组 DMA 缓冲区，用于 xHC 在特定操作中使用。DCBAA 的条目 0
+ *    指向 Scratchpad Buffer Array，该数组包含一组页面大小的缓冲区。
+ *    见 xHCI 规范 4.6.8 节。
+ *
+ * 6. Device Context (设备上下文) 和 Input Context (输入上下文):
+ *    每个虚拟设备 (xhci_virt_device) 包含输出上下文 (硬件使用) 和
+ *    输入上下文 (软件用于配置命令)。每个上下文包含一个 Slot Context
+ *    和最多 31 个 Endpoint Context。
+ *    见 xHCI 规范 6.2.1 节和 6.2.2 节。
+ *
+ * 7. Stream Context Array (流上下文数组):
+ *    用于支持 USB3 批量端点的流 (Stream) 功能，允许端点同时拥有多个
+ *    传输环，每个流 ID 对应一个独立的环。流上下文数组通过 radix tree
+ *    实现 DMA 地址到流 ID 的映射。
+ *    见 xHCI 规范 4.12.1 节。
+ *
+ * 内存分配策略:
+ * - 小尺寸结构 (<256B) 使用 dma_pool 分配 (segment_pool, device_pool)
+ * - 中等尺寸结构 (256B~1KB) 使用 medium_streams_pool
+ * - 大尺寸结构 (>1KB) 使用 dma_alloc_coherent 直接分配
+ * - Segment 使用 TRB_SEGMENT_SIZE (16*64=1024B) 对齐
+ * - 设备上下文需要 64 字节缓存行对齐
+ */
+
 #include <linux/usb.h>
 #include <linux/overflow.h>
 #include <linux/pci.h>
@@ -20,11 +78,29 @@
 #include "xhci-debugfs.h"
 
 /*
- * Allocates a generic ring segment from the ring pool, sets the dma address,
- * initializes the segment to zero, and sets the private next pointer to NULL.
+ * xhci_segment_alloc -- 分配一个环段 (Ring Segment)
  *
- * Section 4.11.1.1:
- * "All components of all Command and Transfer TRBs shall be initialized to '0'"
+ * 从 DMA 内存池 (segment_pool) 中分配一个环段，用于构建命令环、传输环
+ * 或事件环。每个段包含 TRBS_PER_SEGMENT (16) 个 TRB 条目，所有 TRB
+ * 初始化为零以满足 xHCI 规范要求。
+ *
+ * 根据 xHCI 规范 4.11.1.1:
+ * "所有命令和传输 TRB 的所有组件都应初始化为 '0'"
+ *
+ * 工作流程:
+ * 1. 使用 kzalloc_node 分配 xhci_segment 结构体 (NUMA 感知)
+ * 2. 从 DMA 池分配 TRB 数组 (TRBS_PER_SEGMENT * 16 字节, 64 字节对齐)
+ * 3. 如果 max_packet > 0 (传输环), 分配反弹缓冲区 (bounce buffer)
+ *    用于处理非对齐的 DMA 传输
+ * 4. 设置段序号 (num)、DMA 地址 (dma) 和 next 指针为 NULL
+ *
+ * 参数:
+ * @xhci: XHCI 主机控制器实例
+ * @max_packet: 端点最大包大小 (传输环需要反弹缓冲区时使用)
+ * @num: 段在环中的序号
+ * @flags: 内存分配 GFP 标志
+ *
+ * 返回值: 新分配的 xhci_segment 指针, 失败返回 NULL
  */
 static struct xhci_segment *xhci_segment_alloc(struct xhci_hcd *xhci,
 					       unsigned int max_packet,
@@ -367,6 +443,40 @@ free_segments:
 	return -ENOMEM;
 }
 
+/*
+ * xhci_ring_alloc -- 分配并初始化一个环 (Ring)
+ *
+ * 创建包含一个或多个段的环形队列。环是 xHCI 中最核心的数据结构之一,
+ * 用于主机软件与主机控制器之间的异步通信。环的类型决定其用途:
+ *
+ * - TYPE_COMMAND: 命令环, 主机向 xHC 发送命令 (每个 xHC 只有一个)
+ * - TYPE_CTRL: 控制传输环, 用于 ep0 的控制传输
+ * - TYPE_BULK/INT/ISOC: 批量/中断/等时传输环
+ * - TYPE_EVENT: 事件环, xHC 向主机报告事件 (每个中断器有一个)
+ * - TYPE_STREAM: 流环, USB3 批量端点的流传输
+ *
+ * 环的物理结构:
+ * - 由多个段 (xhci_segment) 通过 Link TRB 形成环形链表
+ * - 每个段包含 TRBS_PER_SEGMENT (16) 个 TRB 槽位
+ * - 段之间通过最后一个 TRB (Link TRB) 指向下一个段的首地址
+ * - 最后一个段指向第一个段, 形成闭环
+ * - 见 xHCI 规范 4.9.1 节, 图 15 和 16
+ *
+ * 环的维护状态:
+ * - enqueue: 生产者 (驱动) 放置新 TRB 的位置
+ * - dequeue: 消费者 (xHC) 当前处理的位置
+ * - cycle_state: 循环位状态 (0/1), 用于区分新旧 TRB
+ * - num_trbs_free: 可用 TRB 数量
+ *
+ * 参数:
+ * @xhci: XHCI 主机控制器实例
+ * @num_segs: 段数量 (0 表示空环)
+ * @type: 环类型 (TYPE_COMMAND/TYPE_CTRL/TYPE_BULK/TYPE_EVENT 等)
+ * @max_packet: 最大包大小 (用于反弹缓冲区, 传输环使用)
+ * @flags: 内存分配 GFP 标志
+ *
+ * 返回值: 新分配的 xhci_ring 指针, 失败返回 NULL
+ */
 /*
  * Create a new ring with zero or more segments.
  *
@@ -971,6 +1081,41 @@ out:
 	xhci_free_virt_device(xhci, xhci->devs[slot_id], slot_id);
 }
 
+/*
+ * xhci_alloc_virt_device -- 分配虚拟设备结构 (Slot 分配)
+ *
+ * 为 USB 设备分配虚拟设备 (xhci_virt_device) 结构, 这是 xHCI 驱动中
+ * 设备抽象的核心数据结构。每个连接到系统的 USB 设备对应一个 slot_id,
+ * 通过 DCBAA (Device Context Base Address Array) 索引。
+ *
+ * 分配流程:
+ * 1. 为 xhci_virt_device 分配内存 (kzalloc_obj, NUMA 感知)
+ * 2. 分配输出设备上下文 (Output Device Context):
+ *    - 类型: XHCI_CTX_TYPE_DEVICE
+ *    - 大小: 1024 或 2048 字节 (取决于 HCC_64BYTE_CONTEXT)
+ *    - 用途: xHC 硬件直接读取/写入该上下文以维护设备状态
+ * 3. 分配输入设备上下文 (Input Device Context):
+ *    - 类型: XHCI_CTX_TYPE_INPUT
+ *    - 大小: 输出上下文大小 + 额外的一个上下文条目
+ *    - 用途: 软件用于配置端点命令 (Address Device, Configure Endpoint 等)
+ * 4. 初始化 31 个端点的取消列表 (cancelled_td_list) 和带宽列表
+ * 5. 分配端点 0 (控制端点) 的传输环:
+ *    - 2 个段, TYPE_CTRL 类型
+ *    - 调用 xhci_ring_init 初始化环的 Link TRB 和 cycle_state
+ * 6. 在 DCBAA 中设置指向输出设备上下文的指针
+ *
+ * Slot ID 0 是保留值 (用于 Scratchpad Buffer), 设备从 slot_id=1 开始分配。
+ *
+ * 参数:
+ * @xhci: XHCI 主机控制器实例
+ * @slot_id: 要分配的槽位 ID (1 ~ xhci->max_slots)
+ * @udev: USB 设备结构 (由 USB 核心维护)
+ * @flags: 内存分配 GFP 标志
+ *
+ * 返回值: 成功返回 1, 失败返回 0
+ *
+ * 调用上下文: 通常在 xhci_alloc_dev() 中调用, 作为 usb_hcd_ops->alloc_dev 的回调
+ */
 int xhci_alloc_virt_device(struct xhci_hcd *xhci, int slot_id,
 		struct usb_device *udev, gfp_t flags)
 {
@@ -1095,6 +1240,41 @@ static struct xhci_port *xhci_find_rhub_port(struct xhci_hcd *xhci, struct usb_d
 	return rhub->ports[top_dev->portnum - 1];
 }
 
+/*
+ * xhci_setup_addressable_virt_dev -- 设置可寻址虚拟设备 (Address Device)
+ *
+ * 在 USB 设备收到 Set Address 命令之前, 配置该设备的输入上下文
+ * (Input Context) 中的 Slot Context 和 Endpoint 0 Context。
+ * 此函数将设备的描述信息转换为 xHCI 硬件可识别的上下文格式。
+ *
+ * 配置的内容:
+ *
+ * 1. Slot Context (槽位上下文):
+ *    - dev_info: 设置 LAST_CTX (有效端点数量)、route (路由字符串)、
+ *      设备速度 (SS/SSP/HS/FS/LS)
+ *    - dev_info2: 设置 ROOT_HUB_PORT (连接到的根端口号)
+ *    - tt_info: 对于通过 HS HUB TT 连接的 LS/FS 设备, 设置 TT 信息
+ *    - 带宽表 (bw_table) 选择:
+ *      a) 直接连接根端口: 使用主带宽表 (rh_bw)
+ *      b) 通过外部 HS HUB: 使用对应 TT 的带宽表
+ *
+ * 2. Endpoint 0 Context (控制端点上下文):
+ *    - ep_info2: 设置 EP_TYPE (CTRL_EP)、MAX_BURST=0、ERROR_COUNT=3、
+ *      最大包大小 (根据速度: SSP/SS=512, HS/FS=64, LS=8)
+ *    - deq: 设置端点 0 环的 DMA 地址和 cycle_state
+ *    - tx_info: 设置 EP_AVG_TRB_LENGTH=8 (xHCI 1.0+ 推荐值)
+ *
+ * 遵循 xHCI 规范第 4.3.4 节 "Address Device Operation" 的步骤 3-8。
+ * 步骤 7 和 8 (分配 DCBAA 条目和设置 Slot ID) 在 xhci_alloc_virt_device 中已完成。
+ *
+ * 参数:
+ * @xhci: XHCI 主机控制器实例
+ * @udev: USB 设备描述结构 (包含速度、路由、TT 等信息)
+ *
+ * 返回值: 成功返回 0, 失败返回负的错误码
+ *
+ * 调用上下文: 在 USB 核心的 hub_port_init()->xhci_address_device() 中调用
+ */
 /* Setup an xHCI virtual device for a Set Address command */
 int xhci_setup_addressable_virt_dev(struct xhci_hcd *xhci, struct usb_device *udev)
 {
@@ -1736,6 +1916,30 @@ static void scratchpad_free(struct xhci_hcd *xhci)
 	xhci->scratchpad = NULL;
 }
 
+/*
+ * xhci_alloc_command -- 分配一个 xHCI 命令结构
+ *
+ * 分配并初始化一个 xhci_command 结构, 用于向 xHC 的命令环提交命令。
+ * 命令结构是 xHCI 驱动中异步命令操作的基本单元, 包含命令完成所需
+ * 的所有状态信息。
+ *
+ * 可选的完成机制:
+ * - allocate_completion=true: 分配 completion 变量, 用于同步等待命令完成
+ *   (调用者使用 wait_for_completion() 等待, xHC 中断处理中调用 complete())
+ * - allocate_completion=false: 不分配 completion, 用于异步命令
+ *   (调用者通过其他方式跟踪命令状态)
+ *
+ * 命令的默认超时时间为 XHCI_CMD_DEFAULT_TIMEOUT (5000ms), 可通过
+ * command->timeout_ms 字段修改。status 字段初始化为 0, 在命令完成
+ * 事件处理中被设置为完成码。
+ *
+ * 参数:
+ * @xhci: XHCI 主机控制器实例
+ * @allocate_completion: 是否分配完成同步变量
+ * @mem_flags: 内存分配 GFP 标志
+ *
+ * 返回值: xhci_command 指针, 失败返回 NULL
+ */
 struct xhci_command *xhci_alloc_command(struct xhci_hcd *xhci,
 		bool allocate_completion, gfp_t mem_flags)
 {
@@ -1797,6 +2001,34 @@ void xhci_free_command(struct xhci_hcd *xhci,
 	kfree(command);
 }
 
+/*
+ * xhci_alloc_erst -- 分配事件环段表 (Event Ring Segment Table)
+ *
+ * 分配并初始化 ERST, 这是 xHC 用于定位事件环物理位置的关键数据结构。
+ * ERST 位于主机内存中, 由 DMA API 分配的一致内存构成, xHC 通过
+ * ERST Base Address Register (ERSTBA) 访问它。
+ *
+ * ERST 的结构:
+ * - 每个条目 (xhci_erst_entry) 对应事件环的一个段
+ * - 每个条目包含: 段基地址 (seg_addr)、段大小 (seg_size)、保留字段
+ * - ERST 条目数量等于事件环的段数量
+ *
+ * 事件环的寻址过程:
+ * 1. xHC 读取 ERSTBA 找到 ERST 的基地址
+ * 2. 使用 ERST 队列指针 (ERDP) 确定当前使用的条目
+ * 3. 通过条目的 seg_addr 定位到具体的段 DMA 地址
+ * 4. 在段内根据 TRB 索引访问具体的事件 TRB
+ *
+ * 见 xHCI 规范 5.5.2.3.3 节 "Event Ring Segment Table"。
+ *
+ * 参数:
+ * @xhci: XHCI 主机控制器实例
+ * @evt_ring: 事件环 (其段信息将填入 ERST)
+ * @erst: 要填充的 ERST 结构
+ * @flags: 内存分配 GFP 标志
+ *
+ * 返回值: 成功返回 0, 失败返回 -ENOMEM
+ */
 static int xhci_alloc_erst(struct xhci_hcd *xhci,
 		    struct xhci_ring *evt_ring,
 		    struct xhci_erst *erst,

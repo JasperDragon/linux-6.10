@@ -8,6 +8,61 @@
  * Some code borrowed from the Linux EHCI driver.
  */
 
+/*
+ * xhci-hub.c -- XHCI 根 HUB (Root Hub) 操作实现
+ *
+ * 本文件实现 XHCI 主机控制器的根 HUB 驱动接口，模拟标准 USB HUB 的行为。
+ * 根 HUB 是主机控制器内部集成的虚拟 HUB，负责管理物理 USB 端口的状态
+ * 和电源控制。这是 USB 核心与物理端口之间的桥梁层。
+ *
+ * 关键设计:
+ * 1. XHCI 将端口分为 USB2 和 USB3 两类:
+ *    - USB2 端口 (对应高速/全速/低速设备) 通过主 HCD (xhci->main_hcd) 管理
+ *    - USB3 端口 (对应超速设备) 通过次级 HCD (xhci->usb3_hcd) 管理
+ *    - 两种端口的 PORTSC 寄存器布局相同，但语义有差异
+ *    - 端口速度和类型通过 Extended Capabilities 的 Supported Protocol
+ *      Capabilities 描述
+ *
+ * 2. 端口状态寄存器 (PORTSC) 关键位定义:
+ *    - PORT_CONNECT (bit 0): 设备连接状态 (RO)
+ *    - PORT_PE (bit 1): 端口使能/禁用 (RW1CS, 写 1 清除)
+ *    - PORT_OC (bit 3): 过流指示 (RO)
+ *    - PORT_RESET (bit 4): 端口复位 (RW1S, 写 1 触发)
+ *    - PORT_PLS (bits 5-8): 端口链路状态 (RWS)
+ *    - PORT_POWER (bit 9): 端口电源控制 (RWS)
+ *    - PORT_SPEED (bits 10-13): 端口速度指示 (RO)
+ *    - PORT_LINK_STROBE (bit 16): 链路状态写入选通 (RW)
+ *    - PORT_CSC (bit 17): 连接状态变化 (RW1CS)
+ *    - PORT_PEC (bit 18): 端口使能变化 (RW1CS)
+ *    - PORT_WRC (bit 19): 暖复位变化 (RW1CS)
+ *    - PORT_OCC (bit 20): 过流变化 (RW1CS)
+ *    - PORT_RC (bit 21): 复位变化 (RW1CS)
+ *    - PORT_PLC (bit 22): 链路状态变化 (RW1CS)
+ *    - PORT_CEC (bit 23): 配置错误变化 (RW1CS)
+ *    - PORT_WKCONN_E/WKDISC_E/WKOC_E (bits 25-27): 唤醒使能 (RWS)
+ *
+ * 3. USB3 端口特有的链路状态管理:
+ *    - U0: 活动状态 (正常数据传输)
+ *    - U1/U2: 低功耗状态 (快速退出)
+ *    - U3: 挂起状态 (深度休眠)
+ *    - RxDetect: 检测接收状态
+ *    - Polling: 链路训练中
+ *    - Recovery: 恢复状态
+ *    - Hot Reset: 热复位
+ *    - Compliance Mode: 兼容模式 (用于测试)
+ *
+ * 4. 复位操作:
+ *    - 热复位 (Hot Reset): 对 USB3 端口的标准复位
+ *    - 暖复位 (Warm Reset): USB3 端口从错误状态恢复
+ *    - 冷复位 (Cold Reset): 主机控制器级别的复位
+ *
+ * 主要导出的接口函数:
+ * - xhci_hub_status_data(): 实现 hc_driver->hub_status_data，轮询端口状态变化
+ * - xhci_hub_control(): 实现 hc_driver->hub_control，处理 HUB 类请求
+ * - xhci_bus_suspend() / xhci_bus_resume(): 总线级电源管理
+ * - xhci_get_rhub(): 根据 HCD 获取对应的根 HUB 结构
+ * - xhci_set_link_state(): 设置端口链路状态
+ */
 
 #include <linux/slab.h>
 #include <linux/unaligned.h>
@@ -638,9 +693,27 @@ struct xhci_hub *xhci_get_rhub(struct usb_hcd *hcd)
 }
 
 /*
- * xhci_set_port_power() must be called with xhci->lock held.
- * It will release and re-aquire the lock while calling ACPI
- * method.
+ * xhci_set_port_power -- 设置端口电源状态
+ *
+ * 控制根 HUB 端口的电源开关。USB 端口电源管理涉及两个方面:
+ * 1) xHC 硬件层面的 PORT_POWER 位控制
+ * 2) ACPI 软件层面的电源管理 (用于系统级电源策略)
+ *
+ * 在 USB3 协议中, 端口电源关闭 (PP=0) 会导致端口进入 Disabled 状态,
+ * 所有连接状态丢失; 而 USB2 协议中, 端口电源关闭通常用于省电。
+ *
+ * 重要说明:
+ * - 必须在持有 xhci->lock 锁时调用
+ * - 函数内部会临时释放锁以调用 ACPI 方法 (usb_acpi_set_power_state)
+ * - 调用 ACPI 方法后重新获取锁
+ *
+ * 参数:
+ * @xhci: XHCI 主机控制器实例
+ * @port: 目标端口
+ * @on: true 为开电源, false 为关电源
+ * @flags: 中断保存标志 (由 spin_lock_irqsave 保存, 用于临时释放/重获取锁)
+ *
+ * 锁说明: __must_hold(&xhci->lock)
  */
 static void xhci_set_port_power(struct xhci_hcd *xhci, struct xhci_port *port,
 				bool on, unsigned long *flags)
@@ -1124,14 +1197,52 @@ static void xhci_get_usb2_port_status(struct xhci_port *port, u32 *status,
 }
 
 /*
- * Converts a raw xHCI port status into the format that external USB 2.0 or USB
- * 3.0 hubs use.
+ * xhci_get_port_status -- 读取并转换端口状态
  *
- * Possible side effects:
- *  - Mark a port as being done with device resume,
- *    and ring the endpoint doorbells.
- *  - Stop the Synopsys redriver Compliance Mode polling.
- *  - Drop and reacquire the xHCI lock, in order to wait for port resume.
+ * 将 xHC 硬件原始 PORTSC 寄存器的值转换为 USB 核心标准端口状态格式。
+ * 这是 usb_hcd_ops->hub_control 中 GetPortStatus 请求的关键处理步骤。
+ *
+ * 状态转换涵盖:
+ *
+ * 1. 公共状态位 (USB2 和 USB3 共用):
+ *    - PORT_CSC -> USB_PORT_STAT_C_CONNECTION (连接变化)
+ *    - PORT_PEC -> USB_PORT_STAT_C_ENABLE (使能变化)
+ *    - PORT_OCC -> USB_PORT_STAT_C_OVERCURRENT (过流变化)
+ *    - PORT_RC  -> USB_PORT_STAT_C_RESET (复位变化)
+ *    - PORT_CONNECT -> USB_PORT_STAT_CONNECTION (连接状态)
+ *    - PORT_PE  -> USB_PORT_STAT_ENABLE (使能状态)
+ *    - PORT_OC  -> USB_PORT_STAT_OVERCURRENT (过流状态)
+ *    - PORT_RESET -> USB_PORT_STAT_RESET (复位状态)
+ *
+ * 2. USB2 特有状态 (xhci_get_usb2_port_status):
+ *    - 链路状态 U3 -> USB_PORT_STAT_SUSPEND (挂起)
+ *    - 链路状态 U2 -> USB_PORT_STAT_L1 (L1 省电)
+ *    - 链路状态 Resume -> 调用 xhci_handle_usb2_port_link_resume()
+ *    - 管理 resume_timestamp 和 resuming_ports 状态变量
+ *
+ * 3. USB3 特有状态 (xhci_get_usb3_port_status):
+ *    - PORT_PLC -> USB_PORT_STAT_C_LINK_STATE (链路状态变化)
+ *    - PORT_WRC -> USB_PORT_STAT_C_BH_RESET (暖复位变化)
+ *    - PORT_CEC -> USB_PORT_STAT_C_CONFIG_ERROR (配置错误变化)
+ *    - PORT_POWER -> USB_SS_PORT_STAT_POWER (电源状态)
+ *    - 链路状态处理 (调用 xhci_hub_report_usb3_link_state)
+ *    - Compliance Mode 定时器管理 (xhci_del_comp_mod_timer)
+ *
+ * 副作用:
+ *  - 标记端口设备恢复完成, 并触发端点门铃 (ring doorbell)
+ *  - 停止 Synopsys 重驱动器的 Compliance Mode 轮询
+ *  - 临时释放/重获取 xHCI 锁以等待端口恢复完成
+ *
+ * 参数:
+ * @hcd: USB HCD 实例
+ * @bus_state: 总线状态 (记录挂起端口、恢复端口等)
+ * @portnum: 端口号 (0 索引)
+ * @portsc: PORTSC 寄存器的原始值
+ * @flags: 中断保存标志
+ *
+ * 返回值: 转换为 USB 核心格式的端口状态 (32 位, 低 16 位为状态, 高 16 位为变化位)
+ *
+ * 锁: 释放并重获取 xhci->lock (__releases/__acquires)
  */
 static u32 xhci_get_port_status(struct usb_hcd *hcd, struct xhci_bus_state *bus_state,
 				int portnum, u32 portsc, unsigned long *flags)
@@ -1179,6 +1290,62 @@ static u32 xhci_get_port_status(struct usb_hcd *hcd, struct xhci_bus_state *bus_
 	return status;
 }
 
+/*
+ * xhci_hub_control -- 根 HUB 控制传输处理 (hc_driver->hub_control)
+ *
+ * 这是根 HUB 的核心入口函数, 实现 hc_driver 接口中的 hub_control 回调。
+ * USB 核心通过此函数发送标准的 HUB 类请求来查询和控制端口状态。
+ *
+ * 根据 typeReq 参数处理的请求类型:
+ *
+ * 1. GetHubStatus (0x00):
+ *    返回根 HUB 状态 (电源、过流)。根 HUB 没有全局电源/过流,
+ *    每个端口独立报告, 所以返回全零。
+ *
+ * 2. GetHubDescriptor (0x01):
+ *    返回 HUB 描述符。根据 HCD 类型 (USB2/USB3) 分别调用
+ *    xhci_usb2_hub_descriptor() 或 xhci_usb3_hub_descriptor()。
+ *
+ * 3. GetPortStatus (0x02):
+ *    读取指定端口的状态。核心流程:
+ *    a. 读取 PORTSC 寄存器 (xhci_portsc_readl)
+ *    b. 调用 xhci_get_port_status() 转换为 USB 核心格式
+ *    c. 如果是 USB 3.1+ 且请求 HUB_EXT_PORT_STATUS, 额外读取
+ *       PORTLI 寄存器获取扩展端口信息 (RX/TX 速度 ID, 通道数)
+ *
+ * 4. SetPortFeature (0x03):
+ *    设置端口特性。支持的特性:
+ *    - USB_PORT_FEAT_SUSPEND: 挂起端口 (停止端点, 设 U3 链路状态)
+ *    - USB_PORT_FEAT_LINK_STATE: 设置 USB3 链路状态 (U0/U3/RxDetect/
+ *      Compliance Mode/Disabled)
+ *    - USB_PORT_FEAT_POWER: 开端口电源
+ *    - USB_PORT_FEAT_RESET: 触发端口热复位 (设置 PORT_RESET 位)
+ *    - USB_PORT_FEAT_BH_PORT_RESET: 触发端口暖复位 (USB3 特有)
+ *    - USB_PORT_FEAT_REMOTE_WAKE_MASK: 设置远程唤醒掩码
+ *    - USB_PORT_FEAT_U1_TIMEOUT/U2_TIMEOUT: 设置 U1/U2 超时 (USB3)
+ *    - USB_PORT_FEAT_TEST: 进入 USB2 测试模式
+ *
+ * 5. ClearPortFeature (0x04):
+ *    清除端口特性。支持的特性:
+ *    - USB_PORT_FEAT_SUSPEND: 恢复端口 (设 Resume 链路状态, 等待后改 U0)
+ *    - USB_PORT_FEAT_C_*: 清除端口变化位
+ *    - USB_PORT_FEAT_ENABLE: 禁用端口 (仅 USB2)
+ *    - USB_PORT_FEAT_POWER: 关端口电源
+ *    - USB_PORT_FEAT_TEST: 退出测试模式
+ *
+ * 参数:
+ * @hcd: USB HCD 实例
+ * @typeReq: 请求类型 (GetPortStatus/SetPortFeature/ClearPortFeature 等)
+ * @wValue: 请求参数 (如特性选择器)
+ * @wIndex: 端口号 (1 索引, 低字节) 或额外参数 (高字节)
+ * @buf: 数据缓冲区
+ * @wLength: 数据长度
+ *
+ * 返回值: 成功返回 0, 失败返回负的错误码 (-EPIPE 表示 stall)
+ *
+ * 锁: 函数获取并释放 xhci->lock (spin_lock_irqsave/spin_unlock_irqrestore),
+ *      但在某些操作中会临时释放锁 (如 ACPI 调用或 msleep 等待)
+ */
 int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 		u16 wIndex, char *buf, u16 wLength)
 {
@@ -1601,6 +1768,41 @@ error:
 }
 EXPORT_SYMBOL_GPL(xhci_hub_control);
 
+/*
+ * xhci_hub_status_data -- 根 HUB 状态轮询 (hc_driver->hub_status_data)
+ *
+ * 周期性地轮询根 HUB 的所有端口, 检查是否有状态变化需要 USB 核心处理。
+ * 此函数由 USB 核心的 hub_wq 内核线程定期调用 (通过 HCD 的 polling 机制),
+ * 用于实现热插拔检测和端口事件通知。
+ *
+ * 检查的事件包括:
+ * - PORT_CSC: 连接状态变化 (设备插入/拔出)
+ * - PORT_PEC: 端口使能状态变化
+ * - PORT_OCC: 过流状态变化
+ * - PORT_PLC: 端口链路状态变化 (如 U3->U0 恢复完成)
+ * - PORT_WRC: 暖复位完成 (USB3)
+ * - PORT_CEC: 配置错误 (USB3)
+ * - port_c_suspend: 软件维护的挂起变化位
+ * - resume_timestamp: USB2 端口恢复超时
+ *
+ * 此外, USB3 根 HUB 在启动后有一个宽限期 (run_graceperiod),
+ * 在此期间即使没有状态变化也返回非零值, 以确保链路训练完成的
+ * 设备能被 USB 核心发现。
+ *
+ * 轮询控制:
+ * - 如果有任何变化, 返回状态位图 (非零值) 并保持 HCD_FLAG_POLL_RH 标志
+ * - 如果没有变化且没有复位进行中, 清除 HCD_FLAG_POLL_RH 停止轮询
+ *
+ * 参数:
+ * @hcd: USB HCD 实例
+ * @buf: 输出缓冲区, 每个端口占 1 位 (位 n 对应端口 n+1),
+ *       大小 = (max_ports + 8) / 8 字节
+ *
+ * 返回值:
+ * - >0: 状态变化位图的字节数 (有变化)
+ * - 0: 无状态变化
+ * - 负值: 错误
+ */
 /*
  * Returns 0 if the status hasn't changed, or the number of bytes in buf.
  * Ports are 0-indexed from the HCD point of view,

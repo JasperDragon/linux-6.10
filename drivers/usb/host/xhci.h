@@ -9,6 +9,77 @@
  * Some code borrowed from the Linux EHCI driver.
  */
 
+/*
+ * =============================================================================
+ * xhci.h - XHCI (eXtensible Host Controller Interface) 主控器驱动主头文件
+ * =============================================================================
+ *
+ * 概述:
+ * ------
+ * XHCI (eXtensible Host Controller Interface) 是 USB 3.x / SuperSpeed 的
+ * 标准主机控制器接口规范，同时向后兼容 USB 2.0/1.1。本文件定义了 XHCI 硬件
+ * 相关的所有关键数据结构和常量，是 XHCI 驱动最核心的头文件。
+ *
+ * 一、TRB (Transfer Request Block) — 传输请求块
+ *     TRB 是 XHCI 的基本传输单元，固定 16 字节大小，由 4 个 32-bit 字段组成:
+ *       - Field 0-1 (64-bit): Data Buffer Pointer, 指向数据传输缓冲区
+ *       - Field 2 (32-bit): 状态/传输长度信息
+ *       - Field 3 (32-bit): 控制信息，包含 TRB 类型、Cycle 位等
+ *     TRB 类型包括:
+ *       - Normal TRB: 批量/中断/等时传输的数据 TRB
+ *       - Setup Stage TRB: 控制传输的设置阶段
+ *       - Data Stage TRB: 控制传输的数据阶段
+ *       - Status Stage TRB: 控制传输的状态阶段
+ *       - Link TRB: 连接 Transfer Ring 的不同 segment
+ *       - Event Data TRB: 携带额外事件数据
+ *       - No-Op TRB: 空操作
+ *     Completion Code (完成码) 表示 TRB 的执行结果:
+ *       - COMP_SUCCESS (1): 成功
+ *       - COMP_STALL_ERROR (6): 端点返回 STALL
+ *       - COMP_SHORT_PACKET (13): 短包 (实际数据少于期望)
+ *       - COMP_USB_TRANSACTION_ERROR (4): USB 事务错误
+ *       等等，详见 COMP_* 宏定义。
+ *
+ * 二、Transfer Ring — 传输环
+ *     Transfer Ring 是驱动与 HC 之间通信的循环队列:
+ *       - 驱动 (软件/HCD) 作为生产者，写入 TRB 到 Ring 中
+ *       - HC (硬件) 作为消费者，读取并执行 Ring 中的 TRB
+ *       - 每个 Ring 由多个 segment 组成，通过 Link TRB 连接成逻辑环
+ *       - Cycle State (toggle bit) 控制 TRB 的所有权: Cycle=1 表示 HC 拥有，
+ *         Cycle=0 表示驱动拥有。每次绕环一周 toggle 一次。
+ *
+ * 三、Event Ring — 事件环
+ *     HC 完成 TRB 处理后，将完成状态写入 Event Ring:
+ *       - Transfer Event: 数据传输完成事件
+ *       - Command Completion Event: 命令完成事件
+ *       - Port Status Change Event: 端口状态变化事件
+ *       - 等等
+ *     驱动从中读取事件，更新 URB 状态并唤醒等待的进程。
+ *
+ * 四、Device Context — 设备上下文
+ *     每个 USB 设备对应一个 Slot Context (槽上下文)，包含最多 31 个
+ *     Endpoint Context (端点上下文):
+ *       - Slot Context: 设备路由、速度、地址、状态等信息
+ *       - Endpoint Context: 端点类型、最大包长、Ring 基址、流信息等
+ *     DCBAA (Device Context Base Address Array) 是 HC 内部数组，
+ *     存放所有设备上下文的 DMA 地址。
+ *
+ * 五、关键寄存器
+ *     - Capability Registers (能力寄存器): HC 版本号、结构参数等只读信息
+ *     - Operational Registers (操作寄存器): 命令、状态、配置等运行时控制
+ *     - Runtime Registers (运行时寄存器): 微帧计数器、中断寄存器组
+ *     - Doorbell Array (门铃数组): 驱动通过写 Doorbell 通知 HC 处理新 TRB
+ *       每个端点对应一个 Doorbell，写 Doorbell 相当于"敲门"告诉 HC 有活要干。
+ *
+ * 六、Input/Output Context
+ *     - Input Context: 驱动发给 HC 的上下文变更请求
+ *     - Output Context: HC 执行命令后返回的上下文结果
+ *     通过 Address Device、Configure Endpoint 等命令来变更设备配置。
+ *
+ * 本文件中的数据结构与 xHCI 规范 (www.intel.com 提供) 第 5-6 章直接对应。
+ * =============================================================================
+ */
+
 #ifndef __LINUX_XHCI_HCD_H
 #define __LINUX_XHCI_HCD_H
 
@@ -76,11 +147,27 @@ struct xhci_cap_regs {
 };
 
 /*
- * struct xhci_port_regs - Host Controller USB Port Register Set. xHCI spec 5.4.8
- * @portsc:	Port Status and Control
- * @portpmsc:	Port Power Management Status and Control
- * @portli:	Port Link Info
- * @porthlmpc:	Port Hardware LPM Control
+ * struct xhci_port_regs - USB 端口寄存器组, xHCI 规范 5.4.8
+ *
+ * 每个 USB 端口 (包括 USB2 和 USB3) 对应一组端口寄存器:
+ *
+ * @portsc:      Port Status and Control (端口状态与控制)
+ *               包含连接状态、使能/禁用、复位、链路状态 (U0/U1/U2/U3)、
+ *               速度、电源控制、唤醒配置等。是所有端口寄存器中最核心的。
+ *               USB2 和 USB3 端口的 portsc 布局略有不同:
+ *               - USB2: 包含 PEC (端口使能变更) 等位
+ *               - USB3: 包含 WRC (预热复位完成) 等位
+ * @portpmsc:    Port Power Management Status and Control
+ *               (端口电源管理状态与控制) — LPM、U1/U2 超时等
+ * @portli:      Port Link Info (端口链路信息)
+ *               提供链路错误计数等调试信息
+ * @porthlmpc:   Port Hardware LPM Control
+ *               (端口硬件 LPM 控制) — 硬件辅助 LPM 配置
+ *
+ * 端口编号约定:
+ *   - hw_portnum: HC 硬件端口号 (从 1 开始)
+ *   - hcd_portnum: HCD 驱动端口号 (从 1 开始)
+ *   - USB2 和 USB3 端口共享同一编号空间，通过不同的根 Hub 访问
  */
 struct xhci_port_regs {
 	__le32	portsc;
@@ -288,11 +375,19 @@ struct xhci_run_regs {
 };
 
 /**
- * struct doorbell_array
+ * struct doorbell_array - XHCI Doorbell Array (门铃数组)
  *
- * Bits  0 -  7: Endpoint target
- * Bits  8 - 15: RsvdZ
- * Bits 16 - 31: Stream ID
+ * 门铃机制是 XHCI 的核心通知机制。驱动将一个 TRB 写入 Transfer Ring 后，
+ * 必须写对应端点的 Doorbell 寄存器来通知 HC 处理新 TRB。
+ *
+ * Doorbell 寄存器的位布局:
+ * Bits  0 -  7: Endpoint target (端点目标)
+ *               0 = Command Ring, 1-31 = EP0-EP30
+ * Bits  8 - 15: RsvdZ (保留)
+ * Bits 16 - 31: Stream ID (流 ID)
+ *
+ * Slot 0 的 Doorbell 用于通知 Command Ring，非 0 Slot 的 Doorbell
+ * 用于通知对应端点的 Transfer Ring。
  *
  * Section 5.6
  */
@@ -309,14 +404,25 @@ struct xhci_doorbell_array {
 #define PLT_ASYM_TX     (0x03 << 6)
 
 /**
- * struct xhci_container_ctx
- * @type: Type of context.  Used to calculated offsets to contained contexts.
- * @size: Size of the context data
- * @bytes: The raw context data given to HW
- * @dma: dma address of the bytes
+ * struct xhci_container_ctx - 设备上下文或输入上下文的容器
+ * @type: 上下文类型, 用于计算内部子上下文的偏移
+ *        XHCI_CTX_TYPE_DEVICE (0x1) = 输出上下文 (HC 返回给驱动)
+ *        XHCI_CTX_TYPE_INPUT  (0x2) = 输入上下文 (驱动发给 HC)
+ * @size: 上下文数据的总大小 (字节)
+ * @bytes: 指向原始上下文内存的指针，该内存直接暴露给硬件
+ * @dma: bytes 的 DMA 地址
  *
- * Represents either a Device or Input context.  Holds a pointer to the raw
- * memory used for the context (bytes) and dma address of it (dma).
+ * 每个上下文容器由以下部分按顺序组成:
+ *   1. Input Control Context (仅 Input Context 有) — 8 字节
+ *      指示哪些端点上下文被添加或删除
+ *   2. Slot Context — 32 或 64 字节
+ *      设备级别的信息: 路由、速度、地址、状态
+ *   3. Endpoint Context 0 .. 30 — 各 32 或 64 字节
+ *      每个端点的配置: 类型、Ring 地址、最大包长等
+ *
+ * 输入上下文 (Input Context) 是驱动发给 HC 的请求，告之想如何变更设备状态。
+ * 输出上下文 (Output Context/Device Context) 是 HC 维护的设备当前状态，
+ * 驱动可通过命令让 HC 更新该状态。
  */
 struct xhci_container_ctx {
 	unsigned type;
@@ -330,15 +436,28 @@ struct xhci_container_ctx {
 };
 
 /**
- * struct xhci_slot_ctx
- * @dev_info:	Route string, device speed, hub info, and last valid endpoint
- * @dev_info2:	Max exit latency for device number, root hub port number
- * @tt_info:	tt_info is used to construct split transaction tokens
- * @dev_state:	slot state and device address
+ * struct xhci_slot_ctx - Slot Context (槽上下文), XHCI 规范 6.2.1.1
  *
- * Slot Context - section 6.2.1.1.  This assumes the HC uses 32-byte context
- * structures.  If the HC uses 64-byte contexts, there is an additional 32 bytes
- * reserved at the end of the slot context for HC internal use.
+ * Slot Context 描述一个 USB 设备的全局属性。每个通过 Enable Slot 命令
+ * 分配的设备 Slot 都有一个对应的 Slot Context。它是设备上下文的第一个
+ * 部分，紧接着是 Endpoint Contexts。
+ *
+ * 上下文大小: 32 字节 (如果 HC 使用 64 字节上下文模式，则有额外 32 字节保留)
+ *
+ * @dev_info:   设备信息 — 包含 Route String (路由字符串，描述拓扑路径)、
+ *              设备速度、是否为 Hub、以及最后一个有效端点索引
+ * @dev_info2:  附加信息 — 最大退出延迟 MEL (Max Exit Latency, 单位 us)、
+ *              根 Hub 端口号、以及 Hub 设备的最大端口数
+ * @tt_info:    事务翻译器信息 — 用于构造 Split Transaction Token。
+ *              当 LS/FS 设备通过 HS Hub 连接时需要此信息。
+ *              TT Hub Slot ID、TT 端口号和 Hub 的 Think Time。
+ * @dev_state:  设备地址与状态 — 包含 HC 分配的 USB 设备地址 (8-bit)
+ *              和 Slot 状态机 (27:31 位)
+ *
+ * Slot State 状态转换:
+ *   DISABLED (0) -> DEFAULT (1) -> ADDRESSED (2) -> CONFIGURED (3)
+ *   Address Device 命令将状态从 DEFAULT 推进到 ADDRESSED
+ *   Configure Endpoint 命令将状态从 ADDRESSED 推进到 CONFIGURED
  */
 struct xhci_slot_ctx {
 	__le32	dev_info;
@@ -407,22 +526,31 @@ struct xhci_slot_ctx {
 #define SLOT_STATE_CONFIGURED	3
 
 /**
- * struct xhci_ep_ctx
- * @ep_info:	endpoint state, streams, mult, and interval information.
- * @ep_info2:	information on endpoint type, max packet size, max burst size,
- * 		error count, and whether the HC will force an event for all
- * 		transactions.
- * @deq:	64-bit ring dequeue pointer address.  If the endpoint only
- * 		defines one stream, this points to the endpoint transfer ring.
- * 		Otherwise, it points to a stream context array, which has a
- * 		ring pointer for each flow.
- * @tx_info:
- * 		Average TRB lengths for the endpoint ring and
- * 		max payload within an Endpoint Service Interval Time (ESIT).
+ * struct xhci_ep_ctx - Endpoint Context (端点上下文), XHCI 规范 6.2.1.2
  *
- * Endpoint Context - section 6.2.1.2.  This assumes the HC uses 32-byte context
- * structures.  If the HC uses 64-byte contexts, there is an additional 32 bytes
- * reserved at the end of the endpoint context for HC internal use.
+ * 每个 USB 端点 (除默认控制端点 EP0 外最多 30 个) 对应一个 Endpoint Context。
+ * 它描述端点的所有硬件属性，包括类型、传输配置、Ring 位置等。
+ *
+ * 上下文大小: 32 字节 (64 字节模式下额外 32 字节保留给 HC 内部使用)
+ *
+ * 与 USB 端点的关系:
+ *   EP Index 0 = EP0 (默认控制端点，双向)
+ *   EP Index 奇数 = OUT 端点
+ *   EP Index 偶数 = IN 端点
+ *   ep_index = (ep_id - 1), ep_id 范围 1-31
+ *
+ * @ep_info:    端点信息 — 包含端点状态 (0=禁用, 1=运行, 2=暂停, 3=停止, 4=错误)、
+ *              Mult/Max Burst 数、Max Primary Streams、Interval (服务间隔)
+ * @ep_info2:   附加信息 — 端点类型 (控制/批量/中断/等时+方向)、
+ *              Max Packet Size (最大包长)、Max Burst Size (最大突发)、
+ *              Error Count (错误重试次数)、Force Event 标志
+ * @deq:        64-bit Transfer Ring Dequeue Pointer (TR Dequeue 指针):
+ *              如果端点只定义了单个流，此指针直接指向传输 Ring；
+ *              如果定义了多个流，它指向 Stream Context Array，
+ *              数组中的每个条目包含一个流的 Ring 指针。
+ *              低 4 位包含 Cycle State 和 Stream Context Type。
+ * @tx_info:    传输信息 — Average TRB Length (平均 TRB 长度, 低 16 位)
+ *              和 Max ESIT Payload (每个服务间隔的最大负载量, 高 16 位)
  */
 struct xhci_ep_ctx {
 	__le32	ep_info;
@@ -732,40 +860,30 @@ struct xhci_interval_bw_table {
 
 #define EP_CTX_PER_DEV		31
 
+/*
+ * struct xhci_virt_device - XHCI 虚拟设备 (软件对 USB 设备的抽象)
+ *
+ * 每个通过 Enable Slot 命令分配的 USB 设备 Slot 对应一个虚拟设备。
+ * 它是驱动管理中最关键的软件结构之一，封装了一个 USB 设备的全部状态。
+ *
+ * @slot_id:    HC 分配的 Slot ID (1-255)，是设备的硬件标识
+ * @udev:       Linux USB 核心的 usb_device 结构
+ * @out_ctx:    输出上下文 (Device Context) — HC 维护的设备当前状态。
+ *              驱动通过 Address Device、Configure Endpoint 等命令
+ *              让 HC 更新此上下文。该内存由驱动分配，但内容由 HC 写入。
+ * @in_ctx:     输入上下文 (Input Context) — 驱动发给 HC 的变更请求。
+ *              包含 Input Control Context + 新的 Slot/EP Context。
+ *              如果命令失败，驱动可以保留旧的 out_ctx 来恢复状态。
+ * @eps[31]:    该设备的所有端点 (EP0 + 30 个通用端点)
+ * @rhub_port:  设备连接的根 Hub 端口
+ * @bw_table:   带宽信息表 (用于 SW 带宽检查)
+ * @tt_info:    事务翻译器信息 (LS/FS 设备通过 HS Hub 连接时使用)
+ * @flags:      设备状态标志
+ * @current_mel:当前使能的 USB3 链路状态最大退出延迟
+ * @debugfs_private: debugfs 接口的私有数据
+ * @sideband:   边带访问控制
+ */
 struct xhci_virt_device {
-	int				slot_id;
-	struct usb_device		*udev;
-	/*
-	 * Commands to the hardware are passed an "input context" that
-	 * tells the hardware what to change in its data structures.
-	 * The hardware will return changes in an "output context" that
-	 * software must allocate for the hardware.  We need to keep
-	 * track of input and output contexts separately because
-	 * these commands might fail and we don't trust the hardware.
-	 */
-	struct xhci_container_ctx       *out_ctx;
-	/* Used for addressing devices and configuration changes */
-	struct xhci_container_ctx       *in_ctx;
-	struct xhci_virt_ep		eps[EP_CTX_PER_DEV];
-	struct xhci_port		*rhub_port;
-	struct xhci_interval_bw_table	*bw_table;
-	struct xhci_tt_bw_info		*tt_info;
-	/*
-	 * flags for state tracking based on events and issued commands.
-	 * Software can not rely on states from output contexts because of
-	 * latency between events and xHC updating output context values.
-	 * See xhci 1.1 section 4.8.3 for more details
-	 */
-	unsigned long			flags;
-#define VDEV_PORT_ERROR			BIT(0) /* Port error, link inactive */
-
-	/* The current max exit latency for the enabled USB3 link states. */
-	u16				current_mel;
-	/* Used for the debugfs interfaces. */
-	void				*debugfs_private;
-	/* set if this endpoint is controlled via sideband access*/
-	struct xhci_sideband	*sideband;
-};
 
 /*
  * For each roothub, keep track of the bandwidth information for each periodic
@@ -806,6 +924,56 @@ struct xhci_device_context_array {
  */
 
 
+/*
+ * struct xhci_transfer_event - XHCI Transfer Event (传输完成事件)
+ *
+ * 当 HC 完成一个 TRB 的处理后，会写一个 Transfer Event 到 Event Ring。
+ * 驱动从中读取完成状态，并据此更新 URB 的状态。
+ *
+ * 事件字段:
+ * @buffer:      64-bit 缓冲区地址，或立即数据 (Immediate Data)
+ * @transfer_len:传输剩余长度/完成码 — 低 24 位是剩余字节数，
+ *               高 8 位是 Completion Code (完成码)
+ * @flags:       标志位 — 包含 Slot ID (24:31)、Endpoint ID (16:20) 和
+ *               Cycle bit (0) 等。根据 TRB 类型不同，部分字段含义不同。
+ *
+ * 常见的 Completion Code (完成码) 含义:
+ *   COMP_SUCCESS (1):       传输成功完成
+ *   COMP_SHORT_PACKET (13): 短包 (收到的数据少于期望值)
+ *   COMP_STALL_ERROR (6):   端点返回 STALL 握手
+ *   COMP_USB_TRANSACTION_ERROR (4): USB 事务错误 (CRC 错误等)
+ *   COMP_TRB_ERROR (5):     TRB 编程错误 (无效参数)
+ *   COMP_BABBLE_DETECTED_ERROR (3): 设备发言超时
+ *   COMP_RING_UNDERRUN (14): 等时 OUT 端点没有准备好数据
+ *   COMP_RING_OVERRUN (15):  等时 IN 端点来不及接收数据
+ *   COMP_MISSED_SERVICE_ERROR (23): 等时服务错过
+ *   COMP_CONTEXT_STATE_ERROR (19): 上下文状态错误
+ */
+/*
+ * struct xhci_transfer_event - XHCI Transfer Event (传输完成事件)
+ *
+ * 当 HC 完成一个 TRB 的处理后，会写一个 Transfer Event 到 Event Ring。
+ * 驱动从中读取完成状态，并据此更新 URB 的状态。
+ *
+ * 事件字段:
+ * @buffer:      64-bit 缓冲区地址，或立即数据 (Immediate Data)
+ * @transfer_len:传输剩余长度/完成码 — 低 24 位是剩余字节数，
+ *               高 8 位是 Completion Code (完成码)
+ * @flags:       标志位 — 包含 Slot ID (24:31)、Endpoint ID (16:20) 和
+ *               Cycle bit (0) 等。根据 TRB 类型不同，部分字段含义不同。
+ *
+ * 常见的 Completion Code (完成码) 含义:
+ *   COMP_SUCCESS (1):       传输成功完成
+ *   COMP_SHORT_PACKET (13): 短包 (收到的数据少于期望值)
+ *   COMP_STALL_ERROR (6):   端点返回 STALL 握手
+ *   COMP_USB_TRANSACTION_ERROR (4): USB 事务错误 (CRC 错误等)
+ *   COMP_TRB_ERROR (5):     TRB 编程错误 (无效参数)
+ *   COMP_BABBLE_DETECTED_ERROR (3): 设备发言超时
+ *   COMP_RING_UNDERRUN (14): 等时 OUT 端点没有准备好数据
+ *   COMP_RING_OVERRUN (15):  等时 IN 端点来不及接收数据
+ *   COMP_MISSED_SERVICE_ERROR (23): 等时服务错过
+ *   COMP_CONTEXT_STATE_ERROR (19): 上下文状态错误
+ */
 struct xhci_transfer_event {
 	/* 64-bit buffer address, or immediate data */
 	__le64	buffer;
@@ -1081,10 +1249,44 @@ enum xhci_setup_dev {
 #define TRB_CACHE_SIZE_HS	8
 #define TRB_CACHE_SIZE_SS	16
 
+/*
+ * struct xhci_generic_trb - 通用 TRB 结构
+ *
+ * TRB (Transfer Request Block) 是 XHCI 中最基本的传输单元，固定 16 字节。
+ * 所有类型的 TRB 共享此通用布局，通过 field[3] 的 TRB 类型字段来区分。
+ *
+ * 16 字节布局:
+ *   field[0] (32-bit): 数据缓冲区的低 32 位地址 (Data Buffer Pointer Lo)
+ *   field[1] (32-bit): 数据缓冲区的高 32 位地址 (Data Buffer Pointer Hi)
+ *   field[2] (32-bit): 状态/传输长度 (Status/Length)
+ *   field[3] (32-bit): 控制信息 (Control)
+ *                       bit 0:     Cycle bit (所有权位)
+ *                       bits 5:3:  TRB 类型
+ *                       bits 9:6:  各种控制标志
+ *                       bits 15:10: 中断目标
+ *
+ * Transfer Type (传输类型) 说明:
+ * - Control Transfer: 由 Setup + Data + Status 三个阶段 TRB 组成
+ * - Bulk Transfer: 使用 Normal TRB，大数据量非周期性传输
+ * - Interrupt Transfer: 使用 Normal TRB，周期性小数据量传输
+ * - Isochronous Transfer: 使用 Isoch TRB，周期性实时传输
+ */
 struct xhci_generic_trb {
 	__le32 field[4];
 };
 
+/*
+ * union xhci_trb - TRB 联合体，根据类型选择不同的解读方式
+ *
+ * 同一个 16 字节内存块可以根据 TRB 类型被解读为不同结构:
+ *   - 传输 TRB 可分为 Normal/Setup/Data/Status/Isoch/Link
+ *   - 事件 TRB 分为 Transfer Event / Command Completion Event / Port Status Change
+ *
+ * @link:       作为 Link TRB 时使用，链接不同 ring segment
+ * @trans_event:作为 Transfer Event (完成事件) 时使用
+ * @event_cmd:  作为 Command Completion Event 时使用
+ * @generic:    通用 4x32-bit 视图
+ */
 union xhci_trb {
 	struct xhci_link_trb		link;
 	struct xhci_transfer_event	trans_event;
@@ -1279,6 +1481,25 @@ static inline const char *xhci_trb_type_string(u8 type)
 #define xhci_for_each_ring_seg(head, seg) \
 	for (seg = head; seg != NULL; seg = (seg->next != head ? seg->next : NULL))
 
+/*
+ * struct xhci_segment - XHCI Ring Segment (环段)
+ *
+ * Transfer Ring 由多个 segment (段) 通过 Link TRB 连接成逻辑循环链表。
+ * 每个 segment 包含固定数量的 TRB (通常为 256 个，共 4KB)。
+ *
+ * 链式结构:
+ *   first_seg -> seg1 -> seg2 -> ... -> segN -> first_seg (循环)
+ *   最后一个 segment 的 Link TRB 指向第一个 segment，形成环。
+ *
+ * @trbs:       TRB 数组基址，每个 segment 包含 TRBS_PER_SEGMENT 个 TRB
+ * @next:       指向下一个 segment，最后一个 segment 的 next 指向 first_seg
+ * @num:        segment 在 ring 中的序号 (用于调试和追踪)
+ * @dma:        segment 的 DMA 地址 (硬件可见)
+ * @bounce_dma: 用于非对齐 TD 片段的最大包长弹跳缓冲区 DMA 地址
+ * @bounce_buf: 弹跳缓冲区的虚拟地址
+ * @bounce_offs:弹跳偏移量
+ * @bounce_len: 弹跳长度
+ */
 struct xhci_segment {
 	union xhci_trb		*trbs;
 	/* private to HCD */
@@ -1360,6 +1581,40 @@ static inline const char *xhci_ring_type_string(enum xhci_ring_type type)
 	return "UNKNOWN";
 }
 
+/*
+ * struct xhci_ring - XHCI Transfer Ring (传输环)
+ *
+ * Transfer Ring 是驱动 (软件) 和 HC (硬件) 之间传递传输请求的循环队列。
+ * 这是 XHCI 架构中最核心的数据结构之一。
+ *
+ * 工作原理:
+ *   1. 驱动将 TRB (传输请求块) 写入 Ring 的 enqueue 位置
+ *   2. 驱动写对应端点的 Doorbell 通知 HC
+ *   3. HC 从 dequeue 位置读取 TRB 并执行
+ *   4. HC 完成后写 Event Ring (事件环) 通知驱动
+ *
+ * Cycle State (循环状态位):
+ *   - 每个 TRB 的 bit 0 是 Cycle 位
+ *   - 驱动写入 TRB 时设置 cycle_state，HC 消费后翻转它
+ *   - 每次 Ring 绕完一圈 (通过 Link TRB 回到起点) 时，
+ *     cycle_state 翻转，从而区分新旧 TRB
+ *
+ * @first_seg:   Ring 的第一个 segment
+ * @last_seg:    Ring 的最后一个 segment (用于追加新 segment)
+ * @enqueue:     下一个空闲 TRB 的位置 (驱动写入位置)
+ * @enq_seg:     enqueue 所属的 segment
+ * @dequeue:     下一个待处理 TRB 的位置 (HC 读取位置 / 驱动已处理位置)
+ * @deq_seg:     dequeue 所属的 segment
+ * @td_list:     属于该 Ring 的所有 TD (Transfer Descriptor) 链表
+ * @cycle_state: 当前的 Cycle 状态 (0 或 1)，写入 TRB 时使用
+ * @stream_id:   该 Ring 关联的流 ID (0 = 非流)
+ * @num_segs:    segment 数量
+ * @num_trbs_free: 空闲 TRB 数量 (仅用于 DbC)
+ * @bounce_buf_len: 弹跳缓冲区长度
+ * @type:        Ring 类型 (CTRL/ISOC/BULK/INTR/STREAM/COMMAND/EVENT)
+ * @old_trb_comp_code: 旧的 TRB 完成码 (用于重试逻辑)
+ * @trb_address_map:  物理 TRB 地址到 segment 的映射 (用于流)
+ */
 struct xhci_ring {
 	struct xhci_segment	*first_seg;
 	struct xhci_segment	*last_seg;
@@ -1498,7 +1753,44 @@ struct xhci_hub {
 	u8			min_rev;
 };
 
-/* There is one xhci_hcd structure per controller */
+/*
+ * struct xhci_hcd - XHCI 主控制器结构体 (每个控制器一个实例)
+ *
+ * 这是 XHCI 驱动最核心的结构体，管理一个 xHC 硬件的全部状态。
+ * 包含寄存器映射、数据传输结构、设备管理、和中断处理等所有子系统。
+ *
+ * 内部架构概览:
+ *
+ * 一、寄存器映射 (Register Mappings):
+ *   @cap_regs:   Capability Registers (能力寄存器) — HC 版本、结构参数等只读信息
+ *   @op_regs:    Operational Registers (操作寄存器) — 命令/状态/配置/端口
+ *   @run_regs:   Runtime Registers (运行时寄存器) — 微帧计数器、中断寄存器组
+ *   @dba:        Doorbell Array (门铃数组) — 写门铃通知 HC 处理 TRB
+ *
+ * 二、数据传输结构 (Data Transfer):
+ *   @cmd_ring:   Command Ring — 驱动向 HC 发送命令的传输环
+ *                (如 Enable Slot, Address Device, Configure Endpoint 等)
+ *   @interrupters[]: 中断寄存器组 — 每个 MSI-X 向量对应一个 Event Ring
+ *   @dcbaa:      Device Context Base Address Array — HC 内部使用的设备
+ *                上下文 DMA 地址数组，每个 Slot 对应一个 64-bit 指针
+ *
+ * 三、设备管理 (Device Management):
+ *   @devs[]:     虚拟设备数组 — 软件对 USB 设备的抽象，每个 Slot 一个
+ *   @scratchpad: 暂存缓冲区 — HC 初始化时分配的 DMA 缓冲区，供 HC 内部使用
+ *   @hw_ports:   硬件端口数组 — 所有 USB2/USB3 端口的抽象
+ *   @usb2_rhub / @usb3_rhub: USB2 和 USB3 的根 Hub 信息
+ *
+ * 四、初始化流程:
+ *   1. 读取 cap_regs 获取 HC 能力 (hci_version, max_slots, max_ports)
+ *   2. 分配 DCBAA、Command Ring、Event Ring、Scratchpad
+ *   3. 写 op_regs 的 USBCMD 启动 HC
+ *   4. 中断使能后，HC 开始处理 Doorbell 和事件
+ *
+ * 五、quirk 机制:
+ *   @quirks: 64-bit 标志位，用于处理不同厂商 xHC 的硬件缺陷和行为差异。
+ *            Intel/NEC/AMD/MediaTek/Zhaoxin 等厂商都有对应的 quirk。
+ */
+ /* There is one xhci_hcd structure per controller */
 struct xhci_hcd {
 	struct usb_hcd *main_hcd;
 	struct usb_hcd *shared_hcd;

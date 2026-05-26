@@ -52,6 +52,45 @@
  *   endpoint rings; it generates events on the event ring for these.
  */
 
+/*
+ * xhci-ring.c -- XHCI Transfer Ring 和 Event Ring 操作实现
+ *
+ * 概述:
+ *   XHCI 使用 Ring (环) 作为驱动和硬件之间的通信通道。Ring 是一种
+ *   循环的 DMA 缓冲区, 由多个 Segment (段) 组成, 每个 Segment 包含
+ *   固定数量的 TRB (Transfer Request Block, 传输请求块)。
+ *
+ * 三种 Ring:
+ *   1. Command Ring: 驱动向 HC 发送命令 (生产者=驱动, 消费者=HC)
+ *   2. Transfer Ring: 驱动向 HC 提交数据传输请求 (生产者=驱动, 消费者=HC)
+ *      每个端点 (Endpoint) 拥有自己的 Transfer Ring
+ *   3. Event Ring: HC 向驱动报告事件 (生产者=HC, 消费者=驱动)
+ *
+ * 核心数据传输流程:
+ *   URB 入队 -> xhci_urb_enqueue -> queue_xxx_tx ->
+ *   prepare_transfer (准备传输) -> queue_trb (入队 TRB) ->
+ *   inc_enq (推进入队指针) -> Doorbell (通知 HC)
+ *
+ * 事件处理流程:
+ *   xhci_irq -> xhci_handle_events -> xhci_handle_event_trb ->
+ *   handle_cmd_completion (命令完成) / handle_tx_event (传输完成) ->
+ *   inc_deq (推进事件环出队指针)
+ *
+ * Ring 核心机制:
+ *   - 入队:   inc_enq() / inc_enq_past_link() 推进生产者指针
+ *   - 出队:   inc_deq() 推进消费者指针
+ *   - Cycle Bit: 轮流使用, 区分驱动和 HC 拥有的 TRB
+ *   - Link TRB: 连接不同 Segment, 实现环状结构
+ *   - Segment 扩展: 当环空间不足时动态添加 Segment
+ *
+ * 关键函数:
+ *   - prepare_transfer:   准备一次传输 (构建 TD, 链接到 URB)
+ *   - queue_trb:          入队单个 TRB (写寄存器, 推进 enqueue)
+ *   - prepare_ring:       检查环状态, 必要时扩展
+ *   - handle_cmd_completion: 命令完成事件处理 (分派各命令处理器)
+ *   - handle_tx_event:    传输完成事件处理 (匹配 TD, 设置状态, giveback)
+ *   - inc_enq / inc_deq:  入队/出队指针推进 (含 cycle bit 翻转)
+ */
 #include <linux/jiffies.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
@@ -182,6 +221,24 @@ static void next_trb(struct xhci_segment **seg,
 
 /*
  * See Cycle bit rules. SW is the consumer for the event ring only.
+ *
+ * inc_deq -- Ring 出队指针推进
+ * 功能: 将 Ring 的出队指针 (dequeue) 向前移动一个 TRB 位置。
+ *       根据消费者规则, 当消费完一个 TRB 后需要推进出队指针。
+ *       对于不同 Ring 类型, 行为有所不同:
+ *
+ * Event Ring (HC 是生产者, 驱动是消费者):
+ *   - Event Ring 没有 Link TRB, 只检查是否是 segment 最后一个 TRB
+ *   - 如果是最后一个 TRB, 翻转 cycle_state (表示进入下一个 segment)
+ *   - 推进到下一个 segment 的起始位置
+ *
+ * Command/Transfer Ring (驱动是生产者, HC 是消费者):
+ *   - 跳过 Link TRB (Link TRB 是内部连接, 不是有效数据 TRB)
+ *   - 遇到 Link TRB 时: 调整 deq_seg 指向下一个 segment
+ *   - 可能连续跳过多个 Link TRB (环形闭环保护: 最多跳 num_segs 次)
+ *   - 不会翻转 cycle_state (cycle 翻转由 inc_enq 或硬件控制)
+ *
+ * 注意: 此函数不检查是否超出有效范围, 调用者需确保操作合法
  */
 void inc_deq(struct xhci_hcd *xhci, struct xhci_ring *ring)
 {
@@ -228,6 +285,19 @@ void inc_deq(struct xhci_hcd *xhci, struct xhci_ring *ring)
 /*
  * If enqueue points at a link TRB, follow links until an ordinary TRB is reached.
  * Toggle the cycle bit of passed link TRBs and optionally chain them.
+ *
+ * inc_enq_past_link -- 跳过 Link TRB, 推进入队指针到下一个有效 TRB
+ * 功能: 当入队指针指向 Link TRB 时, 沿着链接链前进直到遇到普通 TRB。
+ *       在 XHCI 中, Ring 由多个 Segment 通过 Link TRB 连接而成,
+ *       当 enqueue 到达 segment 边界时需要跨过 Link TRB。
+ * 流程:
+ *   1. 如果启用了 link_chain_quirk (0.95 规范), 保持 chain 位不变
+ *   2. 否则, 根据调用者需求设置/清除 chain 位
+ *   3. 写内存屏障 (wmb) 确保 TRB 写入对 HC 可见
+ *   4. 翻转 Link TRB 的 cycle bit (将 TRB 交给 HC)
+ *   5. 如果 Link TRB 设置了 toggle 位, 翻转 ring 的 cycle_state
+ *   6. 移动到下一个 segment 的第一个 TRB
+ *   7. 环形闭环保护: 最多遍历 num_segs 次, 防止无限循环
  */
 static void inc_enq_past_link(struct xhci_hcd *xhci, struct xhci_ring *ring, u32 chain)
 {
@@ -279,6 +349,20 @@ static void inc_enq_past_link(struct xhci_hcd *xhci, struct xhci_ring *ring, u32
  *
  * @more_trbs_coming:	Will you enqueue more TRBs before calling
  *			prepare_transfer()?
+ *
+ * inc_enq -- Ring 入队指针推进 (生产者指针移动)
+ * 功能: 在 queue_trb 写入 TRB 后, 将入队指针 (enqueue) 向前移动一个位置。
+ *       这是 XHCI 环操作中最核心的函数之一。
+ * 行为:
+ *   1. 如果当前 TRB 设置了 CHAIN 位 (在 TD 中间), 或者 more_trbs_coming
+ *      为 true, 则立即处理 Link TRB 跳转 (inc_enq_past_link)
+ *   2. 否则, enqueue 可以停在 Link TRB 位置, 延迟到下一次 prepare_ring
+ *      再处理, 这可以避免 enqueue 进入 deq_seg 并简化环扩展逻辑
+ *   3. Cycle bit 的处理: 初始写入时已设置, 在 inc_enq_past_link
+ *      中处理 Link TRB 的 cycle 翻转
+ * 安全保护:
+ *   - 确保 enqueue 不会越过 segment 边界 (否则视为错误)
+ *   - 环形闭环保护 (在 inc_enq_past_link 中)
  */
 static void inc_enq(struct xhci_hcd *xhci, struct xhci_ring *ring,
 			bool more_trbs_coming)
@@ -1792,6 +1876,35 @@ time_out_completed:
 	return;
 }
 
+/*
+ * handle_cmd_completion -- 命令完成事件处理
+ * 功能: 处理 HC 上报的命令完成事件 (TRB_COMPLETION)。
+ *       HC 在执行完 Command Ring 上的一个命令后, 在 Event Ring
+ *       上产生一个命令完成事件, 驱动需要匹配事件与命令并处理结果。
+ * 事件校验:
+ *   1. 检查 slot_id 有效性
+ *   2. 获取事件中的命令 TRB DMA 地址
+ *   3. 检查 DMA 地址是否匹配命令环 dequeue 指针
+ *      (使用 cmd_dequeue_dma 验证事件与命令的对应关系)
+ * 特殊码处理:
+ *   - COMP_COMMAND_RING_STOPPED: 命令环已停止, 完成等待
+ *   - COMP_COMMAND_ABORTED: 命令被中止, 检查命令状态
+ * 命令分派 (根据 TRB 类型):
+ *   - TRB_ENABLE_SLOT -> xhci_handle_cmd_enable_slot
+ *   - TRB_DISABLE_SLOT -> xhci_handle_cmd_disable_slot
+ *   - TRB_CONFIG_EP -> xhci_handle_cmd_config_ep
+ *   - TRB_ADDR_DEV -> xhci_handle_cmd_addr_dev
+ *   - TRB_STOP_RING -> xhci_handle_cmd_stop_ep
+ *   - TRB_SET_DEQ -> xhci_handle_cmd_set_deq
+ *   - TRB_RESET_EP -> xhci_handle_cmd_reset_ep
+ *   - TRB_RESET_DEV -> xhci_handle_cmd_reset_dev
+ *   - 其他: 记录日志
+ * 后处理:
+ *   - 更新 current_cmd 指针
+ *   - 如果队列中还有命令, 重新启动定时器
+ *   - 调用 xhci_complete_del_and_free_cmd 完成并释放命令
+ *   - inc_deq 推进命令环出队指针
+ */
 static void handle_cmd_completion(struct xhci_hcd *xhci,
 		struct xhci_event_cmd *event)
 {
@@ -2629,6 +2742,34 @@ static bool xhci_spurious_success_tx_event(struct xhci_hcd *xhci,
  * If this function returns an error condition, it means it got a Transfer
  * event with a corrupted Slot ID, Endpoint ID, or TRB DMA address.
  * At this point, the host controller is probably hosed and should be reset.
+ *
+ * handle_tx_event -- 传输完成事件处理 (XHCI 最重要的中断处理函数)
+ * 功能: 处理 HC 上报的传输完成事件 (TRB_TRANSFER)。
+ *       HC 完成一个 TRB 的执行后, 在 Event Ring 上产生传输事件,
+ *       驱动需要匹配事件到原始 URB, 更新状态并回传给 USB core。
+ * 入口检查:
+ *   1. 提取 slot_id, ep_index, TRB DMA 地址, completion code
+ *   2. 检查端点有效性 (get_virt_ep)
+ *   3. 检查端点状态 (DISABLED 则报错)
+ * 完成码处理:
+ *   - COMP_SUCCESS: 成功, 检查是否有 short packet
+ *   - COMP_SHORT_PACKET: short packet (数据量少于预期)
+ *   - COMP_STOPPED*: 端点被停止 (如 URB 取消)
+ *   - COMP_STALL_ERROR: 端点 STALL -> -EPIPE
+ *   - COMP_*_ERROR: 各种传输错误 -> -EPROTO/-EOVERFLOW/-EILSEQ
+ *   - COMP_RING_UNDERRUN/OVERRUN: 等时环空/满事件
+ *   - COMP_MISSED_SERVICE_ERROR: 等时服务间隔错过
+ * TD 匹配:
+ *   1. 检查事件 TRB 是否在环的 TD 列表中
+ *   2. 如果不在当前 TD 且 ep->skip 设置, 跳过等时 TD
+ *   3. 循环直到找到匹配的 TD
+ * 完成处理 (根据端点类型):
+ *   - 控制端点: process_ctrl_td
+ *   - 等时端点: process_isoc_td
+ *   - 批量/中断: process_bulk_intr_td
+ * 最终操作:
+ *   - 更新 URB 的 status 和 actual_length
+ *   - usb_hcd_giveback_urb 将 URB 回传给 USB core
  */
 static int handle_tx_event(struct xhci_hcd *xhci,
 			   struct xhci_interrupter *ir,
@@ -3234,6 +3375,22 @@ EXPORT_SYMBOL_GPL(xhci_msi_irq);
  *
  * @more_trbs_coming:	Will you enqueue more TRBs before calling
  *			prepare_transfer()?
+ *
+ * queue_trb -- 入队单个 TRB 到 Ring
+ * 功能: 将四个 32-bit 字写入当前 enqueue 指针指向的 TRB 槽位,
+ *       然后推进 enqueue 指针。这是 XHCI 驱动中最基础的数据写入函数。
+ * 写入顺序 (重要):
+ *   1. 先写 field[0], field[1], field[2] (数据字段)
+ *   2. wmb() 写内存屏障, 确保数据在 field[3] 之前写入
+ *   3. 最后写 field[3] (包含 Cycle Bit 和 TRB 类型)
+ * 原因: field[3] 的 Cycle Bit 标志着这个 TRB 对 HC "可见"。
+ *       必须在其他字段完全写入后再设置 cycle bit, 避免 HC 读到
+ *       不完整的 TRB 数据。
+ * 后续操作:
+ *   - 调用 inc_enq 推进 enqueue 指针 (可能跨 Link TRB)
+ *   - 如果 more_trbs_coming, inc_enq 会立即处理 Link TRB 跳转
+ *
+ * 调用者需保证 Ring 有足够的空间 (通过 prepare_ring 检查)
  */
 static void queue_trb(struct xhci_hcd *xhci, struct xhci_ring *ring,
 		bool more_trbs_coming,
@@ -3258,6 +3415,22 @@ static void queue_trb(struct xhci_hcd *xhci, struct xhci_ring *ring,
 /*
  * Does various checks on the endpoint ring, and makes it ready to queue num_trbs.
  * expand ring if it start to be full.
+ *
+ * prepare_ring -- 准备 Ring 以供队列 TRB
+ * 功能: 在执行 TRB 入队之前检查 Ring 的状态, 确保有足够的空间。
+ *       如果空间不足, 尝试扩展 Ring (添加新的 Segment)。
+ * 流程:
+ *   1. 检查端点状态:
+ *      - EP_STATE_DISABLED: 端点未启用, 返回错误
+ *      - EP_STATE_ERROR: 端点错误, 等待清除
+ *      - EP_STATE_HALTED: 端点已停止, 仍允许入队 (警告)
+ *      - EP_STATE_STOPPED / RUNNING: 正常状态
+ *   2. 检查是否需要 Ring 扩展:
+ *      - 非命令环: xhci_ring_expansion_needed 检查
+ *      - 命令环: 不支持扩展, 空间不足直接返回错误
+ *   3. 如果 enqueue 当前在 Link TRB 上, 调用 inc_enq_past_link 跳过
+ *   4. 检查 enqueue 是否在 segment 末尾 (缺少 Link TRB 则报错)
+ * 返回值: 0 = 就绪, 负值 = 错误
  */
 static int prepare_ring(struct xhci_hcd *xhci, struct xhci_ring *ep_ring,
 		u32 ep_state, unsigned int num_trbs, gfp_t mem_flags)
@@ -3321,6 +3494,28 @@ static int prepare_ring(struct xhci_hcd *xhci, struct xhci_ring *ep_ring,
 	return 0;
 }
 
+/*
+ * prepare_transfer -- 准备一次传输: 构建 TD 并链接到 URB
+ * 功能: 为 URB 构建传输描述符 (TD) 并链接到端点环的 TD 列表。
+ *       在 queue_trb 之前调用, 设置 TD 的起始位置以便后续 TRB 写入。
+ * 参数:
+ *   @xdev:      目标 XHCI 虚拟设备
+ *   @ep_index:  端点索引
+ *   @stream_id: 流 ID (非流端点时为 0)
+ *   @num_trbs:  本次传输需要的 TRB 数量
+ *   @urb:       USB 请求块
+ *   @td_index:  TD 在 urb_priv 数组中的索引
+ *   @mem_flags: 内存分配标志
+ * 流程:
+ *   1. xhci_triad_to_transfer_ring 获取端点传输环
+ *   2. prepare_ring 检查环状态并确保有足够空间
+ *   3. 初始化 TD 列表头
+ *   4. 如果是第一个 TD (td_index == 0), 将 URB 链接到端点
+ *   5. 将 TD 添加到环的 TD 列表尾部
+ *   6. 记录 TD 的起始 segment 和 TRB 指针 (后续 TRB 入队的起始位置)
+ * 返回值: 0 = 成功, 负值 = 失败
+ * 注意: 本函数只准备 TD 结构, 实际的 TRB 写入由后续 queue_trb 完成
+ */
 static int prepare_transfer(struct xhci_hcd *xhci,
 		struct xhci_virt_device *xdev,
 		unsigned int ep_index,
