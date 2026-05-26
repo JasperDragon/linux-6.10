@@ -271,7 +271,6 @@ config SUNVDC
 	  Support for virtual disk devices as a client under Sun
 	  Logical Domains.
 
-source "drivers/s390/block/Kconfig"
 
 config XEN_BLKDEV_FRONTEND
 	tristate "Xen virtual block device support"

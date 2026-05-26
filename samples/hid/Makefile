@@ -35,6 +35,8 @@ endif
 ifeq ($(ARCH), mips)
 TPROGS_CFLAGS += -D__SANE_USERSPACE_TYPES__
 ifdef CONFIG_MACH_LOONGSON64
+BPF_EXTRA_CFLAGS += -I$(srctree)/arch/mips/include/asm/mach-loongson64
+BPF_EXTRA_CFLAGS += -I$(srctree)/arch/mips/include/asm/mach-generic
 endif
 endif
 

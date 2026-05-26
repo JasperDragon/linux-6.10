@@ -56,20 +56,6 @@ depends on ARM || ARM64
 source "drivers/cpuidle/Kconfig.arm"
 endmenu
 
-menu "MIPS CPU Idle Drivers"
-depends on MIPS
-source "drivers/cpuidle/Kconfig.mips"
-endmenu
-
-menu "POWERPC CPU Idle Drivers"
-depends on PPC
-source "drivers/cpuidle/Kconfig.powerpc"
-endmenu
-
-menu "RISC-V CPU Idle Drivers"
-depends on RISCV
-source "drivers/cpuidle/Kconfig.riscv"
-endmenu
 
 config HALTPOLL_CPUIDLE
 	tristate "Halt poll cpuidle driver"

@@ -756,6 +756,8 @@ static const char *const section_white_list[] =
 	".note*",
 	".got*",
 	".toc*",
+	".xt.prop",				 /* xtensa */
+	".xt.lit",         /* xtensa */
 	".arcextmap*",			/* arc */
 	".gnu.linkonce.arcext*",	/* arc : modules */
 	".cmem*",			/* EZchip */

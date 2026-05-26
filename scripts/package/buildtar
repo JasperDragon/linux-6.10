@@ -53,7 +53,40 @@ cp -v -- "${objtree}/vmlinux" "${tmpdir}/boot/vmlinux-${KERNELRELEASE}"
 #
 # Install arch-specific kernel image(s)
 #
+# Note:
+#   mips and arm64 copy the first image found. This may not produce the desired
+#   outcome because it may pick up a stale file remaining in the build tree.
+#
 case "${ARCH}" in
+	alpha)
+		cp -v -- "${objtree}/arch/alpha/boot/vmlinux.gz" "${tmpdir}/boot/vmlinuz-${KERNELRELEASE}"
+		;;
+	parisc*)
+		cp -v -- "${KBUILD_IMAGE}" "${tmpdir}/boot/vmlinux-${KERNELRELEASE}"
+		[ -f "${objtree}/lifimage" ] && cp -v -- "${objtree}/lifimage" "${tmpdir}/boot/lifimage-${KERNELRELEASE}"
+		;;
+	mips)
+		# Please note the following code may copy a stale file.
+		if [ -f "${objtree}/arch/mips/boot/compressed/vmlinux.bin" ]; then
+			cp -v -- "${objtree}/arch/mips/boot/compressed/vmlinux.bin" "${tmpdir}/boot/vmlinuz-${KERNELRELEASE}"
+		elif [ -f "${objtree}/arch/mips/boot/compressed/vmlinux.ecoff" ]; then
+			cp -v -- "${objtree}/arch/mips/boot/compressed/vmlinux.ecoff" "${tmpdir}/boot/vmlinuz-${KERNELRELEASE}"
+		elif [ -f "${objtree}/arch/mips/boot/compressed/vmlinux.srec" ]; then
+			cp -v -- "${objtree}/arch/mips/boot/compressed/vmlinux.srec" "${tmpdir}/boot/vmlinuz-${KERNELRELEASE}"
+		elif [ -f "${objtree}/vmlinux.32" ]; then
+			cp -v -- "${objtree}/vmlinux.32" "${tmpdir}/boot/vmlinux-${KERNELRELEASE}"
+		elif [ -f "${objtree}/vmlinux.64" ]; then
+			cp -v -- "${objtree}/vmlinux.64" "${tmpdir}/boot/vmlinux-${KERNELRELEASE}"
+		elif [ -f "${objtree}/arch/mips/boot/vmlinux.bin" ]; then
+			cp -v -- "${objtree}/arch/mips/boot/vmlinux.bin" "${tmpdir}/boot/vmlinux-${KERNELRELEASE}"
+		elif [ -f "${objtree}/arch/mips/boot/vmlinux.ecoff" ]; then
+			cp -v -- "${objtree}/arch/mips/boot/vmlinux.ecoff" "${tmpdir}/boot/vmlinux-${KERNELRELEASE}"
+		elif [ -f "${objtree}/arch/mips/boot/vmlinux.srec" ]; then
+			cp -v -- "${objtree}/arch/mips/boot/vmlinux.srec" "${tmpdir}/boot/vmlinux-${KERNELRELEASE}"
+		elif [ -f "${objtree}/vmlinux" ]; then
+			cp -v -- "${objtree}/vmlinux" "${tmpdir}/boot/vmlinux-${KERNELRELEASE}"
+		fi
+		;;
 	arm64)
 		# Please note the following code may copy a stale file.
 		for i in Image.bz2 Image.gz Image.lz4 Image.lzma Image.lzo vmlinuz.efi ; do
@@ -62,6 +95,14 @@ case "${ARCH}" in
 				break
 			fi
 		done
+		;;
+	riscv)
+		case "${KBUILD_IMAGE##*/}" in
+			Image.*|vmlinuz.efi)
+				cp -v -- "${KBUILD_IMAGE}" "${tmpdir}/boot/vmlinuz-${KERNELRELEASE}";;
+			*)
+				cp -v -- "${KBUILD_IMAGE}" "${tmpdir}/boot/vmlinux-${KERNELRELEASE}";;
+		esac
 		;;
 	*)
 		cp -v -- "${KBUILD_IMAGE}" "${tmpdir}/boot/vmlinuz-${KERNELRELEASE}"

@@ -17,12 +17,14 @@ binutils)
 	echo 2.30.0
 	;;
 gcc)
+	if [ "$ARCH" = parisc64 ]; then
 		echo 12.0.0
 	else
 		echo 8.1.0
 	fi
 	;;
 llvm)
+	if [ "$SRCARCH" = loongarch ]; then
 		echo 18.0.0
 	else
 		echo 15.0.0

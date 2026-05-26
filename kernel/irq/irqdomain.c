@@ -33,6 +33,12 @@
  *   每个层级都是一个 irq_domain, 通过 parent 指针串联。
  *   分配 Linux IRQ 号时, 从根 domain 开始逐层分配和配置。
  */
+#include <linux/acpi.h>
+#include <linux/debugfs.h>
+#include <linux/hardirq.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irqdesc.h>
 #include <linux/irqdomain.h>
 #include <linux/module.h>
 #include <linux/mutex.h>

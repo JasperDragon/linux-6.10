@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
 #
 # This file contains the system call numbers for all of the
+# more recently added architectures.
 #
 # As a basic principle, no duplication of functionality
 # should be added, e.g. we don't use lseek when llseek
+# is present. New architectures should use this file
 # and implement the less feature-full calls in user space.
 #
 0	common	io_setup			sys_io_setup			compat_sys_io_setup

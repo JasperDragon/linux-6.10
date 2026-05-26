@@ -112,6 +112,14 @@ int main(void)
 	DEVID(eisa_device_id);
 	DEVID_FIELD(eisa_device_id, sig);
 
+	DEVID(parisc_device_id);
+	DEVID_FIELD(parisc_device_id, hw_type);
+	DEVID_FIELD(parisc_device_id, hversion);
+	DEVID_FIELD(parisc_device_id, hversion_rev);
+	DEVID_FIELD(parisc_device_id, sversion);
+
+	DEVID(sdio_device_id);
+	DEVID_FIELD(sdio_device_id, class);
 	DEVID_FIELD(sdio_device_id, vendor);
 	DEVID_FIELD(sdio_device_id, device);
 

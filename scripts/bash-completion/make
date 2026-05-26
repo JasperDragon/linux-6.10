@@ -58,6 +58,7 @@ __kbuild_handle_variable()
 		# sub-directories under arch/
 		keywords+=($(find "${srctree}/arch" -mindepth 1 -maxdepth 1 -type d -printf '%P\n'))
 		# architectures hard-coded in the top Makefile
+		keywords+=(i386 x86_64 sparc32 sparc64 parisc64)
 		;;
 	CROSS_COMPILE)
 		# toolchains with a full path
@@ -210,10 +211,22 @@ __kbuild_get_srcarch()
 		case ${uname_m} in
 		arm64 | aarch64*) arch=arm64 ;;
 		arm* | sa110)     arch=arm ;;
+		i?86 | x86_64)    arch=x86 ;;
+		loongarch*)       arch=loongarch ;;
+		mips*)            arch=mips ;;
+		ppc*)             arch=powerpc ;;
+		riscv*)           arch=riscv ;;
+		s390x)            arch=s390 ;;
+		sh[234]*)         arch=sh ;;
+		sun4u)            arch=sparc64 ;;
+		*)                arch=${uname_m} ;;
 		esac
 	fi
 
 	case ${arch} in
+		parisc64)          srcarch=parisc ;;
+		sparc32 | sparc64) srcarch=sparc ;;
+		i386 | x86_64)     srcarch=x86 ;;
 		*)                 srcarch=${arch} ;;
 	esac
 

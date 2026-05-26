@@ -10,3 +10,4 @@ hostfs-builtin-$(CONFIG_HOSTFS) += hostfs_user.o hostfs_user_exp.o
 obj-y := $(hostfs-builtin-y) $(hostfs-builtin-m)
 obj-$(CONFIG_HOSTFS) += hostfs.o
 
+include $(srctree)/arch/um/scripts/Makefile.rules

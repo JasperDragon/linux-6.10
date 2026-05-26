@@ -29,7 +29,6 @@
  *   传递 "noirqdebug" 可禁用伪中断检测,
  *   在某些已知有噪音但无害的硬件上使用。
  */
- */
 
 #include <linux/jiffies.h>
 #include <linux/irq.h>

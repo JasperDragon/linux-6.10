@@ -65,7 +65,7 @@ u64 mmu_enabled_at_boot __initdata;
 /*
  * 标准内存资源描述
  *
- * setup_arch() 走到后半段时，会把“内核代码段 / 内核数据段 / 系统 RAM / reserved”
+ * setup_arch() 走到后半段时，会把"内核代码段 / 内核数据段 / 系统 RAM / reserved"
  * 这些资源注册进 iomem_resource，供后续 /proc/iomem 和资源冲突检查使用。
  */
 static struct resource mem_res[] = {
@@ -96,7 +96,7 @@ void __init smp_setup_processor_id(void)
 {
 	u64 mpidr = read_cpuid_mpidr() & MPIDR_HWID_BITMASK;
 
-	/* 在 boot CPU 上最早建立“逻辑 CPU 0 -> 物理 MPIDR”的映射关系。
+	/* 在 boot CPU 上最早建立"逻辑 CPU 0 -> 物理 MPIDR"的映射关系。
 	 * 这是后续 SMP、IPI、CPU 拓扑和热插拔路径的基础。
 	 */
 	set_cpu_logical_map(0, mpidr);
@@ -238,7 +238,7 @@ static void __init request_standard_resources(void)
 	res_size = num_standard_resources * sizeof(*standard_resources);
 	standard_resources = memblock_alloc_or_panic(res_size, SMP_CACHE_BYTES);
 
-	/* 再把 memblock 当前认定的所有内存区，按“System RAM / reserved”注册到 iomem 树。 */
+	/* 再把 memblock 当前认定的所有内存区，按"System RAM / reserved"注册到 iomem 树。 */
 	for_each_mem_region(region) {
 		res = &standard_resources[i++];
 		if (memblock_is_nomap(region)) {
@@ -261,7 +261,7 @@ static int __init reserve_memblock_reserved_regions(void)
 {
 	u64 i, j;
 
-	/* 该步骤把 memblock 级别的“reserved”概念同步细化进 iomem resource 树。
+	/* 该步骤把 memblock 级别的"reserved"概念同步细化进 iomem resource 树。
 	 * 这样用户态看到的不只是大块 System RAM，而是已经扣除了保留区的资源分裂结果。
 	 */
 	for (i = 0; i < num_standard_resources; ++i) {
@@ -299,8 +299,8 @@ u64 cpu_logical_map(unsigned int cpu)
  * setup_arch() — ARM64 架构初始化主入口。
  *
  * 这是 start_kernel() 回调的第一个架构级钩子，也是整个内核启动链路中
- * 最重要的架构函数之一。它的职责是把”汇编刚跳进 C 代码、只有最小页表和
- * FDT 指针”的早期状态，逐步建立为”通用内核可理解的完整平台描述”。
+ * 最重要的架构函数之一。它的职责是把"汇编刚跳进 C 代码、只有最小页表和
+ * FDT 指针"的早期状态，逐步建立为"通用内核可理解的完整平台描述"。
  *
  * 整个函数可以按依赖关系划分为七个阶段，阶段之间有严格的先后顺序：
  *
@@ -363,7 +363,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 *   - 没有 ioremap，无法访问 MMIO
 	 *   - 没有 memblock 视图，不知道系统有多少内存
 	 *
-	 * 本阶段的每个步骤都在”能做的事情极其有限”的前提下，
+	 * 本阶段的每个步骤都在"能做的事情极其有限"的前提下，
 	 * 逐步扩大内核的能力边界。
 	 */
 
@@ -423,14 +423,14 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	/*
 	 * 1.6 通过 FDT 接入平台信息。
 	 *
-	 * 这是 ARM64 启动中第一个”信息大入口”：
+	 * 这是 ARM64 启动中第一个"信息大入口"：
 	 *   - 用 fixmap_remap_fdt() 把 FDT 物理地址映射到 fixmap 虚拟窗口
 	 *   - early_init_dt_scan() 解析 /chosen (bootargs, initrd, ...)
 	 *   - 解析 /memory 节点 → 填充 memblock (memblock_add)
 	 *   - 解析 /reserved-memory → 标记保留区
 	 *   - 提取 machine model name
 	 *
-	 * 完成后 memblock 中已经有”物理内存的原始视图”，
+	 * 完成后 memblock 中已经有"物理内存的原始视图"，
 	 * 但尚未进行裁剪和对齐调整（那是 arm64_memblock_init 的工作）。
 	 */
 	setup_machine_fdt(__fdt_pointer);
@@ -528,9 +528,9 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 */
 	if (!efi_enabled(EFI_BOOT)) {
 		if ((u64)_text % MIN_KIMG_ALIGN)
-			pr_warn(FW_BUG “Kernel image misaligned at boot, please fix your bootloader!”);
+			pr_warn(FW_BUG "Kernel image misaligned at boot, please fix your bootloader!");
 		WARN_TAINT(mmu_enabled_at_boot, TAINT_FIRMWARE_WORKAROUND,
-			   FW_BUG “Booted with MMU enabled!”);
+			   FW_BUG "Booted with MMU enabled!");
 	}
 
 	/*
@@ -542,7 +542,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 *   - arm64_memblock_init() 对原始物理内存视图进行 ARM64 特定的裁剪
 	 *   - paging_init() 建立正式的 swapper_pg_dir 页表和线性映射
 	 *
-	 * 完成本阶段后，内核才真正拥有了”完整可用的内存管理基础设施”。
+	 * 完成本阶段后，内核才真正拥有了"完整可用的内存管理基础设施"。
 	 */
 
 	/*
@@ -567,7 +567,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 *   h) reserve 内核镜像、initrd
 	 *   i) 同步 FDT reserved-memory 节点到 memblock reserved 集合
 	 *
-	 * 输出：memblock 中只保留”内核真正打算使用的物理内存”,
+	 * 输出：memblock 中只保留"内核真正打算使用的物理内存",
 	 *      关键区域已被标记为 reserved
 	 */
 	arm64_memblock_init();
@@ -621,7 +621,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 *     把 FDT 平面结构展开为内核 device_node 树
 	 *
 	 * 判定依据：bootloader 是否传入了 ACPI RSDP，以及
-	 * 内核命令行中是否有 “acpi=off”。
+	 * 内核命令行中是否有 "acpi=off"。
 	 */
 	acpi_boot_table_init();
 
@@ -665,9 +665,9 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 * 4.4 注册标准资源 — 把内核代码/数据段和 System RAM 插入 iomem 资源树。
 	 *
 	 * 这会建立 /proc/iomem 中可见的资源层次：
-	 *   - “Kernel code”: _text → __init_begin
-	 *   - “Kernel data”: _sdata → _end
-	 *   - “System RAM”: 每块可用物理内存区域
+	 *   - "Kernel code": _text → __init_begin
+	 *   - "Kernel data": _sdata → _end
+	 *   - "System RAM": 每块可用物理内存区域
 	 *
 	 * reserve_memblock_reserved_regions() 会作为 arch_initcall
 	 * 在更后面把 reserved 区域从 System RAM 中细分出来。
@@ -794,9 +794,9 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 * 此时内核仍然继续运行，但打印警告帮助诊断。
 	 */
 	if (boot_args[1] || boot_args[2] || boot_args[3]) {
-		pr_err(“WARNING: x1-x3 nonzero in violation of boot protocol:\n”
-			“\tx1: %016llx\n\tx2: %016llx\n\tx3: %016llx\n”
-			“This indicates a broken bootloader or old kernel\n”,
+		pr_err("WARNING: x1-x3 nonzero in violation of boot protocol:\n"
+			"\tx1: %016llx\n\tx2: %016llx\n\tx3: %016llx\n"
+			"This indicates a broken bootloader or old kernel\n",
 			boot_args[1], boot_args[2], boot_args[3]);
 	}
 }

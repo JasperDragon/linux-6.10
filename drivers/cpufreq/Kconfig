@@ -252,15 +252,7 @@ config CPUFREQ_DT_PLATDEV
 
 	  If in doubt, say N.
 
-if X86
-source "drivers/cpufreq/Kconfig.x86"
-endif
-
 source "drivers/cpufreq/Kconfig.arm"
-
-if PPC32 || PPC64
-source "drivers/cpufreq/Kconfig.powerpc"
-endif
 
 if MIPS
 config BMIPS_CPUFREQ

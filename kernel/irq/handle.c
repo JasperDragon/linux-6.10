@@ -36,6 +36,16 @@
  *   - ONESHOT: 主 handler 处理完后不自动 unmask, 线程 handler 完成后才 unmask
  */
 
+#include <linux/irq.h>
+#include <linux/random.h>
+#include <linux/sched.h>
+#include <linux/interrupt.h>
+#include <linux/kernel_stat.h>
+
+#include <asm/irq_regs.h>
+
+#include <trace/events/irq.h>
+
 #include "internals.h"
 
 #ifdef CONFIG_GENERIC_IRQ_MULTI_HANDLER

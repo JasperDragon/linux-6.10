@@ -227,9 +227,8 @@ L(copy64_from_end):
 
 	.p2align 4
 
-	/* Large backwards copy for overlapping copies.
-	// 中文：反向复制 — 当 dst 在 src 之后且区域重叠时，从尾到头复制避免覆盖 */
-	   Copy 16 bytes and then align dst to 16-byte alignment.  */
+		/* 反向复制 — 当 dst 在 src 之后且区域重叠时，从尾到头复制避免覆盖。 */
+		/* Copy 16 bytes and then align dst to 16-byte alignment. */
 L(copy_long_backwards):
 	ldp	D_l, D_h, [srcend, -16]
 	and	tmp1, dstend, 15

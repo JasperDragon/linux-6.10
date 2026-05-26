@@ -140,7 +140,6 @@ source "sound/soc/ti/Kconfig"
 source "sound/soc/uniphier/Kconfig"
 source "sound/soc/ux500/Kconfig"
 source "sound/soc/xilinx/Kconfig"
-source "sound/soc/xtensa/Kconfig"
 
 # SOF
 source "sound/soc/sof/Kconfig"
