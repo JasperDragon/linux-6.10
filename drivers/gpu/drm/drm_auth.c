@@ -28,23 +28,6 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-/*
- * DRM 主控与认证管理 - 管理 DRM 设备的主控（Master）权限和客户端认证
- *
- * 本文件实现了 DRM 设备的主控权管理和客户端认证机制。DRM 主控（Master）
- * 用于跟踪打开主设备节点的客户端组，控制对显示硬件的独占访问权限。
- *
- * 核心概念：
- *   - Master：拥有显示硬件控制权的客户端，通过 SET_MASTER/DROP_MASTER
- *     IOCTL 或隐式地通过打开/关闭主设备节点进行切换
- *   - 认证（Authentication）：通过 GETMAGIC/AUTHMAGIC IOCTL 实现
- *     客户端之间的相互信任，认证后的客户端可以访问受控资源
- *   - Magic：每个 DRM 文件上下文关联的整型标识符，用于认证过程
- *
- * 关键函数包括主控权的获取/释放、客户端认证、主控权委派的权限检查，
- * 以及内核内部使用的辅助函数。
- */
-
 #include <linux/export.h>
 #include <linux/slab.h>
 
@@ -87,14 +70,14 @@ static bool drm_is_current_master_locked(struct drm_file *fpriv)
 }
 
 /**
- * drm_is_current_master - 检查 @fpriv 是否为当前设备主控
- * @fpriv: DRM 文件私有数据
+ * drm_is_current_master - checks whether @priv is the current master
+ * @fpriv: DRM file private
  *
- * 检查 @fpriv 是否是其设备的当前主控。这决定了客户端是否有权
- * 执行需要 DRM_MASTER 权限的 IOCTL 操作。
+ * Checks whether @fpriv is current master on its device. This decides whether a
+ * client is allowed to run DRM_MASTER IOCTLs.
  *
- * 大多数需要 DRM_MASTER 的现代 IOCTL 与内核模式设置（KMS）相关 -
- * 当前主控被假定拥有不可共享的显示硬件资源。
+ * Most of the modern IOCTL which require DRM_MASTER are for kernel modesetting
+ * - the current master is assumed to own the non-shareable display hardware.
  */
 bool drm_is_current_master(struct drm_file *fpriv)
 {
@@ -380,10 +363,10 @@ out:
 }
 
 /**
- * drm_master_get - 引用一个 master 指针
+ * drm_master_get - reference a master pointer
  * @master: &struct drm_master
  *
- * 递增 @master 的引用计数并返回指向 @master 的指针。
+ * Increments the reference count of @master and returns a pointer to @master.
  */
 struct drm_master *drm_master_get(struct drm_master *master)
 {
@@ -393,13 +376,14 @@ struct drm_master *drm_master_get(struct drm_master *master)
 EXPORT_SYMBOL(drm_master_get);
 
 /**
- * drm_file_get_master - 引用 @file_priv 的 &drm_file.master
- * @file_priv: DRM 文件私有数据
+ * drm_file_get_master - reference &drm_file.master of @file_priv
+ * @file_priv: DRM file private
  *
- * 递增 @file_priv 的 &drm_file.master 引用计数并返回该 master。
- * 如果 @file_priv 没有 &drm_file.master，则返回 NULL。
+ * Increments the reference count of @file_priv's &drm_file.master and returns
+ * the &drm_file.master. If @file_priv has no &drm_file.master, returns NULL.
  *
- * 从此函数返回的 master 指针应使用 drm_master_put() 解除引用。
+ * Master pointers returned from this function should be unreferenced using
+ * drm_master_put().
  */
 struct drm_master *drm_file_get_master(struct drm_file *file_priv)
 {
@@ -433,10 +417,10 @@ static void drm_master_destroy(struct kref *kref)
 }
 
 /**
- * drm_master_put - 解除引用并清除 master 指针
- * @master: 指向 &struct drm_master 指针的指针
+ * drm_master_put - unreference and clear a master pointer
+ * @master: pointer to a pointer of &struct drm_master
  *
- * 递减 @master 所指向的 &drm_master 的引用计数，并将其设置为 NULL。
+ * This decrements the &drm_master behind @master and sets it to NULL.
  */
 void drm_master_put(struct drm_master **master)
 {
@@ -445,18 +429,7 @@ void drm_master_put(struct drm_master **master)
 }
 EXPORT_SYMBOL(drm_master_put);
 
-/*
- * drm_master_internal_acquire - 获取设备主控权的内部锁（供 drm_client/fb_helper 使用）
- * @dev: DRM 设备
- *
- * 尝试获取 master_mutex 并检查是否没有其他主控持有设备。
- * 如果当前没有主控，则持有锁并返回 true，调用者可以安全地操作显示硬件。
- * 如果有主控，则释放锁并返回 false。
- *
- * 此函数仅供 drm_client 和 drm_fb_helper 内部使用。
- *
- * 返回：没有主控时返回 true（持有锁），有主控时返回 false。
- */
+/* Used by drm_client and drm_fb_helper */
 bool drm_master_internal_acquire(struct drm_device *dev)
 {
 	mutex_lock(&dev->master_mutex);
@@ -469,13 +442,7 @@ bool drm_master_internal_acquire(struct drm_device *dev)
 }
 EXPORT_SYMBOL(drm_master_internal_acquire);
 
-/*
- * drm_master_internal_release - 释放设备主控权的内部锁（供 drm_client/fb_helper 使用）
- * @dev: DRM 设备
- *
- * 释放由 drm_master_internal_acquire() 获取的 master_mutex。
- * 此函数仅供 drm_client 和 drm_fb_helper 内部使用。
- */
+/* Used by drm_client and drm_fb_helper */
 void drm_master_internal_release(struct drm_device *dev)
 {
 	mutex_unlock(&dev->master_mutex);

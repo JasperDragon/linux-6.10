@@ -20,16 +20,6 @@
  * OF THIS SOFTWARE.
  */
 
-/*
- * drm_plane.c — 图层 (Plane) 管理: Primary / Overlay / Cursor。
- *
- * 每个 CRTC 可以有多个 Plane 层:
- *   - Primary: 主显示图层 (全屏)
- *   - Overlay: 叠加图层 (视频、弹出窗口, 硬件缩放/旋转/CSC)
- *   - Cursor: 硬件光标 (小尺寸, 随鼠标移动)
- * Plane state: fb, 位置(src/dst), 尺寸, z-order, rotation, blend...
- */
-
 #include <linux/export.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>

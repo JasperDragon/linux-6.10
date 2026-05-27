@@ -23,27 +23,6 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-/*
- * 中文注释: DRM VMA 偏移管理器 (VMA Offset Manager)
- *
- * 本文件实现了 DRM 子系统的 VMA (虚拟内存区域) 偏移管理器。该管理器负责
- * 将驱动程序依赖的任意内存区域映射到线性的用户地址空间中。它为调用者提供
- * 偏移量, 这些偏移量可用于 DRM 设备的地址空间 (address_space) 中。
- *
- * 核心功能:
- *   1. 偏移分配: 使用 drm_mm 作为后端来管理对象分配, 为每个 GEM 对象分配
- *      唯一的用户空间可见偏移量
- *   2. 快速查找: 使用红黑树加速偏移量查找 (优于 drm_mm 的 alloc/free 优化)
- *   3. 访问控制: 管理每个 open-file 上下文的节点访问权限, 确保只有被授权的
- *      文件描述符可以 mmap 特定节点
- *
- * 重要说明:
- *   - 所有参数和返回值 (除 drm_vma_node_offset_addr() 外) 均以页面数为单位
- *   - 在一个 address_space 上不能使用多个偏移管理器, 否则 mm 核心将无法
- *     正确拆除内存映射
- *   - 节点添加/删除操作内部有锁保护, 但节点分配和销毁由调用者负责
- */
-
 #include <linux/export.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -90,11 +69,6 @@
  */
 
 /**
- * 中文注释: 初始化 VMA 偏移管理器
- * 创建一个新的偏移管理器实例。管理器内部使用 drm_mm 范围分配器来管理
- * 地址空间, 并使用读写锁保护并发访问。@page_offset 和 @size 均以页面
- * 数为单位。
- *
  * drm_vma_offset_manager_init - Initialize new offset-manager
  * @mgr: Manager object
  * @page_offset: Offset of available memory area (page-based)
@@ -118,11 +92,6 @@ void drm_vma_offset_manager_init(struct drm_vma_offset_manager *mgr,
 EXPORT_SYMBOL(drm_vma_offset_manager_init);
 
 /**
- * 中文注释: 销毁偏移管理器
- * 销毁之前通过 drm_vma_offset_manager_init() 创建的偏移管理器。调用者
- * 必须在销毁管理器之前移除所有已分配的节点, 否则 drm_mm 会拒绝释放
- * 资源。销毁后不得再访问该管理器。
- *
  * drm_vma_offset_manager_destroy() - Destroy offset manager
  * @mgr: Manager object
  *
@@ -140,18 +109,6 @@ void drm_vma_offset_manager_destroy(struct drm_vma_offset_manager *mgr)
 EXPORT_SYMBOL(drm_vma_offset_manager_destroy);
 
 /**
- * 中文注释: 在偏移空间中查找节点 (已加锁)
- * 在 VMA 偏移管理器中根据起始地址和大小查找最匹配的节点。@start 可以
- * 指向某个有效区域内部的任意位置, 只要该节点覆盖了整个请求区域即可。
- * 查找使用红黑树实现, 时间复杂度 O(log n)。此函数要求在调用前已持有
- * 查找锁 (通过 drm_vma_offset_lock_lookup())。
- *
- * 典型用法是在持有查找锁的情况下进行弱引用查找:
- *   drm_vma_offset_lock_lookup(mgr);
- *   node = drm_vma_offset_lookup_locked(mgr, start, pages);
- *   if (node) kref_get_unless_zero(container_of(node, ...));
- *   drm_vma_offset_unlock_lookup(mgr);
- *
  * drm_vma_offset_lookup_locked() - Find node in offset space
  * @mgr: Manager object
  * @start: Start address for object (page-based)
@@ -220,14 +177,6 @@ struct drm_vma_offset_node *drm_vma_offset_lookup_locked(struct drm_vma_offset_m
 EXPORT_SYMBOL(drm_vma_offset_lookup_locked);
 
 /**
- * 中文注释: 向管理器添加偏移节点
- * 将节点添加到 VMA 偏移管理器中。如果节点已添加过, 则不执行任何操作
- * 并返回 0。@pages 指定用户空间可见的分配大小 (以页面数为单位), 它不
- * 需要与底层内存对象的实际大小一致, 只是限制了用户空间可以映射的大小。
- *
- * 插入操作通过 drm_mm_insert_node() 在管理器的地址空间中分配一个空闲
- * 区域。使用写锁保护, 线程安全。
- *
  * drm_vma_offset_add() - Add offset node to manager
  * @mgr: Manager object
  * @node: Node to be added
@@ -268,12 +217,6 @@ int drm_vma_offset_add(struct drm_vma_offset_manager *mgr,
 EXPORT_SYMBOL(drm_vma_offset_add);
 
 /**
- * 中文注释: 从管理器移除偏移节点
- * 从偏移管理器中移除节点。如果节点之前未添加过, 则不执行任何操作。
- * 移除后, 节点的偏移量和大小将重置为 0, 直到通过 drm_vma_offset_add()
- * 重新分配新偏移。辅助函数如 drm_vma_node_start() 和
- * drm_vma_node_offset_addr() 在未分配偏移时将返回 0。
- *
  * drm_vma_offset_remove() - Remove offset node from manager
  * @mgr: Manager object
  * @node: Node to be removed
@@ -349,12 +292,6 @@ unlock:
 }
 
 /**
- * 中文注释: 将 open-file 添加到允许用户列表 (引用计数)
- * 将 @tag 添加到节点的允许 open-file 列表中。如果 @tag 已在列表中,
- * 引用计数递增。访问控制列表在 drm_vma_offset_add() 和
- * drm_vma_offset_remove() 之间保持不变, 即使节点当前未添加到任何
- * 偏移管理器也可以调用。销毁节点前必须移除相同次数的 open-file。
- *
  * drm_vma_node_allow - Add open-file to list of allowed users
  * @node: Node to modify
  * @tag: Tag of file to remove
@@ -381,10 +318,6 @@ int drm_vma_node_allow(struct drm_vma_offset_node *node, struct drm_file *tag)
 EXPORT_SYMBOL(drm_vma_node_allow);
 
 /**
- * 中文注释: 将 open-file 添加到允许用户列表 (非引用计数)
- * 与 drm_vma_node_allow() 类似, 但不维护引用计数。因此对于每个节点,
- * drm_vma_node_revoke() 只需调用一次。适用于仅需一次性授权的场景。
- *
  * drm_vma_node_allow_once - Add open-file to list of allowed users
  * @node: Node to modify
  * @tag: Tag of file to remove
@@ -410,11 +343,6 @@ int drm_vma_node_allow_once(struct drm_vma_offset_node *node, struct drm_file *t
 EXPORT_SYMBOL(drm_vma_node_allow_once);
 
 /**
- * 中文注释: 从允许用户列表中移除 open-file
- * 递减 @tag 在节点允许列表中的引用计数。当引用计数降为零时, 从列表中
- * 移除该条目并释放内存。对于每次 drm_vma_node_allow() 调用, 必须对应
- * 调用一次此函数。如果 @tag 不在列表中, 则不执行任何操作。
- *
  * drm_vma_node_revoke - Remove open-file from list of allowed users
  * @node: Node to modify
  * @tag: Tag of file to remove
@@ -456,11 +384,6 @@ void drm_vma_node_revoke(struct drm_vma_offset_node *node,
 EXPORT_SYMBOL(drm_vma_node_revoke);
 
 /**
- * 中文注释: 检查 open-file 是否被授权访问
- * 在节点的允许列表中搜索 @tag, 判断该文件描述符是否有权限访问此节点。
- * 使用读锁保护, 支持并发查找。mmap() 系统调用在处理时通常会调用此
- * 函数来验证权限。
- *
  * drm_vma_node_is_allowed - Check whether an open-file is granted access
  * @node: Node to check
  * @tag: Tag of file to remove

@@ -23,24 +23,6 @@
  * OF THIS SOFTWARE.
  */
 
-/*
- * DRM 傻瓜缓冲（Dumb Buffer）API - 提供标准化的显存缓冲区创建接口
- *
- * 本文件实现了 DRM 框架的傻瓜缓冲区 API，为早期启动图形和简单显示场景
- * 提供一种标准化的显存缓冲区创建、映射和销毁机制。不同于需要专有用户空间
- * 组件（如 libdrm）的复杂 GPU 缓冲区分配，Dumb Buffer 提供了一套简单、
- * 通用的接口，适用于 KMS（内核模式设置）的扫描输出，可在没有完整图形栈
- * 的环境中使用。
- *
- * 要支持 Dumb Buffer，驱动程序需要实现以下回调：
- *   - &drm_driver.dumb_create - 创建傻瓜缓冲区
- *   - &drm_driver.dumb_map_offset - 获取 mmap 偏移量（默认使用 drm_gem_dumb_map_offset）
- *   - &drm_driver.dumb_destroy - 销毁傻瓜缓冲区（非 GEM 驱动需要）
- *
- * 注意：Dumb Buffer 不应用于 GPU 加速，这已在一些 ARM 嵌入式平台上被尝试过，
- * 此类驱动确实需要硬件特定的 IOCTL 来分配适当的缓冲对象。
- */
-
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_dumb_buffers.h>
@@ -109,26 +91,31 @@ static int drm_mode_align_dumb(struct drm_mode_create_dumb *args,
 }
 
 /**
- * drm_mode_size_dumb - 计算傻瓜缓冲区的扫描行和缓冲区大小
- * @dev: DRM 设备
- * @args: 傻瓜缓冲区的参数
- * @hw_pitch_align: 硬件要求的扫描行对齐字节数
- * @hw_size_align: 硬件要求的缓冲区大小对齐字节数
+ * drm_mode_size_dumb - Calculates the scanline and buffer sizes for dumb buffers
+ * @dev: DRM device
+ * @args: Parameters for the dumb buffer
+ * @hw_pitch_align: Hardware scanline alignment in bytes
+ * @hw_size_align: Hardware buffer-size alignment in bytes
  *
- * 辅助函数 drm_mode_size_dumb() 计算傻瓜缓冲区的分配大小和扫描行大小。
- * 调用者需要在参数 @arg 中设置缓冲区的宽度、高度和颜色模式。
- * 该函数验证输入的正确性并检查可能的溢出。如果成功，则返回所需
- * 的扫描行步幅（pitch）和缓冲区大小。
+ * The helper drm_mode_size_dumb() calculates the size of the buffer
+ * allocation and the scanline size for a dumb buffer. Callers have to
+ * set the buffers width, height and color mode in the argument @arg.
+ * The helper validates the correctness of the input and tests for
+ * possible overflows. If successful, it returns the dumb buffer's
+ * required scanline pitch and size in &args.
  *
- * 参数 @hw_pitch_align 允许驱动程序指定扫描行对齐要求（如果硬件需要）。
- * 计算出的步幅将是对齐值的整数倍。参数 @hw_size_align 允许指定
- * 缓冲区大小的对齐要求。提供的对齐值应反映图形硬件的实际需求。
- * drm_mode_size_dumb() 自动处理跨所有驱动和硬件的 GEM 相关约束。
- * 例如，返回的缓冲区大小始终是 PAGE_SIZE 的整数倍，以满足 mmap()
- * 的内存页对齐要求。
+ * The parameter @hw_pitch_align allows the driver to specifies an
+ * alignment for the scanline pitch, if the hardware requires any. The
+ * calculated pitch will be a multiple of the alignment. The parameter
+ * @hw_size_align allows to specify an alignment for buffer sizes. The
+ * provided alignment should represent requirements of the graphics
+ * hardware. drm_mode_size_dumb() handles GEM-related constraints
+ * automatically across all drivers and hardware. For example, the
+ * returned buffer size is always a multiple of PAGE_SIZE, which is
+ * required by mmap().
  *
- * 返回：
- * 成功返回 0，失败返回负错误码。
+ * Returns:
+ * Zero on success, or a negative error code otherwise.
  */
 int drm_mode_size_dumb(struct drm_device *dev,
 		       struct drm_mode_create_dumb *args,
@@ -240,21 +227,6 @@ int drm_mode_create_dumb(struct drm_device *dev,
 	return dev->driver->dumb_create(file_priv, dev, args);
 }
 
-/*
- * drm_mode_create_dumb_ioctl - 创建傻瓜缓冲区的 IOCTL 处理函数
- * @dev: DRM 设备
- * @data: IOCTL 参数，指向 drm_mode_create_dumb 结构
- * @file_priv: DRM 文件私有数据
- *
- * 处理 DRM_IOCTL_MODE_CREATE_DUMB IOCTL。创建适用于扫描输出的
- * 傻瓜缓冲区，返回句柄（handle）、步幅（pitch）和大小（size）。
- *
- * 内部调用 drm_mode_create_dumb()，后者进一步调用驱动程序注册的
- * dumb_create 回调。如果创建失败，输出参数会被清零以防止未初始化的
- * 数据泄漏给用户空间。
- *
- * 返回：0 表示成功，负错误码表示失败。
- */
 int drm_mode_create_dumb_ioctl(struct drm_device *dev,
 			       void *data, struct drm_file *file_priv)
 {
@@ -285,17 +257,18 @@ static int drm_mode_mmap_dumb(struct drm_device *dev, struct drm_mode_map_dumb *
 }
 
 /**
- * drm_mode_mmap_dumb_ioctl - 为傻瓜缓冲区创建 mmap 偏移量 IOCTL 处理函数
- * @dev: DRM 设备
- * @data: IOCTL 数据
- * @file_priv: DRM 文件信息
+ * drm_mode_mmap_dumb_ioctl - create an mmap offset for a dumb backing storage buffer
+ * @dev: DRM device
+ * @data: ioctl data
+ * @file_priv: DRM file info
  *
- * 在 DRM 设备节点的地址空间中分配一个偏移量，以便能够对傻瓜缓冲区
- * 进行内存映射（mmap）。用户空间通过 IOCTL 调用此函数获取映射偏移，
- * 然后使用 mmap() 将缓冲区映射到进程地址空间。
+ * Allocate an offset in the drm device node's address space to be able to
+ * memory map a dumb buffer.
  *
- * 返回：
- * 成功返回 0，失败返回负错误码。
+ * Called by the user via ioctl.
+ *
+ * Returns:
+ * Zero on success, negative errno on failure.
  */
 int drm_mode_mmap_dumb_ioctl(struct drm_device *dev,
 			     void *data, struct drm_file *file_priv)
@@ -309,17 +282,6 @@ int drm_mode_mmap_dumb_ioctl(struct drm_device *dev,
 	return err;
 }
 
-/*
- * drm_mode_destroy_dumb - 销毁傻瓜缓冲区
- * @dev: DRM 设备
- * @handle: 要销毁的缓冲区句柄
- * @file_priv: DRM 文件私有数据
- *
- * 通过删除 GEM 句柄来销毁先前创建的傻瓜缓冲区。
- * 如果驱动不支持 dumb_create，则返回 -ENOSYS。
- *
- * 返回：0 表示成功，负错误码表示失败。
- */
 int drm_mode_destroy_dumb(struct drm_device *dev, u32 handle,
 			  struct drm_file *file_priv)
 {
@@ -329,16 +291,6 @@ int drm_mode_destroy_dumb(struct drm_device *dev, u32 handle,
 	return drm_gem_handle_delete(file_priv, handle);
 }
 
-/*
- * drm_mode_destroy_dumb_ioctl - 销毁傻瓜缓冲区的 IOCTL 处理函数
- * @dev: DRM 设备
- * @data: IOCTL 参数，指向 drm_mode_destroy_dumb 结构
- * @file_priv: DRM 文件私有数据
- *
- * 处理 DRM_IOCTL_MODE_DESTROY_DUMB IOCTL，销毁指定的傻瓜缓冲区。
- *
- * 返回：0 表示成功，负错误码表示失败。
- */
 int drm_mode_destroy_dumb_ioctl(struct drm_device *dev,
 				void *data, struct drm_file *file_priv)
 {

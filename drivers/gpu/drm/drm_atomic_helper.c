@@ -25,18 +25,6 @@
  * Daniel Vetter <daniel.vetter@ffwll.ch>
  */
 
-/*
- * drm_atomic_helper.c — Atomic Modesetting 辅助函数集。
- *
- * 为驱动提供标准的 atomic 回调实现:
- *   - drm_atomic_helper_check(): 标准 modeset + plane check 流程
- *   - drm_atomic_helper_commit(): 完整的 commit 序列 (prepare→swap_state→commit→cleanup)
- *   - drm_atomic_helper_commit_tail(): 驱动应调用的默认硬件编程入口
- *   - drm_atomic_helper_page_flip(): 传统的单 CRTC 页面翻转
- *
- * 大多数 KMS 驱动使用这套 helper 而非自己实现所有 atomic 逻辑。
- */
-
 #include <linux/export.h>
 #include <linux/dma-fence.h>
 #include <linux/ktime.h>
@@ -1992,24 +1980,6 @@ EXPORT_SYMBOL(drm_atomic_helper_wait_for_flip_done);
  * Note that the default ordering of how the various stages are called is to
  * match the legacy modeset helper library closest.
  */
-/*
- * drm_atomic_helper_commit_tail — 默认的硬件编程序列 (commit tail)。
- *
- * 这是大多数 KMS 驱动使用的标准 commit 尾部实现, 按照严格顺序操作硬件:
- *
- *   1) commit_modeset_disables: 先关闭不再使用的 CRTC/Encoder/Bridge
- *      (必须先关旧管线, 再开新管线, 避免两个管线同时驱动同一连接器)
- *   2) commit_planes: 编程所有 Plane 的新 Framebuffer 地址 (扫描输出)
- *      - 此时旧的管线已关, 可以安全地重配置
- *   3) commit_modeset_enables: 开启新的 CRTC/Encoder/Bridge
- *   4) fake_vblank: 对无硬件 vblank 的设备 (如 writeback) 模拟 vblank
- *   5) commit_hw_done: 通知等待者硬件 commit 完成
- *   6) wait_for_vblanks: 等待 vblank 发生 (确保新配置在屏幕上可见)
- *   7) cleanup_planes: 释放旧 framebuffer 的 pin/unpin
- *
- * 对于需要 runtime PM 的驱动, 使用 drm_atomic_helper_commit_tail_rpm()
- * 变体: 先 enable CRTC, 再 commit planes (因为 CRTC 关闭时寄存器不可访问)
- */
 void drm_atomic_helper_commit_tail(struct drm_atomic_state *state)
 {
 	struct drm_device *dev = state->dev;
@@ -2271,33 +2241,6 @@ EXPORT_SYMBOL(drm_atomic_helper_async_commit);
  *
  * RETURNS:
  * Zero for success or -errno.
- */
-/*
- * drm_atomic_helper_commit — 标准的 atomic commit 实现 (大多数 KMS 驱动使用)。
- * @dev:      DRM 设备
- * @state:    已验证的 atomic state
- * @nonblock: true=异步 (nonblocking page flip), false=同步 (modeset)
- *
- * 这是 KMS 驱动最常使用的 commit 入口, 实现了完整的 commit 管线:
- *
- * ┌─ async_update (快速路径, 仅光标移动等):
- * │    prepare_planes → async_commit → unprepare_planes → return
- * │
- * └─ 常规 commit:
- *      1) setup_commit: 创建 drm_crtc_commit 对象 (跟踪进度)
- *      2) prepare_planes: pin framebuffer (确保 GEM 缓冲区物理页在显存中)
- *      3) swap_state:  ★ 软件状态切换 ★ (old_state ↔ new_state 交换)
- *         - 此后 new_state 成为当前状态, old_state 成为待清理状态
- *         - 这是 "point of no return" — 软件侧已经认为新状态生效
- *      4) commit_work (调度到 workqueue):
- *         a) wait_for_fences: 等待 dma_fence (确保 GPU 渲染完成)
- *         b) wait_for_dependencies: 等待前一个 commit 完成
- *         c) commit_tail: 编程硬件 (disable → planes → enable → vblank → cleanup)
- *         d) send_vblank_event: 通知用户态 page flip 完成
- *
- * 同步 vs 异步:
- *   - nonblock=false: 等待 commit_work 完成后再返回 (modeset)
- *   - nonblock=true: 立即返回, commit_work 在后台执行 (page flip)
  */
 int drm_atomic_helper_commit(struct drm_device *dev,
 			     struct drm_atomic_state *state,

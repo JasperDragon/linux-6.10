@@ -27,27 +27,6 @@
  * Daniel Vetter <daniel.vetter@ffwll.ch>
  */
 
-/*
- * DRM 原子操作 UAPI 接口 - 中文注释补充
- *
- * 本文件提供 DRM 原子模式设置（Atomic Modesetting）的用户空间 API
- * 的序列化（marshalling）与反序列化（demarshalling）粘合层。核心功能：
- *
- *   - drm_mode_atomic_ioctl() - 核心的原子操作 IOCTL 处理函数，是
- *     整个原子模式设置的用户空间入口点
- *   - drm_atomic_set_property() / drm_atomic_get_property() - 通用
- *     属性设置/获取函数，按对象类型分派到对应的处理函数
- *   - 各类对象（CRTC、Plane、Connector、ColorOP）的属性 set/get
- *     处理函数
- *   - 显式 fence（显式同步）支持，包括 IN_FENCE_FD 和 OUT_FENCE_PTR
- *     属性
- *   - 异步页面翻转（async page flip）支持
- *
- * 原子模式设置的核心思想：所有显示状态变更（模式、平面、连接器配置等）
- * 在一个原子操作中完成校验和提交，确保要么全部成功，要么全部回滚，
- * 避免中间状态导致的画面撕裂等问题。
- */
-
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic_uapi.h>
@@ -76,21 +55,6 @@
  * for load detect or similar.
  */
 
-/*
- * 为 CRTC 设置显示模式 - 中文注释
- *
- * 将内核内部表示（struct drm_display_mode）的显示模式设置到 CRTC 的
- * 原子状态中，同时更新 enable 属性。该函数通过创建 blob 属性来存储
- * 模式信息，适用于内核内部发起的模式设置（如模块加载时的默认模式）。
- *
- * 参数:
- *   @state - 目标 CRTC 的即将生效的状态对象
- *   @mode - 内核内部的显示模式，传入 NULL 表示关闭该 CRTC
- *
- * 返回值: 0 成功，负值表示错误。不会返回 -EDEADLK。
- *
- * 注意: 该函数不涉及 ww_mutex 锁获取，不会触发死锁检测回退。
- */
 /**
  * drm_atomic_set_mode_for_crtc - set mode for CRTC
  * @state: the CRTC whose incoming state to update
@@ -143,22 +107,6 @@ int drm_atomic_set_mode_for_crtc(struct drm_crtc_state *state,
 }
 EXPORT_SYMBOL(drm_atomic_set_mode_for_crtc);
 
-/*
- * 通过 blob 属性为 CRTC 设置显示模式 - 中文注释
- *
- * 与 drm_atomic_set_mode_for_crtc 不同，此函数从用户空间传递的
- * blob 属性中解析显示模式。blob 包含了 drm_mode_modeinfo 结构，
- * 需要将其转换为内核内部的 drm_display_mode。
- *
- * 参数:
- *   @state - CRTC 的即将生效的状态对象
- *   @blob - 包含模式信息的 blob 属性，NULL 表示关闭 CRTC
- *
- * 返回值: 0 成功，负值表示错误。不会返回 -EDEADLK。
- *
- * 注意: 会对 blob 进行引用计数管理。先释放旧的 mode_blob 引用，
- * 再获取新的 blob 引用。
- */
 /**
  * drm_atomic_set_mode_prop_for_crtc - set mode for CRTC
  * @state: the CRTC whose incoming state to update
@@ -224,26 +172,6 @@ int drm_atomic_set_mode_prop_for_crtc(struct drm_crtc_state *state,
 }
 EXPORT_SYMBOL(drm_atomic_set_mode_prop_for_crtc);
 
-/*
- * 为平面（Plane）设置绑定的 CRTC - 中文注释
- *
- * 更改平面绑定的 CRTC 时，需要获取新 CRTC 的锁和状态，并且需要更新
- * 新旧 CRTC 的 plane_mask（平面掩码）。该函数封装了这些复杂性。
- *
- * 核心逻辑:
- *   1. 如果 plane 原先绑定了某个 CRTC，从该 CRTC 的 plane_mask 中
- *      移除当前 plane 的位
- *   2. 如果设置了新 CRTC，将其添加到新 CRTC 的 plane_mask 中
- *   3. plane_mask 用于跟踪每个 CRTC 上连接了哪些 plane，在驱动
- *      commit 阶段用于确定需要更新的硬件资源
- *
- * 参数:
- *   @plane_state - 平面的即将生效的状态对象
- *   @crtc - 要绑定到的 CRTC，NULL 表示解除绑定
- *
- * 返回值: 0 成功，-EDEADLK 表示检测到死锁需要回退重试，
- *         -ENOMEM 表示内存不足
- */
 /**
  * drm_atomic_set_crtc_for_plane - set CRTC for plane
  * @plane_state: the plane whose incoming state to update
@@ -300,19 +228,6 @@ drm_atomic_set_crtc_for_plane(struct drm_plane_state *plane_state,
 }
 EXPORT_SYMBOL(drm_atomic_set_crtc_for_plane);
 
-/*
- * 为平面设置帧缓冲（Framebuffer）- 中文注释
- *
- * 更改平面要显示的帧缓冲。该函数通过 drm_framebuffer_assign() 管理
- * 新旧 framebuffer 的引用计数：自动增加新 fb 的引用并释放旧 fb 的引用。
- *
- * 参数:
- *   @plane_state - 平面的原子状态对象
- *   @fb - 要使用的帧缓冲，NULL 表示清除当前帧缓冲
- *
- * 注意: 此函数不会检查 fb 与 CRTC 的兼容性，兼容性校验在 atomic
- * check 阶段由驱动完成。
- */
 /**
  * drm_atomic_set_fb_for_plane - set framebuffer for plane
  * @plane_state: atomic state object for the plane
@@ -371,23 +286,6 @@ drm_atomic_set_colorop_for_plane(struct drm_plane_state *plane_state,
 }
 EXPORT_SYMBOL(drm_atomic_set_colorop_for_plane);
 
-/*
- * 为连接器（Connector）设置绑定的 CRTC - 中文注释
- *
- * 更改连接器绑定的 CRTC。连接器是物理显示接口（如 HDMI、DP、VGA），
- * 通过绑定到 CRTC 来确定其显示内容来源。与 Plane 不同，Connector
- * 使用的 drm_atomic_get_new_crtc_state() 获取的是"新"状态，
- * 而非"即将获取"的状态，因为 Connector 状态在获取时已存在。
- *
- * 另外，Connector 的绑定变更涉及引用计数管理：在解除绑定时需要
- * 释放 connector 的引用（drm_connector_put），绑定时获取引用。
- *
- * 参数:
- *   @conn_state - 连接器的原子状态对象
- *   @crtc - 要绑定到的 CRTC，NULL 表示解除绑定
- *
- * 返回值: 0 成功，-EDEADLK 表示死锁需回退，-ENOMEM 表示内存不足
- */
 /**
  * drm_atomic_set_crtc_for_connector - set CRTC for connector
  * @conn_state: atomic state object for the connector
@@ -1139,26 +1037,7 @@ drm_atomic_connector_get_property(struct drm_connector *connector,
 int drm_atomic_get_property(struct drm_mode_object *obj,
 		struct drm_property *property, uint64_t *val)
 {
-	/*
- * drm_atomic_get_property - 获取 DRM 对象的原子属性值 - 中文注释
- *
- * 通用属性获取函数，根据对象类型分派到对应的 get_property 处理函数。
- */
-struct drm_device *dev = property->dev;
-/*
- * drm_atomic_get_property - 获取 DRM 对象的原子属性值 - 中文注释
- *
- * 通用属性获取函数，根据对象类型（CRTC/Plane/Connector/ColorOP）
- * 分派到对应的 get_property 处理函数。用于实现 DRM_IOCTL_MODE_GETPROPERTY
- * IOCTL，供用户空间查询对象的当前属性值。
- *
- * 参数:
- *   @obj - 要查询的 DRM 模式对象
- *   @property - 要获取的属性
- *   @val - 输出参数，存放属性值
- *
- * 返回值: 0 成功，负值表示错误
- */
+	struct drm_device *dev = property->dev;
 	int ret;
 
 	switch (obj->type) {
@@ -1292,26 +1171,6 @@ static int drm_atomic_check_prop_changes(int ret, uint64_t old_val, uint64_t pro
 	return 0;
 }
 
-/*
- * drm_atomic_set_property - 设置原子状态中的对象属性 - 中文注释
- *
- * 根据对象类型（CONNECTOR/CRTC/PLANE/COLOROP）将属性值设置到
- * 对应的原子状态中。此函数是原子 IOCTL 处理流程中的核心转换函数，
- * 实现从用户空间属性集合到内核 atomic state 对象的转换。
- *
- * 对于异步翻转（async_flip），会检查变更的属性是否被允许，
- * 仅 framebuffer ID、in-fence fd 和 damage clips 等可变更。
- *
- * 参数:
- *   @state - 原子状态对象
- *   @file_priv - DRM 文件私有数据
- *   @obj - 要设置属性的模式对象
- *   @prop - 要设置的属性
- *   @prop_value - 属性值
- *   @async_flip - 是否为异步翻转操作
- *
- * 返回值: 0 成功，负值表示错误
- */
 int drm_atomic_set_property(struct drm_atomic_state *state,
 			    struct drm_file *file_priv,
 			    struct drm_mode_object *obj,
@@ -1701,25 +1560,6 @@ set_async_flip(struct drm_atomic_state *state)
 	}
 }
 
-/*
- * drm_mode_atomic_ioctl - 原子模式设置 IOCTL 主处理函数 - 中文注释
- *
- * 这是 DRM 原子模式设置的核心 IOCTL 处理函数（DRM_IOCTL_MODE_ATOMIC）。
- * 用户空间通过此 IOCTL 提交一组原子更新请求，包括多个对象
- * （CRTC、Plane、Connector）的属性变更。
- *
- * 处理流程:
- *   1. 检查设备能力和用户空间权限（DRIVER_ATOMIC 特性标志）
- *   2. 解析 IOCTL 参数，验证标志位合法性
- *   3. 遍历用户空间传入的对象和属性列表，通过 drm_atomic_set_property()
- *      设置到临时 atomic state 中
- *   4. 准备显式 fence 信令（prepare_signaling）
- *   5. 根据 flags 执行校验、非阻塞提交或阻塞提交
- *   6. 如果检测到死锁（-EDEADLK），释放所有锁后重试
- *   7. 完成 fence 信令（complete_signaling）
- *
- * 返回值: 0 成功，负值表示错误
- */
 int drm_mode_atomic_ioctl(struct drm_device *dev,
 			  void *data, struct drm_file *file_priv)
 {

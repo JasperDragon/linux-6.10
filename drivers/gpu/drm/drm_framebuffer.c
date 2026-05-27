@@ -20,16 +20,6 @@
  * OF THIS SOFTWARE.
  */
 
-/*
- * drm_framebuffer.c — Framebuffer 对象管理 (像素缓冲区描述符)。
- *
- * drm_framebuffer 描述像素数据的内存布局:
- *   - fourcc 格式: ARGB8888, NV12, P010, ...
- *   - 尺寸 (width x height), 多平面 (planes)
- *   - 修饰符 (modifiers): 压缩/tiling 格式
- *   - 通过 GEM handles 关联底层缓冲区
- */
-
 #include <linux/export.h>
 #include <linux/uaccess.h>
 

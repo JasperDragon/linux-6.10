@@ -5,23 +5,6 @@
  * Copyright (C) 2017 Noralf Trønnes
  */
 
-/**
- * DOC: GEM 帧缓冲辅助函数概述 (中文)
- *
- * 该文件实现了 GEM 对象到帧缓冲（framebuffer）的桥接辅助函数，为不子类化
- * &drm_framebuffer 且使用 &drm_gem_object 作为后端存储的驱动程序提供支持。
- *
- * 核心功能包括：
- *   - 创建、初始化和销毁基于 GEM 对象的帧缓冲
- *   - 为帧缓冲创建 GEM 句柄（handle），支持 GETFB IOCTL
- *   - 将帧缓冲的缓冲区对象映射/取消映射到内核地址空间
- *   - 管理 CPU 访问 DMA-BUF 导入缓冲区的同步
- *   - 支持 AFBC（Arm Frame Buffer Compression）帧缓冲的尺寸验证
- *
- * 简单驱动程序可直接使用 drm_gem_fb_create() 作为 &drm_mode_config_funcs.fb_create
- * 回调，无需额外定制。需要脏区域跟踪的驱动可使用 drm_gem_fb_create_with_dirty()。
- */
-
 #include <linux/export.h>
 #include <linux/slab.h>
 #include <linux/module.h>
@@ -58,14 +41,12 @@ MODULE_IMPORT_NS("DMA_BUF");
  */
 
 /**
- * drm_gem_fb_get_obj() - 获取帧缓冲后端的 GEM 对象
+ * drm_gem_fb_get_obj() - Get GEM object backing the framebuffer
+ * @fb: Framebuffer
+ * @plane: Plane index
  *
- * 中文: 返回指定帧缓冲和平面索引对应的 GEM 对象指针。该函数不获取额外的
- * 引用计数，仅返回 &drm_frambuffer 已持有的对象指针。如果平面索引超出范围
- * 或对应平面没有 GEM 对象，返回 NULL 并触发警告。
- *
- * @fb: 帧缓冲
- * @plane: 平面索引
+ * No additional reference is taken beyond the one that the &drm_frambuffer
+ * already holds.
  *
  * Returns:
  * Pointer to &drm_gem_object for the given framebuffer and plane index or NULL
@@ -109,13 +90,12 @@ drm_gem_fb_init(struct drm_device *dev,
 }
 
 /**
- * drm_gem_fb_destroy - 释放基于 GEM 的帧缓冲
+ * drm_gem_fb_destroy - Free GEM backed framebuffer
+ * @fb: Framebuffer
  *
- * 中文: 释放基于 GEM 对象的帧缓冲及其后端缓冲区。该函数逐一释放每个平面的
- * GEM 对象引用，然后调用 drm_framebuffer_cleanup() 清理帧缓冲，最后释放
- * 帧缓冲结构体本身。驱动程序可将其用作 &drm_framebuffer_funcs->destroy 回调。
- *
- * @fb: 要释放的帧缓冲
+ * Frees a GEM backed framebuffer with its backing buffer(s) and the structure
+ * itself. Drivers can use this as their &drm_framebuffer_funcs->destroy
+ * callback.
  */
 void drm_gem_fb_destroy(struct drm_framebuffer *fb)
 {
@@ -130,15 +110,14 @@ void drm_gem_fb_destroy(struct drm_framebuffer *fb)
 EXPORT_SYMBOL(drm_gem_fb_destroy);
 
 /**
- * drm_gem_fb_create_handle - 为基于 GEM 的帧缓冲创建句柄
+ * drm_gem_fb_create_handle - Create handle for GEM backed framebuffer
+ * @fb: Framebuffer
+ * @file: DRM file to register the handle for
+ * @handle: Pointer to return the created handle
  *
- * 中文: 为帧缓冲后端的 GEM 对象创建句柄。驱动程序可将其用作
- * &drm_framebuffer_funcs->create_handle 回调。GETFB IOCTL 会调用此回调。
- * 该函数仅为第一个平面（plane 0）的 GEM 对象创建句柄。
- *
- * @fb: 帧缓冲
- * @file: 注册句柄的 DRM 文件
- * @handle: 返回创建的句柄
+ * This function creates a handle for the GEM object backing the framebuffer.
+ * Drivers can use this as their &drm_framebuffer_funcs->create_handle
+ * callback. The GETFB IOCTL calls into this callback.
  *
  * Returns:
  * 0 on success or a negative error code on failure.
@@ -151,19 +130,24 @@ int drm_gem_fb_create_handle(struct drm_framebuffer *fb, struct drm_file *file,
 EXPORT_SYMBOL(drm_gem_fb_create_handle);
 
 /**
- * drm_gem_fb_init_with_funcs() - 使用自定义函数表初始化基于 GEM 的帧缓冲
+ * drm_gem_fb_init_with_funcs() - Helper function for implementing
+ *				  &drm_mode_config_funcs.fb_create
+ *				  callback in cases when the driver
+ *				  allocates a subclass of
+ *				  struct drm_framebuffer
+ * @dev: DRM device
+ * @fb: framebuffer object
+ * @file: DRM file that holds the GEM handle(s) backing the framebuffer
+ * @info: pixel format information
+ * @mode_cmd: Metadata from the userspace framebuffer creation request
+ * @funcs: vtable to be used for the new framebuffer object
  *
- * 中文: 为需要自定义帧缓冲回调的驱动程序设置 &drm_framebuffer_funcs。
- * 该函数执行像素格式验证、GEM 对象查找、缓冲区大小验证，然后初始化帧缓冲。
- * 如果不需要自定义回调，应使用 drm_gem_fb_create()。
- * 注意：缓冲区大小验证仅针对一般情况，驱动开发者应确保其适用于自己的硬件。
- *
- * @dev: DRM 设备
- * @fb: 帧缓冲对象
- * @file: 持有帧缓冲后端 GEM 句柄的 DRM 文件
- * @info: 像素格式信息
- * @mode_cmd: 用户空间帧缓冲创建请求的元数据
- * @funcs: 新帧缓冲对象要使用的函数表
+ * This function can be used to set &drm_framebuffer_funcs for drivers that need
+ * custom framebuffer callbacks. Use drm_gem_fb_create() if you don't need to
+ * change &drm_framebuffer_funcs. The function does buffer size validation.
+ * The buffer size validation is for a general case, though, so users should
+ * pay attention to the checks being appropriate for them or, at least,
+ * non-conflicting.
  *
  * Returns:
  * Zero or a negative error code.
@@ -229,18 +213,18 @@ err_gem_object_put:
 EXPORT_SYMBOL_GPL(drm_gem_fb_init_with_funcs);
 
 /**
- * drm_gem_fb_create_with_funcs() - 使用自定义函数表创建帧缓冲
+ * drm_gem_fb_create_with_funcs() - Helper function for the
+ *                                  &drm_mode_config_funcs.fb_create
+ *                                  callback
+ * @dev: DRM device
+ * @file: DRM file that holds the GEM handle(s) backing the framebuffer
+ * @info: pixel format information
+ * @mode_cmd: Metadata from the userspace framebuffer creation request
+ * @funcs: vtable to be used for the new framebuffer object
  *
- * 中文: 分配帧缓冲结构体并使用给定的自定义函数表调用
- * drm_gem_fb_init_with_funcs() 完成初始化。适用于需要自定义
- * &drm_framebuffer_funcs 的驱动程序。如果不需要自定义函数表，
- * 应使用更简洁的 drm_gem_fb_create()。
- *
- * @dev: DRM 设备
- * @file: 持有帧缓冲后端 GEM 句柄的 DRM 文件
- * @info: 像素格式信息
- * @mode_cmd: 用户空间帧缓冲创建请求的元数据
- * @funcs: 新帧缓冲对象要使用的函数表
+ * This function can be used to set &drm_framebuffer_funcs for drivers that need
+ * custom framebuffer callbacks. Use drm_gem_fb_create() if you don't need to
+ * change &drm_framebuffer_funcs. The function does buffer size validation.
  *
  * Returns:
  * Pointer to a &drm_framebuffer on success or an error pointer on failure.
@@ -274,19 +258,24 @@ static const struct drm_framebuffer_funcs drm_gem_fb_funcs = {
 };
 
 /**
- * drm_gem_fb_create() - 创建基于 GEM 的帧缓冲（核心辅助函数）
+ * drm_gem_fb_create() - Helper function for the
+ *                       &drm_mode_config_funcs.fb_create callback
+ * @dev: DRM device
+ * @file: DRM file that holds the GEM handle(s) backing the framebuffer
+ * @info: pixel format information
+ * @mode_cmd: Metadata from the userspace framebuffer creation request
  *
- * 中文: 创建一个由 &drm_mode_fb_cmd2 描述的帧缓冲对象。
- * 此函数是 &drm_mode_config_funcs.fb_create 回调的标准实现。
- * 它会验证像素格式与可用平面是否匹配、检查缓冲区大小是否足够，
- * 然后调用 drm_gem_fb_init_with_funcs() 完成初始化。
- * 对于有特殊对齐或 pitch 要求的硬件，驱动程序应在调用此函数前进行检查。
- * 如果需要帧缓冲刷新功能，应使用 drm_gem_fb_create_with_dirty()。
+ * This function creates a new framebuffer object described by
+ * &drm_mode_fb_cmd2. This description includes handles for the buffer(s)
+ * backing the framebuffer.
  *
- * @dev: DRM 设备
- * @file: 持有帧缓冲后端 GEM 句柄的 DRM 文件
- * @info: 像素格式信息
- * @mode_cmd: 用户空间帧缓冲创建请求的元数据
+ * If your hardware has special alignment or pitch requirements these should be
+ * checked before calling this function. The function does buffer size
+ * validation. Use drm_gem_fb_create_with_dirty() if you need framebuffer
+ * flushing.
+ *
+ * Drivers can use this as their &drm_mode_config_funcs.fb_create callback.
+ * The ADDFB2 IOCTL calls into this callback.
  *
  * Returns:
  * Pointer to a &drm_framebuffer on success or an error pointer on failure.
@@ -308,18 +297,25 @@ static const struct drm_framebuffer_funcs drm_gem_fb_funcs_dirtyfb = {
 };
 
 /**
- * drm_gem_fb_create_with_dirty() - 创建支持脏区域跟踪的帧缓冲
+ * drm_gem_fb_create_with_dirty() - Helper function for the
+ *                       &drm_mode_config_funcs.fb_create callback
+ * @dev: DRM device
+ * @file: DRM file that holds the GEM handle(s) backing the framebuffer
+ * @info: pixel format information
+ * @mode_cmd: Metadata from the userspace framebuffer creation request
  *
- * 中文: 创建带脏区域回调（dirty callback）的帧缓冲对象。与 drm_gem_fb_create()
- * 的区别在于，该函数设置 drm_atomic_helper_dirtyfb() 作为 dirty 回调，
- * 使帧缓冲刷新可以通过原子机制进行。驱动程序还应在所有平面上调用
- * drm_plane_enable_fb_damage_clips() 以允许用户空间通过 ATOMIC IOCTL
- * 使用损坏区域剪辑（damage clips）。
+ * This function creates a new framebuffer object described by
+ * &drm_mode_fb_cmd2. This description includes handles for the buffer(s)
+ * backing the framebuffer. drm_atomic_helper_dirtyfb() is used for the dirty
+ * callback giving framebuffer flushing through the atomic machinery. Use
+ * drm_gem_fb_create() if you don't need the dirty callback.
+ * The function does buffer size validation.
  *
- * @dev: DRM 设备
- * @file: 持有帧缓冲后端 GEM 句柄的 DRM 文件
- * @info: 像素格式信息
- * @mode_cmd: 用户空间帧缓冲创建请求的元数据
+ * Drivers should also call drm_plane_enable_fb_damage_clips() on all planes
+ * to enable userspace to use damage clips also with the ATOMIC IOCTL.
+ *
+ * Drivers can use this as their &drm_mode_config_funcs.fb_create callback.
+ * The ADDFB2 IOCTL calls into this callback.
  *
  * Returns:
  * Pointer to a &drm_framebuffer on success or an error pointer on failure.
@@ -335,17 +331,24 @@ drm_gem_fb_create_with_dirty(struct drm_device *dev, struct drm_file *file,
 EXPORT_SYMBOL_GPL(drm_gem_fb_create_with_dirty);
 
 /**
- * drm_gem_fb_vmap - 将所有帧缓冲 BO 映射到内核地址空间
+ * drm_gem_fb_vmap - maps all framebuffer BOs into kernel address space
+ * @fb: the framebuffer
+ * @map: returns the mapping's address for each BO
+ * @data: returns the data address for each BO, can be NULL
  *
- * 中文: 将给定帧缓冲的所有缓冲区对象（BO）映射到内核地址空间，并将映射
- * 存储在 struct iosys_map 数组中。如果某个 BO 的映射操作失败，函数会自动
- * 取消已建立的所有映射。如果需要访问 BO 中存储的实际数据，应传入 @data
- * 参数，它会返回考虑帧缓冲 offsets 字段后的数据地址。
- * 映射应通过 drm_gem_fb_vunmap() 取消。
+ * This function maps all buffer objects of the given framebuffer into
+ * kernel address space and stores them in struct iosys_map. If the
+ * mapping operation fails for one of the BOs, the function unmaps the
+ * already established mappings automatically.
  *
- * @fb: 帧缓冲
- * @map: 返回每个 BO 的映射地址
- * @data: 返回每个 BO 的数据地址（可为 NULL）
+ * Callers that want to access a BO's stored data should pass @data.
+ * The argument returns the addresses of the data stored in each BO. This
+ * is different from @map if the framebuffer's offsets field is non-zero.
+ *
+ * Both, @map and @data, must each refer to arrays with at least
+ * fb->format->num_planes elements.
+ *
+ * See drm_gem_fb_vunmap() for unmapping.
  *
  * Returns:
  * 0 on success, or a negative errno code otherwise.
@@ -392,14 +395,13 @@ err_drm_gem_vunmap:
 EXPORT_SYMBOL(drm_gem_fb_vmap);
 
 /**
- * drm_gem_fb_vunmap - 从内核地址空间取消帧缓冲 BO 的映射
+ * drm_gem_fb_vunmap - unmaps framebuffer BOs from kernel address space
+ * @fb: the framebuffer
+ * @map: mapping addresses as returned by drm_gem_fb_vmap()
  *
- * 中文: 取消给定帧缓冲的所有缓冲区对象的内核地址空间映射。
- * 该函数与 drm_gem_fb_vmap() 配对使用。遍历每个平面的 GEM 对象，
- * 跳过空映射后调用 drm_gem_vunmap() 解除映射。
+ * This function unmaps all buffer objects of the given framebuffer.
  *
- * @fb: 帧缓冲
- * @map: drm_gem_fb_vmap() 返回的映射地址数组
+ * See drm_gem_fb_vmap() for more information.
  */
 void drm_gem_fb_vunmap(struct drm_framebuffer *fb, struct iosys_map *map)
 {
@@ -441,14 +443,15 @@ static void __drm_gem_fb_end_cpu_access(struct drm_framebuffer *fb, enum dma_dat
 }
 
 /**
- * drm_gem_fb_begin_cpu_access - 为 CPU 访问准备 GEM 缓冲区对象
+ * drm_gem_fb_begin_cpu_access - prepares GEM buffer objects for CPU access
+ * @fb: the framebuffer
+ * @dir: access mode
  *
- * 中文: 准备帧缓冲的 GEM 缓冲区对象以供 CPU 访问。在内核中访问 BO 数据
- * 前必须调用此函数。对于 dma-buf 导入的 BO，该函数调用 dma_buf_begin_cpu_access()
- * 确保缓存一致性。访问完成后应调用 drm_gem_fb_end_cpu_access()。
+ * Prepares a framebuffer's GEM buffer objects for CPU access. This function
+ * must be called before accessing the BO data within the kernel. For imported
+ * BOs, the function calls dma_buf_begin_cpu_access().
  *
- * @fb: 帧缓冲
- * @dir: 访问模式（DMA 数据方向）
+ * See drm_gem_fb_end_cpu_access() for signalling the end of CPU access.
  *
  * Returns:
  * 0 on success, or a negative errno code otherwise.
@@ -483,14 +486,15 @@ err___drm_gem_fb_end_cpu_access:
 EXPORT_SYMBOL(drm_gem_fb_begin_cpu_access);
 
 /**
- * drm_gem_fb_end_cpu_access - 通知 CPU 对 GEM 缓冲区对象的访问结束
+ * drm_gem_fb_end_cpu_access - signals end of CPU access to GEM buffer objects
+ * @fb: the framebuffer
+ * @dir: access mode
  *
- * 中文: 通知对帧缓冲的 GEM 缓冲区对象的 CPU 访问已结束。此函数必须与
- * drm_gem_fb_begin_cpu_access() 配对调用。对于 dma-buf 导入的 BO，
- * 调用 dma_buf_end_cpu_access() 完成缓存同步。
+ * Signals the end of CPU access to the given framebuffer's GEM buffer objects. This
+ * function must be paired with a corresponding call to drm_gem_fb_begin_cpu_access().
+ * For imported BOs, the function calls dma_buf_end_cpu_access().
  *
- * @fb: 帧缓冲
- * @dir: 访问模式
+ * See also drm_gem_fb_begin_cpu_access().
  */
 void drm_gem_fb_end_cpu_access(struct drm_framebuffer *fb, enum dma_data_direction dir)
 {
@@ -574,18 +578,21 @@ static int drm_gem_afbc_min_size(struct drm_device *dev,
 }
 
 /**
- * drm_gem_fb_afbc_init() - 为支持 AFBC 的驱动程序初始化帧缓冲
+ * drm_gem_fb_afbc_init() - Helper function for drivers using afbc to
+ *			    fill and validate all the afbc-specific
+ *			    struct drm_afbc_framebuffer members
  *
- * 中文: 供支持 AFBC（Arm Frame Buffer Compression，ARM 帧缓冲压缩）的
- * 驱动程序使用，完成 struct drm_afbc_framebuffer 的准备和验证工作。
- * 必须在分配该结构体并调用 drm_gem_fb_init_with_funcs() 之后调用。
- * 如果调用失败，调用者负责释放 afbc_fb->base.obj 中的对象。
- * 该函数计算 AFBC 头部大小和主体大小的最小值，并验证 GEM 对象大小是否足够。
+ * @dev: DRM device
+ * @afbc_fb: afbc-specific framebuffer
+ * @info: pixel format information
+ * @mode_cmd: Metadata from the userspace framebuffer creation request
+ * @afbc_fb: afbc framebuffer
  *
- * @dev: DRM 设备
- * @afbc_fb: AFBC 特有的帧缓冲
- * @info: 像素格式信息
- * @mode_cmd: 用户空间帧缓冲创建请求的元数据
+ * This function can be used by drivers which support afbc to complete
+ * the preparation of struct drm_afbc_framebuffer. It must be called after
+ * allocating the said struct and calling drm_gem_fb_init_with_funcs().
+ * It is caller's responsibility to put afbc_fb->base.obj objects in case
+ * the call is unsuccessful.
  *
  * Returns:
  * Zero on success or a negative error value on failure.

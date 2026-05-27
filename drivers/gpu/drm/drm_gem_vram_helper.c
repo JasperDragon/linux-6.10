@@ -1,32 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-/*
- * 中文注释: DRM GEM VRAM 辅助函数 (GEM VRAM Helper)
- *
- * 本文件实现了基于视频内存 (VRAM) 的 GEM 缓冲区对象管理框架, 提供
- * struct drm_gem_vram_object (GEM VRAM) 的实现。该框架适用于具有
- * 专用视频内存的帧缓冲设备。
- *
- * 核心组件:
- *   1. drm_gem_vram_object: 表示一个 GEM 缓冲区对象, 其数据可以位于
- *      视频内存 (VRAM) 或系统内存 (System RAM) 中
- *   2. drm_vram_mm: VRAM 内存管理器, 封装了 TTM (Translation Table Maps)
- *      内存管理后端
- *
- * 主要功能:
- *   - 缓冲区对象创建/销毁 (drm_gem_vram_create / drm_gem_vram_put)
- *   - 缓冲区固定/解固定 (pin/unpin), 将对象锁定在 VRAM 中
- *   - 内核态映射 (vmap/vunmap), 将缓冲区映射到内核地址空间
- *   - 平面 (plane) 辅助: prepare_fb / cleanup_fb 处理帧缓冲的固定与释放
- *   - Dumb 缓冲区创建: 实现 DRM driver 的 dumb_create 接口
- *   - 模式验证: 检查显示模式的帧缓冲是否不超过可用 VRAM 的一半
- *
- * 设计特点:
- *   - 使用 TTM 作为底层内存管理器, 支持 VRAM 与系统内存之间的迁移
- *   - 通过 drmm_vram_helper_init() 进行资源托管, 自动清理
- *   - vmap 采用延迟取消映射策略, 减少页表更新开销
- */
-
 #include <linux/export.h>
 #include <linux/iosys-map.h>
 #include <linux/module.h>
@@ -187,12 +160,6 @@ static void drm_gem_vram_placement(struct drm_gem_vram_object *gbo,
 }
 
 /**
- * 中文注释: 创建 VRAM 支持的 GEM 对象
- * 分配并初始化一个 GEM VRAM 缓冲区对象。首先通过驱动程序的
- * gem_create_object 回调 (如果设置) 分配 GEM 对象, 否则使用 kzalloc。
- * 然后初始化 GEM 对象和 TTM 缓冲区对象 (通过 ttm_bo_init_validate)。
- * 初始放置位置为系统内存 (SYSTEM), 后续可通过 pin 操作迁移到 VRAM。
- *
  * drm_gem_vram_create() - Creates a VRAM-backed GEM object
  * @dev:		the DRM device
  * @size:		the buffer size in bytes
@@ -262,10 +229,6 @@ struct drm_gem_vram_object *drm_gem_vram_create(struct drm_device *dev,
 EXPORT_SYMBOL(drm_gem_vram_create);
 
 /**
- * 中文注释: 释放 VRAM 支持的 GEM 对象的引用
- * 通过 ttm_bo_fini() 释放 TTM 缓冲区对象。当引用计数降为零时,
- * TTM 会调用销毁回调 ttm_buffer_object_destroy 来最终释放对象。
- *
  * drm_gem_vram_put() - Releases a reference to a VRAM-backed GEM object
  * @gbo:	the GEM VRAM object
  *
@@ -288,11 +251,6 @@ static u64 drm_gem_vram_pg_offset(struct drm_gem_vram_object *gbo)
 }
 
 /**
- * 中文注释: 返回 GEM VRAM 对象在视频内存中的偏移量
- * 返回缓冲区对象在设备视频内存中的偏移量。缓冲区必须已固定 (pinned)
- * 到 TTM_PL_VRAM 才能调用此函数。该偏移量通常用于编程硬件的扫描
- * 引擎 (scanout engine) 或光标覆盖层 (cursor overlay)。
- *
  * drm_gem_vram_offset() - Returns a GEM VRAM object's offset in video memory
  * @gbo:	the GEM VRAM object
  *
@@ -370,15 +328,6 @@ static int drm_gem_vram_unpin(struct drm_gem_vram_object *gbo)
 }
 
 /**
- * 中文注释: 固定并映射 GEM VRAM 对象到内核地址空间
- * 将 GEM VRAM 对象固定到其当前位置 (系统内存或视频内存), 并将缓冲区
- * 映射到内核地址空间。维护 vmap 使用计数, 支持多次嵌套 vmap 调用。
- * 固定的对象无法被迁移, 因此应避免长期固定。
- *
- * 优化: VRAM 辅助函数采用延迟取消映射策略, 仅在缓冲区被逐出时
- * (通过 drm_gem_vram_bo_driver_move_notify) 才真正解除映射, 以减少
- * 页表更新开销。
- *
  * drm_gem_vram_vmap() - Pins and maps a GEM VRAM object into kernel address
  *                       space
  * @gbo: The GEM VRAM object to map
@@ -423,12 +372,6 @@ out:
 EXPORT_SYMBOL(drm_gem_vram_vmap);
 
 /**
- * 中文注释: 取消映射并解固定 GEM VRAM 对象
- * 递减 vmap 使用计数。当使用计数降为零时, 并不立即解除映射, 而是
- * 延迟到 TTM 迁移通知 (move_notify) 时再执行实际的 vunmap 操作。
- * 这种策略避免了频繁更新页表带来的性能开销和调试输出干扰。
- * 注意: @map 必须与之前的 drm_gem_vram_vmap() 返回的映射匹配。
- *
  * drm_gem_vram_vunmap() - Unmaps and unpins a GEM VRAM object
  * @gbo: The GEM VRAM object to unmap
  * @map: Kernel virtual address where the VRAM GEM object was mapped
@@ -462,11 +405,6 @@ void drm_gem_vram_vunmap(struct drm_gem_vram_object *gbo,
 EXPORT_SYMBOL(drm_gem_vram_vunmap);
 
 /**
- * 中文注释: 实现 dumb_create 回调的辅助函数
- * 填充 struct drm_mode_create_dumb, 用于实现 DRM 驱动的 dumb_create
- * 接口。计算所需的 pitch (每行字节数) 和缓冲区大小, 考虑 pitch_align
- * 对齐要求, 然后创建 GEM VRAM 对象并生成用户空间句柄。
- *
  * drm_gem_vram_fill_create_dumb() - Helper for implementing
  *				     &struct drm_driver.dumb_create
  *
@@ -588,11 +526,6 @@ static void drm_gem_vram_object_free(struct drm_gem_object *gem)
  */
 
 /**
- * 中文注释: 实现 DRM 驱动的 dumb_create 回调
- * 简单的封装函数, 调用 drm_gem_vram_fill_create_dumb() 并传递
- * 默认的对齐参数 (pg_align=0, pitch_align=0)。要求驱动程序已通过
- * dev->vram_mm 初始化了 VRAM MM 实例。
- *
  * drm_gem_vram_driver_dumb_create() - Implements &struct drm_driver.dumb_create
  * @file:		the DRM file
  * @dev:		the DRM device
@@ -640,11 +573,6 @@ static void __drm_gem_vram_plane_helper_cleanup_fb(struct drm_plane *plane,
 }
 
 /**
- * 中文注释: 实现平面辅助的 prepare_fb 回调
- * 在平面更新期间, 将新帧缓冲区的所有 GEM VRAM 对象固定到 VRAM,
- * 确保扫描引擎可以访问这些缓冲区。同时还设置平面的 fence。
- * 对应的清理操作由 drm_gem_vram_plane_helper_cleanup_fb() 完成。
- *
  * drm_gem_vram_plane_helper_prepare_fb() - Implements &struct
  *					    drm_plane_helper_funcs.prepare_fb
  * @plane:	a DRM plane
@@ -696,11 +624,6 @@ err_drm_gem_vram_unpin:
 EXPORT_SYMBOL(drm_gem_vram_plane_helper_prepare_fb);
 
 /**
- * 中文注释: 实现平面辅助的 cleanup_fb 回调
- * 在平面更新完成后, 解固定旧帧缓冲区中的所有 GEM VRAM 对象,
- * 将它们从 VRAM 中释放, 与 drm_gem_vram_plane_helper_prepare_fb()
- * 配对使用。
- *
  * drm_gem_vram_plane_helper_cleanup_fb() - Implements &struct
  *					    drm_plane_helper_funcs.cleanup_fb
  * @plane:	a DRM plane
@@ -911,10 +834,6 @@ static const struct drm_debugfs_info drm_vram_mm_debugfs_list[] = {
 };
 
 /**
- * 中文注释: 注册 VRAM MM debugfs 文件
- * 在 debugfs 中创建 "vram-mm" 文件, 提供 VRAM 内存管理器的调试信息,
- * 包括已分配和空闲的内存区域等统计信息。
- *
  * drm_vram_mm_debugfs_init() - Register VRAM MM debugfs file.
  *
  * @minor: drm minor device.
@@ -1000,12 +919,6 @@ static void drm_vram_mm_release(struct drm_device *dev, void *ptr)
 }
 
 /**
- * 中文注释: 初始化设备的 VRAM MM 实例 (托管版本)
- * 创建 struct drm_vram_mm 实例并存储在 drm_device.vram_mm 中。
- * 该实例是资源托管的 (device-managed), 在设备清理时自动释放。
- * 内部完成 TTM 设备初始化和 VRAM 范围管理器的设置。
- * 多次调用会生成错误消息。
- *
  * drmm_vram_helper_init - Initializes a device's instance of
  *                         &struct drm_vram_mm
  * @dev:	the DRM device
@@ -1062,15 +975,6 @@ drm_vram_helper_mode_valid_internal(struct drm_device *dev,
 }
 
 /**
- * 中文注释: 测试显示模式的帧缓冲是否适合可用视频内存
- * 检查指定显示模式所需的帧缓冲大小是否不超过可用 VRAM 的一半。
- * 原子模式设置要求在逐出当前帧缓冲之前, 先将新的帧缓冲导入视频内存,
- * 因此任何帧缓冲最多只能消耗可用 VRAM 的一半。假设每个帧缓冲为
- * 32 位色深 (DRM_FORMAT_XRGB8888)。
- *
- * 局限性: 该函数只能进行一般性检查。如果太多帧缓冲被固定到视频内存,
- * 即使单个帧缓冲大小符合要求, 实际也可能无法使用。
- *
  * drm_vram_helper_mode_valid - Tests if a display mode's
  *	framebuffer fits into the available video memory.
  * @dev:	the DRM device

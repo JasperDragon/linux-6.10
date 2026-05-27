@@ -9,29 +9,6 @@
  * Copyright (c) 2011 Samsung Electronics Co., Ltd.
  */
 
-/**
- * DOC: DMA GEM 对象管理概述 (中文)
- *
- * 该文件实现了基于 DMA 的 GEM 对象辅助函数。DMA GEM 对象为设备提供连续的
- * 内存缓冲区，适用于以下两种场景：
- *
- * 1. 不支持散列/聚集 DMA（SG DMA）的设备——通过 CMA（连续内存分配器）
- *    提供物理连续的内存。
- * 2. 通过 IOMMU 访问内存总线的设备——内存页可以物理离散但在 IOVA 空间中
- *    连续，对设备表现为连续内存。
- *
- * 核心功能包括：
- *   - 创建和初始化 DMA GEM 对象，分配 DMA 一致内存
- *   - 释放对象及其后端 DMA 内存
- *   - 生成 SG 表用于 PRIME 缓冲区共享
- *   - 提供内核虚拟地址映射（vmap）
- *   - 支持 mmap 操作映射到用户空间
- *   - 创建 dumb 缓冲区对象
- *
- * 该辅助层通过 struct drm_gem_dma_object 结构体管理每个 DMA GEM 对象，
- * 并提供了 _object_ 后缀的包装函数自动完成类型转换。
- */
-
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/export.h>
@@ -139,16 +116,18 @@ error:
 }
 
 /**
- * drm_gem_dma_create - 分配指定大小的 DMA GEM 对象
+ * drm_gem_dma_create - allocate an object with the given size
+ * @drm: DRM device
+ * @size: size of the object to allocate
  *
- * 中文: 创建 DMA GEM 对象并分配后端存储内存。分配的内存占用连续的
- * 总线地址空间。对于直接连接到内存总线的设备，分配的内存将是物理连续的；
- * 对于通过 IOMMU 访问的设备，只需 IOVA 连续即可满足 DMA 要求。
- * 该函数使用 dma_alloc_wc()（或 dma_alloc_noncoherent() 用于非一致性映射）
- * 分配写结合（write-combine）DMA 内存。
+ * This function creates a DMA GEM object and allocates memory as backing store.
+ * The allocated memory will occupy a contiguous chunk of bus address space.
  *
- * @drm: DRM 设备
- * @size: 要分配的对象大小
+ * For devices that are directly connected to the memory bus then the allocated
+ * memory will be physically contiguous. For devices that access through an
+ * IOMMU, then the allocated memory is not expected to be physically contiguous
+ * because having contiguous IOVAs is sufficient to meet a devices DMA
+ * requirements.
  *
  * Returns:
  * A struct drm_gem_dma_object * on success or an ERR_PTR()-encoded negative
@@ -240,14 +219,12 @@ drm_gem_dma_create_with_handle(struct drm_file *file_priv,
 }
 
 /**
- * drm_gem_dma_free - 释放 DMA GEM 对象占用的资源
+ * drm_gem_dma_free - free resources associated with a DMA GEM object
+ * @dma_obj: DMA GEM object to free
  *
- * 中文: 释放 DMA GEM 对象的后端内存，清理 GEM 对象状态并释放存储对象
- * 本身的内存。对于 dma-buf 导入的缓冲区，如果设置了虚拟地址，会先解除
- * vmap 映射；对于本地分配的对象，使用 dma_free_wc() 或 dma_free_noncoherent()
- * 释放 DMA 内存。
- *
- * @dma_obj: 要释放的 DMA GEM 对象
+ * This function frees the backing memory of the DMA GEM object, cleans up the
+ * GEM object state and frees the memory used to store the object itself.
+ * If the buffer is imported and the virtual address is set, it is released.
  */
 void drm_gem_dma_free(struct drm_gem_dma_object *dma_obj)
 {
@@ -310,16 +287,19 @@ int drm_gem_dma_dumb_create_internal(struct drm_file *file_priv,
 EXPORT_SYMBOL_GPL(drm_gem_dma_dumb_create_internal);
 
 /**
- * drm_gem_dma_dumb_create - 创建 dumb DMA 缓冲区对象
+ * drm_gem_dma_dumb_create - create a dumb buffer object
+ * @file_priv: DRM file-private structure to create the dumb buffer for
+ * @drm: DRM device
+ * @args: IOCTL data
  *
- * 中文: 计算 dumb 缓冲区的 pitch 并向上取整到整数字节/像素。
- * 对于没有额外硬件 pitch 限制的驱动程序，可直接将此函数用作
- * &drm_driver.dumb_create 回调。对于有特殊硬件对齐要求的驱动，
- * 可调整用户空间设置的字段后调用 drm_gem_dma_dumb_create_internal()。
+ * This function computes the pitch of the dumb buffer and rounds it up to an
+ * integer number of bytes per pixel. Drivers for hardware that doesn't have
+ * any additional restrictions on the pitch can directly use this function as
+ * their &drm_driver.dumb_create callback.
  *
- * @file_priv: 创建 dumb 缓冲区的 DRM 文件私有结构
- * @drm: DRM 设备
- * @args: IOCTL 数据
+ * For hardware with additional restrictions, drivers can adjust the fields
+ * set up by userspace and pass the IOCTL data along to the
+ * drm_gem_dma_dumb_create_internal() function.
  *
  * Returns:
  * 0 on success or a negative error code on failure.
@@ -435,13 +415,12 @@ void drm_gem_dma_print_info(const struct drm_gem_dma_object *dma_obj,
 EXPORT_SYMBOL(drm_gem_dma_print_info);
 
 /**
- * drm_gem_dma_get_sg_table - 提供 DMA GEM 对象的散列/聚集表
+ * drm_gem_dma_get_sg_table - provide a scatter/gather table of pinned
+ *     pages for a DMA GEM object
+ * @dma_obj: DMA GEM object
  *
- * 中文: 通过调用标准 DMA 映射 API 导出散列/聚集（SG）表。
- * 该函数从 dma_addr 和 vaddr 创建 SG 表，适用于 PRIME 缓冲区共享。
- * 调用 dma_get_sgtable() 获取底层设备的 DMA 映射信息。
- *
- * @dma_obj: DMA GEM 对象
+ * This function exports a scatter/gather table by calling the standard
+ * DMA mapping API.
  *
  * Returns:
  * A pointer to the scatter/gather table of pinned pages or NULL on failure.
@@ -470,16 +449,17 @@ out:
 EXPORT_SYMBOL_GPL(drm_gem_dma_get_sg_table);
 
 /**
- * drm_gem_dma_prime_import_sg_table - 从其他驱动的 SG 表导入 DMA GEM 对象
+ * drm_gem_dma_prime_import_sg_table - produce a DMA GEM object from another
+ *     driver's scatter/gather table of pinned pages
+ * @dev: device to import into
+ * @attach: DMA-BUF attachment
+ * @sgt: scatter/gather table of pinned pages
  *
- * 中文: 从另一个驱动通过 DMA-BUF 导出的散列/聚集表创建 DMA GEM 对象。
- * 注意：导入的缓冲区必须在内存中物理连续（即 SG 表只能包含一个条目）。
- * 使用 DMA 助手的驱动程序应将此函数设置为 &drm_driver.gem_prime_import_sg_table
- * 回调。该函数会检查 SG 表的连续性，不连续则返回错误。
- *
- * @dev: 导入目标设备
- * @attach: DMA-BUF 附件
- * @sgt: 固定页面的散列/聚集表
+ * This function imports a scatter/gather table exported via DMA-BUF by
+ * another driver. Imported buffers must be physically contiguous in memory
+ * (i.e. the scatter/gather table must contain a single entry). Drivers that
+ * use the DMA helpers should set this as their
+ * &drm_driver.gem_prime_import_sg_table callback.
  *
  * Returns:
  * A pointer to a newly created GEM object or an ERR_PTR-encoded negative
@@ -512,14 +492,15 @@ drm_gem_dma_prime_import_sg_table(struct drm_device *dev,
 EXPORT_SYMBOL_GPL(drm_gem_dma_prime_import_sg_table);
 
 /**
- * drm_gem_dma_vmap - 将 DMA GEM 对象映射到内核虚拟地址空间
+ * drm_gem_dma_vmap - map a DMA GEM object into the kernel's virtual
+ *     address space
+ * @dma_obj: DMA GEM object
+ * @map: Returns the kernel virtual address of the DMA GEM object's backing
+ *       store.
  *
- * 中文: 将缓冲区映射到内核虚拟地址空间。由于 DMA 缓冲区在分配时已经映射到
- * 内核虚拟地址空间（dma_alloc_wc() 返回内核虚拟地址），此函数直接返回缓存的
- * 虚拟地址，无需实际建立新映射。
- *
- * @dma_obj: DMA GEM 对象
- * @map: 返回 DMA GEM 对象后端存储的内核虚拟地址
+ * This function maps a buffer into the kernel's virtual address space.
+ * Since the DMA buffers are already mapped into the kernel virtual address
+ * space this simply returns the cached virtual address.
  *
  * Returns:
  * 0 on success, or a negative error code otherwise.
@@ -534,15 +515,13 @@ int drm_gem_dma_vmap(struct drm_gem_dma_object *dma_obj,
 EXPORT_SYMBOL_GPL(drm_gem_dma_vmap);
 
 /**
- * drm_gem_dma_mmap - 对导出的 DMA GEM 对象执行内存映射
+ * drm_gem_dma_mmap - memory-map an exported DMA GEM object
+ * @dma_obj: DMA GEM object
+ * @vma: VMA for the area to be mapped
  *
- * 中文: 将 DMA 缓冲区映射到用户空间进程的地址空间。与通常的 GEM VMA 设置
- * 不同，该函数立即将整个对象映射到页表中（通过 dma_mmap_wc() 或
- * dma_mmap_pages()），而不是使用按需缺页处理。对于非一致性映射使用
- * dma_mmap_pages()，对于写结合映射使用 dma_mmap_wc()。
- *
- * @dma_obj: DMA GEM 对象
- * @vma: 要映射区域的 VMA
+ * This function maps a buffer into a userspace process's address space.
+ * In addition to the usual GEM VMA setup it immediately faults in the entire
+ * object instead of using on-demand faulting.
  *
  * Returns:
  * 0 on success or a negative error code on failure.

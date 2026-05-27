@@ -1,22 +1,5 @@
 // SPDX-License-Identifier: MIT
 
-/*
- * DRM fbdev DMA 模拟实现
- *
- * 本文件为使用 DMA 内存管理后端的 DRM 驱动提供 fbdev 模拟支持。
- * DMA 后端是一种简单的连续内存分配器，适用于不需要复杂内存管理
- * 的嵌入式系统和简单显示控制器。
- *
- * 功能特点：
- *   - 创建由 dumb 缓冲区支持的 fbdev 帧缓冲
- *   - 支持脏区域追踪和刷新（通过 shadow buffer + deferred I/O）
- *   - 处理 fbdev 的 open/release/mmap/destroy 等文件操作
- *
- * 适用场景：
- *   - 使用 drm_gem_dma_helper 的驱动
- *   - 需要 fbdev 兼容层的系统
- */
-
 #include <linux/export.h>
 #include <linux/fb.h>
 #include <linux/vmalloc.h>
@@ -281,20 +264,6 @@ err_vfree:
 	return ret;
 }
 
-/**
- * drm_fbdev_dma_driver_fbdev_probe - DMA fbdev 探测回调
- * @fb_helper: fbdev 辅助结构
- * @sizes: 所需的表面尺寸
- *
- * 这是 &drm_driver.fbdev_probe 的 DMA 实现。该函数：
- *   1. 创建一个由 dumb 缓冲区支持的客户端缓冲区
- *   2. 将缓冲区映射到内核地址空间
- *   3. 设置 fbdev 信息结构（fix, var, 屏幕缓冲区）
- *   4. 如果帧缓冲支持 dirty 回调，设置 shadow buffer 和 deferred I/O
- *
- * 返回值：
- * 成功返回 0，失败返回负的错误码。
- */
 int drm_fbdev_dma_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
 				     struct drm_fb_helper_surface_size *sizes)
 {

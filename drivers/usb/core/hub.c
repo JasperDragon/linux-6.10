@@ -753,65 +753,8 @@ static int hub_ext_port_status(struct usb_hub *hub, int port1, int type,
 }
 
 /*
- * usb_hub_port_status -- 封装 hub_ext_port_status, 请求标准 4 字节端口状态
+ * usb_hub_port_status — 封装 hub_ext_port_status, 请求标准 4 字节端口状态
  */
-int usb_hub_port_status(struct usb_hub *hub, int port1,
-			u16 *status, u16 *change)
-{
-	int ret;
-	int len = 4;
-
-	if (type != HUB_PORT_STATUS)
-		len = 8;
-
-	mutex_lock(&hub->status_mutex);
-	ret = get_port_status(hub->hdev, port1, &hub->status->port, type, len);
-	if (ret < len) {
-		if (ret != -ENODEV)
-			dev_err(hub->intfdev,
-				"%s failed (err = %d)\n", __func__, ret);
-		if (ret >= 0)
-			ret = -EIO;
-	} else {
-		*status = le16_to_cpu(hub->status->port.wPortStatus);
-		*change = le16_to_cpu(hub->status->port.wPortChange);
-		if (type != HUB_PORT_STATUS && ext_status)
-			*ext_status = le32_to_cpu(
-				hub->status->port.dwExtPortStatus);
-		ret = 0;
-	}
-	mutex_unlock(&hub->status_mutex);
-
-	/*
-	 * There is no need to lock status_mutex here, because status_mutex
-	 * protects hub->status, and the phy driver only checks the port
-	 * status without changing the status.
-	 */
-	if (!ret) {
-		struct usb_device *hdev = hub->hdev;
-
-		/*
-		 * Only roothub will be notified of connection changes,
-		 * since the USB PHY only cares about changes at the next
-		 * level.
-		 */
-		if (is_root_hub(hdev)) {
-			struct usb_hcd *hcd = bus_to_hcd(hdev->bus);
-			bool connect;
-			bool connect_change;
-
-			connect_change = *change & USB_PORT_STAT_C_CONNECTION;
-			connect = *status & USB_PORT_STAT_CONNECTION;
-			if (connect_change && connect)
-				usb_phy_roothub_notify_connect(hcd->phy_roothub, port1 - 1);
-			else if (connect_change)
-				usb_phy_roothub_notify_disconnect(hcd->phy_roothub, port1 - 1);
-		}
-	}
-
-	return ret;
-}
-
 int usb_hub_port_status(struct usb_hub *hub, int port1,
 		u16 *status, u16 *change)
 {

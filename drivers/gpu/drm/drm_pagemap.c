@@ -3,31 +3,6 @@
  * Copyright © 2024-2025 Intel Corporation
  */
 
-/**
- * DOC: DRM 页面映射层概述 (中文)
- *
- * 该文件实现了 DRM 页面映射（pagemap）层，扩展了内核的 dev_pagemap 功能，
- * 为 GPU 设备内存管理提供辅助支持。核心功能包括：
- *
- * 1. 设备内存分配与迁移：支持在设备内存和系统 RAM 之间双向迁移内存页面。
- *    迁移粒度通常遵循 GPU SVM range 请求，支持分配设备内存、填充 PFN、
- *    以及通过驱动提供的 copy_to_devmem/copy_to_ram 回调进行数据复制。
- *
- * 2. 虚拟地址范围填充：提供 drm_pagemap_populate_mm() 将 CPU 虚拟地址范围
- *    填充为设备内存页面，支持指定时间片以防止迁移活锁。
- *
- * 3. 设备内存驱逐：drm_pagemap_evict_to_ram() 将设备内存分配的全部页面
- *    迁移回系统 RAM，在设备卸载时使用。
- *
- * 4. 设备内存分配生命周期管理：通过 drm_pagemap_devmem_init() 初始化设备
- *    内存分配结构体，包含设备引用、内存操作回调、预迁移 fence 等。
- *
- * 关键组件包括：
- *   - struct drm_pagemap：封装了 dev_pagemap、drm_device 引用和操作回调
- *   - struct drm_pagemap_devmem：设备内存分配描述，包含迁移所需信息
- *   - struct drm_pagemap_zdd：页面 zone_device_data 包装器，支持异步释放
- */
-
 #include <linux/dma-fence.h>
 #include <linux/dma-mapping.h>
 #include <linux/migrate.h>
@@ -516,26 +491,26 @@ static int drm_pagemap_cpages(unsigned long *migrate_pfn, unsigned long npages)
 }
 
 /**
- * drm_pagemap_migrate_to_devmem() - 将 mm_struct 范围的虚拟地址迁移到设备内存
+ * drm_pagemap_migrate_to_devmem() - Migrate a struct mm_struct range to device memory
+ * @devmem_allocation: The device memory allocation to migrate to.
+ * The caller should hold a reference to the device memory allocation,
+ * and the reference is consumed by this function even if it returns with
+ * an error.
+ * @mm: Pointer to the struct mm_struct.
+ * @start: Start of the virtual address range to migrate.
+ * @end: End of the virtual address range to migrate.
+ * @mdetails: Details to govern the migration.
  *
- * 中文: 将指定的虚拟地址范围从系统内存迁移到设备内存。使用内核的 migrate_vma
- * 框架完成页面迁移。迁移流程：
- * 1. 通过 migrate_vma_setup() 收集源页面的 PFN
- * 2. 通过驱动提供的 populate_devmem_pfn() 回调填充目标设备内存 PFN
- * 3. 对每个页面，如果是系统内存页面则通过 copy_to_devmem 复制到设备；
- *    如果是其他设备的内存页面（peer pages），则通过 copy_to_ram 先读到
- *    本设备（当前版本暂不支持直接的设备间复制）
- * 4. 通过 migrate_vma_pages() 和 migrate_vma_finalize() 完成迁移
+ * This function migrates the specified virtual address range to device memory.
+ * It performs the necessary setup and invokes the driver-specific operations for
+ * migration to device memory. Expected to be called while holding the mmap lock in
+ * at least read mode.
  *
- * @timeslice_ms 参数用于防止迁移活锁——数据将在设备内存中停留足够长的时间
- * 供 GPU 完成任务。调用者需持有 mmap 锁（至少读模式）。
- *
- * @devmem_allocation: 要迁移到的设备内存分配。调用者应持有其引用，
- *                     此函数会消费该引用（即使返回错误）
- * @mm: 指向 struct mm_struct 的指针
- * @start: 要迁移的虚拟地址范围起始
- * @end: 要迁移的虚拟地址范围结束
- * @mdetails: 控制迁移行为的详细信息
+ * Note: The @timeslice_ms parameter can typically be used to force data to
+ * remain in pagemap pages long enough for a GPU to perform a task and to prevent
+ * a migration livelock. One alternative would be for the GPU driver to block
+ * in a mmu_notifier for the specified amount of time, but adding the
+ * functionality to the pagemap is likely nicer to the system as a whole.
  *
  * Return: %0 on success, negative error code on failure.
  */
@@ -958,13 +933,12 @@ drm_pagemap_dev_hold(struct drm_pagemap *dpagemap)
 }
 
 /**
- * drm_pagemap_reinit() - 重新初始化 drm_pagemap
+ * drm_pagemap_reinit() - Reinitialize a drm_pagemap
+ * @dpagemap: The drm_pagemap to reinitialize
  *
- * 中文: 重新初始化一个已经被 drm_pagemap_release() 释放的 drm_pagemap。
- * 此接口适用于驱动程序缓存已销毁的 drm_pagemap 后需要重新使用的场景。
- * 重新分配 dev_hold 结构并重新初始化引用计数。
- *
- * @dpagemap: 要重新初始化的 drm_pagemap
+ * Reinitialize a drm_pagemap, for which drm_pagemap_release
+ * has already been called. This interface is intended for the
+ * situation where the driver caches a destroyed drm_pagemap.
  *
  * Return: 0 on success, negative error code on failure.
  */
@@ -980,20 +954,19 @@ int drm_pagemap_reinit(struct drm_pagemap *dpagemap)
 EXPORT_SYMBOL(drm_pagemap_reinit);
 
 /**
- * drm_pagemap_init() - 初始化预分配的 drm_pagemap
+ * drm_pagemap_init() - Initialize a pre-allocated drm_pagemap
+ * @dpagemap: The drm_pagemap to initialize.
+ * @pagemap: The associated dev_pagemap providing the device
+ * private pages.
+ * @drm: The drm device. The drm_pagemap holds a reference on the
+ * drm_device and the module owning the drm_device until
+ * drm_pagemap_release(). This facilitates drm_pagemap exporting.
+ * @ops: The drm_pagemap ops.
  *
- * 中文: 初始化一个预分配的 &drm_pagemap 结构体，设置其引用计数为 1。
- * 初始化包括关联 dev_pagemap、DRM 设备、操作回调以及 shrinker 链接。
- * drm_pagemap 会持有 drm_device 和其模块的引用，直到 drm_pagemap_release()
- * 被调用。这支持了 drm_pagemap 的导出场景。
- * 成功后应通过 drm_pagemap_put() 销毁。
+ * Initialize and take an initial reference on a drm_pagemap.
+ * After successful return, use drm_pagemap_put() to destroy.
  *
- * @dpagemap: 要初始化的 drm_pagemap
- * @pagemap: 提供设备私有页面的关联 dev_pagemap
- * @drm: DRM 设备（drm_pagemap 持有其引用）
- * @ops: drm_pagemap 操作回调
- *
- * Return: 0 on success, negative error code on error.
+ ** Return: 0 on success, negative error code on error.
  */
 int drm_pagemap_init(struct drm_pagemap *dpagemap,
 		     struct dev_pagemap *pagemap,
@@ -1012,14 +985,11 @@ int drm_pagemap_init(struct drm_pagemap *dpagemap,
 EXPORT_SYMBOL(drm_pagemap_init);
 
 /**
- * drm_pagemap_put() - 释放 drm_pagemap 引用
+ * drm_pagemap_put() - Put a struct drm_pagemap reference
+ * @dpagemap: Pointer to a struct drm_pagemap object.
  *
- * 中文: 递减 &drm_pagemap 的引用计数。当引用计数降至零时，触发
- * drm_pagemap_release()，该函数会将 drm_device 和模块的引用释放
- * 放入工作队列异步处理，并将 drm_pagemap 添加到 shrinker 列表以
- * 支持缓存重用。
- *
- * @dpagemap: 指向 struct drm_pagemap 对象的指针
+ * Puts a struct drm_pagemap reference and frees the drm_pagemap object
+ * if the refount reaches zero.
  */
 void drm_pagemap_put(struct drm_pagemap *dpagemap)
 {
@@ -1031,15 +1001,11 @@ void drm_pagemap_put(struct drm_pagemap *dpagemap)
 EXPORT_SYMBOL(drm_pagemap_put);
 
 /**
- * drm_pagemap_evict_to_ram() - 将设备内存分配驱逐回 RAM
+ * drm_pagemap_evict_to_ram() - Evict GPU SVM range to RAM
+ * @devmem_allocation: Pointer to the device memory allocation
  *
- * 中文: 将设备内存分配的所有页面迁移回系统 RAM。与 __drm_pagemap_migrate_to_ram()
- * 类似，但不需要 mmap 锁，使用 migrate_device_* 函数族进行迁移。
- * 迁移流程：填充设备内存 PFN -> migrate_device_pfns() -> 填充 RAM PFN ->
- * DMA 映射 -> copy_to_ram 复制数据 -> migrate_device_pages() 完成迁移。
- * 最多重试 2 次，处理竞态条件。
- *
- * @devmem_allocation: 指向设备内存分配的指针
+ * Similar to __drm_pagemap_migrate_to_ram but does not require mmap lock and
+ * migration done via migrate_device_* functions.
  *
  * Return: 0 on success, negative error code on failure.
  */
@@ -1305,12 +1271,7 @@ static const struct dev_pagemap_ops drm_pagemap_pagemap_ops = {
 };
 
 /**
- * drm_pagemap_pagemap_ops_get() - 获取设备页面映射操作回调
- *
- * 中文: 返回 dev_pagemap_ops 结构体指针，其中包含 folio_free（页面释放时
- * 关联 zdd 引用释放）、migrate_to_ram（CPU 缺页时从设备内存迁移回 RAM）
- * 和 folio_split（大页分裂时复制 zone_device_data）回调。驱动程序在注册
- * dev_pagemap 时应使用此函数获取标准操作回调。
+ * drm_pagemap_pagemap_ops_get() - Retrieve GPU SVM device page map operations
  *
  * Returns:
  * Pointer to the GPU SVM device page map operations structure.
@@ -1322,20 +1283,16 @@ const struct dev_pagemap_ops *drm_pagemap_pagemap_ops_get(void)
 EXPORT_SYMBOL_GPL(drm_pagemap_pagemap_ops_get);
 
 /**
- * drm_pagemap_devmem_init() - 初始化 drm_pagemap 设备内存分配
+ * drm_pagemap_devmem_init() - Initialize a drm_pagemap device memory allocation
  *
- * 中文: 初始化 struct drm_pagemap_devmem 结构体，设置设备内存分配的所有
- * 必要字段：所属设备、地址空间 mm、设备内存操作回调、源 drm_pagemap、
- * 分配大小以及预迁移 fence。预迁移 fence 允许迁移操作等待或流水线化
- * 在其他 fence 之后执行（可为 NULL）。
- *
- * @devmem_allocation: 要初始化的 struct drm_pagemap_devmem
- * @dev: 设备内存分配所属的设备
- * @mm: 地址空间的 mm_struct
- * @ops: GPU SVM 设备内存的操作回调
- * @dpagemap: 分配来源的 struct drm_pagemap
- * @size: 设备内存分配大小
- * @pre_migrate_fence: 迁移开始前等待的 fence（可为 NULL）
+ * @devmem_allocation: The struct drm_pagemap_devmem to initialize.
+ * @dev: Pointer to the device structure which device memory allocation belongs to
+ * @mm: Pointer to the mm_struct for the address space
+ * @ops: Pointer to the operations structure for GPU SVM device memory
+ * @dpagemap: The struct drm_pagemap we're allocating from.
+ * @size: Size of device memory allocation
+ * @pre_migrate_fence: Fence to wait for or pipeline behind before migration starts.
+ * (May be NULL).
  */
 void drm_pagemap_devmem_init(struct drm_pagemap_devmem *devmem_allocation,
 			     struct device *dev, struct mm_struct *mm,
@@ -1354,13 +1311,8 @@ void drm_pagemap_devmem_init(struct drm_pagemap_devmem *devmem_allocation,
 EXPORT_SYMBOL_GPL(drm_pagemap_devmem_init);
 
 /**
- * drm_pagemap_page_to_dpagemap() - 返回页面所属的 drm_pagemap 指针
- *
- * 中文: 返回设备私有页面所属的 struct drm_pagemap 指针。通过页面的
- * zone_device_data 找到 zdd 结构，再从 zdd 的 devmem_allocation 获取
- * dpagemap 引用。如果页面不是从 struct drm_pagemap 填充的，结果未定义。
- *
- * @page: 设备私有页面的 struct page
+ * drm_pagemap_page_to_dpagemap() - Return a pointer the drm_pagemap of a page
+ * @page: The struct page.
  *
  * Return: A pointer to the struct drm_pagemap of a device private page that
  * was populated from the struct drm_pagemap. If the page was *not* populated
@@ -1376,19 +1328,18 @@ struct drm_pagemap *drm_pagemap_page_to_dpagemap(struct page *page)
 EXPORT_SYMBOL_GPL(drm_pagemap_page_to_dpagemap);
 
 /**
- * drm_pagemap_populate_mm() - 用设备内存页面填充虚拟地址范围
+ * drm_pagemap_populate_mm() - Populate a virtual range with device memory pages
+ * @dpagemap: Pointer to the drm_pagemap managing the device memory
+ * @start: Start of the virtual range to populate.
+ * @end: End of the virtual range to populate.
+ * @mm: Pointer to the virtual address space.
+ * @timeslice_ms: The time requested for the migrated pagemap pages to
+ * be present in @mm before being allowed to be migrated back.
  *
- * 中文: 尝试用设备内存页面填充指定的虚拟地址范围。该函数会获取 mm 引用，
- * 持有 mmap 读锁后调用驱动提供的 populate_mm 回调。回调将清除现有页面
- * 或从现有页面迁移数据到设备内存。此函数仅为尽力而为（best effort）实现，
- * 不同实现的努力程度可能不同。如果硬件设备已被移除/解除绑定，返回 -ENODEV。
- * @timeslice_ms 参数确保迁移后的页面在 @mm 中停留指定时间后才允许被迁回。
- *
- * @dpagemap: 管理设备内存的 drm_pagemap 指针
- * @start: 要填充的虚拟范围起始地址
- * @end: 要填充的虚拟范围结束地址
- * @mm: 指向虚拟地址空间的指针
- * @timeslice_ms: 迁移页面在 @mm 中应保留的时间（毫秒）
+ * Attempt to populate a virtual range with device memory pages,
+ * clearing them or migrating data from the existing pages if necessary.
+ * The function is best effort only, and implementations may vary
+ * in how hard they try to satisfy the request.
  *
  * Return: %0 on success, negative error code on error. If the hardware
  * device was removed / unbound the function will return %-ENODEV.

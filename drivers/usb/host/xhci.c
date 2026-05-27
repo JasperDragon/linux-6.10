@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * xHCI host controller driver
+ * ============================================================================
+ * xhci.c — XHCI 主控驱动核心 (USB 3.x eXtensible Host Controller Interface)
+ * ============================================================================
+ *
+ * XHCI 是 USB 3.x 的标准主控接口, 取代了 EHCI/OHCI/UHCI。本驱动支持
+ * USB 3.2/3.1/3.0 SuperSpeed 以及内建 USB 2.0 端口。
+ *
+ * 关键概念: Device Slot (设备槽位)、TRB (Transfer Request Block)、
+ * Transfer Ring (传输环)、Event Ring (事件环)、Input/Output Context。
+ *
+ * 模块入口: xhci_init → xhci_register_pci / xhci_register_plat
+ * HC 状态机: HALT → RUNNING。Command Ring 用于向 HC 发送命令。
  *
  * Copyright (C) 2008 Intel Corp.
  *
@@ -8,57 +19,6 @@
  * Some code borrowed from the Linux EHCI driver.
  */
 
-/*
- * xhci.c -- XHCI (eXtensible Host Controller Interface) 主控制器驱动
- *
- * 概述:
- *   XHCI 是 USB 3.x (SuperSpeed, SuperSpeedPlus) 的标准主控接口驱动，
- *   同时也通过集成 USB2 HUB 向后兼容 USB 2.0/1.1/1.0 设备。
- *   XHCI 架构与传统的 EHCI/UHCI/OHCI 有根本不同：它使用"device slot"
- *   抽象来管理设备，每个连接的 USB 设备分配一个 slot，每个 slot 拥有
- *   独立的端点上下文 (Endpoint Context) 和传输环 (Transfer Ring)。
- *
- * 核心概念:
- *   - Device Slot: 每个 USB 设备对应一个 slot，由 HC 分配 slot ID
- *   - Context: Slot Context + Endpoint Context，描述设备和端点的状态
- *   - TRB (Transfer Request Block): 传输请求块，驱动和 HC 通过 TRB 交互
- *   - Ring: Transfer Ring (传输环), Command Ring (命令环), Event Ring (事件环)
- *
- * 模块入口:
- *   1. module_init(xhci_hcd_init) -> xhci_debugfs_create_root, xhci_dbc_init
- *   2. PCI/平台驱动注册 -> xhci_init_driver() 填充 hc_driver 操作集
- *   3. hc_driver.reset -> XHCI 寄存器初始化
- *   4. hc_driver.start (xhci_run) -> 启动 HC
- *
- * 核心操作:
- *   - 设备管理: xhci_alloc_dev(分配slot), xhci_address_device(地址设备),
- *              xhci_configure_endpoint(配置端点), xhci_free_dev(释放slot)
- *   - 数据传输: xhci_urb_enqueue(URB->TRB), xhci_urb_dequeue(取消URB)
- *   - 带宽管理: xhci_check_bandwidth, xhci_reset_bandwidth
- *
- * HC 状态机:
- *   HALT (复位后) -> RUNNING (xhci_start后) -> HALTED (出错时)
- *   xhci_quiesce(): 暂停HC (清RUN位, 保留中断)
- *   xhci_halt(): 停止HC (清RUN位, 等待HCHalted)
- *   xhci_reset(): 复位HC (清所有管道/定时器/状态机)
- *
- * 命令机制:
- *   驱动通过 Command Ring 向 HC 发送命令。关键命令类型:
- *   - TRB_ENABLE_SLOT / TRB_DISABLE_SLOT: 设备slot管理
- *   - TRB_ADDR_DEV: 地址设备
- *   - TRB_CONFIG_EP: 配置端点
- *   - TRB_EVAL_CONTEXT: 评估上下文变更
- *   - TRB_STOP_RING: 停止端点环
- *   - TRB_SET_DEQ: 设置环的出队指针
- *   - TRB_RESET_EP: 复位端点
- *
- * 事件机制:
- *   HC 在 Event Ring 上报告命令完成和传输完成事件。
- *   中断处理: xhci_irq -> xhci_handle_events -> xhci_handle_event_trb
- *   - TRB_COMPLETION: 命令完成事件 -> handle_cmd_completion
- *   - TRB_TRANSFER: 传输完成事件 -> handle_tx_event
- *   - TRB_PORT_STATUS: 端口状态变化 -> handle_port_status
- */
 #include <linux/jiffies.h>
 #include <linux/pci.h>
 #include <linux/iommu.h>
@@ -150,16 +110,6 @@ int xhci_handshake(void __iomem *ptr, u32 mask, u32 done, u64 timeout_us)
 
 /*
  * Disable interrupts and begin the xHCI halting process.
- *
- * xhci_quiesce -- XHCI 暂停操作 (HC 停止的第一步)
- * 功能: 禁用中断并开始 XHCI 的暂停（quiesce）过程。
- *       清除 RUN 位让 HC 完成当前正在处理的事务，但保留部分状态。
- * 流程:
- *   1. 读取 HC 状态寄存器，检查是否已 HALT
- *   2. 如果已 HALT, 只清除中断使能位
- *   3. 如果未 HALT, 同时清除 RUN 位和中断使能位
- *   4. 将修改后的命令写入 COMMAND 寄存器
- * 注意: 本函数仅清除运行位，实际等待 HC 停止由 xhci_halt() 完成。
  */
 void xhci_quiesce(struct xhci_hcd *xhci)
 {
@@ -184,15 +134,6 @@ void xhci_quiesce(struct xhci_hcd *xhci)
  * HC will complete any current and actively pipelined transactions, and
  * should halt within 16 ms of the run/stop bit being cleared.
  * Read HC Halted bit in the status register to see when the HC is finished.
- *
- * xhci_halt -- 强制 XHCI 控制器进入 HALT 状态
- * 功能: 调用 xhci_quiesce 清除运行位，然后轮询等待 HC 完全停止。
- *       同步操作，最多等待 XHCI_MAX_HALT_USEC 微秒。
- * 状态转换: RUNNING -> HALTED
- * 副作用:
- *   - 设置 XHCI_STATE_HALTED 标志
- *   - 停止命令环 (cmd_ring_state = CMD_RING_STATE_STOPPED)
- * 失败处理: 超时返回负错误码，并记录警告日志
  */
 int xhci_halt(struct xhci_hcd *xhci)
 {
@@ -254,20 +195,6 @@ int xhci_start(struct xhci_hcd *xhci)
  * This resets pipelines, timers, counters, state machines, etc.
  * Transactions will be terminated immediately, and operational registers
  * will be set to their defaults.
- *
- * xhci_reset -- 复位 XHCI 控制器
- * 功能: 复位 HC, 立即终止所有进行中的事务，所有操作寄存器恢复默认值。
- *       复位后 HC 进入 HALT 状态，需要重新初始化。
- * 前置条件: HC 必须已经处于 HALT 状态
- * 流程:
- *   1. 检查状态寄存器是否可访问 (非 all-ones)
- *   2. 检查 HC 是否已 HALT (未 HALT 则警告返回)
- *   3. 设置 CMD_RESET 位触发硬件复位
- *   4. 针对 Intel XHCI 增加 1ms 延迟 (硬件 errata)
- *   5. 轮询等待 CMD_RESET 位清除 (复位完成)
- *   6. 等待 Controller Not Ready 标志清除
- * 后处理: 清除 USB2/USB3 的暂停/恢复端口状态
- * 注意: 复位后所有之前的上下文配置将丢失, 需要重新初始化.
  */
 int xhci_reset(struct xhci_hcd *xhci, u64 timeout_us)
 {
@@ -620,23 +547,7 @@ static void xhci_set_dev_notifications(struct xhci_hcd *xhci)
 	writel(dev_notf, &xhci->op_regs->dev_notification);
 }
 
-/* Setup basic xHCI registers
- *
- * xhci_init -- XHCI 初始化 (HC 寄存器级)
- * 功能: 配置 XHCI 的基本操作寄存器，为 HC 运行做准备。
- *       在 HC 启动 (xhci_run) 之前必须调用一次。
- * 执行的操作:
- *   1. xhci_enable_max_dev_slots - 设置最大设备槽位数 (CONFIG 寄存器)
- *   2. xhci_ring_init - 初始化命令环 (Command Ring)
- *   3. 预留一个命令环 TRB 用于禁用 LPM (所有设备共享)
- *   4. xhci_set_cmd_ring_deq - 设置命令环出队指针 (CRCR 寄存器)
- *   5. 写入 Device Context Base Address Array Pointer (DCBAAP)
- *   6. xhci_set_doorbell_ptr - 设置 Doorbell 数组指针
- *   7. xhci_set_dev_notifications - 启用 USB 3.0 设备唤醒通知
- *   8. 初始化主中断器的事件环 (Event Ring)
- *   9. 可选: Compliance Mode 恢复定时器 (针对特定硬件缺陷)
- * 注意: 调用时 HC 应处于 HALT 状态
- */
+/* Setup basic xHCI registers */
 static void xhci_init(struct usb_hcd *hcd)
 {
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
@@ -729,26 +640,6 @@ static int xhci_run_finished(struct xhci_hcd *xhci)
  * set command ring pointer and event ring pointer.
  *
  * Setup MSI-X vectors and enable interrupts.
- *
- * xhci_run -- 启动 XHCI 控制器
- * 功能: 在 xhci_init 之后启动 HC。由 USB core 在 HC 驱动添加时调用。
- * 流程:
- *   1. 设置 uses_new_polling 标志
- *   2. 如果 MSI-X 启用, 设置 ip_autoclear
- *   3. 对于 shared_hcd (USB2 roothub), 直接调用 xhci_run_finished
- *   4. 对于 primary HCD (USB3 roothub):
- *      a. 设置中断调节 (Interrupt Moderation)
- *      b. NEC 主控器特殊处理: 发送厂商命令获取固件版本
- *      c. 创建 Debug Capability 设备
- *      d. 初始化 DebugFS
- *      e. 如果只有一个 roothub, 调用 xhci_run_finished
- *      f. 否则延迟 roothub 注册 (DEFER_RH_REGISTER)
- * xhci_run_finished 执行:
- *   1. 启用中断 (CMD_EIE)
- *   2. 启用主中断器
- *   3. 设置 CMD_RUN 位启动 HC
- *   4. 设置命令环状态为 RUNNING
- * 状态转换: HALTED -> RUNNING
  */
 int xhci_run(struct usb_hcd *hcd)
 {
@@ -812,20 +703,6 @@ EXPORT_SYMBOL_GPL(xhci_run);
  *
  * Disable device contexts, disable IRQs, and quiesce the HC.
  * Reset the HC, finish any completed transactions, and cleanup memory.
- *
- * xhci_stop -- 停止 XHCI 控制器
- * 功能: 停止 HC 并释放所有资源。由 USB core 在移除 HC 驱动时调用。
- * 流程:
- *   1. 仅对 primary HCD (USB3) 执行实际停止操作
- *   2. 删除 Debug Capability 设备
- *   3. 设置 HALTED 标志, 停止命令环
- *   4. xhci_halt + xhci_reset 完全停止并复位 HC
- *   5. 删除 Compliance Mode 恢复定时器 (如果启用了该 quirk)
- *   6. AMD PLL 修复处理
- *   7. 禁用事件环中断
- *   8. xhci_mem_cleanup 释放所有内存
- *   9. 删除 DebugFS
- * 注意: 对于 shared_hcd (USB2), 不执行实际停止, 只释放它
  */
 void xhci_stop(struct usb_hcd *hcd)
 {
@@ -1752,26 +1629,6 @@ static int xhci_check_ep0_maxpacket(struct xhci_hcd *xhci, struct xhci_virt_devi
 /*
  * non-error returns are a promise to giveback() the urb later
  * we drop ownership so next owner (or urb unlink) can get it
- *
- * xhci_urb_enqueue -- XHCI 的 URB 入队实现 (URB -> TRB 转换入口)
- * 功能: 将 USB core 提交的 URB 转换为 XHCI 的 TRB 并排队到传输环。
- *       这是 XHCI 驱动的核心数据路径入口函数。
- * 流程:
- *   1. 计算所需的 TD (Transfer Descriptor) 数量:
- *      - 等时端点: number_of_packets 个 TD
- *      - 批量端点 + ZERO_PACKET 标志: 2 个 TD (数据 + 零长度)
- *      - 其他: 1 个 TD
- *   2. 分配 urb_priv 结构, 设置 td 数组
- *   3. 参数检查 (xhci_check_args)
- *   4. 检查 HC 状态: 是否可访问、端口错误、DYING 等
- *   5. 检查端点状态: 是否在 stream 转换中、toggle 清除中
- *   6. 根据端点类型分发到不同的 TRB 队列函数:
- *      - USB_ENDPOINT_XFER_CONTROL -> xhci_queue_ctrl_tx
- *      - USB_ENDPOINT_XFER_BULK   -> xhci_queue_bulk_tx
- *      - USB_ENDPOINT_XFER_INT    -> xhci_queue_intr_tx
- *      - USB_ENDPOINT_XFER_ISOC   -> xhci_queue_isoc_tx_prepare
- * 返回: 0 表示成功 (承诺稍后 giveback), 负值表示失败
- * 注意: 函数在持有 xhci->lock 自旋锁的上下文中执行
  */
 static int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 {
@@ -3110,27 +2967,6 @@ int xhci_usb_endpoint_maxp(struct usb_device *udev,
 
 /* Issue a configure endpoint command or evaluate context command
  * and wait for it to finish.
- *
- * xhci_configure_endpoint -- 配置端点 (相当于其他 HC 的端点启用)
- * 功能: 发送 Configure Endpoint 或 Evaluate Context 命令到命令环,
- *       等待执行完成。这是 XHCI 中启用/配置端点的核心函数。
- *       调用场景: 设置配置 (set_configuration), 设置接口 (set_interface),
- *                以及 EP0 最大包大小变更时。
- * 参数:
- *   @ctx_change: false -> 发送 TRB_CONFIG_EP (配置端点命令)
- *                 true  -> 发送 TRB_EVAL_CONTEXT (评估上下文命令)
- *   @must_succeed: 命令失败时是否重试 (通常用于 LPM 禁用场景)
- * 流程:
- *   1. 检查 HC 状态 (DYING)
- *   2. 获取输入控制上下文
- *   3. XHCI_EP_LIMIT_QUIRK: 检查并预留主机资源
- *   4. XHCI_SW_BW_CHECKING: 检查带宽
- *   5. 队列命令到命令环, 敲 Doorbell
- *   6. 等待命令完成
- *   7. 根据命令类型解析完成码:
- *      - xhci_configure_endpoint_result (TRB_CONFIG_EP)
- *      - xhci_evaluate_context_result (TRB_EVAL_CONTEXT)
- * 注意: 此函数同步等待命令完成, 可能在进程上下文阻塞
  */
 static int xhci_configure_endpoint(struct xhci_hcd *xhci,
 		struct usb_device *udev,
@@ -3251,24 +3087,6 @@ static void xhci_check_bw_drop_ep_streams(struct xhci_hcd *xhci,
  * enqueued for any endpoint on the old config or interface.  Nothing
  * else should be touching the xhci->devs[slot_id] structure, so we
  * don't need to take the xhci->lock for manipulating that.
- *
- * xhci_check_bandwidth -- 带宽检查和端点上下文更新
- * 功能: 在 xhci_add_endpoint / xhci_drop_endpoint 之后调用,
- *       提交 Configure Endpoint 命令来应用新的端点配置。
- *       这是 XHCI 的带宽检查 + 配置提交的组合操作。
- * 调用场景: usb_set_configuration / usb_set_interface 流程中
- * 流程:
- *   1. 分配命令, 设置输入控制上下文
- *   2. add_flags 设 SLOT_FLAG, 清除 EP0_FLAG
- *   3. 如果 add_flags 和 drop_flags 都为空, 跳过命令
- *   4. 计算并设置 slot 上下文的 Context Entries 字段
- *   5. 调用 xhci_configure_endpoint 发送 TRB_CONFIG_EP
- *   6. 命令成功时:
- *      - 释放被删除(未更改)端点的环
- *      - 安装新端点/变更端点的环
- *      - 清理旧的环
- *   7. 命令失败时: 调用者应调用 xhci_reset_bandwidth 回滚
- * 返回值: 0 成功, 负值失败
  */
 int xhci_check_bandwidth(struct usb_hcd *hcd, struct usb_device *udev)
 {
@@ -4286,19 +4104,8 @@ command_cleanup:
  * At this point, the struct usb_device is about to go away, the device has
  * disconnected, and all traffic has been stopped and the endpoints have been
  * disabled.  Free any HC data structures associated with that device.
- *
- * xhci_free_dev -- 释放设备 Slot 及相关资源
- * 功能: 当 USB 设备断开连接时释放所有 HC 端数据结构。
- *       对应 xhci_alloc_dev 的逆操作。
- * 流程:
- *   1. XHCI_RESET_ON_RESUME quirk: 减少运行时 PM 引用计数
- *   2. 参数检查, 即使 HC 已 HALT 也需要释放
- *   3. 停止所有端点的定时器函数
- *   4. 清除 udev 指针
- *   5. xhci_disable_slot: 发送 TRB_DISABLE_SLOT 命令
- *   6. xhci_free_virt_device: 释放虚拟设备结构体及其所有子结构
- * 注意: 此函数在设备断开或驱动卸载时被调用
  */
+static void xhci_free_dev(struct usb_hcd *hcd, struct usb_device *udev)
 {
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
 	struct xhci_virt_device *virt_dev;
@@ -4417,23 +4224,8 @@ static int xhci_reserve_host_control_ep_resources(struct xhci_hcd *xhci)
 /*
  * Returns 0 if the xHC ran out of device slots, the Enable Slot command
  * timed out, or allocating memory failed.  Returns 1 on success.
- *
- * xhci_alloc_dev -- 分配设备 Slot
- * 功能: 为新连接的 USB 设备分配一个 XHCI 设备槽位 (Device Slot)。
- *       这是设备枚举的第一步，在 XHCI 中 slot 是设备上下文的基础。
- * 流程:
- *   1. 分配命令结构，发送 TRB_ENABLE_SLOT 到命令环
- *   2. 敲 Doorbell 通知 HC, 等待命令完成
- *   3. 从命令完成结果获取 slot_id
- *   4. 如果 slot_id 为 0 或命令失败，表示 HC 无可用 slot
- *   5. 为 EP_LIMIT_QUIRK 预留控制端点资源
- *   6. xhci_alloc_virt_device 分配虚拟设备结构体
- *   7. 初始化 DebugFS 的 slot 目录
- *   8. 对于 XHCI_RESET_ON_RESUME quirk, 增加运行时 PM 引用计数
- * 返回: 1 = 成功, 0 = 失败 (HC 无可用 slot 或内存不足)
- * 注意: 分配 slot 后设备处于 Default 状态, 还需要
- *       xhci_address_device 分配 USB 地址才能使用。
  */
+int xhci_alloc_dev(struct usb_hcd *hcd, struct usb_device *udev)
 {
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
 	struct xhci_virt_device *vdev;
@@ -4525,27 +4317,6 @@ disable_slot:
  * @timeout_ms: Max wait time (ms) for the command operation to complete.
  *
  * Return: 0 if successful; otherwise, negative error code.
- *
- * xhci_setup_device -- 设置设备地址 (SET_ADDRESS 的 XHCI 实现)
- * 功能: 通过 TRB_ADDR_DEV 命令为之前已经分配了 slot 的设备分配 USB 地址。
- *       在 XHCI 中, SET_ADDRESS 不是通过控制传输完成的, 而是通过命令环发送
- *       Address Device 命令。这是 XHCI 与 EHCI 的关键区别之一。
- * 流程:
- *   1. 检查 HC 状态和 slot_id 有效性
- *   2. 如果 virt_dev 不存在, 返回错误 (罕见竞态条件)
- *   3. 分配命令结构, 设置 in_ctx 为设备的输入上下文
- *   4. 如果是第一次地址设置 (dev_info == 0):
- *      - xhci_setup_addressable_virt_dev 初始化可寻址虚拟设备
- *      - 配置 slot 上下文和 ep0 上下文
- *   5. 否则: 更新 ep0 环的出队指针 (xhci_copy_ep0_dequeue_into_input_ctx)
- *   6. 设置 add_flags = SLOT_FLAG | EP0_FLAG
- *   7. 发送 TRB_ADDR_DEV 命令到命令环, 敲 Doorbell
- *   8. 等待命令完成 (带超时)
- *   9. 处理各种完成码:
- *      - COMP_USB_TRANSACTION_ERROR: 设备无响应, 重新分配 slot 重试
- *      - COMP_SUCCESS: 成功, 从 slot 上下文提取设备地址
- *      - 其他: 返回对应错误码
- * 注意: USB core 使用地址 1 给 roothub, 所以 HC 返回的地址需要加 1
  */
 static int xhci_setup_device(struct usb_hcd *hcd, struct usb_device *udev,
 			     enum xhci_setup_dev setup, unsigned int timeout_ms)
@@ -4730,15 +4501,6 @@ out:
 	return ret;
 }
 
-/*
- * xhci_address_device -- 地址设备 (USB SET_ADDRESS 的 XHCI 实现)
- * 功能: 为指定 USB 设备分配唯一总线地址。
- *       这是 xhci_setup_device 的包装函数, 以 SETUP_CONTEXT_ADDRESS
- *       模式调用, 表示需要完整分配地址 (不只是更新上下文)。
- * 对比 EHCI: EHCI 通过控制传输发送 SET_ADDRESS, 而 XHCI 通过命令环
- *           发送 Address Device 命令, HC 内部处理地址分配。
- * 返回值: 0 = 成功, 负值 = 失败
- */
 static int xhci_address_device(struct usb_hcd *hcd, struct usb_device *udev,
 			       unsigned int timeout_ms)
 {
@@ -5825,66 +5587,6 @@ static void xhci_clear_tt_buffer_complete(struct usb_hcd *hcd,
 	spin_unlock_irqrestore(&xhci->lock, flags);
 }
 
-/*
- * xhci_hc_driver -- XHCI 主机控制器驱动操作集
- * 功能: 这是 Linux USB 核心与 XHCI 硬件驱动之间的接口操作集。
- *       hc_driver 定义了 USB 主机控制器驱动必须实现的所有回调函数，
- *       Linux USB core 通过这些回调来操控 XHCI 控制器。
- *       各字段说明:
- *
- * 基本属性:
- *   .description:   驱动描述字符串 "xhci-hcd"
- *   .product_desc:  产品描述 "xHCI Host Controller"
- *   .hcd_priv_size: 私有数据结构大小 (sizeof xhci_hcd)
- *
- * 硬件链接:
- *   .irq:           中断处理函数 xhci_irq
- *   .flags:         HCD_MEMORY | HCD_DMA | HCD_USB3 | HCD_SHARED | HCD_BH
- *
- * 生命周期管理:
- *   .reset:         复位 HC (由 xhci_init_driver 设置)
- *   .start:         启动 HC (xhci_run)
- *   .stop:          停止 HC (xhci_stop)
- *   .shutdown:      系统关机时关闭 HC (xhci_shutdown)
- *
- * I/O 请求和设备资源管理:
- *   .map_urb_for_dma:   URB DMA 映射 (xhci_map_urb_for_dma, 支持 IDT)
- *   .unmap_urb_for_dma: URB DMA 解映射
- *   .urb_enqueue:       URB 入队 -> TRB (xhci_urb_enqueue)
- *   .urb_dequeue:       URB 去队/取消 (xhci_urb_dequeue)
- *   .alloc_dev:         分配设备 slot (xhci_alloc_dev)
- *   .free_dev:          释放设备 slot (xhci_free_dev)
- *   .alloc_streams:     分配 USB 流资源
- *   .free_streams:      释放 USB 流资源
- *   .add_endpoint:      添加端点 (xhci_add_endpoint)
- *   .drop_endpoint:     删除端点 (xhci_drop_endpoint)
- *   .endpoint_disable:  禁用端点
- *   .endpoint_reset:    复位端点
- *   .check_bandwidth:   检查/提交带宽 (xhci_check_bandwidth)
- *   .reset_bandwidth:   回滚带宽变更
- *   .address_device:    地址设备 (xhci_address_device)
- *   .enable_device:     使能设备 (仅更新上下文)
- *   .update_hub_device: 更新 HUB 设备上下文
- *   .reset_device:      复位设备
- *
- * 调度支持:
- *   .get_frame_number:  获取当前帧号
- *
- * Root Hub 支持:
- *   .hub_control:       Root hub 控制请求处理
- *   .hub_status_data:   Root hub 状态读取
- *   .bus_suspend:       总线挂起
- *   .bus_resume:        总线恢复
- *   .get_resuming_ports:获取恢复中的端口
- *
- * 设备通知:
- *   .update_device:             设备更新回调
- *   .set_usb2_hw_lpm:           设置 USB2 硬件 LPM
- *   .enable_usb3_lpm_timeout:   启用 USB3 LPM 超时
- *   .disable_usb3_lpm_timeout:  禁用 USB3 LPM 超时
- *   .find_raw_port_number:      查找原始端口号
- *   .clear_tt_buffer_complete:  TT 缓冲清除完成
- */
 static const struct hc_driver xhci_hc_driver = {
 	.description =		"xhci-hcd",
 	.product_desc =		"xHCI Host Controller",

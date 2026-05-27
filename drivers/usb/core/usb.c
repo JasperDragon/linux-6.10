@@ -1305,7 +1305,7 @@ static void usb_debugfs_cleanup(void)
  *   6. usb_major_init()           - 注册 USB 主设备号（USB 设备节点）
  *   7. class_register()           - 注册 usbmisc 类（次设备号管理）
  *   8. usb_register()             - 注册 usbfs 驱动
- *   9. usb_devio_init()           - 初始化 USB 设备节点接口（/dev/usb/*）
+ *   9. usb_devio_init()           - 初始化 USB 设备节点接口 (/dev/usb/)
  *  10. usb_hub_init()             - 初始化 Hub 子系统（核心步骤，启动 Hub 线程）
  *  11. usb_register_device_driver() - 注册通用 USB 设备驱动
  *

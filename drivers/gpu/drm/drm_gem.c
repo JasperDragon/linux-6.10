@@ -48,16 +48,6 @@
 
 #include <drm/drm.h>
 #include <drm/drm_device.h>
-/*
- * drm_gem.c — GEM (Graphics Execution Manager) 核心。
- *
- * GEM 管理 GPU 内存/缓冲区对象 (drm_gem_object):
- *   - 对象生命周期: init → handle → mmap → refcount → free
- *   - 句柄映射: 全局唯一的 handle → GEM 对象 (每 drm_file 独立名称空间)
- *   - PRIME: drm_gem_prime_export()/import() 通过 dma-buf fd 跨设备共享
- *   - GPUVA: 可选的 drm_gpuvm 集成, 管理 GPU 虚拟地址空间
- */
-
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
@@ -156,17 +146,8 @@ drm_gem_init_release(struct drm_device *dev, void *ptr)
 }
 
 /**
- * drm_gem_init — 初始化 GEM 子系统的设备级字段。
- * @dev: DRM 设备
- *
- * 建立两个核心数据结构:
- *   1) object_name_idr: 全局 GEM handle → GEM 对象的 IDR 映射
- *      - handle 是用户态引用 GEM 缓冲区的方式 (类似 fd)
- *      - 通过 flink/open/close ioctl 管理
- *   2) vma_offset_manager: GEM mmap 偏移管理
- *      - 为每个 GEM 对象分配唯一的 fake offset
- *      - 用户态 mmap() 时通过 offset 找到对应的 GEM 对象
- *      - offset 范围从 DRM_FILE_PAGE_OFFSET_START 开始
+ * drm_gem_init - Initialize the GEM device fields
+ * @dev: drm_devic structure to initialize
  */
 int
 drm_gem_init(struct drm_device *dev)
@@ -190,19 +171,15 @@ drm_gem_init(struct drm_device *dev)
 }
 
 /**
- * drm_gem_object_init — 初始化一个基于 shmem 的 GEM 对象。
- * @dev:  DRM 设备
- * @obj:  要初始化的 GEM 对象 (由驱动分配)
- * @size: 缓冲区大小 (字节)
+ * drm_gem_object_init - initialize an allocated shmem-backed GEM object
  *
- * 这是最常用的 GEM 对象初始化方式, 使用 shmem (tmpfs) 作为后备存储:
- *   1) drm_gem_private_object_init() — 初始化公共字段 (refcount, size, ...)
- *   2) shmem_file_setup() — 创建匿名 shmem file 作为物理页面来源
- *      - 支持透明大页 (通过 drm_gem_huge_mnt_create 预创建的挂载点)
- *      - 页面按需分配: mmap 或 CPU 访问时才真正分配物理页
- *   3) obj->filp = filp — GEM 对象绑定到 shmem file
+ * @dev: drm_device the object should be initialized for
+ * @obj: drm_gem_object to initialize
+ * @size: object size
  *
- * 对于需要 DMA 一致性的平台, 使用 drm_gem_dma_create() 替代此函数。
+ * Initialize an already allocated GEM object of the specified size with
+ * shmfs backing store. A huge mountpoint can be used by calling
+ * drm_gem_huge_mnt_create() beforehand.
  */
 int drm_gem_object_init(struct drm_device *dev, struct drm_gem_object *obj,
 			size_t size)

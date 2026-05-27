@@ -24,17 +24,6 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-/*
- * drm_vblank.c — VBlank (垂直消隐) 中断管理与页面翻转时序。
- *
- * VBlank 是显示器在两帧之间的短暂间隔, 是更新显示配置的安全窗口:
- *   - drm_vblank_init(): 初始化 per-CRTC 的 VBlank 数据结构
- *   - drm_crtc_vblank_get/put: VBlank 中断的引用计数管理
- *   - drm_crtc_send_vblank_event: 向用户态通知 page flip 完成
- *   - drm_crtc_wait_one_vblank: 同步等待下一个 VBlank
- *   - drm_vblank_work: 在 VBlank 时执行的 kthread_work 队列
- */
-
 #include <linux/export.h>
 #include <linux/kthread.h>
 #include <linux/moduleparam.h>
@@ -536,22 +525,16 @@ static void drm_vblank_init_release(struct drm_device *dev, void *ptr)
 }
 
 /**
- * drm_vblank_init — 初始化 VBlank 中断子系统。
- * @dev:       DRM 设备
- * @num_crtcs: 设备支持的 CRTC 数量 (每个 CRTC 有独立的 vblank)
+ * drm_vblank_init - initialize vblank support
+ * @dev: DRM device
+ * @num_crtcs: number of CRTCs supported by @dev
  *
- * 为每个 CRTC 分配并初始化一个 drm_vblank_crtc:
- *   - vblank->queue: 等待队列 (用户态可阻塞等待 vblank)
- *   - vblank->disable_timer: 延迟关闭 vblank 中断的定时器
- *     (避免频繁 enable/disable 中断, 默认延迟 5 秒通过 vblankoffdelay 参数配置)
- *   - vblank->seqlock: 序列锁, 保护 vblank count 的读写
- *   - vblank->worker: kthread_worker, 在 vblank 上下文中执行的工作队列
+ * This function initializes vblank support for @num_crtcs display pipelines.
+ * Cleanup is handled automatically through a cleanup function added with
+ * drmm_add_action_or_reset().
  *
- * 驱动必须在注册之前调用此函数。之后驱动需要:
- *   1) 实现 crtc->funcs->enable_vblank / disable_vblank 回调
- *   2) 在 vblank 中断处理中调用 drm_crtc_handle_vblank()
- *
- * Returns: 0 = 成功, 负值 = 错误
+ * Returns:
+ * Zero on success or a negative error code on failure.
  */
 int drm_vblank_init(struct drm_device *dev, unsigned int num_crtcs)
 {

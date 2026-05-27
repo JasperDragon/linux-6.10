@@ -3,19 +3,6 @@
  * Copyright 2018 Noralf Trønnes
  */
 
-/*
- * DRM 客户端基础设施
- *
- * 本文件实现了 DRM 客户端（client）的创建、注册、释放以及客户端缓冲区的管理。
- * DRM 客户端是运行在内核空间中的 DRM 使用者，例如 fbdev 模拟和启动画面（bootsplash）。
- * 它通过打开一个内部的 DRM 文件句柄来与 DRM 驱动交互，并进行模式设置和帧缓冲操作。
- *
- * 主要功能：
- *   - 客户端的初始化、注册和释放（drm_client_init/register/release）
- *   - 客户端缓冲区的创建、删除与映射管理（drm_client_buffer_*）
- *   - 客户端缓冲区的脏区域刷新（drm_client_buffer_flush）
- */
-
 #include <linux/export.h>
 #include <linux/iosys-map.h>
 #include <linux/list.h>
@@ -76,19 +63,19 @@ static void drm_client_close(struct drm_client_dev *client)
 }
 
 /**
- * drm_client_init - 初始化 DRM 客户端
- * @dev: DRM 设备
- * @client: DRM 客户端
- * @name: 客户端名称
- * @funcs: DRM 客户端函数表（可选）
+ * drm_client_init - Initialise a DRM client
+ * @dev: DRM device
+ * @client: DRM client
+ * @name: Client name
+ * @funcs: DRM client functions (optional)
  *
- * 初始化 DRM 客户端并为其打开一个内部的 &drm_file。
- * 调用 drm_client_register() 来完成注册流程。
- * 调用者需要在此函数之前持有 @dev 的引用计数。
- * 当 &drm_device 被注销时，客户端会自动释放。参见 drm_client_release()。
+ * This initialises the client and opens a &drm_file.
+ * Use drm_client_register() to complete the process.
+ * The caller needs to hold a reference on @dev before calling this function.
+ * The client is freed when the &drm_device is unregistered. See drm_client_release().
  *
- * 返回值：
- * 成功返回 0，失败返回负的错误码。
+ * Returns:
+ * Zero on success or negative error code on failure.
  */
 int drm_client_init(struct drm_device *dev, struct drm_client_dev *client,
 		    const char *name, const struct drm_client_funcs *funcs)
@@ -121,16 +108,18 @@ err_free:
 EXPORT_SYMBOL(drm_client_init);
 
 /**
- * drm_client_register - 注册客户端
- * @client: DRM 客户端
+ * drm_client_register - Register client
+ * @client: DRM client
  *
- * 将客户端添加到 &drm_device 的客户端列表中，以激活其回调函数。
- * @client 必须已经通过 drm_client_init() 初始化。
- * 调用 drm_client_register() 之后，不能再直接调用 drm_client_release() 来释放
- * （通过注销回调的方式除外），而是由驱动卸载时自动完成清理。
+ * Add the client to the &drm_device client list to activate its callbacks.
+ * @client must be initialized by a call to drm_client_init(). After
+ * drm_client_register() it is no longer permissible to call drm_client_release()
+ * directly (outside the unregister callback), instead cleanup will happen
+ * automatically on driver unload.
  *
- * 注册客户端会触发一个热插拔事件，使客户端能够从已有的输出设备中
- * 设置其显示配置。客户端必须已经完成状态初始化，以便能够成功处理该热插拔事件。
+ * Registering a client generates a hotplug event that allows the client
+ * to set up its display from pre-existing outputs. The client must have
+ * initialized its state to able to handle the hotplug event successfully.
  */
 void drm_client_register(struct drm_client_dev *client)
 {
@@ -160,18 +149,18 @@ void drm_client_register(struct drm_client_dev *client)
 EXPORT_SYMBOL(drm_client_register);
 
 /**
- * drm_client_release - 释放 DRM 客户端资源
- * @client: DRM 客户端
+ * drm_client_release - Release DRM client resources
+ * @client: DRM client
  *
- * 释放由 drm_client_init() 打开的 &drm_file 等相关资源。
- * 如果 &drm_client_funcs.unregister 回调未设置，则由系统自动调用此函数完成清理。
+ * Releases resources by closing the &drm_file that was opened by drm_client_init().
+ * It is called automatically if the &drm_client_funcs.unregister callback is _not_ set.
  *
- * 此函数应当仅在注销回调中被调用。例外情况是 fbdev，
- * 因为如果用户空间持有打开的文件描述符，fbdev 无法释放缓冲区。
+ * This function should only be called from the unregister callback. An exception
+ * is fbdev which cannot free the buffer if userspace has open file descriptors.
  *
- * 注意：
- * 客户端不能自行发起释放操作（这是为了保持代码简单）。
- * 必须先卸载驱动，然后才能卸载客户端。
+ * Note:
+ * Clients cannot initiate a release by themselves. This is done to keep the code simple.
+ * The driver has to be unloaded before the client can be unloaded.
  */
 void drm_client_release(struct drm_client_dev *client)
 {
@@ -190,11 +179,8 @@ void drm_client_release(struct drm_client_dev *client)
 EXPORT_SYMBOL(drm_client_release);
 
 /**
- * drm_client_buffer_delete - 删除客户端缓冲区
- * @buffer: DRM 客户端缓冲区
- *
- * 删除一个客户端缓冲区对象：释放其映射、从 DRM 中移除帧缓冲（framebuffer）、
- * 释放 GEM 对象的引用，最后释放缓冲区结构体本身。
+ * drm_client_buffer_delete - Delete a client buffer
+ * @buffer: DRM client buffer
  */
 void drm_client_buffer_delete(struct drm_client_buffer *buffer)
 {
@@ -218,22 +204,9 @@ void drm_client_buffer_delete(struct drm_client_buffer *buffer)
 }
 EXPORT_SYMBOL(drm_client_buffer_delete);
 
-/**
- * drm_client_buffer_create - 创建客户端缓冲区
- * @client: DRM 客户端
- * @width: 宽度
- * @height: 高度
- * @format: 像素格式
- * @handle: GEM 对象句柄
- * @pitch: 每行字节数（跨距）
- *
- * 使用已有的 GEM 对象句柄创建一个客户端缓冲区。
- * 该函数会创建一个 &drm_framebuffer 并将其与给定的句柄关联。
- * 调用者应使用 drm_client_buffer_delete() 释放返回的缓冲区。
- *
- * 返回值：
- * 成功返回指向客户端缓冲区的指针，失败返回错误指针。
- */
+struct drm_client_buffer *
+drm_client_buffer_create(struct drm_client_dev *client, u32 width, u32 height,
+			 u32 format, u32 handle, u32 pitch)
 {
 	struct drm_mode_fb_cmd2 fb_req = {
 		.width = width,
@@ -295,22 +268,24 @@ err_delete:
 EXPORT_SYMBOL(drm_client_buffer_create);
 
 /**
- * drm_client_buffer_vmap_local - 映射客户端缓冲区到内核地址空间（局部映射）
- * @buffer: DRM 客户端缓冲区
- * @map_copy: 返回映射后的内存地址
+ * drm_client_buffer_vmap_local - Map DRM client buffer into address space
+ * @buffer: DRM client buffer
+ * @map_copy: Returns the mapped memory's address
  *
- * 将客户端缓冲区映射到内核地址空间。如果缓冲区已经映射，则返回已有映射的地址。
- * 该映射是"局部"的，要求在函数返回后尽快解除映射。
+ * This function maps a client buffer into kernel address space. If the
+ * buffer is already mapped, it returns the existing mapping's address.
  *
- * 客户端缓冲区映射不进行引用计数。每次调用 drm_client_buffer_vmap_local()
- * 应当紧随一个 drm_client_buffer_vunmap_local() 调用。
- * 对于长期持有的映射，请使用 drm_client_buffer_vmap()。
+ * Client buffer mappings are not ref'counted. Each call to
+ * drm_client_buffer_vmap_local() should be closely followed by a call to
+ * drm_client_buffer_vunmap_local(). See drm_client_buffer_vmap() for
+ * long-term mappings.
  *
- * 返回的地址是内部值的副本。与其他 vmap 接口不同，你不需要用它来调用
- * 客户端的 vunmap 函数。因此可以在 blit 和绘图操作中随意修改它。
+ * The returned address is a copy of the internal value. In contrast to
+ * other vmap interfaces, you don't need it for the client's vunmap
+ * function. So you can modify it at will during blit and draw operations.
  *
- * 返回值：
- *	成功返回 0，失败返回负的错误码。
+ * Returns:
+ *	0 on success, or a negative errno code otherwise.
  */
 int drm_client_buffer_vmap_local(struct drm_client_buffer *buffer,
 				 struct iosys_map *map_copy)
@@ -335,11 +310,12 @@ err_drm_gem_vmap_unlocked:
 EXPORT_SYMBOL(drm_client_buffer_vmap_local);
 
 /**
- * drm_client_buffer_vunmap_local - 解除 DRM 客户端缓冲区的局部映射
- * @buffer: DRM 客户端缓冲区
+ * drm_client_buffer_vunmap_local - Unmap DRM client buffer
+ * @buffer: DRM client buffer
  *
- * 移除之前通过 drm_client_buffer_vmap_local() 建立的映射。
- * 仅当客户端自行管理其缓冲区映射时才需要手动调用此函数。
+ * This function removes a client buffer's memory mapping established
+ * with drm_client_buffer_vunmap_local(). Calling this function is only
+ * required by clients that manage their buffer mappings by themselves.
  */
 void drm_client_buffer_vunmap_local(struct drm_client_buffer *buffer)
 {
@@ -352,22 +328,24 @@ void drm_client_buffer_vunmap_local(struct drm_client_buffer *buffer)
 EXPORT_SYMBOL(drm_client_buffer_vunmap_local);
 
 /**
- * drm_client_buffer_vmap - 映射客户端缓冲区到内核地址空间（长期映射）
- * @buffer: DRM 客户端缓冲区
- * @map_copy: 返回映射后的内存地址
+ * drm_client_buffer_vmap - Map DRM client buffer into address space
+ * @buffer: DRM client buffer
+ * @map_copy: Returns the mapped memory's address
  *
- * 将客户端缓冲区映射到内核地址空间。如果缓冲区已经映射，则返回已有映射的地址。
- * 该映射是"长期"的，用于在整个生命周期内保持映射。
+ * This function maps a client buffer into kernel address space. If the
+ * buffer is already mapped, it returns the existing mapping's address.
  *
- * 客户端缓冲区映射不进行引用计数。每次调用 drm_client_buffer_vmap()
- * 应当对应一次 drm_client_buffer_vunmap()；或者让客户端缓冲区
- * 在整个生命周期内保持映射状态。
+ * Client buffer mappings are not ref'counted. Each call to
+ * drm_client_buffer_vmap() should be followed by a call to
+ * drm_client_buffer_vunmap(); or the client buffer should be mapped
+ * throughout its lifetime.
  *
- * 返回的地址是内部值的副本。与其他 vmap 接口不同，你不需要用它来调用
- * 客户端的 vunmap 函数。因此可以在 blit 和绘图操作中随意修改它。
+ * The returned address is a copy of the internal value. In contrast to
+ * other vmap interfaces, you don't need it for the client's vunmap
+ * function. So you can modify it at will during blit and draw operations.
  *
- * 返回值：
- *	成功返回 0，失败返回负的错误码。
+ * Returns:
+ *	0 on success, or a negative errno code otherwise.
  */
 int drm_client_buffer_vmap(struct drm_client_buffer *buffer,
 			   struct iosys_map *map_copy)
@@ -385,11 +363,12 @@ int drm_client_buffer_vmap(struct drm_client_buffer *buffer,
 EXPORT_SYMBOL(drm_client_buffer_vmap);
 
 /**
- * drm_client_buffer_vunmap - 解除 DRM 客户端缓冲区的长期映射
- * @buffer: DRM 客户端缓冲区
+ * drm_client_buffer_vunmap - Unmap DRM client buffer
+ * @buffer: DRM client buffer
  *
- * 移除之前通过 drm_client_buffer_vmap() 建立的长期映射。
- * 仅当客户端自行管理其缓冲区映射时才需要手动调用此函数。
+ * This function removes a client buffer's memory mapping. Calling this
+ * function is only required by clients that manage their buffer mappings
+ * by themselves.
  */
 void drm_client_buffer_vunmap(struct drm_client_buffer *buffer)
 {
@@ -400,19 +379,18 @@ void drm_client_buffer_vunmap(struct drm_client_buffer *buffer)
 EXPORT_SYMBOL(drm_client_buffer_vunmap);
 
 /**
- * drm_client_buffer_create_dumb - 创建由 dumb 缓冲区支持的客户端缓冲区
- * @client: DRM 客户端
- * @width: 帧缓冲宽度
- * @height: 帧缓冲高度
- * @format: 缓冲区格式
+ * drm_client_buffer_create_dumb - Create a client buffer backed by a dumb buffer
+ * @client: DRM client
+ * @width: Framebuffer width
+ * @height: Framebuffer height
+ * @format: Buffer format
  *
- * 创建一个 &drm_client_buffer，其内部包含一个由 dumb 缓冲区支持的
- * &drm_framebuffer。dumb 缓冲区是一种简单的、驱动分配的连续内存缓冲区，
- * 适用于不需要 GPU 加速的简单显示场景。
- * 调用 drm_client_buffer_delete() 释放该缓冲区。
+ * This function creates a &drm_client_buffer which consists of a
+ * &drm_framebuffer backed by a dumb buffer.
+ * Call drm_client_buffer_delete() to free the buffer.
  *
- * 返回值：
- * 成功返回指向客户端缓冲区的指针，失败返回错误指针。
+ * Returns:
+ * Pointer to a client buffer or an error pointer on failure.
  */
 struct drm_client_buffer *
 drm_client_buffer_create_dumb(struct drm_client_dev *client, u32 width, u32 height, u32 format)
@@ -454,15 +432,15 @@ err_drm_mode_destroy_dumb:
 EXPORT_SYMBOL(drm_client_buffer_create_dumb);
 
 /**
- * drm_client_buffer_flush - 手动刷新客户端缓冲区
- * @buffer: DRM 客户端缓冲区
- * @rect: 脏区域矩形（如果为 NULL 则刷新全部）
+ * drm_client_buffer_flush - Manually flush client buffer
+ * @buffer: DRM client buffer
+ * @rect: Damage rectangle (if NULL flushes all)
  *
- * 调用 &drm_framebuffer_funcs->dirty 回调（如果存在的话）来刷新缓冲区的更改。
- * 某些硬件驱动需要显式的脏区域通知来更新显示内容。
+ * This calls &drm_framebuffer_funcs->dirty (if present) to flush buffer changes
+ * for drivers that need it.
  *
- * 返回值：
- * 成功返回 0，失败返回负的错误码。
+ * Returns:
+ * Zero on success or negative error code on failure.
  */
 int drm_client_buffer_flush(struct drm_client_buffer *buffer, struct drm_rect *rect)
 {

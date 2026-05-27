@@ -26,19 +26,6 @@
  * Daniel Vetter <daniel.vetter@ffwll.ch>
  */
 
-/*
- * drm_atomic.c — Atomic Modesetting 核心状态机。
- *
- * 这是 KMS 最重要的事务性 API。核心流程:
- *   1) 用户态构建 drm_atomic_state (包含所有对象的 old/new state)
- *   2) drm_atomic_check_only() — 校验整个配置是否合法 (驱动 atomic_check 回调)
- *   3) drm_atomic_commit() — 提交到硬件 (同步/异步)
- *   4) drm_atomic_state_default_clear() — 释放状态
- *
- * All-or-nothing 语义: 要么整个事务成功生效, 要么完全保持旧状态,
- * 消除了旧 API 的中间状态闪烁和竞态问题。
- */
-
 #include <linux/export.h>
 #include <linux/sync_file.h>
 
@@ -357,30 +344,22 @@ void __drm_atomic_state_free(struct kref *ref)
 EXPORT_SYMBOL(__drm_atomic_state_free);
 
 /**
- * drm_atomic_get_crtc_state — 获取/创建 CRTC 的 per-CRTC 状态 (最核心的 atomic helper)。
- * @state: 全局 atomic state 容器
- * @crtc:  目标 CRTC
+ * drm_atomic_get_crtc_state - get CRTC state
+ * @state: global atomic state object
+ * @crtc: CRTC to get state object for
  *
- * 这是 atomic 框架中最常被调用的函数之一。采用 "get or create" 模式:
+ * This function returns the CRTC state for the given CRTC, allocating it if
+ * needed. It will also grab the relevant CRTC lock to make sure that the state
+ * is consistent.
  *
- *   1) 如果该 CRTC 的 state 已经存在于 @state 中 → 直接返回 (幂等)
- *   2) 如果不存在:
- *      a) 通过 drm_modeset_lock() 获取 CRTC 的 ww_mutex   ← 死锁保护
- *      b) 调用 crtc->funcs->atomic_duplicate_state()         ← 驱动复制当前硬件状态
- *      c) 将 old_state/new_state 填入 state->crtcs[] 数组中
- *      d) 设置 state_to_destroy 供后续清理
- *
- * ww_mutex (wound-wait mutex) 死锁处理:
- *   - 当多个 CRTC 被同时修改时, 锁的获取顺序可能导致死锁
- *   - ww_mutex 通过 "wound" 机制检测并打破死锁: 返回 -EDEADLK
- *   - 调用者必须释放所有已获取的状态, 重新开始整个 atomic 事务
- *
- * allow_modeset 约束:
- *   只有 allow_modeset==true 时才能添加新的 CRTC state。
- *   这是为了防止"只是 page flip"操作意外触发 full modeset。
+ * WARNING: Drivers may only add new CRTC states to a @state if
+ * drm_atomic_state.allow_modeset is set, or if it's a driver-internal commit
+ * not created by userspace through an IOCTL call.
  *
  * Returns:
- *   成功返回 crtc_state 指针, 失败返回 ERR_PTR(-EDEADLK) 或 ERR_PTR(-ENOMEM)
+ * Either the allocated state or the error code encoded into the pointer. When
+ * the error is EDEADLK then the w/w mutex code has detected a deadlock and the
+ * entire atomic sequence must be restarted. All other errors are fatal.
  */
 struct drm_crtc_state *
 drm_atomic_get_crtc_state(struct drm_atomic_state *state,
@@ -1779,19 +1758,18 @@ int drm_atomic_check_only(struct drm_atomic_state *state)
 EXPORT_SYMBOL(drm_atomic_check_only);
 
 /**
- * drm_atomic_commit — 同步提交 atomic 配置到硬件 (阻塞模式)。
- * @state: 已通过 atomic_check 验证的 atomic state
+ * drm_atomic_commit - commit configuration atomically
+ * @state: atomic configuration to check
  *
- * 流程: debug_print → drm_atomic_check_only → config->funcs->atomic_commit(..., false)
+ * Note that this function can return -EDEADLK if the driver needed to acquire
+ * more locks but encountered a deadlock. The caller must then do the usual w/w
+ * backoff dance and restart. All other errors are fatal.
  *
- * 同步模式: 函数返回时, 硬件已经完成了配置切换。
- * 适用于需要"提交后立即读取新状态"的场景 (如 VT 切换、fbdev 仿真)。
+ * This function will take its own reference on @state.
+ * Callers should always release their reference with drm_atomic_state_put().
  *
- * 对比 nonblocking 模式:
- *   - 阻塞: 等待 vblank 完成, 适合 modeset
- *   - 非阻塞: 立即返回, 硬件在下一个 vblank 时完成, 适合 page flip
- *
- * Returns: 0 = 成功, -EDEADLK = 死锁需重试, 其他负值 = 致命错误
+ * Returns:
+ * 0 on success, negative error code on failure.
  */
 int drm_atomic_commit(struct drm_atomic_state *state)
 {
@@ -1813,13 +1791,18 @@ int drm_atomic_commit(struct drm_atomic_state *state)
 EXPORT_SYMBOL(drm_atomic_commit);
 
 /**
- * drm_atomic_nonblocking_commit — 异步提交 (非阻塞)。
+ * drm_atomic_nonblocking_commit - atomic nonblocking commit
+ * @state: atomic configuration to check
  *
- * 与同步版本的区别: atomic_commit(..., true) 的 nonblock=true。
- * 函数立即返回, 硬件在下一个 VBlank 时完成配置切换,
- * 完成后通过 drm_crtc_send_vblank_event() 通知用户态 (page flip event)。
+ * Note that this function can return -EDEADLK if the driver needed to acquire
+ * more locks but encountered a deadlock. The caller must then do the usual w/w
+ * backoff dance and restart. All other errors are fatal.
  *
- * 典型使用: compositor 的页面翻转 (Wayland DRM backend 的 atomic flip)
+ * This function will take its own reference on @state.
+ * Callers should always release their reference with drm_atomic_state_put().
+ *
+ * Returns:
+ * 0 on success, negative error code on failure.
  */
 int drm_atomic_nonblocking_commit(struct drm_atomic_state *state)
 {

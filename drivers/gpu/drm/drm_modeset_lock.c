@@ -21,41 +21,6 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-/*
- * DRM 模式设置锁定机制 - 中文注释补充
- *
- * 本文件实现了 DRM 子系统的模式设置锁（modeset lock）机制，基于
- * 等待-武断互斥锁（ww_mutex, Wait-Wound Mutex）实现死锁避免。
- * 这是 DRM 原子操作中确保正确锁顺序的关键基础设施。
- *
- * 核心概念:
- *   - drm_modeset_lock - 模式设置锁对象，包装 ww_mutex
- *   - drm_modeset_acquire_ctx - 锁获取上下文，跟踪已获取的锁
- *   - 死锁检测: 当 ww_mutex 检测到潜在死锁时返回 -EDEADLK，
- *     调用者需释放所有锁并回退（backoff）
- *
- * 典型使用模式:
- *   drm_modeset_acquire_init(ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE)
- *   retry:
- *     foreach (lock in locks) {
- *       ret = drm_modeset_lock(lock, ctx)
- *       if (ret == -EDEADLK) {
- *         drm_modeset_backoff(ctx);
- *         goto retry;
- *       }
- *     }
- *     ... 执行操作 ...
- *     out:
- *     drm_modeset_drop_locks(ctx);
- *     drm_modeset_acquire_fini(ctx);
- *
- * 相关的辅助宏 DRM_MODESET_LOCK_ALL_BEGIN() 和
- * DRM_MODESET_LOCK_ALL_END() 封装了上述流程。
- *
- * 另提供旧的 drm_modeset_lock_all() 接口用于一次性获取所有锁，
- * 但已弃用，新代码应使用 drm_modeset_lock_all_ctx()。
- */
-
 #include <linux/export.h>
 
 #include <drm/drm_atomic.h>
@@ -162,20 +127,6 @@ static void __drm_stack_depot_init(void)
 }
 #endif /* CONFIG_DRM_DEBUG_MODESET_LOCK */
 
-/*
- * drm_modeset_lock_all - 获取所有模式设置锁（已弃用）- 中文注释
- *
- * 此函数一次性获取所有模式设置锁（connection_mutex 以及所有
- * CRTC、Plane、私有对象的 mutex）。它会自动分配一个获取上下文
- * 并存储在 drm_device.mode_config.acquire_ctx 中。
- *
- * 注意: 此函数已弃用！它在内部分配获取上下文，这导致嵌套调用时
- * 容易出现错误。新代码应使用 drm_modeset_lock_all_ctx() 并
- * 显式管理获取上下文。
- *
- * 锁定顺序: connection_mutex -> CRTC mutexes -> Plane mutexes
- * -> 私有对象 mutexes
- */
 /**
  * drm_modeset_lock_all - take all modeset locks
  * @dev: DRM device
@@ -285,20 +236,6 @@ void drm_warn_on_modeset_not_all_locked(struct drm_device *dev)
 }
 EXPORT_SYMBOL(drm_warn_on_modeset_not_all_locked);
 
-/*
- * drm_modeset_acquire_init - 初始化锁获取上下文 - 中文注释
- *
- * 初始化 drm_modeset_acquire_ctx 结构，设置 ww_mutex 的
- * 获取上下文并初始化已锁定链表。
- *
- * 如果设置 DRM_MODESET_ACQUIRE_INTERRUPTIBLE 标志，后续所有
- * drm_modeset_lock() 调用将通过可中断等待（interruptible wait）
- * 获取锁，允许在等待时被信号中断并返回 -ERESTARTSYS。
- *
- * 参数:
- *   @ctx - 要初始化的获取上下文
- *   @flags - 0 或 DRM_MODESET_ACQUIRE_INTERRUPTIBLE
- */
 /**
  * drm_modeset_acquire_init - initialize acquire context
  * @ctx: the acquire context
@@ -330,18 +267,6 @@ void drm_modeset_acquire_fini(struct drm_modeset_acquire_ctx *ctx)
 }
 EXPORT_SYMBOL(drm_modeset_acquire_fini);
 
-/*
- * drm_modeset_drop_locks - 释放获取上下文持有的所有锁 - 中文注释
- *
- * 遍历上下文中的已锁定链表，逐个调用 drm_modeset_unlock()
- * 释放所有通过该上下文获取的模式设置锁。
- *
- * 如果上下文标记了 contended（存在竞争未解决的锁），会先输出
- * 调试栈回溯信息以帮助诊断死锁问题。
- *
- * 参数:
- *   @ctx - 包含已获取锁的获取上下文
- */
 /**
  * drm_modeset_drop_locks - drop all locks
  * @ctx: the acquire context
@@ -408,21 +333,6 @@ static inline int modeset_lock(struct drm_modeset_lock *lock,
 	return ret;
 }
 
-/*
- * drm_modeset_backoff - 死锁避免的回退操作 - 中文注释
- *
- * 当 drm_modeset_lock() 返回 -EDEADLK 时调用此函数。
- * 它会释放当前持有的所有锁，然后以慢速路径（slow path）
- * 重新获取发生竞争的锁，等待该锁可用后再返回。
- *
- * 如果上下文配置为可中断模式，等待期间可能被信号中断，
- * 此时返回 -ERESTARTSYS。
- *
- * 参数:
- *   @ctx - 检测到死锁的获取上下文
- *
- * 返回值: 0 成功，-ERESTARTSYS 表示被信号中断
- */
 /**
  * drm_modeset_backoff - deadlock avoidance backoff
  * @ctx: the acquire context
@@ -463,28 +373,6 @@ void drm_modeset_lock_init(struct drm_modeset_lock *lock)
 }
 EXPORT_SYMBOL(drm_modeset_lock_init);
 
-/*
- * drm_modeset_lock - 获取模式设置锁 - 中文注释
- *
- * 根据是否提供获取上下文采取不同行为:
- *   - 提供 ctx: 使用 ww_mutex 的获取上下文进行锁获取，支持死锁
- *     检测和回退。锁会被记录在 ctx 的已锁定链表中，可通过
- *     drm_modeset_drop_locks() 统一释放。
- *   - ctx 为 NULL: 行为类似于普通的、不可中断的 mutex_lock()，
- *     不参与死锁检测。
- *
- * 如果上下文配置为 DRM_MODESET_ACQUIRE_INTERRUPTIBLE，此函数
- * 使用可中断等待，可被信号中断返回 -ERESTARTSYS。
- *
- * 检测到死锁时返回 -EDEADLK，调用者必须调用 drm_modeset_backoff()
- * 释放所有锁并重试。
- *
- * 参数:
- *   @lock - 要获取的模式设置锁
- *   @ctx - 获取上下文，可为 NULL
- *
- * 返回值: 0 成功，-EDEADLK 死锁需回退，-ERESTARTSYS 被信号中断
- */
 /**
  * drm_modeset_lock - take modeset lock
  * @lock: lock to take
@@ -540,26 +428,6 @@ void drm_modeset_unlock(struct drm_modeset_lock *lock)
 }
 EXPORT_SYMBOL(drm_modeset_unlock);
 
-/*
- * drm_modeset_lock_all_ctx - 通过指定上下文获取所有模式设置锁 - 中文注释
- *
- * 相比已弃用的 drm_modeset_lock_all()，此函数接受显式的获取
- * 上下文，使调用者能更好地控制锁生命周期。它按固定顺序获取
- * 所有模式设置锁:
- *   1. connection_mutex（全局连接器锁）
- *   2. 所有 CRTC 的 mutex
- *   3. 所有 Plane 的 mutex
- *   4. 所有私有对象的 lock
- *
- * 注意: 此函数不获取 drm_mode_config.mutex，该锁用于保护
- * 连接器探测状态和热插拔事件，调用者如需使用需自行加锁。
- *
- * 参数:
- *   @dev - DRM 设备
- *   @ctx - 获取上下文
- *
- * 返回值: 0 成功，负值表示错误（可能是 -EDEADLK）
- */
 /**
  * drm_modeset_lock_all_ctx - take all modeset locks
  * @dev: DRM device

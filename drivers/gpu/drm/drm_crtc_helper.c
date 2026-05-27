@@ -29,31 +29,6 @@
  *      Jesse Barnes <jesse.barnes@intel.com>
  */
 
-/*
- * DRM 传统 CRTC 模式设置辅助函数
- *
- * 本文件提供了一组基于回调的传统 CRTC 模式设置辅助函数。它们实现了
- * DRM 核心接口（如 set_config、dpms）与驱动硬件操作之间的中间层。
- * 这些函数将通用的模式设置操作分解为一系列驱动回调调用
- * （prepare、mode_set、commit、dpms、disable 等），
- * 使驱动可以分别实现每个阶段的硬件操作。
- *
- * 主要功能：
- *   - drm_crtc_helper_set_config：实现 &drm_crtc_funcs.set_config 回调
- *   - drm_crtc_helper_set_mode：内部辅助函数，执行实际的模式设置序列
- *   - drm_helper_connector_dpms：实现 &drm_connector_funcs.dpms 回调
- *   - drm_helper_resume_force_mode：从挂起状态恢复时强制恢复模式设置
- *   - drm_helper_force_disable_all：强制关闭所有已启用的 CRTC
- *   - drm_helper_disable_unused_functions：禁用未使用的编码器和 CRTC
- *
- * 重要说明：
- *   这些是传统的模式设置辅助函数，新的驱动必须使用原子模式设置框架。
- *   这些函数与原子辅助函数共享相同的函数表结构（&drm_crtc_helper_funcs、
- *   &drm_encoder_helper_funcs、&drm_connector_helper_funcs）。
- */
-
-#include <linux/export.h>
-
 #include <linux/export.h>
 #include <linux/kernel.h>
 #include <linux/moduleparam.h>
@@ -119,15 +94,15 @@ DECLARE_DYNDBG_CLASSMAP(drm_debug_classes, DD_CLASS_TYPE_DISJOINT_BITS, 0,
  */
 
 /**
- * drm_helper_encoder_in_use - 检查给定的编码器是否被使用
- * @encoder: 要检查的编码器
+ * drm_helper_encoder_in_use - check if a given encoder is in use
+ * @encoder: encoder to check
  *
- * 检查在当前模式设置输出配置中，@encoder 是否被任何连接器使用。
- * 这不表示编码器实际已启用（DPMS 状态独立跟踪）。
- * 仅适用于传统（非原子）驱动。
+ * Checks whether @encoder is with the current mode setting output configuration
+ * in use by any connector. This doesn't mean that it is actually enabled since
+ * the DPMS state is tracked separately.
  *
- * 返回值：
- * 如果 @encoder 被使用返回 true，否则返回 false。
+ * Returns:
+ * True if @encoder is used, false otherwise.
  */
 bool drm_helper_encoder_in_use(struct drm_encoder *encoder)
 {
@@ -160,15 +135,15 @@ bool drm_helper_encoder_in_use(struct drm_encoder *encoder)
 EXPORT_SYMBOL(drm_helper_encoder_in_use);
 
 /**
- * drm_helper_crtc_in_use - 检查给定的 CRTC 是否在模式配置中被使用
- * @crtc: 要检查的 CRTC
+ * drm_helper_crtc_in_use - check if a given CRTC is in a mode_config
+ * @crtc: CRTC to check
  *
- * 检查在当前模式设置输出配置中，@crtc 是否被任何连接器使用。
- * 这不表示 CRTC 实际已启用（DPMS 状态独立跟踪）。
- * 仅适用于传统（非原子）驱动。
+ * Checks whether @crtc is with the current mode setting output configuration
+ * in use by any connector. This doesn't mean that it is actually enabled since
+ * the DPMS state is tracked separately.
  *
- * 返回值：
- * 如果 @crtc 被使用返回 true，否则返回 false。
+ * Returns:
+ * True if @crtc is used, false otherwise.
  */
 bool drm_helper_crtc_in_use(struct drm_crtc *crtc)
 {
@@ -235,19 +210,23 @@ static void __drm_helper_disable_unused_functions(struct drm_device *dev)
 }
 
 /**
- * drm_helper_disable_unused_functions - 禁用未使用的对象
- * @dev: DRM 设备
+ * drm_helper_disable_unused_functions - disable unused objects
+ * @dev: DRM device
  *
- * 遍历 @dev 的整个模式设置配置。此函数会移除未使用编码器的 CRTC 链接
- * 和已断开连接器的编码器链接。然后禁用所有未使用的编码器和 CRTC，
- * 优先调用 disable 回调，如果不可用则调用 dpms 回调（设为 DRM_MODE_DPMS_OFF）。
+ * This function walks through the entire mode setting configuration of @dev. It
+ * will remove any CRTC links of unused encoders and encoder links of
+ * disconnected connectors. Then it will disable all unused encoders and CRTCs
+ * either by calling their disable callback if available or by calling their
+ * dpms callback with DRM_MODE_DPMS_OFF.
  *
- * 注意：
- * 此函数属于传统模式设置辅助库，与原子驱动不兼容。
- * 原子辅助框架保证不会在已禁用的函数上调用 ->disable()，
- * 也不会在已启用的函数上调用 ->enable()。
- * 但 drm_helper_disable_unused_functions() 不考虑这些保证，
- * 无条件地在未使用的函数上调用 disable 钩子。
+ * NOTE:
+ *
+ * This function is part of the legacy modeset helper library and will cause
+ * major confusion with atomic drivers. This is because atomic helpers guarantee
+ * to never call ->disable() hooks on a disabled function, or ->enable() hooks
+ * on an enabled functions. drm_helper_disable_unused_functions() on the other
+ * hand throws such guarantees into the wind and calls disable hooks
+ * unconditionally on unused functions.
  */
 void drm_helper_disable_unused_functions(struct drm_device *dev)
 {
@@ -282,31 +261,24 @@ drm_crtc_prepare_encoders(struct drm_device *dev)
 }
 
 /**
- * drm_crtc_helper_set_mode - 内部辅助函数：设置显示模式
- * @crtc: 要编程的 CRTC
- * @mode: 要使用的模式
- * @x: 表面的水平偏移
- * @y: 表面的垂直偏移
- * @old_fb: 旧的帧缓冲，用于清理
+ * drm_crtc_helper_set_mode - internal helper to set a mode
+ * @crtc: CRTC to program
+ * @mode: mode to use
+ * @x: horizontal offset into the surface
+ * @y: vertical offset into the surface
+ * @old_fb: old framebuffer, for cleanup
  *
- * 尝试在 @crtc 上设置 @mode。在尝试设置之前，给 @crtc 及其关联的连接器
- * 一个修复或拒绝模式的机会。
+ * Try to set @mode on @crtc.  Give @crtc and its associated connectors a chance
+ * to fixup or reject the mode prior to trying to set it. This is an internal
+ * helper that drivers could e.g. use to update properties that require the
+ * entire output pipe to be disabled and re-enabled in a new configuration. For
+ * example for changing whether audio is enabled on a hdmi link or for changing
+ * panel fitter or dither attributes. It is also called by the
+ * drm_crtc_helper_set_config() helper function to drive the mode setting
+ * sequence.
  *
- * 模式设置序列（按顺序）：
- *   1. 调用所有关联编码器的 mode_fixup 回调
- *   2. 调用 CRTC 的 mode_fixup 回调
- *   3. 调用所有关联编码器的 prepare 回调（准备阶段）
- *   4. 调用 CRTC 的 prepare 回调
- *   5. 调用 CRTC 的 mode_set 回调（设置 PLL 和模式参数）
- *   6. 调用所有关联编码器的 mode_set 回调
- *   7. 调用 CRTC 的 commit 回调（提交/激活）
- *   8. 调用所有关联编码器的 commit 回调
- *   9. 计算并存储 VBLANK 和交换完成时间戳所需的常量
- *
- * 如果任何步骤失败，会回滚到之前保存的状态。
- *
- * 返回值：
- * 成功返回 true，失败返回 false。
+ * Returns:
+ * True if the mode was set successfully, false otherwise.
  */
 bool drm_crtc_helper_set_mode(struct drm_crtc *crtc,
 			      struct drm_display_mode *mode,
@@ -463,18 +435,16 @@ done:
 EXPORT_SYMBOL(drm_crtc_helper_set_mode);
 
 /**
- * drm_crtc_helper_atomic_check() - 检查 CRTC 原子状态的辅助函数
- * @crtc: 要检查的 CRTC
- * @state: 原子状态对象
+ * drm_crtc_helper_atomic_check() - Helper to check CRTC atomic-state
+ * @crtc: CRTC to check
+ * @state: atomic state object
  *
- * 为只连接了一个主平面的 CRTC 提供默认的 CRTC 状态检查处理函数。
- * 这是简单帧缓冲 CRTC 的常见情况。
+ * Provides a default CRTC-state check handler for CRTCs that only have
+ * one primary plane attached to it. This is often the case for the CRTC
+ * of simple framebuffers.
  *
- * 如果 CRTC 已启用，此函数会检查是否配置了有效的主平面，
- * 确保主平面有有效的帧缓冲。
- *
- * 返回值：
- * 成功返回 0，失败返回负的错误码。
+ * RETURNS:
+ * Zero on success, or an errno code otherwise.
  */
 int drm_crtc_helper_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
@@ -542,26 +512,42 @@ drm_connector_get_single_encoder(struct drm_connector *connector)
 }
 
 /**
- * drm_crtc_helper_set_config - 从用户空间设置新配置
- * @set: 模式设置配置
- * @ctx: 锁获取上下文（此处未使用）
+ * drm_crtc_helper_set_config - set a new config from userspace
+ * @set: mode set configuration
+ * @ctx: lock acquire context, not used here
  *
- * 为使用传统 CRTC 辅助函数的驱动实现 &drm_crtc_funcs.set_config 回调。
+ * The drm_crtc_helper_set_config() helper function implements the of
+ * &drm_crtc_funcs.set_config callback for drivers using the legacy CRTC
+ * helpers.
  *
- * 执行流程：
- *   1. 为每个连接器选择最佳编码器（通过 best_encoder 回调）
- *   2. 调用 mode_fixup 回调调整或拒绝请求的模式
- *   3. 如果新模式与当前模式相同但帧缓冲不同，调用 mode_set_base
- *   4. 如果新模式与当前模式不同，执行完整的模式设置序列
- *      （prepare -> mode_set -> commit）
- *   5. 禁用所有未使用的函数
- *   6. 如果任何步骤失败，回滚到之前保存的配置
+ * It first tries to locate the best encoder for each connector by calling the
+ * connector @drm_connector_helper_funcs.best_encoder helper operation.
  *
- * 此函数已废弃。新的驱动必须实现原子模式设置支持，
- * 应使用 drm_atomic_helper_set_config() 替代。
+ * After locating the appropriate encoders, the helper function will call the
+ * mode_fixup encoder and CRTC helper operations to adjust the requested mode,
+ * or reject it completely in which case an error will be returned to the
+ * application. If the new configuration after mode adjustment is identical to
+ * the current configuration the helper function will return without performing
+ * any other operation.
  *
- * 返回值：
- * 成功返回 0，失败返回负的错误码。
+ * If the adjusted mode is identical to the current mode but changes to the
+ * frame buffer need to be applied, the drm_crtc_helper_set_config() function
+ * will call the CRTC &drm_crtc_helper_funcs.mode_set_base helper operation.
+ *
+ * If the adjusted mode differs from the current mode, or if the
+ * ->mode_set_base() helper operation is not provided, the helper function
+ * performs a full mode set sequence by calling the ->prepare(), ->mode_set()
+ * and ->commit() CRTC and encoder helper operations, in that order.
+ * Alternatively it can also use the dpms and disable helper operations. For
+ * details see &struct drm_crtc_helper_funcs and struct
+ * &drm_encoder_helper_funcs.
+ *
+ * This function is deprecated.  New drivers must implement atomic modeset
+ * support, for which this function is unsuitable. Instead drivers should use
+ * drm_atomic_helper_set_config().
+ *
+ * Returns:
+ * Returns 0 on success, negative errno numbers on failure.
  */
 int drm_crtc_helper_set_config(struct drm_mode_set *set,
 			       struct drm_modeset_acquire_ctx *ctx)
@@ -900,26 +886,25 @@ static int drm_helper_choose_crtc_dpms(struct drm_crtc *crtc)
 }
 
 /**
- * drm_helper_connector_dpms() - 连接器 DPMS 辅助实现
- * @connector: 受影响的连接器
- * @mode: DPMS 模式
+ * drm_helper_connector_dpms() - connector dpms helper implementation
+ * @connector: affected connector
+ * @mode: DPMS mode
  *
- * 为使用传统 CRTC 辅助函数的驱动实现 &drm_connector_funcs.dpms 回调。
+ * The drm_helper_connector_dpms() helper function implements the
+ * &drm_connector_funcs.dpms callback for drivers using the legacy CRTC
+ * helpers.
  *
- * 这是 CRTC 辅助框架提供的主要 DPMS 辅助函数。它计算输出网格中所有
- * 编码器和 CRTC 的所需 DPMS 状态，然后调用驱动提供的
- * &drm_crtc_helper_funcs.dpms 和 &drm_encoder_helper_funcs.dpms 回调。
+ * This is the main helper function provided by the CRTC helper framework for
+ * implementing the DPMS connector attribute. It computes the new desired DPMS
+ * state for all encoders and CRTCs in the output mesh and calls the
+ * &drm_crtc_helper_funcs.dpms and &drm_encoder_helper_funcs.dpms callbacks
+ * provided by the driver.
  *
- * 转换顺序：
- *   - 从关到开（mode < old_dpms）：先 CRTC 后编码器
- *   - 从开到关（mode > old_dpms）：先编码器后 CRTC
- *   这种顺序确保了正确的电源序列。
+ * This function is deprecated.  New drivers must implement atomic modeset
+ * support, where DPMS is handled in the DRM core.
  *
- * 此函数已废弃。新的驱动必须实现原子模式设置支持，
- * 在原子框架中 DPMS 由 DRM 核心直接处理。
- *
- * 返回值：
- * 始终返回 0。
+ * Returns:
+ * Always returns 0.
  */
 int drm_helper_connector_dpms(struct drm_connector *connector, int mode)
 {
@@ -969,24 +954,29 @@ int drm_helper_connector_dpms(struct drm_connector *connector, int mode)
 EXPORT_SYMBOL(drm_helper_connector_dpms);
 
 /**
- * drm_helper_resume_force_mode - 强制恢复模式设置配置
- * @dev: 要恢复的 DRM 设备
+ * drm_helper_resume_force_mode - force-restore mode setting configuration
+ * @dev: drm_device which should be restored
  *
- * 使用模式设置辅助函数的驱动可以使用此函数强制恢复模式设置配置，
- * 例如在恢复（resume）时，或者当其他因素可能破坏硬件状态时
- * （如某些过于激进的旧 BIOS）。
+ * Drivers which use the mode setting helpers can use this function to
+ * force-restore the mode setting configuration e.g. on resume or when something
+ * else might have trampled over the hw state (like some overzealous old BIOSen
+ * tended to do).
  *
- * 此辅助函数不提供错误返回值，因为恢复旧的配置因为资源分配问题
- * 而失败的情况不应该发生——驱动之前已经成功设置了这些配置。
- * 因此这基本上等同于几次 dpms 开启调用。
+ * This helper doesn't provide a error return value since restoring the old
+ * config should never fail due to resource allocation issues since the driver
+ * has successfully set the restored configuration already. Hence this should
+ * boil down to the equivalent of a few dpms on calls, which also don't provide
+ * an error code.
  *
- * 如果只是简单恢复旧的配置可能会导致失败（例如在恢复时因顺序不同
- * 导致共享资源分配的微小差异），驱动需要使用自己的恢复逻辑。
+ * Drivers where simply restoring an old configuration again might fail (e.g.
+ * due to slight differences in allocating shared resources when the
+ * configuration is restored in a different order than when userspace set it up)
+ * need to use their own restore logic.
  *
- * 此函数已废弃。新的驱动应实现原子模式设置并使用原子的
- * suspend/resume 辅助函数。
+ * This function is deprecated. New drivers should implement atomic mode-
+ * setting and use the atomic suspend/resume helpers.
  *
- * 另请参见：
+ * See also:
  * drm_atomic_helper_suspend(), drm_atomic_helper_resume()
  */
 void drm_helper_resume_force_mode(struct drm_device *dev)
@@ -1039,17 +1029,17 @@ void drm_helper_resume_force_mode(struct drm_device *dev)
 EXPORT_SYMBOL(drm_helper_resume_force_mode);
 
 /**
- * drm_helper_force_disable_all - 强制关闭所有已启用的 CRTC
- * @dev: 要关闭 CRTC 的 DRM 设备
+ * drm_helper_force_disable_all - Forcibly turn off all enabled CRTCs
+ * @dev: DRM device whose CRTCs to turn off
  *
- * 驱动可以在卸载时调用此函数，以确保所有显示器关闭，
- * GPU 处于一致的、低功耗状态。会获取模式设置锁。
+ * Drivers may want to call this on unload to ensure that all displays are
+ * unlit and the GPU is in a consistent, low power state. Takes modeset locks.
  *
- * 注意：此函数仅适用于非原子的传统驱动。
- * 对于原子版本，请查看 drm_atomic_helper_shutdown()。
+ * Note: This should only be used by non-atomic legacy drivers. For an atomic
+ * version look at drm_atomic_helper_shutdown().
  *
- * 返回值：
- * 成功返回 0，失败返回错误码。
+ * Returns:
+ * Zero on success, error code on failure.
  */
 int drm_helper_force_disable_all(struct drm_device *dev)
 {

@@ -29,34 +29,6 @@
  *      Jesse Barnes <jesse.barnes@intel.com>
  */
 
-/*
- * DRM 连接器探测辅助函数
- *
- * 本文件提供了连接器输出探测的辅助函数。核心功能是实现了
- * &drm_connector_funcs.fill_modes 接口的
- * drm_helper_probe_single_connector_modes() 函数。
- *
- * 此外，还提供了：
- *   - 通过工作项定期轮询连接器状态的机制（output_poll_execute）
- *   - 通用的热插拔中断处理（无需驱动追踪每个连接器的 HPD 中断）
- *   - 连接器状态检测辅助函数
- *   - EDID 读取和模式填充的默认实现
- *
- * 探测流程：
- *   1. 对连接器进行状态检测（调用 detect 回调）
- *   2. 获取显示模式（通过 get_modes 回调或添加 EDID 模式）
- *   3. 添加内核命令行指定的模式
- *   4. 验证所有模式的有效性
- *   5. 移除无效的模式
- *   6. 对剩余模式进行排序
- *
- * 轮询机制：
- *   驱动可以为连接器设置 DRM_CONNECTOR_POLL_CONNECT/DISCONNECT 标志，
- *   辅助框架会定期（默认 10 秒）轮询这些连接器的状态变化。
- */
-
-#include <linux/export.h>
-
 #include <linux/export.h>
 #include <linux/moduleparam.h>
 
@@ -313,19 +285,22 @@ static void reschedule_output_poll_work(struct drm_device *dev)
 }
 
 /**
- * drm_kms_helper_poll_enable - 重新启用输出轮询
- * @dev: DRM 设备
+ * drm_kms_helper_poll_enable - re-enable output polling.
+ * @dev: drm_device
  *
- * 在使用 drm_kms_helper_poll_disable() 临时禁用输出轮询后
- * （例如在 suspend/resume 期间），此函数重新启用输出轮询工作。
+ * This function re-enables the output polling work, after it has been
+ * temporarily disabled using drm_kms_helper_poll_disable(), for example over
+ * suspend/resume.
  *
- * 驱动可以从其设备恢复（resume）实现中调用此辅助函数。
- * 即使输出轮询尚未启用，调用此函数也不是错误。
+ * Drivers can call this helper from their device resume implementation. It is
+ * not an error to call this even when output polling isn't enabled.
  *
- * 如果设备轮询从未被初始化过，此调用会触发警告并返回。
+ * If device polling was never initialized before, this call will trigger a
+ * warning and return.
  *
- * 注意：启用和禁用轮询的调用必须严格有序，
- * 当仅在 suspend/resume 回调中调用时自动满足此要求。
+ * Note that calls to enable and disable polling must be strictly ordered, which
+ * is automatically the case when they're only call from suspend/resume
+ * callbacks.
  */
 void drm_kms_helper_poll_enable(struct drm_device *dev)
 {
@@ -342,19 +317,20 @@ void drm_kms_helper_poll_enable(struct drm_device *dev)
 EXPORT_SYMBOL(drm_kms_helper_poll_enable);
 
 /**
- * drm_kms_helper_poll_reschedule - 重新调度输出轮询工作
- * @dev: DRM 设备
+ * drm_kms_helper_poll_reschedule - reschedule the output polling work
+ * @dev: drm_device
  *
- * 在启用某个连接器的轮询后，重新调度输出轮询工作。
+ * This function reschedules the output polling work, after polling for a
+ * connector has been enabled.
  *
- * 驱动在通过设置 drm_connector::polled 中的
- * %DRM_CONNECTOR_POLL_CONNECT / %DRM_CONNECTOR_POLL_DISCONNECT 标志
- * 来启用连接器的轮询后，必须调用此辅助函数。
- * 注意：如果通过清除这些标志禁用了某个连接器的轮询，且所有其他
- * 连接器的轮询也被禁用，输出轮询工作会自动停止。
+ * Drivers must call this helper after enabling polling for a connector by
+ * setting %DRM_CONNECTOR_POLL_CONNECT / %DRM_CONNECTOR_POLL_DISCONNECT flags
+ * in drm_connector::polled. Note that after disabling polling by clearing these
+ * flags for a connector will stop the output polling work automatically if
+ * the polling is disabled for all other connectors as well.
  *
- * 只有在调用了 drm_kms_helper_poll_init() / drm_kms_helper_poll_enable()
- * 启用轮询后才能调用此函数。
+ * The function can be called only after polling has been enabled by calling
+ * drm_kms_helper_poll_init() / drm_kms_helper_poll_enable().
  */
 void drm_kms_helper_poll_reschedule(struct drm_device *dev)
 {
@@ -408,15 +384,14 @@ retry:
 }
 
 /**
- * drm_helper_probe_detect - 探测连接器状态
- * @connector: 要探测的连接器
- * @ctx: 锁获取上下文，或 NULL 表示让此函数自行处理锁定
- * @force: 是否执行破坏性（destructive）探测操作
+ * drm_helper_probe_detect - probe connector status
+ * @connector: connector to probe
+ * @ctx: acquire_ctx, or NULL to let this function handle locking.
+ * @force: Whether destructive probe operations should be performed.
  *
- * 调用连接器的 detect 回调来检测其状态。
- * 如果 @ctx 不为 NULL，调用者负责锁定管理，此函数可能返回 -EDEADLK
- * 表示需要回退（backoff）并重试。
- * 如果 @ctx 为 NULL，此函数自行处理所有锁定。
+ * This function calls the detect callbacks of the connector.
+ * This function returns &drm_connector_status, or
+ * if @ctx is set, it might also return -EDEADLK.
  */
 int
 drm_helper_probe_detect(struct drm_connector *connector,
@@ -523,48 +498,63 @@ static int __drm_helper_update_and_validate(struct drm_connector *connector,
 }
 
 /**
- * drm_helper_probe_single_connector_modes - 获取完整的显示模式集合
- * @connector: 要探测的连接器
- * @maxX: 模式的最大宽度
- * @maxY: 模式的最大高度
+ * drm_helper_probe_single_connector_modes - get complete set of display modes
+ * @connector: connector to probe
+ * @maxX: max width for modes
+ * @maxY: max height for modes
  *
- * 基于 @connector 在 &drm_connector_helper_funcs 中实现辅助回调，
- * 尝试检测所有有效的显示模式。模式首先被添加到连接器的 probed_modes 列表，
- * 然后经过验证和筛选（基于有效性和 @maxX/@maxY 参数），
- * 最后放入正常的 modes 列表中。
+ * Based on the helper callbacks implemented by @connector in struct
+ * &drm_connector_helper_funcs try to detect all valid modes.  Modes will first
+ * be added to the connector's probed_modes list, then culled (based on validity
+ * and the @maxX, @maxY parameters) and put into the normal modes list.
  *
- * 这是 &drm_connector_funcs.fill_modes() vfunc 的通用实现，
- * 供使用 CRTC 辅助函数进行输出模式过滤和检测的驱动使用。
+ * Intended to be used as a generic implementation of the
+ * &drm_connector_funcs.fill_modes() vfunc for drivers that use the CRTC helpers
+ * for output mode filtering and detection.
  *
- * 基本流程：
+ * The basic procedure is as follows
  *
- * 1. 将连接器 modes 列表中现有模式标记为过期（stale）
+ * 1. All modes currently on the connector's modes list are marked as stale
  *
- * 2. 向 probed_modes 列表添加新模式，按以下优先级从单个来源添加：
+ * 2. New modes are added to the connector's probed_modes list with
+ *    drm_mode_probed_add(). New modes start their life with status as OK.
+ *    Modes are added from a single source using the following priority order.
+ *
  *    - &drm_connector_helper_funcs.get_modes vfunc
- *    - 如果连接器状态为 connected，自动添加标准 VESA DMT 模式
- *      （最高 1024x768，通过 drm_add_modes_noedid()）
- *    - 最后添加内核命令行（video=...）指定的模式
- *      （通过 drm_helper_probe_add_cmdline_mode()）
+ *    - if the connector status is connector_status_connected, standard
+ *      VESA DMT modes up to 1024x768 are automatically added
+ *      (drm_add_modes_noedid())
  *
- * 3. 模式从 probed_modes 列表移动到 modes 列表，重复项合并
+ *    Finally modes specified via the kernel command line (video=...) are
+ *    added in addition to what the earlier probes produced
+ *    (drm_helper_probe_add_cmdline_mode()). These modes are generated
+ *    using the VESA GTF/CVT formulas.
  *
- * 4. 所有非过期模式进行验证：
- *    - drm_mode_validate_basic()：基本完整性检查
- *    - drm_mode_validate_size()：筛选超过 @maxX/@maxY 的模式
- *    - drm_mode_validate_flag()：检查连接器能力标志
- *    - drm_connector_helper_funcs.mode_valid/mode_valid_ctx：
- *      驱动和/或接收端特定检查
- *    - drm_crtc_helper_funcs.mode_valid、drm_bridge_funcs.mode_valid、
- *      drm_encoder_helper_funcs.mode_valid：驱动和/或源端特定检查
+ * 3. Modes are moved from the probed_modes list to the modes list. Potential
+ *    duplicates are merged together (see drm_connector_list_update()).
+ *    After this step the probed_modes list will be empty again.
  *
- * 5. 移除所有状态不为 OK 的模式
+ * 4. Any non-stale mode on the modes list then undergoes validation
  *
- * 对于 DisplayPort 连接器，如果所有模式都被移除，会尝试添加
- * 640x480 @60Hz 作为故障安全模式（符合 DP 规范 5.2.1.2 节要求）。
+ *    - drm_mode_validate_basic() performs basic sanity checks
+ *    - drm_mode_validate_size() filters out modes larger than @maxX and @maxY
+ *      (if specified)
+ *    - drm_mode_validate_flag() checks the modes against basic connector
+ *      capabilities (interlace_allowed,doublescan_allowed,stereo_allowed)
+ *    - the optional &drm_connector_helper_funcs.mode_valid or
+ *      &drm_connector_helper_funcs.mode_valid_ctx helpers can perform driver
+ *      and/or sink specific checks
+ *    - the optional &drm_crtc_helper_funcs.mode_valid,
+ *      &drm_bridge_funcs.mode_valid and &drm_encoder_helper_funcs.mode_valid
+ *      helpers can perform driver and/or source specific checks which are also
+ *      enforced by the modeset/atomic helpers
  *
- * 返回值：
- * 在 @connector 上找到的模式数量。
+ * 5. Any mode whose status is not OK is pruned from the connector's modes list,
+ *    accompanied by a debug message indicating the reason for the mode's
+ *    rejection (see drm_mode_prune_invalid()).
+ *
+ * Returns:
+ * The number of modes found on @connector.
  */
 int drm_helper_probe_single_connector_modes(struct drm_connector *connector,
 					    uint32_t maxX, uint32_t maxY)
@@ -722,20 +712,23 @@ exit:
 EXPORT_SYMBOL(drm_helper_probe_single_connector_modes);
 
 /**
- * drm_kms_helper_hotplug_event - 触发 KMS 热插拔事件
- * @dev: 连接器状态发生变化的 DRM 设备
+ * drm_kms_helper_hotplug_event - fire off KMS hotplug events
+ * @dev: drm_device whose connector state changed
  *
- * 向用户空间发送 uevent，同时调用客户端热插拔函数（最常用于通知
- * fbdev 模拟代码更新 fbcon 输出配置）。
+ * This function fires off the uevent for userspace and also calls the
+ * client hotplug function, which is most commonly used to inform the fbdev
+ * emulation code and allow it to update the fbcon output configuration.
  *
- * 驱动在检测到连接器状态变化时，应从其热插拔处理代码中调用此函数。
- * 注意：此函数不自行执行任何输出检测（不像 drm_helper_hpd_irq_event()），
- * 驱动应已经完成了检测工作。
+ * Drivers should call this from their hotplug handling code when a change is
+ * detected. Note that this function does not do any output detection of its
+ * own, like drm_helper_hpd_irq_event() does - this is assumed to be done by the
+ * driver already.
  *
- * 必须从进程上下文中调用，且不持有任何模式设置锁。
+ * This function must be called from process context with no mode
+ * setting locks held.
  *
- * 如果只有单个连接器发生变化，建议使用
- * drm_kms_helper_connector_hotplug_event() 以获得更细粒度的事件通知。
+ * If only a single connector has changed, consider calling
+ * drm_kms_helper_connector_hotplug_event() instead.
  */
 void drm_kms_helper_hotplug_event(struct drm_device *dev)
 {
@@ -745,12 +738,11 @@ void drm_kms_helper_hotplug_event(struct drm_device *dev)
 EXPORT_SYMBOL(drm_kms_helper_hotplug_event);
 
 /**
- * drm_kms_helper_connector_hotplug_event - 触发 KMS 连接器热插拔事件
- * @connector: 发生变化的 DRM 连接器
+ * drm_kms_helper_connector_hotplug_event - fire off a KMS connector hotplug event
+ * @connector: drm_connector which has changed
  *
- * 与 drm_kms_helper_hotplug_event() 功能相同，但只为单个连接器
- * 触发更细粒度的 uevent。当驱动可以精确定位是哪个连接器发生变化时，
- * 应优先使用此函数。
+ * This is the same as drm_kms_helper_hotplug_event(), except it fires a more
+ * fine-grained uevent for a single connector.
  */
 void drm_kms_helper_connector_hotplug_event(struct drm_connector *connector)
 {
@@ -860,15 +852,16 @@ out:
 }
 
 /**
- * drm_kms_helper_is_poll_worker - 判断当前任务是否为输出轮询工作线程
+ * drm_kms_helper_is_poll_worker - is %current task an output poll worker?
  *
- * 确定当前任务是否是输出轮询工作线程。可用于为输出轮询与其他上下文
- * 选择不同的代码路径。
+ * Determine if %current task is an output poll worker.  This can be used
+ * to select distinct code paths for output polling versus other contexts.
  *
- * 一个典型的使用场景是避免输出轮询工作线程和自动挂起工作线程之间的
- * 死锁：后者在调用 drm_kms_helper_poll_disable() 时等待轮询完成，
- * 而前者在连接器 ->detect 钩子中调用 pm_runtime_get_sync() 时
- * 等待运行时挂起完成。
+ * One use case is to avoid a deadlock between the output poll worker and
+ * the autosuspend worker wherein the latter waits for polling to finish
+ * upon calling drm_kms_helper_poll_disable(), while the former waits for
+ * runtime suspend to finish upon calling pm_runtime_get_sync() in a
+ * connector ->detect hook.
  */
 bool drm_kms_helper_is_poll_worker(void)
 {
@@ -879,17 +872,21 @@ bool drm_kms_helper_is_poll_worker(void)
 EXPORT_SYMBOL(drm_kms_helper_is_poll_worker);
 
 /**
- * drm_kms_helper_poll_disable - 禁用输出轮询
- * @dev: DRM 设备
+ * drm_kms_helper_poll_disable - disable output polling
+ * @dev: drm_device
  *
- * 禁用输出轮询工作。驱动可以从其设备挂起（suspend）实现中调用此函数。
- * 即使输出轮询尚未启用或已禁用，调用此函数也不是错误。
- * 轮询通过调用 drm_kms_helper_poll_enable() 重新启用。
+ * This function disables the output polling work.
  *
- * 如果轮询从未被初始化过，此调用会触发警告并返回。
+ * Drivers can call this helper from their device suspend implementation. It is
+ * not an error to call this even when output polling isn't enabled or already
+ * disabled. Polling is re-enabled by calling drm_kms_helper_poll_enable().
  *
- * 注意：启用和禁用轮询的调用必须严格有序，
- * 当仅在 suspend/resume 回调中调用时自动满足此要求。
+ * If however, the polling was never initialized, this call will trigger a
+ * warning and return.
+ *
+ * Note that calls to enable and disable polling must be strictly ordered, which
+ * is automatically the case when they're only call from suspend/resume
+ * callbacks.
  */
 void drm_kms_helper_poll_disable(struct drm_device *dev)
 {
@@ -906,19 +903,23 @@ void drm_kms_helper_poll_disable(struct drm_device *dev)
 EXPORT_SYMBOL(drm_kms_helper_poll_disable);
 
 /**
- * drm_kms_helper_poll_init - 初始化并启用输出轮询
- * @dev: DRM 设备
+ * drm_kms_helper_poll_init - initialize and enable output polling
+ * @dev: drm_device
  *
- * 初始化并为 @dev 启用输出轮询支持。对于没有可靠热插拔硬件支持的驱动，
- * 可以使用此辅助基础设施定期轮询连接器的连接状态变化。
+ * This function initializes and then also enables output polling support for
+ * @dev. Drivers which do not have reliable hotplug support in hardware can use
+ * this helper infrastructure to regularly poll such connectors for changes in
+ * their connection state.
  *
- * 驱动可以通过设置 DRM_CONNECTOR_POLL_CONNECT 和 DRM_CONNECTOR_POLL_DISCONNECT
- * 标志来控制哪些连接器被轮询。对于探测带电输出可能导致视觉失真的连接器，
- * 驱动不应设置 DRM_CONNECTOR_POLL_DISCONNECT 标志以避免此问题。
- * 没有标志或仅设置了 DRM_CONNECTOR_POLL_HPD 的连接器被轮询逻辑完全忽略。
+ * Drivers can control which connectors are polled by setting the
+ * DRM_CONNECTOR_POLL_CONNECT and DRM_CONNECTOR_POLL_DISCONNECT flags. On
+ * connectors where probing live outputs can result in visual distortion drivers
+ * should not set the DRM_CONNECTOR_POLL_DISCONNECT flag to avoid this.
+ * Connectors which have no flag or only DRM_CONNECTOR_POLL_HPD set are
+ * completely ignored by the polling logic.
  *
- * 注意：如果热插拔中断已知不可靠，一个连接器可以同时被轮询和通过热插拔
- * 处理函数探测。
+ * Note that a connector can be both polled and probed from the hotplug handler,
+ * in case the hotplug interrupt is known to be unreliable.
  */
 void drm_kms_helper_poll_init(struct drm_device *dev)
 {
@@ -930,11 +931,8 @@ void drm_kms_helper_poll_init(struct drm_device *dev)
 EXPORT_SYMBOL(drm_kms_helper_poll_init);
 
 /**
- * drm_kms_helper_poll_fini - 禁用输出轮询并清理
- * @dev: DRM 设备
- *
- * 禁用输出轮询并清理相关资源。调用 drm_kms_helper_poll_disable()
- * 并设置 poll_enabled = false。
+ * drm_kms_helper_poll_fini - disable output polling and clean it up
+ * @dev: drm_device
  */
 void drm_kms_helper_poll_fini(struct drm_device *dev)
 {
@@ -953,14 +951,14 @@ static void drm_kms_helper_poll_init_release(struct drm_device *dev, void *res)
 }
 
 /**
- * drmm_kms_helper_poll_init - 初始化并启用输出轮询（托管版本）
- * @dev: DRM 设备
+ * drmm_kms_helper_poll_init - initialize and enable output polling
+ * @dev: drm_device
  *
- * 类似于 drm_kms_helper_poll_init()，但使用 DRM 托管机制
- * （devres managed），当 DRM 设备销毁时轮询会自动清理。
- * 使用 drmm_add_action_or_reset() 注册了清理回调。
+ * This function initializes and then also enables output polling support for
+ * @dev similar to drm_kms_helper_poll_init(). Polling will automatically be
+ * cleaned up when the DRM device goes away.
  *
- * 详见 drm_kms_helper_poll_init() 的文档。
+ * See drm_kms_helper_poll_init() for more information.
  */
 void drmm_kms_helper_poll_init(struct drm_device *dev)
 {
@@ -1014,20 +1012,25 @@ static bool check_connector_changed(struct drm_connector *connector)
 }
 
 /**
- * drm_connector_helper_hpd_irq_event - 单连接器热插拔事件处理
- * @connector: DRM 连接器
+ * drm_connector_helper_hpd_irq_event - hotplug processing
+ * @connector: drm_connector
  *
- * 对设置了 DRM_CONNECTOR_POLL_HPD 标志的连接器执行一次检测循环。
+ * Drivers can use this helper function to run a detect cycle on a connector
+ * which has the DRM_CONNECTOR_POLL_HPD flag set in its &polled member.
  *
- * 此辅助函数适用于能够追踪单个连接器热插拔中断的驱动。
- * 如果需要为所有连接器发送热插拔事件或无法按连接器追踪
- * 热插拔中断，应使用 drm_helper_hpd_irq_event()。
+ * This helper function is useful for drivers which can track hotplug
+ * interrupts for a single connector. Drivers that want to send a
+ * hotplug event for all connectors or can't track hotplug interrupts
+ * per connector need to use drm_helper_hpd_irq_event().
  *
- * 此函数必须在进程上下文中调用，且不持有任何模式设置锁。
- * 如果热插拔中断已知不可靠，连接器可以同时被轮询和通过热插拔处理函数探测。
+ * This function must be called from process context with no mode
+ * setting locks held.
  *
- * 返回值：
- * 表示连接器状态是否发生变化的布尔值。
+ * Note that a connector can be both polled and probed from the hotplug
+ * handler, in case the hotplug interrupt is known to be unreliable.
+ *
+ * Returns:
+ * A boolean indicating whether the connector status changed or not
  */
 bool drm_connector_helper_hpd_irq_event(struct drm_connector *connector)
 {
@@ -1050,24 +1053,31 @@ bool drm_connector_helper_hpd_irq_event(struct drm_connector *connector)
 EXPORT_SYMBOL(drm_connector_helper_hpd_irq_event);
 
 /**
- * drm_helper_hpd_irq_event - 全局热插拔事件处理
- * @dev: DRM 设备
+ * drm_helper_hpd_irq_event - hotplug processing
+ * @dev: drm_device
  *
- * 对所有设置了 DRM_CONNECTOR_POLL_HPD 标志的连接器执行一次检测循环。
- * 其他连接器被忽略（避免重新探测固定面板）。
+ * Drivers can use this helper function to run a detect cycle on all connectors
+ * which have the DRM_CONNECTOR_POLL_HPD flag set in their &polled member. All
+ * other connectors are ignored, which is useful to avoid reprobing fixed
+ * panels.
  *
- * 此辅助函数适用于无法或不需要按连接器追踪热插拔中断的驱动。
+ * This helper function is useful for drivers which can't or don't track hotplug
+ * interrupts for each connector.
  *
- * 如果只有一个连接器状态发生了变化，会触发针对该连接器的细粒度 uevent；
- * 如果有多个连接器变化，则触发全局热插拔事件。
+ * Drivers which support hotplug interrupts for each connector individually and
+ * which have a more fine-grained detect logic can use
+ * drm_connector_helper_hpd_irq_event(). Alternatively, they should bypass this
+ * code and directly call drm_kms_helper_hotplug_event() in case the connector
+ * state changed.
  *
- * 支持单独热插拔中断和更细粒度检测逻辑的驱动应使用
- * drm_connector_helper_hpd_irq_event() 或直接调用 drm_kms_helper_hotplug_event()。
+ * This function must be called from process context with no mode
+ * setting locks held.
  *
- * 此函数必须在进程上下文中调用，且不持有任何模式设置锁。
+ * Note that a connector can be both polled and probed from the hotplug handler,
+ * in case the hotplug interrupt is known to be unreliable.
  *
- * 返回值：
- * 表示是否有连接器状态发生变化的布尔值。
+ * Returns:
+ * A boolean indicating whether the connector status changed or not
  */
 bool drm_helper_hpd_irq_event(struct drm_device *dev)
 {
@@ -1110,17 +1120,13 @@ bool drm_helper_hpd_irq_event(struct drm_device *dev)
 EXPORT_SYMBOL(drm_helper_hpd_irq_event);
 
 /**
- * drm_crtc_helper_mode_valid_fixed - 验证显示模式（固定模式版本）
- * @crtc: CRTC
- * @mode: 要验证的模式
- * @fixed_mode: 显示硬件的固定模式
+ * drm_crtc_helper_mode_valid_fixed - Validates a display mode
+ * @crtc: the crtc
+ * @mode: the mode to validate
+ * @fixed_mode: the display hardware's mode
  *
- * 验证给定的模式是否与硬件固定的显示模式匹配。
- * 适用于只有一种固定分辨率的显示硬件（如许多嵌入式 LCD 面板）。
- *
- * 返回值：
- * 成功返回 MODE_OK，否则返回其他模式状态码
- * （如 MODE_ONE_SIZE、MODE_ONE_WIDTH、MODE_ONE_HEIGHT）。
+ * Returns:
+ * MODE_OK on success, or another mode-status code otherwise.
  */
 enum drm_mode_status drm_crtc_helper_mode_valid_fixed(struct drm_crtc *crtc,
 						      const struct drm_display_mode *mode,
@@ -1138,18 +1144,16 @@ enum drm_mode_status drm_crtc_helper_mode_valid_fixed(struct drm_crtc *crtc,
 EXPORT_SYMBOL(drm_crtc_helper_mode_valid_fixed);
 
 /**
- * drm_connector_helper_get_modes_fixed - 为连接器复制固定显示模式
- * @connector: 连接器
- * @fixed_mode: 显示硬件的固定模式
+ * drm_connector_helper_get_modes_fixed - Duplicates a display mode for a connector
+ * @connector: the connector
+ * @fixed_mode: the display hardware's mode
  *
- * 为连接器复制一个固定显示模式。只支持单一固定模式的显示硬件驱动
- * 可以在其连接器的 get_modes 辅助函数中使用此函数。
+ * This function duplicates a display modes for a connector. Drivers for hardware
+ * that only supports a single fixed mode can use this function in their connector's
+ * get_modes helper.
  *
- * 复制的模式会被标记为 DRM_MODE_TYPE_PREFERRED（首选模式），
- * 如果提供了物理尺寸信息，还会更新连接器的显示信息。
- *
- * 返回值：
- * 创建的模式数量（成功返回 1，失败返回 0）。
+ * Returns:
+ * The number of created modes.
  */
 int drm_connector_helper_get_modes_fixed(struct drm_connector *connector,
 					 const struct drm_display_mode *fixed_mode)
@@ -1180,18 +1184,17 @@ int drm_connector_helper_get_modes_fixed(struct drm_connector *connector,
 EXPORT_SYMBOL(drm_connector_helper_get_modes_fixed);
 
 /**
- * drm_connector_helper_get_modes - 读取 EDID 并更新连接器
- * @connector: 连接器
+ * drm_connector_helper_get_modes - Read EDID and update connector.
+ * @connector: The connector
  *
- * 使用 drm_edid_read() 读取 EDID（要求设置了 connector->ddc），
- * 并根据 EDID 内容更新连接器的显示信息和模式列表。
+ * Read the EDID using drm_edid_read() (which requires that connector->ddc is
+ * set), and update the connector using the EDID.
  *
- * 此函数可用作连接器辅助函数 .get_modes() 钩子的默认实现，
-* 适用于不需要特殊处理的驱动。它展示了自定义 .get_modes() 钩子
- * 在 EDID 读取和连接器更新方面应遵循的模式。
+ * This can be used as the "default" connector helper .get_modes() hook if the
+ * driver does not need any special processing. This is sets the example what
+ * custom .get_modes() hooks should do regarding EDID read and connector update.
  *
- * 返回值：
- * 添加的模式数量。
+ * Returns: Number of modes.
  */
 int drm_connector_helper_get_modes(struct drm_connector *connector)
 {
@@ -1217,20 +1220,17 @@ int drm_connector_helper_get_modes(struct drm_connector *connector)
 EXPORT_SYMBOL(drm_connector_helper_get_modes);
 
 /**
- * drm_connector_helper_tv_get_modes - 填充 TV 连接器的可用模式
- * @connector: 连接器
+ * drm_connector_helper_tv_get_modes - Fills the modes availables to a TV connector
+ * @connector: The connector
  *
- * 根据支持的电视制式（NTSC/PAL/SECAM 等）和内核命令行指定的默认模式，
- * 填充 TV 连接器的可用显示模式。
+ * Fills the available modes for a TV connector based on the supported
+ * TV modes, and the default mode expressed by the kernel command line.
  *
- * 此函数可用作 TV 连接器辅助函数 .get_modes() 钩子的默认实现，
- * 适用于不需要特殊处理的驱动。
+ * This can be used as the default TV connector helper .get_modes() hook
+ * if the driver does not need any special processing.
  *
- * 会根据驱动支持的电视制式自动选择 NTSC（480i）或 PAL（576i）模式，
- * 并考虑内核命令行中指定的电视制式参数。
- *
- * 返回值：
- * 添加到连接器的模式数量。
+ * Returns:
+ * The number of modes added to the connector.
  */
 int drm_connector_helper_tv_get_modes(struct drm_connector *connector)
 {
@@ -1303,20 +1303,17 @@ int drm_connector_helper_tv_get_modes(struct drm_connector *connector)
 EXPORT_SYMBOL(drm_connector_helper_tv_get_modes);
 
 /**
- * drm_connector_helper_detect_from_ddc - 通过 DDC 读取 EDID 并检测连接器状态
- * @connector: 连接器
- * @ctx: 锁获取上下文
- * @force: 是否执行破坏性操作
+ * drm_connector_helper_detect_from_ddc - Read EDID and detect connector status.
+ * @connector: The connector
+ * @ctx: Acquire context
+ * @force: Perform screen-destructive operations, if necessary
  *
- * 通过读取 EDID 来检测连接器状态（使用 drm_probe_ddc() 进行检测，
- * 要求设置了 connector->ddc）。
+ * Detects the connector status by reading the EDID using drm_probe_ddc(),
+ * which requires connector->ddc to be set. Returns connector_status_connected
+ * on success or connector_status_disconnected on failure.
  *
- * 这是一种非破坏性的检测方法，适用于简单的 DDC 检测场景。
- * 如果 DDC 通信成功，假定连接器已连接；否则假定为已断开。
- *
- * 返回值：
- * 由 enum drm_connector_status 定义的连接器状态
- * （connector_status_connected / disconnected / unknown）。
+ * Returns:
+ * The connector status as defined by enum drm_connector_status.
  */
 int drm_connector_helper_detect_from_ddc(struct drm_connector *connector,
 					 struct drm_modeset_acquire_ctx *ctx,

@@ -20,33 +20,6 @@
  * OF THIS SOFTWARE.
  */
 
-/*
- * DRM 色彩管理子系统 - 中文注释补充
- *
- * 本文件实现了 DRM CRTC 对象的色彩管理功能，支持通过 5 个标准属性
- * 对像素数据进行色彩空间调整。色彩处理管线顺序为：
- *
- *   framebuffer -> DEGAMMA_LUT -> CTM（色彩变换矩阵）-> GAMMA_LUT -> connector
- *
- * 关键属性：
- *   1. DEGAMMA_LUT：去 gamma 查找表（在 CTM 之前）
- *   2. DEGAMMA_LUT_SIZE：去 gamma 表大小
- *   3. CTM：色彩变换矩阵（CSC/色彩空间转换）
- *   4. GAMMA_LUT：gamma 查找表（在 CTM 之后）
- *   5. GAMMA_LUT_SIZE：gamma 表大小
- *
- * 还提供以下功能：
- *   - 传统 gamma 表的设置（通过 drm_mode_crtc_set_gamma_size）
- *   - legacy gamma IOCTL（drm_mode_gamma_set_ioctl / get_ioctl）
- *   - 平面级色彩编码属性（COLOR_ENCODING / COLOR_RANGE）
- *   - gamma 表验证辅助函数
- *   - gamma LUT 编程辅助函数（888/565/555 格式）
- *   - 调色板编程辅助函数（C8/RGB332 格式）
- *
- * CTM 使用 S31.32 符号-幅度格式，可通过 drm_color_ctm_s31_32_to_qm_n()
- * 转换为 Qm.n 格式供硬件使用。
- */
-
 #include <linux/export.h>
 #include <linux/uaccess.h>
 
@@ -160,13 +133,6 @@
  * NOTE: the m can be zero if all bit_precision are used to present fractional
  *       bits like Q0.32
  */
-/*
- * 中文说明：将 S31.32 符号-幅度格式的 CTM 系数转换为 Qm.n 格式
- * （有符号二进制补码）。S31.32 是 DRM 核心使用的标准 CTM 格式，
- * 而硬件可能使用不同精度的定点数格式。
- * m = 整数位数（含符号位），n = 小数位数，m+n <= 64。
- * 结果会钳位到目标格式的取值范围。
- */
 u64 drm_color_ctm_s31_32_to_qm_n(u64 user_input, u32 m, u32 n)
 {
 	u64 mag = (user_input & ~BIT_ULL(63)) >> (32 - n);
@@ -196,13 +162,6 @@ EXPORT_SYMBOL(drm_color_ctm_s31_32_to_qm_n);
  * optional. The gamma and degamma properties are only attached if
  * their size is not 0 and ctm_property is only attached if has_ctm is
  * true.
- */
-/*
- * 中文说明：使能 CRTC 的色彩管理功能。根据参数挂载以下属性：
- *   - DEGAMMA_LUT / DEGAMMA_LUT_SIZE（degamma_lut_size > 0 时）
- *   - CTM（has_ctm 为 true 时）
- *   - GAMMA_LUT / GAMMA_LUT_SIZE（gamma_lut_size > 0 时）
- * 色彩处理管线：framebuffer -> DEGAMMA -> CTM -> GAMMA -> connector
  */
 void drm_crtc_enable_color_mgmt(struct drm_crtc *crtc,
 				uint degamma_lut_size,
@@ -245,12 +204,6 @@ EXPORT_SYMBOL(drm_crtc_enable_color_mgmt);
  *
  * Returns:
  * Zero on success, negative errno on failure.
- */
-/*
- * 中文说明：设置 CRTC 的 gamma 表大小并分配存储空间。
- * gamma_store 中按 R/G/B 顺序连续存放 gamma_size 个 16 位值。
- * 初始化为线性 gamma 表（值 = i << 8）。
- * legacy gamma IOCTL 依赖此函数分配的存储空间。
  */
 int drm_mode_crtc_set_gamma_size(struct drm_crtc *crtc,
 				 int gamma_size)
@@ -575,13 +528,6 @@ EXPORT_SYMBOL_IF_KUNIT(drm_get_color_range_name);
  * Each bit set in the bitmask indicates that its number as enum
  * value is supported.
  */
-/*
- * 中文说明：为平面创建色彩编码和色彩范围属性。
- * COLOR_ENCODING 指定非 RGB 色彩编码标准
- * （BT.601/BT.709/BT.2020），COLOR_RANGE 指定
- * 有限范围（limited）或全范围（full）。
- * 这些属性用于 YUV 到 RGB 转换的正确参数化。
- */
 int drm_plane_create_color_properties(struct drm_plane *plane,
 				      u32 supported_encodings,
 				      u32 supported_ranges,
@@ -657,13 +603,6 @@ EXPORT_SYMBOL(drm_plane_create_color_properties);
  *
  * Returns 0 on success, -EINVAL on failure.
  */
-/*
- * 中文说明：验证 gamma/LUT 表数据的合法性。
- * tests 位掩码指定检查项：
- *   - DRM_COLOR_LUT_EQUAL_CHANNELS：所有通道值必须相等
- *   - DRM_COLOR_LUT_NON_DECREASING：值必须非递减（单调性）
- * 驱动可在 atomic_check 中调用此函数验证用户提供的 LUT。
- */
 int drm_color_lut_check(const struct drm_property_blob *lut, u32 tests)
 {
 	const struct drm_color_lut *entry;
@@ -708,11 +647,6 @@ EXPORT_SYMBOL(drm_color_lut_check);
  *
  * Programs the gamma ramp specified in @lut to hardware. The input gamma
  * ramp must have 256 entries per color component.
- */
-/*
- * 中文说明：为 RGB888 格式的硬件编程 gamma 校正斜坡（ramp）。
- * 直接使用 256 个表项映射每个颜色分量。
- * 适用于每颜色分量 8 位的显示控制器。
  */
 void drm_crtc_load_gamma_888(struct drm_crtc *crtc, const struct drm_color_lut *lut,
 			     drm_crtc_set_lut_func set_gamma)
@@ -796,11 +730,6 @@ static void fill_gamma_888(struct drm_crtc *crtc, unsigned int i, u16 r, u16 g, 
  *
  * Programs a default gamma ramp to hardware.
  */
-/*
- * 中文说明：为 RGB888 格式的硬件编程默认线性 gamma 斜坡。
- * 将 8 位索引值扩展到 16 位（值 = (i << 8) | i），
- * 实现线性的输入到输出映射。
- */
 void drm_crtc_fill_gamma_888(struct drm_crtc *crtc, drm_crtc_set_lut_func set_gamma)
 {
 	unsigned int i;
@@ -826,11 +755,6 @@ static void fill_gamma_565(struct drm_crtc *crtc, unsigned int i, u16 r, u16 g, 
  * @set_gamma: Callback for programming the hardware gamma LUT
  *
  * Programs a default gamma ramp to hardware.
- */
-/*
- * 中文说明：为 RGB565 格式的硬件编程默认 gamma 斜坡。
- * RGB565 中绿色有 6 位（64 级），红色和蓝色各有 5 位（32 级），
- * 因此需要分段处理：前 32 个表项同时设置 RGB，后 32 个仅设置 G。
  */
 void drm_crtc_fill_gamma_565(struct drm_crtc *crtc, drm_crtc_set_lut_func set_gamma)
 {
@@ -861,11 +785,6 @@ static void fill_gamma_555(struct drm_crtc *crtc, unsigned int i, u16 r, u16 g, 
  *
  * Programs a default gamma ramp to hardware.
  */
-/*
- * 中文说明：为 RGB555 格式的硬件编程默认 gamma 斜坡。
- * RGB555 中每个颜色分量各占 5 位，共 32 级。
- * 线性映射索引值到各个通道。
- */
 void drm_crtc_fill_gamma_555(struct drm_crtc *crtc, drm_crtc_set_lut_func set_gamma)
 {
 	unsigned int i;
@@ -887,11 +806,6 @@ EXPORT_SYMBOL(drm_crtc_fill_gamma_555);
  *
  * Programs the palette specified in @lut to hardware. The input palette
  * must have 256 entries per color component.
- */
-/*
- * 中文说明：为 C8（8 位索引色）格式的硬件编程调色板。
- * 将 256 个颜色表项（每个包含 R/G/B 分量）写入硬件调色板 RAM。
- * 用于支持索引色显示模式的设备。
  */
 void drm_crtc_load_palette_8(struct drm_crtc *crtc, const struct drm_color_lut *lut,
 			     drm_crtc_set_lut_func set_palette)
@@ -923,11 +837,6 @@ static void fill_palette_332(struct drm_crtc *crtc, u16 r, u16 g, u16 b,
  *
  * Programs an RGB332 palette to hardware.
  */
-/*
- * 中文说明：为 RGB332 格式编程默认调色板。
- * RGB332 中 R 和 G 各 3 位（8 级），B 为 2 位（4 级）。
- * 遍历 8x8x4 种组合，将 3/3/2 位值扩展为 16 位后写入调色板。
- */
 void drm_crtc_fill_palette_332(struct drm_crtc *crtc, drm_crtc_set_lut_func set_palette)
 {
 	unsigned int r, g, b;
@@ -957,11 +866,6 @@ static void fill_palette_8(struct drm_crtc *crtc, unsigned int i,
  *
  * Programs a default palette to hardware.
  */
-/*
- * 中文说明：为 C8 格式编程默认调色板（灰度调色板）。
- * 将 8 位索引值 i 映射为 R=G=B=Y 的灰度值，其中 Y = (i << 8) | i，
- * 即将 8 位值扩展为 16 位线性灰度。
- */
 void drm_crtc_fill_palette_8(struct drm_crtc *crtc, drm_crtc_set_lut_func set_palette)
 {
 	unsigned int i;
@@ -981,11 +885,6 @@ EXPORT_SYMBOL(drm_crtc_fill_palette_8);
  * the tests in &drm_color_lut_tests should be performed.
  *
  * Returns 0 on success, -EINVAL on failure.
- */
-/*
- * 中文说明：验证扩展 gamma/LUT 表（dr_color_lut32）的合法性。
- * 与 drm_color_lut_check() 功能相同，但处理更高精度的 32 位 LUT 表项。
- * 支持 DRM_COLOR_LUT_EQUAL_CHANNELS 和 DRM_COLOR_LUT_NON_DECREASING 检查。
  */
 int drm_color_lut32_check(const struct drm_property_blob *lut, u32 tests)
 {

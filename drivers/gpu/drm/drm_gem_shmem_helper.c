@@ -3,26 +3,6 @@
  * Copyright 2018 Noralf Trønnes
  */
 
-/**
- * DOC: SHMEM GEM 对象管理概述 (中文)
- *
- * 该文件实现了基于 shmem（共享内存）的 GEM（图形执行管理器）对象辅助函数。
- * SHMEM GEM 对象使用匿名可分页内存作为后端存储，是 DRM 子系统中最为通用的
- * GEM 内存分配方式之一。
- *
- * 核心功能包括：
- *   - 创建和初始化 shmem 类型的 GEM 对象
- *   - 管理对象的物理页面生命周期（获取、释放、固定）
- *   - 提供内核虚拟地址映射（vmap/vunmap）
- *   - 支持 mmap 操作，将缓冲区映射到用户空间
- *   - 生成和管理散列/聚集表（SG table），用于 DMA 操作和 PRIME 缓冲区共享
- *   - 支持内存容量建议（madvise）和页面回收（purge）
- *
- * 该辅助层通过 struct drm_gem_shmem_object 结构体管理每个 shmem GEM 对象，
- * 并提供了 _object_ 后缀的包装函数（如 drm_gem_shmem_object_vmap() 封装
- * drm_gem_shmem_vmap()），自动完成类型转换。
- */
-
 #include <linux/dma-buf.h>
 #include <linux/export.h>
 #include <linux/module.h>
@@ -116,16 +96,12 @@ err_release:
 }
 
 /**
- * drm_gem_shmem_init - 初始化已分配的 shmem GEM 对象
+ * drm_gem_shmem_init - Initialize an allocated object.
+ * @dev: DRM device
+ * @shmem: shmem GEM object to initialize
+ * @size: Buffer size in bytes
  *
- * 中文: 初始化一个已分配内存的 shmem GEM 对象。该函数设置对象的基本属性，
- * 包括 GEM 对象初始化、内存映射偏移量创建以及 GFP 掩码配置。对于非私有对象，
- * 会配置 GFP_HIGHUSER 标志并禁用 MOVABLE 区域分配，因为 shmem 缓冲区通常
- * 需要保持固定（pinned）状态，从 MOVABLE 区域分配会与 CMA 产生冲突。
- *
- * @dev: DRM 设备
- * @shmem: 要初始化的 shmem GEM 对象
- * @size: 缓冲区大小（字节）
+ * This function initializes an allocated shmem GEM object.
  *
  * Returns:
  * 0 on success, or a negative error code on failure.
@@ -166,14 +142,11 @@ __drm_gem_shmem_create(struct drm_device *dev, size_t size, bool private)
 	return shmem;
 }
 /**
- * drm_gem_shmem_create - 分配指定大小的 shmem GEM 对象
+ * drm_gem_shmem_create - Allocate an object with the given size
+ * @dev: DRM device
+ * @size: Size of the object to allocate
  *
- * 中文: 创建并初始化一个 shmem GEM 对象。该函数首先尝试通过驱动程序提供的
- * gem_create_object 回调创建对象，否则直接分配新的 shmem 对象。对象大小
- * 会向上对齐到 PAGE_SIZE。创建过程包括初始化 GEM 对象、创建 mmap 偏移量等步骤。
- *
- * @dev: DRM 设备
- * @size: 要分配的对象大小
+ * This function creates a shmem GEM object.
  *
  * Returns:
  * A struct drm_gem_shmem_object * on success or an ERR_PTR()-encoded negative
@@ -223,14 +196,11 @@ void drm_gem_shmem_release(struct drm_gem_shmem_object *shmem)
 EXPORT_SYMBOL_GPL(drm_gem_shmem_release);
 
 /**
- * drm_gem_shmem_free - 释放 shmem GEM 对象占用的资源
+ * drm_gem_shmem_free - Free resources associated with a shmem GEM object
+ * @shmem: shmem GEM object to free
  *
- * 中文: 清理 shmem GEM 对象状态并释放存储对象本身的内存。
- * 该函数会调用 drm_gem_shmem_release() 完成底层资源释放（包括 sg 表、
- * 物理页面、dma 映射等），然后通过 kfree 释放对象内存。
- * 对于 Rust GEM 绑定场景，驱动程序可直接使用 drm_gem_shmem_release()。
- *
- * @shmem: 要释放的 shmem GEM 对象
+ * This function cleans up the GEM object state and frees the memory used to
+ * store the object itself.
  */
 void drm_gem_shmem_free(struct drm_gem_shmem_object *shmem)
 {
@@ -330,15 +300,11 @@ void drm_gem_shmem_unpin_locked(struct drm_gem_shmem_object *shmem)
 EXPORT_SYMBOL(drm_gem_shmem_unpin_locked);
 
 /**
- * drm_gem_shmem_pin - 固定 shmem GEM 对象的后端物理页面
+ * drm_gem_shmem_pin - Pin backing pages for a shmem GEM object
+ * @shmem: shmem GEM object
  *
- * 中文: 确保后端物理页面在缓冲区导出期间被固定（pinned）在内存中。
- * 当一个 shmem GEM 对象被导出到其他设备（如 PRIME 共享）时，需要保证
- * 其物理页面不会被交换出去。该函数使用引用计数管理 pin 状态：首次 pin
- * 会触发页面分配和固定，后续 pin 仅递增引用计数。
- * 与外部的 drm_gem_shmem_pin_locked() 不同，该函数会自行获取 dma_resv 锁。
- *
- * @shmem: shmem GEM 对象
+ * This function makes sure the backing pages are pinned in memory while the
+ * buffer is exported.
  *
  * Returns:
  * 0 on success or a negative error code on failure.
@@ -364,13 +330,11 @@ int drm_gem_shmem_pin(struct drm_gem_shmem_object *shmem)
 EXPORT_SYMBOL_GPL(drm_gem_shmem_pin);
 
 /**
- * drm_gem_shmem_unpin - 解除 shmem GEM 对象后端页面的固定状态
+ * drm_gem_shmem_unpin - Unpin backing pages for a shmem GEM object
+ * @shmem: shmem GEM object
  *
- * 中文: 解除对后端物理页面的固定要求。当 pin 引用计数递减至零时，
- * 允许物理页面被交换出去。该函数与外部的 drm_gem_shmem_unpin_locked()
- * 不同，会自行获取 dma_resv 锁后再执行实际的解除固定操作。
- *
- * @shmem: shmem GEM 对象
+ * This function removes the requirement that the backing pages are pinned in
+ * memory.
  */
 void drm_gem_shmem_unpin(struct drm_gem_shmem_object *shmem)
 {
@@ -387,18 +351,17 @@ void drm_gem_shmem_unpin(struct drm_gem_shmem_object *shmem)
 }
 EXPORT_SYMBOL_GPL(drm_gem_shmem_unpin);
 
-/**
- * drm_gem_shmem_vmap_locked - 为 shmem GEM 对象创建内核虚拟地址映射
+/*
+ * drm_gem_shmem_vmap_locked - Create a virtual mapping for a shmem GEM object
+ * @shmem: shmem GEM object
+ * @map: Returns the kernel virtual address of the SHMEM GEM object's backing
+ *       store.
  *
- * 中文: 确保 shmem GEM 对象的后端缓冲区存在连续的内核虚拟地址映射。
- * 该函数隐藏了 dma-buf 导入对象和本地分配对象之间的差异：
- * 对于导入对象，调用 dma_buf_vmap()；对于本地对象，使用 vmap() 创建映射。
- * 映射引用计数确保仅在最后一个使用者释放后才真正解除映射。
- * 获取的映射应通过 drm_gem_shmem_vunmap_locked() 清理。
- * 调用者需持有 dma_resv 锁。
+ * This function makes sure that a contiguous kernel virtual address mapping
+ * exists for the buffer backing the shmem GEM object. It hides the differences
+ * between dma-buf imported and natively allocated objects.
  *
- * @shmem: shmem GEM 对象
- * @map: 返回 SHMEM GEM 对象后端存储的内核虚拟地址
+ * Acquired mappings should be cleaned up by calling drm_gem_shmem_vunmap_locked().
  *
  * Returns:
  * 0 on success or a negative error code on failure.
@@ -456,16 +419,17 @@ err_put_pages:
 }
 EXPORT_SYMBOL_GPL(drm_gem_shmem_vmap_locked);
 
-/**
- * drm_gem_shmem_vunmap_locked - 解除 shmem GEM 对象的内核虚拟地址映射
+/*
+ * drm_gem_shmem_vunmap_locked - Unmap a virtual mapping for a shmem GEM object
+ * @shmem: shmem GEM object
+ * @map: Kernel virtual address where the SHMEM GEM object was mapped
  *
- * 中文: 清理由 drm_gem_shmem_vmap_locked() 获取的内核虚拟地址映射。
- * 仅当 vmap 引用计数降至零时才真正移除映射。对于 dma-buf 导入对象，
- * 调用 dma_buf_vunmap()；对于本地分配对象，使用 vunmap() 解除映射。
- * 调用者需持有 dma_resv 锁。
+ * This function cleans up a kernel virtual address mapping acquired by
+ * drm_gem_shmem_vmap_locked(). The mapping is only removed when the use count
+ * drops to zero.
  *
- * @shmem: shmem GEM 对象
- * @map: SHMEM GEM 对象映射到的内核虚拟地址
+ * This function hides the differences between dma-buf imported and natively
+ * allocated objects.
  */
 void drm_gem_shmem_vunmap_locked(struct drm_gem_shmem_object *shmem,
 				 struct iosys_map *map)
@@ -561,16 +525,18 @@ void drm_gem_shmem_purge_locked(struct drm_gem_shmem_object *shmem)
 EXPORT_SYMBOL_GPL(drm_gem_shmem_purge_locked);
 
 /**
- * drm_gem_shmem_dumb_create - 创建 dumb shmem 缓冲区对象
+ * drm_gem_shmem_dumb_create - Create a dumb shmem buffer object
+ * @file: DRM file structure to create the dumb buffer for
+ * @dev: DRM device
+ * @args: IOCTL data
  *
- * 中文: 计算 dumb 缓冲区的 pitch（每行字节数）并向上取整到整数字节/像素。
- * 对于没有额外 pitch 限制的硬件，驱动程序可直接将此函数用作
- * &drm_driver.dumb_create 回调。对于有特定硬件对齐要求的驱动，
- * 可在调用此函数前调整用户空间设置的字段。
+ * This function computes the pitch of the dumb buffer and rounds it up to an
+ * integer number of bytes per pixel. Drivers for hardware that doesn't have
+ * any additional restrictions on the pitch can directly use this function as
+ * their &drm_driver.dumb_create callback.
  *
- * @file: 创建 dumb 缓冲区的 DRM 文件结构
- * @dev: DRM 设备
- * @args: IOCTL 数据
+ * For hardware with additional restrictions, drivers can adjust the fields
+ * set up by userspace before calling into this function.
  *
  * Returns:
  * 0 on success or a negative error code on failure.
@@ -735,15 +701,12 @@ const struct vm_operations_struct drm_gem_shmem_vm_ops = {
 EXPORT_SYMBOL_GPL(drm_gem_shmem_vm_ops);
 
 /**
- * drm_gem_shmem_mmap - 对 shmem GEM 对象执行内存映射
+ * drm_gem_shmem_mmap - Memory-map a shmem GEM object
+ * @shmem: shmem GEM object
+ * @vma: VMA for the area to be mapped
  *
- * 中文: 实现 shmem GEM 对象的增强版文件 mmap 操作。对于 dma-buf 导入的对象，
- * 委托给 dma_buf_mmap() 处理；对于本地对象，确保物理页面已获取，并设置
- * VM_PFNMAP、VM_DONTEXPAND 和 VM_DONTDUMP 标志。若设置了 map_wc 属性，
- * 则使用 write-combine 页保护属性。
- *
- * @shmem: shmem GEM 对象
- * @vma: 要映射区域的 VMA
+ * This function implements an augmented version of the GEM DRM file mmap
+ * operation for shmem objects.
  *
  * Returns:
  * 0 on success or a negative error code on failure.
@@ -809,13 +772,15 @@ void drm_gem_shmem_print_info(const struct drm_gem_shmem_object *shmem,
 EXPORT_SYMBOL_GPL(drm_gem_shmem_print_info);
 
 /**
- * drm_gem_shmem_get_sg_table - 提供固定页面的散列/聚集表
+ * drm_gem_shmem_get_sg_table - Provide a scatter/gather table of pinned
+ *                              pages for a shmem GEM object
+ * @shmem: shmem GEM object
  *
- * 中文: 导出适用于 PRIME 使用的散列/聚集（SG）表。该函数通过标准 DMA 映射
- * API 将 shmem GEM 对象的固定物理页面转换为 SG 表。驱动程序如果要获取对象的
- * SG 表，应使用 drm_gem_shmem_get_pages_sgt() 而非直接调用此函数。
+ * This function exports a scatter/gather table suitable for PRIME usage by
+ * calling the standard DMA mapping API.
  *
- * @shmem: shmem GEM 对象
+ * Drivers who need to acquire an scatter/gather table for objects need to call
+ * drm_gem_shmem_get_pages_sgt() instead.
  *
  * Returns:
  * A pointer to the scatter/gather table of pinned pages or error pointer on failure.
@@ -868,14 +833,17 @@ err_put_pages:
 }
 
 /**
- * drm_gem_shmem_get_pages_sgt - 固定页面、执行 DMA 映射并返回 SG 表
+ * drm_gem_shmem_get_pages_sgt - Pin pages, dma map them, and return a
+ *				 scatter/gather table for a shmem GEM object.
+ * @shmem: shmem GEM object
  *
- * 中文: 这是驱动程序获取后端存储的主要函数。如果 SG 表尚不存在，会固定页面、
- * 执行 DMA 映射并创建 SG 表。该函数隐藏了 dma-buf 导入对象和本地分配对象
- * 之间的差异。驱动程序不应直接调用 drm_gem_shmem_get_sg_table()，
- * 而应使用此函数。
+ * This function returns a scatter/gather table suitable for driver usage. If
+ * the sg table doesn't exist, the pages are pinned, dma-mapped, and a sg
+ * table created.
  *
- * @shmem: shmem GEM 对象
+ * This is the main function for drivers to get at backing storage, and it hides
+ * and difference between dma-buf imported and natively allocated objects.
+ * drm_gem_shmem_get_sg_table() should not be directly called by drivers.
  *
  * Returns:
  * A pointer to the scatter/gather table of pinned pages or errno on failure.
@@ -896,16 +864,15 @@ struct sg_table *drm_gem_shmem_get_pages_sgt(struct drm_gem_shmem_object *shmem)
 EXPORT_SYMBOL_GPL(drm_gem_shmem_get_pages_sgt);
 
 /**
- * drm_gem_shmem_prime_import_sg_table - 从其他驱动的 SG 表导入 shmem GEM 对象
+ * drm_gem_shmem_prime_import_sg_table - Produce a shmem GEM object from
+ *                 another driver's scatter/gather table of pinned pages
+ * @dev: Device to import into
+ * @attach: DMA-BUF attachment
+ * @sgt: Scatter/gather table of pinned pages
  *
- * 中文: 从通过 DMA-BUF 导出的其他驱动的 SG 表创建 shmem GEM 对象。
- * 使用 shmem 助手的驱动程序应将此函数设置为 &drm_driver.gem_prime_import_sg_table
- * 回调。该函数通过 __drm_gem_shmem_create() 创建一个私有 shmem 对象，
- * 并将传入的 SG 表直接赋给新对象。
- *
- * @dev: 导入目标设备
- * @attach: DMA-BUF 附件
- * @sgt: 固定页面的散列/聚集表
+ * This function imports a scatter/gather table exported via DMA-BUF by
+ * another driver. Drivers that use the shmem helpers should set this as their
+ * &drm_driver.gem_prime_import_sg_table callback.
  *
  * Returns:
  * A pointer to a newly created GEM object or an ERR_PTR-encoded negative

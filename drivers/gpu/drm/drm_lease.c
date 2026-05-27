@@ -2,33 +2,6 @@
 /*
  * Copyright © 2017 Keith Packard <keithp@keithp.com>
  */
-
-/*
- * DRM 租赁（Lease）管理 - 实现显示资源的细粒度访问控制
- *
- * 本文件实现了 DRM 的租赁机制，允许 DRM Master 将其控制的显示资源
- * （如 CRTC、连接器、平面等）的子集租借给其他 DRM Master。这种机制
- * 支持在单个 GPU 上创建多个独立的显示服务，适用于虚拟化、容器化和
- * 多用户场景，例如 Wayland 合成器可以租借显示资源给独立的应用。
- *
- * 核心概念：
- *   - Owner（所有者）：资源的最初拥有者，&drm_master.lessor 为 NULL
- *   - Lessor（出租方）：将资源租借给他人的 Master
- *   - Lessee（承租方）：从他人处租借资源的 Master
- *   - Lease（租赁契约）：定义承租方可控制的资源集合
- *
- * 当前实现限制：
- *   - 承租方不能创建子租赁（sub-lease），租赁树深度最大为 1
- *   - 同一对象不能同时租借给多个承租方
- *   - 所有租赁在顶层设备主控切换时同时激活
- *
- * 用户空间接口（IOCTL）：
- *   - DRM_IOCTL_MODE_CREATE_LEASE - 创建新的租赁
- *   - DRM_IOCTL_MODE_LIST_LESSEES - 列出所有承租方
- *   - DRM_IOCTL_MODE_GET_LEASE - 获取租赁的对象列表
- *   - DRM_IOCTL_MODE_REVOKE_LEASE - 撤销租赁
- */
-
 #include <linux/file.h>
 #include <linux/uaccess.h>
 
@@ -98,15 +71,6 @@
 
 static uint64_t drm_lease_idr_object;
 
-/*
- * drm_lease_owner - 查找租赁树中的顶层所有者
- * @master: 要查找的 DRM Master
- *
- * 沿租赁树向上遍历，找到最顶层的所有者（lessor 为 NULL 的 Master）。
- * 所有者的租赁 ID 为 0，是资源的原始拥有者。
- *
- * 返回：顶层所有者 Master 指针。
- */
 struct drm_master *drm_lease_owner(struct drm_master *master)
 {
 	while (master->lessor != NULL)
@@ -159,17 +123,6 @@ bool _drm_lease_held(struct drm_file *file_priv, int id)
 	return ret;
 }
 
-/*
- * drm_lease_held - 检查指定 DRM 对象是否被给定的文件所持有
- * @file_priv: DRM 文件私有数据
- * @id: DRM 模式对象 ID
- *
- * 检查指定的 DRM 模式对象（如 CRTC、连接器、平面等）是否被
- * file_priv 所持有。如果 file_priv 是所有者（非承租方），
- * 则所有对象都被视为持有。如果是承租方，则仅检查租赁的对象集合。
- *
- * 返回：true 表示对象被持有，false 表示未被持有。
- */
 bool drm_lease_held(struct drm_file *file_priv, int id)
 {
 	struct drm_master *master;
@@ -195,18 +148,9 @@ out:
 }
 
 /*
- * drm_lease_filter_crtcs - 根据租赁关系过滤 CRTC 掩码
- * @file_priv: DRM 文件私有数据
- * @crtcs_in: 输入的 CRTC 位掩码
- *
- * 根据指定的文件（可能是承租方）所持有的 CRTC 列表，重建 CRTC 位掩码。
- * 如果文件是所有者（非承租方），直接返回输入的掩码。如果是承租方，
- * 则仅保留在租赁范围内的 CRTC 位，并重新排列位掩码以反映从 0 开始
- * 的连续编号。
- *
- * 返回：过滤后的 CRTC 位掩码。
+ * Given a bitmask of crtcs to check, reconstructs a crtc mask based on the
+ * crtcs which are visible through the specified file.
  */
-
 uint32_t drm_lease_filter_crtcs(struct drm_file *file_priv, uint32_t crtcs_in)
 {
 	struct drm_master *master;
@@ -319,17 +263,6 @@ out_lessee:
 	return ERR_PTR(error);
 }
 
-/*
- * drm_lease_destroy - 销毁指定 Master 的所有租赁关系
- * @master: 要销毁租赁的 DRM Master
- *
- * 从所有者的 lessee_idr 中移除该 Master，并从租赁列表中删除。
- * 如果该 Master 是承租方（有 lessor），则发送租赁变更事件通知
- * 所有者重新检查租赁列表。
- *
- * 注意：由于所有承租方都引用了所有者 Master，在所有承租方被销毁
- * 之前，所有者 Master 不能被销毁。
- */
 void drm_lease_destroy(struct drm_master *master)
 {
 	struct drm_device *dev = master->dev;
@@ -534,22 +467,10 @@ out_free_objects:
 }
 
 /*
- * drm_mode_create_lease_ioctl - 创建新的 DRM 租赁 IOCTL 处理函数
- * @dev: DRM 设备
- * @data: IOCTL 参数，指向 drm_mode_create_lease 结构
- * @lessor_priv: 出租方的 DRM 文件私有数据
- *
- * 处理 DRM_IOCTL_MODE_CREATE_LEASE IOCTL。为指定的文件创建一个新的
- * 租赁 Master，将请求的 DRM 模式对象（CRTC、连接器、平面等）出租给它。
- *
- * 流程：
- *   1. 验证当前 Master 是所有者（不允许子租赁）
- *   2. 验证请求的对象 ID 合法且未被占用
- *   3. 创建新的承租方 Master 并分配租赁对象
- *   4. 克隆出租方的文件描述符并关联到承租方
- *   5. 返回文件描述符和承租方 ID 给用户空间
- *
- * 返回：0 表示成功，负错误码表示失败。
+ * The master associated with the specified file will have a lease
+ * created containing the objects specified in the ioctl structure.
+ * A file descriptor will be allocated for that and returned to the
+ * application.
  */
 int drm_mode_create_lease_ioctl(struct drm_device *dev,
 				void *data, struct drm_file *lessor_priv)
@@ -664,18 +585,6 @@ out_lessor:
 	return ret;
 }
 
-/**
- * drm_mode_list_lessees_ioctl - 列出指定出租方的所有承租方 IOCTL 处理函数
- * @dev: DRM 设备
- * @data: IOCTL 参数，指向 drm_mode_list_lessees 结构
- * @lessor_priv: 出租方的 DRM 文件私有数据
- *
- * 处理 DRM_IOCTL_MODE_LIST_LESSEES IOCTL。列出指定出租方（Lessor）
- * 的所有承租方（Lessee），返回承租方的 ID 列表。出租方可以通过此
- * IOCTL 查看当前有哪些承租方正在使用其租赁的资源。
- *
- * 返回：0 表示成功，负错误码表示失败。
- */
 int drm_mode_list_lessees_ioctl(struct drm_device *dev,
 			       void *data, struct drm_file *lessor_priv)
 {
@@ -723,18 +632,7 @@ int drm_mode_list_lessees_ioctl(struct drm_device *dev,
 	return ret;
 }
 
-/**
- * drm_mode_get_lease_ioctl - 获取指定承租方租赁的对象列表 IOCTL 处理函数
- * @dev: DRM 设备
- * @data: IOCTL 参数，指向 drm_mode_get_lease 结构
- * @lessee_priv: 承租方的 DRM 文件私有数据
- *
- * 处理 DRM_IOCTL_MODE_GET_LEASE IOCTL。返回指定承租方所租赁的
- * DRM 模式对象（CRTC、连接器、平面等）的 ID 列表。承租方可以
- * 通过此 IOCTL 查看其被赋予哪些显示资源的使用权。
- *
- * 返回：0 表示成功，负错误码表示失败。
- */
+/* Return the list of leased objects for the specified lessee */
 int drm_mode_get_lease_ioctl(struct drm_device *dev,
 			     void *data, struct drm_file *lessee_priv)
 {
@@ -788,19 +686,10 @@ int drm_mode_get_lease_ioctl(struct drm_device *dev,
 	return ret;
 }
 
-/**
- * drm_mode_revoke_lease_ioctl - 撤销指定承租方的租赁 IOCTL 处理函数
- * @dev: DRM 设备
- * @data: IOCTL 参数，指向 drm_mode_revoke_lease 结构
- * @lessor_priv: 出租方的 DRM 文件私有数据
- *
- * 处理 DRM_IOCTL_MODE_REVOKE_LEASE IOCTL。撤销指定承租方的租赁，
- * 将租赁的 DRM 模式对象的所有权归还给出租方。
- *
- * 此操作从租赁中移除所有对象，但并不销毁租赁结构本身，因此
- * 所有对它的引用仍然能正常工作。
- *
- * 返回：0 表示成功，负错误码表示失败。
+/*
+ * This removes all of the objects from the lease without
+ * actually getting rid of the lease itself; that way all
+ * references to it still work correctly
  */
 int drm_mode_revoke_lease_ioctl(struct drm_device *dev,
 				void *data, struct drm_file *lessor_priv)

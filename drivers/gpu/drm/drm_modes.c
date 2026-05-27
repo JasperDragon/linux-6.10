@@ -30,29 +30,6 @@
  * authorization from the copyright holder(s) and author(s).
  */
 
-/*
- * DRM 显示模式数据库 - 中文注释补充
- *
- * 本文件实现了 DRM 显示模式的管理和操作。显示模式（drm_display_mode）
- * 描述了显示设备（显示器/TV/投影仪）的时序参数，包括分辨率、刷新率、
- * 同步信号、消隐区间等。
- *
- * 主要功能：
- *   1. 模式的创建、销毁、复制、比较
- *   2. 标准模式生成算法：
- *      - CVT（Coordinated Video Timing）：VESA 标准
- *      - GTF（Generalized Timing Formula）：通用时序公式
- *      - 模拟 TV 模式：NTSC/PAL/SECAM 标准
- *   3. 模式验证和排序（prune invalid, sort）
- *   4. 命令行模式解析（用户指定的 mode_option）
- *   5. 模式与 videomode/device tree 的相互转换
- *   6. YCbCr 420 模式查询
- *   7. 模式名称生成、刷新率计算等辅助功能
- *
- * 模式通过 probed_modes 列表从驱动获取，经过验证和筛选后
- * 移入 modes 列表供用户空间选择。
- */
-
 #include <linux/ctype.h>
 #include <linux/export.h>
 #include <linux/fb.h> /* for KHZ2PICOS() */
@@ -78,11 +55,6 @@
  *
  * Describe @mode using DRM_DEBUG.
  */
-/*
- * 中文说明：将显示模式信息输出到内核日志（dmesg）。
- * 使用 DRM_MODE_FMT 格式化宏输出完整的模型线信息，
- * 包含时钟、分辨率、同步和消隐等参数的调试输出。
- */
 void drm_mode_debug_printmodeline(const struct drm_display_mode *mode)
 {
 	DRM_DEBUG_KMS("Modeline " DRM_MODE_FMT "\n", DRM_MODE_ARG(mode));
@@ -98,11 +70,6 @@ EXPORT_SYMBOL(drm_mode_debug_printmodeline);
  *
  * Returns:
  * Pointer to new mode on success, NULL on error.
- */
-/*
- * 中文说明：创建并初始化一个新的显示模式结构。
- * 使用 kzalloc 分配内存，确保所有字段初始为零。
- * 调用者负责在不再使用时通过 drm_mode_destroy() 释放。
  */
 struct drm_display_mode *drm_mode_create(struct drm_device *dev)
 {
@@ -123,9 +90,6 @@ EXPORT_SYMBOL(drm_mode_create);
  *
  * Release @mode's unique ID, then free it @mode structure itself using kfree.
  */
-/*
- * 中文说明：销毁显示模式，释放内存。允许传入 NULL。
- */
 void drm_mode_destroy(struct drm_device *dev, struct drm_display_mode *mode)
 {
 	if (!mode)
@@ -143,11 +107,6 @@ EXPORT_SYMBOL(drm_mode_destroy);
  * Add @mode to @connector's probed_mode list for later use. This list should
  * then in a second step get filtered and all the modes actually supported by
  * the hardware moved to the @connector's modes list.
- */
-/*
- * 中文说明：将探测到的模式添加到连接器的 probed_modes 列表。
- * 这些模式后续需经过验证和筛选，最终有效模式被移入 modes 列表
- * 供用户空间选择。调用者需持有 mode_config.mutex。
  */
 void drm_mode_probed_add(struct drm_connector *connector,
 			 struct drm_display_mode *mode)
@@ -583,12 +542,6 @@ static int fill_analog_mode(struct drm_device *dev,
  * A pointer to the mode, allocated with drm_mode_create(). Returns NULL
  * on error.
  */
-/*
- * 中文说明：为模拟 TV 输出（NTSC/PAL/SECAM 等标准）创建显示模式。
- * 根据 TV 制式选择对应的行数（525/625）、行持续时间等参数，
- * 计算水平/垂直同步、消隐前后沿等时序值。
- * hdisplay 可以大于标准 PAL/NTSC 限制，部分约束会被忽略。
- */
 struct drm_display_mode *drm_analog_tv_mode(struct drm_device *dev,
 					    enum drm_connector_tv_mode tv_mode,
 					    unsigned long pixel_clock_hz,
@@ -666,14 +619,6 @@ EXPORT_SYMBOL(drm_analog_tv_mode);
  * The modeline based on the CVT algorithm stored in a drm_display_mode object.
  * The display mode object is allocated with drm_mode_create(). Returns NULL
  * when no mode could be allocated.
- */
-/*
- * 中文说明：根据 VESA CVT（Coordinated Video Timing）算法生成显示模式。
- * CVT 是 VESA 标准的时序生成算法，根据分辨率、刷新率自动计算
- * 水平/垂直消隐、同步信号宽度等参数。
- * reduced 参数指定是否使用减消隐（reduced blanking）模式，
- * 常用于宽屏显示器和 LCD 面板的节能时序。
- * 算法参考：VESA CVT v1.1 标准文档。
  */
 struct drm_display_mode *drm_cvt_mode(struct drm_device *dev, int hdisplay,
 				      int vdisplay, int vrefresh,
@@ -900,13 +845,6 @@ EXPORT_SYMBOL(drm_cvt_mode);
  * The display mode object is allocated with drm_mode_create(). Returns NULL
  * when no mode could be allocated.
  */
-/*
- * 中文说明：根据完整的 GTF（Generalized Timing Formula）算法生成显示模式。
- * GTF 是 VESA 标准的通用时序生成算法，比 CVT 更灵活。
- * 本函数提供完整参数版本，允许自定义 GTF_M、GTF_2C、GTF_K、GTF_2J 参数。
- * 标准参数值：M=600, C=40, K=128, J=20（传入时 C 和 J 需乘以 2）。
- * 算法参考：VESA GTF v1.0 标准。
- */
 struct drm_display_mode *
 drm_gtf_mode_complex(struct drm_device *dev, int hdisplay, int vdisplay,
 		     int vrefresh, bool interlaced, int margins,
@@ -1112,11 +1050,6 @@ EXPORT_SYMBOL(drm_gtf_mode_complex);
  * The display mode object is allocated with drm_mode_create(). Returns NULL
  * when no mode could be allocated.
  */
-/*
- * 中文说明：使用标准参数创建 GTF 模式。
- * 这是 drm_gtf_mode_complex() 的简化版本，使用标准 GTF 参数
- * （M=600, C=40, K=128, J=20）生成符合 VESA 标准的显示时序。
- */
 struct drm_display_mode *
 drm_gtf_mode(struct drm_device *dev, int hdisplay, int vdisplay, int vrefresh,
 	     bool interlaced, int margins)
@@ -1134,12 +1067,6 @@ EXPORT_SYMBOL(drm_gtf_mode);
  * @dmode: drm_display_mode structure to use as destination
  *
  * Fills out @dmode using the display mode specified in @vm.
- */
-/*
- * 中文说明：将 videomode 结构转换为 drm_display_mode 结构。
- * videomode 是通用的显示时序描述结构，在设备树和 fbdev 子系统中广泛使用。
- * 此函数将 videomode 的各个时序字段（有效区域、前后沿、同步长度等）
- * 映射到 DRM 显示模式的对应字段，并设置同步极性、隔行等标志。
  */
 void drm_display_mode_from_videomode(const struct videomode *vm,
 				     struct drm_display_mode *dmode)
@@ -1181,11 +1108,6 @@ EXPORT_SYMBOL_GPL(drm_display_mode_from_videomode);
  * @vm: videomode structure to use as destination
  *
  * Fills out @vm using the display mode specified in @dmode.
- */
-/*
- * 中文说明：将 drm_display_mode 结构转换回 videomode 结构。
- * 是 drm_display_mode_from_videomode() 的逆操作，将 DRM 显示模式的时序参数
- * 转换到通用 videomode 结构中，用于设备树绑定或与 fbdev 子系统交互。
  */
 void drm_display_mode_to_videomode(const struct drm_display_mode *dmode,
 				   struct videomode *vm)
@@ -1231,12 +1153,6 @@ EXPORT_SYMBOL_GPL(drm_display_mode_to_videomode);
  * and DISPLAY_FLAGS_SYNC_(POS|NEG)EDGE in @bus_flags according to DISPLAY_FLAGS
  * found in @vm
  */
-/*
- * 中文说明：从 videomode 中提取总线信号标志。
- * 包括像素时钟边沿（上升/下降沿驱动）、同步信号边沿、
- * 和数据使能（DE）极性等信息。这些总线标志用于配置
- * 显示控制器与面板/桥接芯片之间的接口时序。
- */
 void drm_bus_flags_from_videomode(const struct videomode *vm, u32 *bus_flags)
 {
 	*bus_flags = 0;
@@ -1272,13 +1188,6 @@ EXPORT_SYMBOL_GPL(drm_bus_flags_from_videomode);
  * Returns:
  * 0 on success, a negative errno code when no of videomode node was found.
  */
-/*
- * 中文说明：从设备树（Device Tree）节点获取 DRM 显示模式。
- * 解析设备树中指定索引的 timing 节点，转换为 DRM 显示模式。
- * 同时提取总线标志（像素时钟极性、同步信号极性等）。
- * 函数开销较大，仅适用于获取单个模式；批量获取应使用
- * of_get_display_timings()。
- */
 int of_get_drm_display_mode(struct device_node *np,
 			    struct drm_display_mode *dmode, u32 *bus_flags,
 			    int index)
@@ -1312,11 +1221,6 @@ EXPORT_SYMBOL_GPL(of_get_drm_display_mode);
  *
  * Returns:
  * Zero on success, negative error code on failure.
- */
-/*
- * 中文说明：从设备树获取面板时序（panel-timing）DRM 显示模式。
- * 除了解析 timing 节点外，还会读取必需的 width-mm 和 height-mm
- * 属性（面板物理尺寸），设置到显示模式的对应字段中。
  */
 int of_get_drm_panel_display_mode(struct device_node *np,
 				  struct drm_display_mode *dmode, u32 *bus_flags)
@@ -1363,10 +1267,6 @@ EXPORT_SYMBOL_GPL(of_get_drm_panel_display_mode);
  * Set the name of @mode to a standard format which is <hdisplay>x<vdisplay>
  * with an optional 'i' suffix for interlaced modes.
  */
-/*
- * 中文说明：设置模式的名称字符串。格式为 "WxH" 或 "WxHi"
- * （隔行扫描模式附加 'i' 后缀）。名称用于用户空间显示和日志输出。
- */
 void drm_mode_set_name(struct drm_display_mode *mode)
 {
 	bool interlaced = !!(mode->flags & DRM_MODE_FLAG_INTERLACE);
@@ -1383,13 +1283,6 @@ EXPORT_SYMBOL(drm_mode_set_name);
  *
  * Returns:
  * @modes's vrefresh rate in Hz, rounded to the nearest integer.
- */
-/*
- * 中文说明：计算显示模式的垂直刷新率（Hz）。
- * 公式：vrefresh = clock * 1000 / (htotal * vtotal)，
- * 其中隔行扫描模式乘 2（每帧两个场），
- * 双倍扫描（dblscan）和 vscan > 1 时对应分母调整。
- * 结果四舍五入到最接近的整数。
  */
 int drm_mode_vrefresh(const struct drm_display_mode *mode)
 {
@@ -1424,12 +1317,6 @@ EXPORT_SYMBOL(drm_mode_vrefresh);
  * The vdisplay value will be doubled if the specified mode is a stereo mode of
  * the appropriate layout.
  */
-/*
- * 中文说明：获取显示模式的有效分辨率和垂直分辨率。
- * 通过 CRTC 时序信息获取显示尺寸，对于立体 3D 模式
- * （如 frame packing 布局），垂直分辨率会翻倍以反映
- * 包含双眼数据的缓冲区大小。
- */
 void drm_mode_get_hv_timing(const struct drm_display_mode *mode,
 			    int *hdisplay, int *vdisplay)
 {
@@ -1457,14 +1344,6 @@ EXPORT_SYMBOL(drm_mode_get_hv_timing);
  *   "frame packing" or "side by side full").
  * - The CRTC_NO_DBLSCAN and CRTC_NO_VSCAN flags request that adjustment *not*
  *   be performed for doublescan and vscan > 1 modes respectively.
- */
-/*
- * 中文说明：设置 CRTC 模式设置时序参数。
- * 从显示模式的原始时序复制 crtc_* 字段，并根据 adjust_flags 调整：
- *   - CRTC_INTERLACE_HALVE_V：隔行扫描模式下垂直参数减半
- *   - CRTC_STEREO_DOUBLE：立体 3D 模式加倍时钟和垂直参数
- *   - CRTC_NO_DBLSCAN/CRTC_NO_VSCAN：跳过双倍扫描和 vscan 调整
- * 同时计算 crtc_vblank/hblank 起止位置用于 VSync/HSync 中断。
  */
 void drm_mode_set_crtcinfo(struct drm_display_mode *p, int adjust_flags)
 {
@@ -1538,10 +1417,6 @@ EXPORT_SYMBOL(drm_mode_set_crtcinfo);
  * Copy an existing mode into another mode, preserving the
  * list head of the destination mode.
  */
-/*
- * 中文说明：复制显示模式。保持目标模式的链表头不变，
- * 适用于已链入列表的模式对象的复制操作。
- */
 void drm_mode_copy(struct drm_display_mode *dst, const struct drm_display_mode *src)
 {
 	struct list_head head = dst->head;
@@ -1561,10 +1436,6 @@ EXPORT_SYMBOL(drm_mode_copy);
  * to guarantee the list head is not left with stack
  * garbage in on-stack modes.
  */
-/*
- * 中文说明：初始化并复制模式。先清零目标结构再复制，
- * 确保链表头被安全初始化。用于栈上分配的临时模式对象。
- */
 void drm_mode_init(struct drm_display_mode *dst, const struct drm_display_mode *src)
 {
 	memset(dst, 0, sizeof(*dst));
@@ -1582,11 +1453,6 @@ EXPORT_SYMBOL(drm_mode_init);
  *
  * Returns:
  * Pointer to duplicated mode on success, NULL on error.
- */
-/*
- * 中文说明：分配并复制一个新的显示模式。
- * 使用 drm_mode_create() 分配新模式，然后复制内容。
- * 常用于驱动在探测到显示器的 EDID 模式后创建模式的副本。
  */
 struct drm_display_mode *drm_mode_duplicate(struct drm_device *dev,
 					    const struct drm_display_mode *mode)
@@ -1662,16 +1528,6 @@ static bool drm_mode_match_aspect_ratio(const struct drm_display_mode *mode1,
  * Returns:
  * True if the modes are (partially) equal, false otherwise.
  */
-/*
- * 中文说明：比较两个显示模式的（部分）相等性。
- * 通过 match_flags 位掩码选择比较的子项：
- *   - DRM_MODE_MATCH_TIMINGS：比较所有时序参数
- *   - DRM_MODE_MATCH_CLOCK：比较像素时钟
- *   - DRM_MODE_MATCH_FLAGS：比较模式标志（不含 3D 标志）
- *   - DRM_MODE_MATCH_3D_FLAGS：比较 3D 立体标志
- *   - DRM_MODE_MATCH_ASPECT_RATIO：比较画面宽高比
- * 两个 NULL 指针视为相等，一个 NULL 视为不相等。
- */
 bool drm_mode_match(const struct drm_display_mode *mode1,
 		    const struct drm_display_mode *mode2,
 		    unsigned int match_flags)
@@ -1716,12 +1572,6 @@ EXPORT_SYMBOL(drm_mode_match);
  * Returns:
  * True if the modes are equal, false otherwise.
  */
-/*
- * 中文说明：检查两个显示模式是否完全相等。
- * 比较所有关键字段：时序参数、像素时钟、模式标志、
- * 3D 标志和画面宽高比。这是完整的相等性检查，
- * 用于判断两个模式是否为同一分辨率/刷新率的显示模式。
- */
 bool drm_mode_equal(const struct drm_display_mode *mode1,
 		    const struct drm_display_mode *mode2)
 {
@@ -1745,11 +1595,6 @@ EXPORT_SYMBOL(drm_mode_equal);
  * Returns:
  * True if the modes are equal, false otherwise.
  */
-/*
- * 中文说明：检查两个模式是否相等（不比较像素时钟）。
- * 用于同一帧缓冲在不同像素时钟下被多个连接器使用的情况。
- * 在 EDID 匹配和模式去重场景中，有时需要忽略时钟差异。
- */
 bool drm_mode_equal_no_clocks(const struct drm_display_mode *mode1,
 			      const struct drm_display_mode *mode2)
 {
@@ -1770,12 +1615,6 @@ EXPORT_SYMBOL(drm_mode_equal_no_clocks);
  *
  * Returns:
  * True if the modes are equal, false otherwise.
- */
-/*
- * 中文说明：检查两个模式是否相等（不比较像素时钟和 3D 立体标志）。
- * 这是最宽松的比较方式，仅检查时序参数和常规标志。
- * 用于在连接器模式更新时判断两个模式是否"本质上"相同，
- * 忽略时钟和 3D 布局的差异。
  */
 bool drm_mode_equal_no_clocks_no_stereo(const struct drm_display_mode *mode1,
 					const struct drm_display_mode *mode2)
@@ -1828,12 +1667,6 @@ drm_mode_validate_basic(const struct drm_display_mode *mode)
  * Returns:
  * The mode status
  */
-/*
- * 中文说明：验证模式的基本合法性并调用驱动特定的验证。
- * 先检查时序参数的基本约束（时钟非零、分辨率有效、消隐区间合理等），
- * 然后调用驱动提供的 mode_valid 回调进行设备级验证
- * （如硬件时钟上限、带宽限制等）。
- */
 enum drm_mode_status
 drm_mode_validate_driver(struct drm_device *dev,
 			const struct drm_display_mode *mode)
@@ -1865,10 +1698,6 @@ EXPORT_SYMBOL(drm_mode_validate_driver);
  * Returns:
  * The mode status
  */
-/*
- * 中文说明：验证模式是否满足尺寸限制。检查显示模式的水平和垂直分辨率
- * 是否超过指定的最大值，用于确保模式不超过显示控制器的硬件限制。
- */
 enum drm_mode_status
 drm_mode_validate_size(const struct drm_display_mode *mode,
 		       int maxX, int maxY)
@@ -1893,11 +1722,6 @@ EXPORT_SYMBOL(drm_mode_validate_size);
  *
  * Returns:
  * The mode status
- */
-/*
- * 中文说明：验证 YCbCr 420 模式的兼容性。
- * 如果连接器不支持 YCbCr 420 输出，则过滤掉仅支持 420 格式的模式。
- * 用于 HDMI 2.0 的 YCbCr 420 模式筛选。
  */
 enum drm_mode_status
 drm_mode_validate_ycbcr420(const struct drm_display_mode *mode,
@@ -1979,12 +1803,6 @@ const char *drm_get_mode_status_name(enum drm_mode_status status)
  * removed from the list, and if @verbose the status code and mode name is also
  * printed to dmesg.
  */
-/*
- * 中文说明：从模式列表中移除无效的显示模式。
- * 遍历模式列表，删除状态不为 MODE_OK 的模式。
- * 如果 verbose 为 true，则将被移除的模式信息输出到内核日志。
- * 用户自定义模式（DRM_MODE_TYPE_USERDEF）被拒绝时会发出警告。
- */
 void drm_mode_prune_invalid(struct drm_device *dev,
 			    struct list_head *mode_list, bool verbose)
 {
@@ -2049,11 +1867,6 @@ static int drm_mode_compare(void *priv, const struct list_head *lh_a,
  *
  * Sort @mode_list by favorability, moving good modes to the head of the list.
  */
-/*
- * 中文说明：对显示模式列表按优先度排序。
- * 排序优先级：首选标志（PREFERRED）> 高分辨率 > 高刷新率 > 高时钟。
- * 最佳模式排在列表头部，供用户空间或驱动自动选择。
- */
 void drm_mode_sort(struct list_head *mode_list)
 {
 	list_sort(NULL, mode_list, drm_mode_compare);
@@ -2070,14 +1883,6 @@ EXPORT_SYMBOL(drm_mode_sort);
  *
  * This is just a helper functions doesn't validate any modes itself and also
  * doesn't prune any invalid modes. Callers need to do that themselves.
- */
-/*
- * 中文说明：更新连接器的显示模式列表。
- * 将 probed_modes 列表中的新探测模式合并到最终的 modes 列表中。
- * 已存在的模式会合并类型标志（如 PREFERRED），
- * 仅有新模式才会被添加。对于标记为 MODE_STALE 的旧模式，
- * 直接替换为新探测的模式。此函数只做合并操作，
- * 不进行验证和筛选，调用者需自行完成。
  */
 void drm_connector_list_update(struct drm_connector *connector)
 {
@@ -2553,15 +2358,6 @@ static int drm_mode_parse_cmdline_named_mode(const char *name,
  * Returns:
  * True if a valid modeline has been parsed, false otherwise.
  */
-/*
- * 中文说明：解析连接器的命令行模式选项字符串。
- * 支持格式：<xres>x<yres>[M][R][-<bpp>][@<refresh>][i][m][eDd]
- *   其中 M = CVT 模式，R = 减消隐，i = 隔行扫描，
- *   m = 边距，e = 强制开启，D = 强制数字开启，d = 强制关闭
- * 还支持通过逗号分隔的扩展选项：rotate, reflect_x/y,
- * margin_right/left/top/bottom, panel_orientation, tv_mode 等。
- * 解析结果存储在 drm_cmdline_mode 结构中。
- */
 bool drm_mode_parse_command_line_for_connector(const char *mode_option,
 					       const struct drm_connector *connector,
 					       struct drm_cmdline_mode *mode)
@@ -2740,15 +2536,6 @@ static struct drm_display_mode *drm_named_mode(struct drm_device *dev,
  * Returns:
  * Pointer to converted mode on success, NULL on error.
  */
-/*
- * 中文说明：将命令行模式描述转换为实际的 DRM 显示模式。
- * 支持三种模式生成方式：
- * 1. 命名模式（NTSC/PAL）-> 使用 drm_analog_tv_mode()
- * 2. CVT 模式（标记 M）-> 使用 drm_cvt_mode()
- * 3. GTF 模式（默认）-> 使用 drm_gtf_mode()
- * 模式类型被标记为 DRM_MODE_TYPE_USERDEF（用户自定义）。
- * 特殊处理 1366x768 分辨率（GTF/CVT 无法精确表达此宽度）。
- */
 struct drm_display_mode *
 drm_mode_create_from_cmdline_mode(struct drm_device *dev,
 				  struct drm_cmdline_mode *cmd)
@@ -2791,12 +2578,6 @@ EXPORT_SYMBOL(drm_mode_create_from_cmdline_mode);
  *
  * Convert a drm_display_mode into a drm_mode_modeinfo structure to return to
  * the user.
- */
-/*
- * 中文说明：将内核 DRM 显示模式转换为用户空间可用的 modeinfo 结构。
- * 填充时钟、显示参数、刷新率和标志等字段。
- * 画面宽高比（aspect ratio）从 picture_aspect_ratio 枚举转换为
- * 用户空间标志位（DRM_MODE_FLAG_PIC_AR_*）。
  */
 void drm_mode_convert_to_umode(struct drm_mode_modeinfo *out,
 			       const struct drm_display_mode *in)
@@ -2852,13 +2633,6 @@ void drm_mode_convert_to_umode(struct drm_mode_modeinfo *out,
  *
  * Returns:
  * Zero on success, negative errno on failure.
- */
-/*
- * 中文说明：将用户空间传入的 modeinfo 结构转换为内核 DRM 显示模式。
- * 从用户空间标志位提取画面宽高比，清除无用的 type 位，
- * 在转换后调用 drm_mode_validate_driver() 验证模式合法性，
- * 并调用 drm_mode_set_crtcinfo() 设置 CRTC 时序参数。
- * 兼容旧版 xf86-video-vmware 未初始化 type 字段的问题。
  */
 int drm_mode_convert_umode(struct drm_device *dev,
 			   struct drm_display_mode *out,
@@ -2934,12 +2708,6 @@ int drm_mode_convert_umode(struct drm_device *dev,
  * true if the mode can be supported in YCBCR420 format
  * false if not.
  */
-/*
- * 中文说明：检查指定模式是否仅支持 YCbCr 420 格式输出。
- * 通过匹配 CEA 时序识别 VIC（Video Identification Code），
- * 然后查询显示器的 420 VDB（Video Data Block）来判断。
- * 仅 420 模式不能以 RGB 或 444/422 格式输出。
- */
 bool drm_mode_is_420_only(const struct drm_display_info *display,
 			  const struct drm_display_mode *mode)
 {
@@ -2960,12 +2728,6 @@ EXPORT_SYMBOL(drm_mode_is_420_only);
  * true if the mode can be support YCBCR420 format
  * false if not.
  */
-/*
- * 中文说明：检查指定模式是否也能支持 YCbCr 420 格式输出。
- * 与 drm_mode_is_420_only() 的区别在于，420 also 模式
- * 既支持 RGB/YCbCr 444/422 格式，也支持 420 格式。
- * 通过查询显示器的 420 CMDB（Capability Map Data Block）判断。
- */
 bool drm_mode_is_420_also(const struct drm_display_info *display,
 			  const struct drm_display_mode *mode)
 {
@@ -2985,11 +2747,6 @@ EXPORT_SYMBOL(drm_mode_is_420_also);
  * true if the mode can be supported in YCBCR420 format
  * false if not.
  */
-/*
- * 中文说明：检查指定模式是否能支持 YCbCr 420 格式输出。
- * 这是 drm_mode_is_420_only() 和 drm_mode_is_420_also() 的合并判断，
- * 只要模式满足两者之一即返回 true。
- */
 bool drm_mode_is_420(const struct drm_display_info *display,
 		     const struct drm_display_mode *mode)
 {
@@ -3006,12 +2763,6 @@ EXPORT_SYMBOL(drm_mode_is_420);
  *
  * Marks a mode as preferred if it matches the resolution specified by @hpref
  * and @vpref.
- */
-/*
- * 中文说明：设置连接器的首选显示模式。
- * 在 probed_modes 列表中查找与指定分辨率匹配的模式，
- * 为其添加 DRM_MODE_TYPE_PREFERRED 标志。
- * 用户空间通常在模式选择时优先使用标记为首选的模式。
  */
 void drm_set_preferred_mode(struct drm_connector *connector,
 			    int hpref, int vpref)

@@ -20,32 +20,6 @@
  * OF THIS SOFTWARE.
  */
 
-/*
- * DRM 属性管理系统 - 中文注释补充
- *
- * 本文件实现了 DRM 核心属性（property）机制。属性是 DRM 展示子系统
- * 用于扩展模式设置接口的核心抽象，用户空间通过属性来传输和查询
- * 模式设置的元数据。
- *
- * 主要功能：
- *   1. 属性的创建和销毁，支持多种属性类型：
- *      - 范围属性（Range）：无符号/有符号整数范围
- *      - 枚举属性（Enum）：预定义的枚举值
- *      - 位掩码属性（Bitmask）：可组合的位标志
- *      - 对象属性（Object）：引用其他模式对象
- *      - 布尔属性（Bool）：0/1 值
- *      - Blob 属性（Blob）：大块二进制数据（如 gamma 表、EDID）
- *   2. Blob 属性生命周期管理（引用计数）
- *   3. 属性值的合法性验证
- *   4. 用户空间 IOCTL 接口（get/set/destroy blob）
- *
- * 属性本身不直接存储当前值，需要通过 drm_object_attach_property()
- * 挂载到具体的模式对象上。属性值统一为 64 位整数，大块数据通过
- * Blob 属性传递。
- *
- * 原子（Atomic）模式设置中，属性是用户空间传递新配置的唯一方式。
- */
-
 #include <linux/export.h>
 #include <linux/uaccess.h>
 
@@ -120,12 +94,6 @@ static bool drm_property_flags_valid(u32 flags)
  * Returns:
  * A pointer to the newly created property on success, NULL on failure.
  */
-/*
- * 中文说明：创建通用 DRM 属性的核心函数。
- * flags 指定属性类型（范围/枚举/位掩码/对象/blob 等）和行为（不可变/原子）。
- * num_values 用于预分配 values 数组，对范围属性设为 2（存 min/max），
- * 枚举/位掩码设为枚举项数量。属性创建后自动加入设备的 property_list。
- */
 struct drm_property *drm_property_create(struct drm_device *dev,
 					 u32 flags, const char *name,
 					 int num_values)
@@ -191,11 +159,6 @@ EXPORT_SYMBOL(drm_property_create);
  * Returns:
  * A pointer to the newly created property on success, NULL on failure.
  */
-/*
- * 中文说明：创建枚举类型属性。用户空间只能设置为预定义值之一。
- * 典型用途：连接器类型、平面混合模式、色彩编码格式等。
- * props 数组由 drm_prop_enum_list 结构组成，包含 (value, name) 对。
- */
 struct drm_property *drm_property_create_enum(struct drm_device *dev,
 					      u32 flags, const char *name,
 					      const struct drm_prop_enum_list *props,
@@ -243,11 +206,6 @@ EXPORT_SYMBOL(drm_property_create_enum);
  *
  * Returns:
  * A pointer to the newly created property on success, NULL on failure.
- */
-/*
- * 中文说明：创建位掩码类型属性。与枚举不同，用户空间可以设置任意
- * 预定义值的组合（按位或）。典型用途：平面旋转/反射标志组合。
- * supported_bits 声明哪些位是有效的，num_props 中的位若不在其中则被跳过。
  */
 struct drm_property *drm_property_create_bitmask(struct drm_device *dev,
 						 u32 flags, const char *name,
@@ -316,11 +274,6 @@ static struct drm_property *property_create_range(struct drm_device *dev,
  * Returns:
  * A pointer to the newly created property on success, NULL on failure.
  */
-/*
- * 中文说明：创建无符号整数范围属性。通过 DRM_MODE_PROP_RANGE 标志
- * 将其标记为范围类型，values[0] 存最小值，values[1] 存最大值。
- * 用户空间可设置 [min, max] 闭区间内的任意整数。
- */
 struct drm_property *drm_property_create_range(struct drm_device *dev,
 					       u32 flags, const char *name,
 					       uint64_t min, uint64_t max)
@@ -349,11 +302,6 @@ EXPORT_SYMBOL(drm_property_create_range);
  * Returns:
  * A pointer to the newly created property on success, NULL on failure.
  */
-/*
- * 中文说明：创建有符号整数范围属性。与无符号版本类似，但使用
- * signed range 标志，且内部通过 I642U64()/U642I64() 进行有符号/无符号转换。
- * 用户空间可设置 [min, max] 闭区间内的任意有符号整数。
- */
 struct drm_property *drm_property_create_signed_range(struct drm_device *dev,
 						      u32 flags, const char *name,
 						      int64_t min, int64_t max)
@@ -380,11 +328,6 @@ EXPORT_SYMBOL(drm_property_create_signed_range);
  *
  * Returns:
  * A pointer to the newly created property on success, NULL on failure.
- */
-/*
- * 中文说明：创建对象引用类型属性。该属性的值引用另一个 DRM 模式对象
- * （如 CRTC/Connector/Plane）的 ID。仅用于原子模式设置。
- * type 参数指定允许引用的对象类型（DRM_MODE_OBJECT_*）。
  */
 struct drm_property *drm_property_create_object(struct drm_device *dev,
 						u32 flags, const char *name,
@@ -423,10 +366,6 @@ EXPORT_SYMBOL(drm_property_create_object);
  * Returns:
  * A pointer to the newly created property on success, NULL on failure.
  */
-/*
- * 中文说明：创建布尔类型属性。实现上是对 drm_property_create_range()
- * 的封装，将有效值限定为 {0, 1}，分别表示 false 和 true。
- */
 struct drm_property *drm_property_create_bool(struct drm_device *dev,
 					      u32 flags, const char *name)
 {
@@ -447,12 +386,6 @@ EXPORT_SYMBOL(drm_property_create_bool);
  *
  * Returns:
  * Zero on success, error code on failure.
- */
-/*
- * 中文说明：向枚举或位掩码属性添加一个枚举值。
- * value 是数值，name 是用户空间看到的字符串名。
- * 同一属性中不允许重复的 value，位掩码属性的 value 必须在 0~63 范围内。
- * 此函数已废弃，建议使用一次性创建函数（如 drm_property_create_enum）。
  */
 int drm_property_add_enum(struct drm_property *property,
 			  uint64_t value, const char *name)
@@ -504,11 +437,6 @@ EXPORT_SYMBOL(drm_property_add_enum);
  *
  * This function frees a property including any attached resources like
  * enumeration values.
- */
-/*
- * 中文说明：销毁 DRM 属性。释放枚举列表、values 数组，
- * 从模式对象 IDR 中注销，并从设备的 property_list 中移除。
- * 通常在 drm_mode_config_cleanup() 中自动调用。
  */
 void drm_property_destroy(struct drm_device *dev, struct drm_property *property)
 {
@@ -624,12 +552,6 @@ static void drm_property_free_blob(struct kref *kref)
  * New blob property with a single reference on success, or an ERR_PTR
  * value on failure.
  */
-/*
- * 中文说明：创建 Blob 类型属性。Blob 用于传输大块数据
- * （如 gamma LUT、CTM 矩阵、EDID 等）。blob 数据在创建后不可变，
- * 替换时需要创建新的 blob 再替换旧 blob 的引用。
- * blob 通过引用计数管理生命周期，dev->mode_config.blob_lock 保护链表。
- */
 struct drm_property_blob *
 drm_property_create_blob(struct drm_device *dev, size_t length,
 			 const void *data)
@@ -676,10 +598,6 @@ EXPORT_SYMBOL(drm_property_create_blob);
  *
  * Releases a reference to a blob property. May free the object.
  */
-/*
- * 中文说明：释放 blob 属性的一个引用。当引用计数归零时，
- * 自动从全局 blob 列表移除并释放内存。允许传入 NULL。
- */
 void drm_property_blob_put(struct drm_property_blob *blob)
 {
 	if (!blob)
@@ -711,10 +629,6 @@ void drm_property_destroy_user_blobs(struct drm_device *dev,
  * Acquires a reference to an existing blob property. Returns @blob, which
  * allows this to be used as a shorthand in assignments.
  */
-/*
- * 中文说明：增加 blob 属性的引用计数。返回 blob 本身，
- * 方便链式赋值。与 drm_property_blob_put() 配对使用。
- */
 struct drm_property_blob *drm_property_blob_get(struct drm_property_blob *blob)
 {
 	drm_mode_object_get(&blob->base);
@@ -733,11 +647,6 @@ EXPORT_SYMBOL(drm_property_blob_get);
  *
  * Return:
  * NULL on failure, pointer to the blob on success.
- */
-/*
- * 中文说明：通过 ID 查找 blob 属性并增加引用计数。
- * 调用者必须在用完后通过 drm_property_blob_put() 释放引用。
- * 内部使用 __drm_mode_object_find() 在 IDR 中查找。
  */
 struct drm_property_blob *drm_property_lookup_blob(struct drm_device *dev,
 					           uint32_t id)
@@ -778,12 +687,6 @@ EXPORT_SYMBOL(drm_property_lookup_blob);
  * base object, and prop_holds_id set to the path property name, will perform
  * a completely atomic update. The access to path_blob_ptr is protected by the
  * caller holding a lock on the connector.
- */
-/*
- * 中文说明：全局 blob 属性替换函数。用于原子性地替换 blob 并更新
- * 持有其 ID 的属性。典型场景：更新连接器的 PATH 属性（MST 路径）。
- * 如果 length/data 为空，则将持有属性置为 0（即清除 blob 引用）。
- * 调用者必须确保对 replace 指针的访问已加锁保护。
  */
 int drm_property_replace_global_blob(struct drm_device *dev,
 				     struct drm_property_blob **replace,
@@ -833,11 +736,6 @@ EXPORT_SYMBOL(drm_property_replace_global_blob);
  *
  * Return: true if the blob was in fact replaced.
  */
-/*
- * 中文说明：替换 blob 属性指针。释放旧 blob 的引用，
- * 获取新 blob 的引用（如果非 NULL）。如果新旧相同则跳过。
- * 返回是否实际发生了替换。
- */
 bool drm_property_replace_blob(struct drm_property_blob **blob,
 			       struct drm_property_blob *new_blob)
 {
@@ -870,11 +768,6 @@ EXPORT_SYMBOL(drm_property_replace_blob);
  *
  * Return: true if the blob was in fact replaced. -EINVAL if the new blob was
  * not found or sizes don't match.
- */
-/*
- * 中文说明：通过 ID 查找并替换 blob 属性。在替换前进行尺寸校验：
- * max_size 限制最大长度，expected_size 要求精确匹配，expected_elem_size 要求长度对齐。
- * 任意一项检查不通过则返回 -EINVAL。blob_id 为 0 表示清除 blob。
  */
 int drm_property_replace_blob_from_id(struct drm_device *dev,
 					 struct drm_property_blob **blob,

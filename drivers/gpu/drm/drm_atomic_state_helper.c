@@ -24,33 +24,6 @@
  * Daniel Vetter <daniel.vetter@ffwll.ch>
  */
 
-/*
- * DRM 原子状态辅助函数 - 中文注释补充
- *
- * 本文件提供了 DRM 原子模式设置中各类状态对象的生命周期管理辅助函数，
- * 包括状态对象的初始化（reset）、复制（duplicate）和销毁（destroy）。
- *
- * 涵盖的对象类型:
- *   - CRTC（显示控制器）状态 - 含模式、色彩管理（degamma/CTM/gamma）、
- *     自刷新（self refresh）等字段的管理
- *   - Plane（显示平面）状态 - 含透明度混合、旋转、Z序、色彩空间、
- *     热点（cursor hotspot）等字段的管理
- *   - Connector（连接器）状态 - 含电视制式、写回（writeback）帧缓冲、
- *     HDR 元数据等字段的管理
- *   - Private Object（私有对象）状态
- *   - Bridge（桥接芯片）状态
- *
- * 这些辅助函数为驱动程序提供了标准实现，驱动可以通过子类化
- * （subclass）状态结构来添加自定义字段，同时通过调用对应的
- * __drm_atomic_helper_* 函数复用默认行为。
- *
- * 支持的钩子函数:
- *   - reset: 将状态重置为默认值（通常用于驱动初始化或系统恢复）
- *   - duplicate_state: 复制当前状态创建新状态（用于 atomic check/commit）
- *   - destroy_state: 释放状态中的资源（不释放状态对象本身），
- *     由子类化的驱动在自定义销毁函数中调用
- */
-
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_blend.h>
@@ -89,14 +62,6 @@
  * for these functions.
  */
 
-/*
- * __drm_atomic_helper_crtc_state_reset - 重置 CRTC 状态为默认值 - 中文注释
- *
- * 初始化新分配的 CRTC 状态对象，设置默认值。当前默认值仅包含
- * CRTC 指针本身和背景色（默认不透明黑色 ARGB 0xffff00000000）。
- * 驱动子类化 CRTC 状态时，应在自己的 reset 函数中先调用此函数
- * 初始化公共字段，再初始化自定义字段。
- */
 /**
  * __drm_atomic_helper_crtc_state_reset - reset the CRTC state
  * @crtc_state: atomic CRTC state, must not be NULL
@@ -114,14 +79,6 @@ __drm_atomic_helper_crtc_state_reset(struct drm_crtc_state *crtc_state,
 }
 EXPORT_SYMBOL(__drm_atomic_helper_crtc_state_reset);
 
-/*
- * __drm_atomic_helper_crtc_reset - 将 CRTC 状态赋值到 CRTC 对象 - 中文注释
- *
- * 将初始化的状态对象赋值给 CRTC 的 state 指针。如果传入了有效的
- * 状态对象，先调用 __drm_atomic_helper_crtc_state_reset() 初始化。
- * 另外，如果设备支持 vblank，会重置 CRTC 的 vblank 计数。
- * 驱动子类化 CRTC 状态时，通常在自定义 reset 钩子中调用此函数。
- */
 /**
  * __drm_atomic_helper_crtc_reset - reset state on CRTC
  * @crtc: drm CRTC
@@ -167,21 +124,6 @@ void drm_atomic_helper_crtc_reset(struct drm_crtc *crtc)
 }
 EXPORT_SYMBOL(drm_atomic_helper_crtc_reset);
 
-/*
- * __drm_atomic_helper_crtc_duplicate_state - 复制 CRTC 原子状态 - 中文注释
- *
- * 使用 memcpy 复制 CRTC 的当前状态，并正确处理引用计数的递增：
- * - mode_blob、degamma_lut、ctm、gamma_lut 等 blob 属性的引用计数加 1
- * 同时重置推断状态（inferred state）字段:
- * - mode_changed、active_changed、planes_changed、connectors_changed、
- *   color_mgmt_changed、zpos_changed 均重置为 false
- * - commit 和 event 指针置 NULL
- * - async_flip 重置为 false
- * - self_refresh_active 重置为 false，active 重新计算
- *
- * 驱动子类化 CRTC 状态时，应在自定义 duplicate_state 函数中
- * 先调用此函数复制公共字段，再复制自定义字段。
- */
 /**
  * __drm_atomic_helper_crtc_duplicate_state - copy atomic CRTC state
  * @crtc: CRTC object
@@ -242,19 +184,6 @@ drm_atomic_helper_crtc_duplicate_state(struct drm_crtc *crtc)
 }
 EXPORT_SYMBOL(drm_atomic_helper_crtc_duplicate_state);
 
-/*
- * __drm_atomic_helper_crtc_destroy_state - 释放 CRTC 状态中的资源 - 中文注释
- *
- * 释放 CRTC 状态对象中存储的资源（递减引用计数），但不释放
- * 状态对象本身的内存。具体操作:
- *   1. 处理 commit 对象：如果存在未完成的 commit，释放其 event
- *      并递减 commit 的引用计数
- *   2. 释放 mode_blob、degamma_lut、ctm、gamma_lut 等 blob 属性
- *      （drm_property_blob_put）
- *
- * 驱动子类化 CRTC 状态时，应在自定义 destroy_state 函数中
- * 先释放自定义字段，再调用此函数释放公共字段。
- */
 /**
  * __drm_atomic_helper_crtc_destroy_state - release CRTC state
  * @state: CRTC state object to release
@@ -307,19 +236,6 @@ void drm_atomic_helper_crtc_destroy_state(struct drm_crtc *crtc,
 }
 EXPORT_SYMBOL(drm_atomic_helper_crtc_destroy_state);
 
-/*
- * __drm_atomic_helper_plane_state_reset - 重置平面状态为默认值 - 中文注释
- *
- * 初始化新分配的平面状态对象，设置各属性的默认值:
- *   - rotation: DRM_MODE_ROTATE_0（不旋转）
- *   - alpha: DRM_BLEND_ALPHA_OPAQUE（完全不透明）
- *   - pixel_blend_mode: DRM_MODE_BLEND_PREMULTI（预乘混合）
- *   - color_encoding、color_range、zpos、hotspot_x/y 等属性
- *     从对应的 property 定义中读取默认值
- *   - color_pipeline: 默认 NULL（绕过）
- *
- * 驱动子类化平面状态时，应在自定义 reset 函数中调用此函数。
- */
 /**
  * __drm_atomic_helper_plane_state_reset - resets plane state to default values
  * @plane_state: atomic plane state, must not be NULL
@@ -509,16 +425,6 @@ void drm_atomic_helper_plane_destroy_state(struct drm_plane *plane,
 }
 EXPORT_SYMBOL(drm_atomic_helper_plane_destroy_state);
 
-/*
- * __drm_atomic_helper_connector_state_reset - 重置连接器状态 - 中文注释
- *
- * 初始化新分配的连接器状态对象，仅设置 connector 指针。
- * 连接器状态的大部分字段（如电视制式、HDR 元数据、写回配置等）
- * 由驱动或特定 reset 函数（如 drm_atomic_helper_connector_tv_reset）
- * 负责初始化。
- *
- * 驱动子类化连接器状态时，应在自定义 reset 函数中调用此函数。
- */
 /**
  * __drm_atomic_helper_connector_state_reset - reset the connector state
  * @conn_state: atomic connector state, must not be NULL
@@ -808,16 +714,6 @@ void drm_atomic_helper_connector_destroy_state(struct drm_connector *connector,
 }
 EXPORT_SYMBOL(drm_atomic_helper_connector_destroy_state);
 
-/*
- * __drm_atomic_helper_private_obj_create_state - 初始化私有对象状态 - 中文注释
- *
- * 初始化新分配的私有对象状态，设置 obj 指针并将状态赋值给
- * 私有对象的 state 指针。私有对象用于驱动自定义的全局状态
- * （如共享硬件资源的状态跟踪），不通过标准 CRTC/Plane/Connector
- * 状态管理。
- *
- * 驱动子类化私有状态时，应在自定义 create_state 函数中调用此函数。
- */
 /**
  * __drm_atomic_helper_private_obj_create_state - initializes private object state
  * @obj: private object

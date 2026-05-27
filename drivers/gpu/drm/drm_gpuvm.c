@@ -25,27 +25,6 @@
  *
  */
 
-/**
- * DOC: GPU 虚拟地址空间管理器概述 (中文)
- *
- * 该文件实现了 DRM GPU 虚拟地址（VA）空间管理器，由 struct drm_gpuvm 表示，
- * 负责跟踪 GPU 的虚拟地址空间并管理由 &drm_gpuva 对象表示的虚拟映射。
- *
- * 核心功能包括：
- *   1. VA 空间管理：使用红黑树管理 GPU VA 映射，支持插入、删除和区间查询。
- *   2. 分裂与合并算法：实现 Vulkan 稀疏内存绑定（Sparse Memory Bindings）
- *      所需的 map/unmap 操作序列计算，通过 drm_gpuvm_sm_map() 和
- *      drm_gpuvm_sm_unmap() 向驱动程序提供回调序列。
- *   3. 对象跟踪：维护 GEM 对象与 GPUVA 之间的关联，通过 drm_gpuvm_bo 抽象
- *      表示 &drm_gpuvm 和 &drm_gem_object 的唯一组合。
- *   4. 外部对象和驱逐列表：加速 dma-resv 锁的获取和驱逐对象的验证。
- *   5. 锁定辅助：提供 drm_gpuvm_exec_lock() 等函数批量锁定 GPUVM 关联的所有
- *      对象的 dma-resv。
- *
- * &drm_gem_object 维护一个 &drm_gpuva 对象的列表，表示使用该 &drm_gem_object
- * 作为后端缓冲的所有 GPU VA 映射。
- */
-
 #include <drm/drm_gpuvm.h>
 #include <drm/drm_print.h>
 
@@ -1035,15 +1014,13 @@ drm_gpuvm_in_kernel_node(struct drm_gpuvm *gpuvm, u64 addr, u64 range)
 }
 
 /**
- * drm_gpuvm_range_valid() - 检查给定范围是否在 GPUVM 有效地址空间内
+ * drm_gpuvm_range_valid() - checks whether the given range is valid for the
+ * given &drm_gpuvm
+ * @gpuvm: the GPUVM to check the range for
+ * @addr: the base address
+ * @range: the range starting from the base address
  *
- * 中文: 验证指定地址和范围是否在 &drm_gpuvm 管理的边界内。检查包括：
- * 地址溢出、是否在 mm_range 范围内以及是否与内核保留区域重叠。
- * 驱动程序在插入 GPUVA 前应使用此函数进行验证。
- *
- * @gpuvm: 要检查范围的 GPUVM
- * @addr: 基地址
- * @range: 从基地址开始的范围
+ * Checks whether the range is within the GPUVM's managed boundaries.
  *
  * Returns: true for a valid range, false otherwise
  */
@@ -1069,11 +1046,12 @@ static const struct drm_gem_object_funcs drm_gpuvm_object_funcs = {
 };
 
 /**
- * drm_gpuvm_resv_object_alloc() - 分配一个虚拟 &drm_gem_object 作为公共 dma_resv 容器
+ * drm_gpuvm_resv_object_alloc() - allocate a dummy &drm_gem_object
+ * @drm: the drivers &drm_device
  *
- * 中文: 分配一个虚拟的 &drm_gem_object，可传递给 drm_gpuvm_init() 作为根 GEM 对象，
- * 为单个 GPUVM 内的本地 &drm_gem_objects 提供共享的 &dma_resv。
- * 驱动程序也可使用自己的 &drm_gem_object（如包含根页表的对象）作为 resv 对象。
+ * Allocates a dummy &drm_gem_object which can be passed to drm_gpuvm_init() in
+ * order to serve as root GEM object providing the &drm_resv shared across
+ * &drm_gem_objects local to a single GPUVM.
  *
  * Returns: the &drm_gem_object on success, NULL on failure
  */
@@ -1094,24 +1072,22 @@ drm_gpuvm_resv_object_alloc(struct drm_device *drm)
 EXPORT_SYMBOL_GPL(drm_gpuvm_resv_object_alloc);
 
 /**
- * drm_gpuvm_init() - 初始化 &drm_gpuvm
+ * drm_gpuvm_init() - initialize a &drm_gpuvm
+ * @gpuvm: pointer to the &drm_gpuvm to initialize
+ * @name: the name of the GPU VA space
+ * @flags: the &drm_gpuvm_flags for this GPUVM
+ * @drm: the &drm_device this VM resides in
+ * @r_obj: the resv &drm_gem_object providing the GPUVM's common &dma_resv
+ * @start_offset: the start offset of the GPU VA space
+ * @range: the size of the GPU VA space
+ * @reserve_offset: the start of the kernel reserved GPU VA area
+ * @reserve_range: the size of the kernel reserved GPU VA area
+ * @ops: &drm_gpuvm_ops called on &drm_gpuvm_sm_map / &drm_gpuvm_sm_unmap
  *
- * 中文: 初始化 GPU 虚拟地址管理器。设置红黑树、外部对象列表、驱逐列表、
- * bo_defer 列表等内部数据结构。如果指定了 reserve_range，会插入内核保留
- * 节点（kernel_alloc_node）来标记内核保留的 VA 空间区域。
- * @gpuvm 在使用前必须清零初始化。
- * 注意：@name 由调用者管理生命周期。
+ * The &drm_gpuvm must be initialized with this function before use.
  *
- * @gpuvm: 指向要初始化的 &drm_gpuvm 的指针
- * @name: GPU VA 空间的名称
- * @flags: &drm_gpuvm_flags
- * @drm: 此 VM 所在的 &drm_device
- * @r_obj: 提供 GPUVM 公共 &dma_resv 的 resv &drm_gem_object
- * @start_offset: GPU VA 空间的起始偏移
- * @range: GPU VA 空间的大小
- * @reserve_offset: 内核保留 GPU VA 区域的起始地址
- * @reserve_range: 内核保留 GPU VA 区域的大小
- * @ops: 在 drm_gpuvm_sm_map/drm_gpuvm_sm_unmap 时调用的 &drm_gpuvm_ops
+ * Note that @gpuvm must be cleared to 0 before calling this function. The given
+ * &name is expected to be managed by the surrounding driver structures.
  */
 void
 drm_gpuvm_init(struct drm_gpuvm *gpuvm, const char *name,
@@ -1194,15 +1170,12 @@ drm_gpuvm_free(struct kref *kref)
 }
 
 /**
- * drm_gpuvm_put() - 释放 &drm_gpuvm 引用
+ * drm_gpuvm_put() - drop a struct drm_gpuvm reference
+ * @gpuvm: the &drm_gpuvm to release the reference of
  *
- * 中文: 释放 &drm_gpuvm 的一个引用计数。当引用计数降至零时，调用
- * drm_gpuvm_free() 清理 GPU VA 空间，包括移除内核保留节点、检查树是否为空、
- * 检查外部对象和驱逐列表是否为空，最后通过 &drm_gpuvm_ops.vm_free 回调
- * 释放 GPUVM 结构体。
- * 此函数可在原子上下文中调用。
+ * This releases a reference to @gpuvm.
  *
- * @gpuvm: 要释放引用的 &drm_gpuvm
+ * This function may be called from atomic context.
  */
 void
 drm_gpuvm_put(struct drm_gpuvm *gpuvm)
@@ -1221,16 +1194,16 @@ exec_prepare_obj(struct drm_exec *exec, struct drm_gem_object *obj,
 }
 
 /**
- * drm_gpuvm_prepare_vm() - 准备 GPUVM 的公共 dma-resv
+ * drm_gpuvm_prepare_vm() - prepare the GPUVMs common dma-resv
+ * @gpuvm: the &drm_gpuvm
+ * @exec: the &drm_exec context
+ * @num_fences: the amount of &dma_fences to reserve
  *
- * 中文: 为 GPUVM 的虚拟 &drm_gem_object（作为公共 dma-resv 容器）调用
- * drm_exec_prepare_obj() 准备锁定。如果 @num_fences 为零，则调用
- * drm_exec_lock_obj() 代替。直接使用此函数时，驱动程序需自行调用
- * drm_exec_init() 和 drm_exec_fini()。
+ * Calls drm_exec_prepare_obj() for the GPUVMs dummy &drm_gem_object; if
+ * @num_fences is zero drm_exec_lock_obj() is called instead.
  *
- * @gpuvm: &drm_gpuvm
- * @exec: &drm_exec 上下文
- * @num_fences: 要预留的 &dma_fences 数量
+ * Using this function directly, it is the drivers responsibility to call
+ * drm_exec_init() and drm_exec_fini() accordingly.
  *
  * Returns: 0 on success, negative error code on failure.
  */
@@ -1289,17 +1262,25 @@ drm_gpuvm_prepare_objects_locked(struct drm_gpuvm *gpuvm,
 }
 
 /**
- * drm_gpuvm_prepare_objects() - 准备所有关联的外部 BO
+ * drm_gpuvm_prepare_objects() - prepare all associated BOs
+ * @gpuvm: the &drm_gpuvm
+ * @exec: the &drm_exec locking context
+ * @num_fences: the amount of &dma_fences to reserve
  *
- * 中文: 为 &drm_gpuvm 中包含映射的所有 &drm_gem_objects 调用
- * drm_exec_prepare_obj()。此函数可安全应对外部对象的并发插入和删除，
- * 但本身不是并发安全的。驱动程序需通过外部 VM 锁，或在
- * drm_exec_until_all_locked() 循环中先调用 drm_gpuvm_prepare_vm()
- * 以确保互斥。
+ * Calls drm_exec_prepare_obj() for all &drm_gem_objects the given
+ * &drm_gpuvm contains mappings of; if @num_fences is zero drm_exec_lock_obj()
+ * is called instead.
  *
- * @gpuvm: &drm_gpuvm
- * @exec: &drm_exec 锁定上下文
- * @num_fences: 要预留的 &dma_fences 数量
+ * Using this function directly, it is the drivers responsibility to call
+ * drm_exec_init() and drm_exec_fini() accordingly.
+ *
+ * Note: This function is safe against concurrent insertion and removal of
+ * external objects, however it is not safe against concurrent usage itself.
+ *
+ * Drivers need to make sure to protect this case with either an outer VM lock
+ * or by calling drm_gpuvm_prepare_vm() before this function within the
+ * drm_exec_until_all_locked() loop, such that the GPUVM's dma-resv lock ensures
+ * mutual exclusion.
  *
  * Returns: 0 on success, negative error code on failure.
  */
@@ -1317,17 +1298,16 @@ drm_gpuvm_prepare_objects(struct drm_gpuvm *gpuvm,
 EXPORT_SYMBOL_GPL(drm_gpuvm_prepare_objects);
 
 /**
- * drm_gpuvm_prepare_range() - 准备指定 VA 范围内映射的所有 BO
+ * drm_gpuvm_prepare_range() - prepare all BOs mapped within a given range
+ * @gpuvm: the &drm_gpuvm
+ * @exec: the &drm_exec locking context
+ * @addr: the start address within the VA space
+ * @range: the range to iterate within the VA space
+ * @num_fences: the amount of &dma_fences to reserve
  *
- * 中文: 遍历 GPU VA 空间中 @addr 到 @addr + @range 范围内的所有 GPUVA 映射，
- * 为每个映射对应的 &drm_gem_object 调用 drm_exec_prepare_obj() 准备锁定。
- * 使用 drm_gpuvm_for_each_va_range() 遍历指定范围内的所有 VA 映射。
- *
- * @gpuvm: &drm_gpuvm
- * @exec: &drm_exec 锁定上下文
- * @addr: VA 空间内的起始地址
- * @range: VA 空间内的范围大小
- * @num_fences: 要预留的 &dma_fences 数量
+ * Calls drm_exec_prepare_obj() for all &drm_gem_objects mapped between @addr
+ * and @addr + @range; if @num_fences is zero drm_exec_lock_obj() is called
+ * instead.
  *
  * Returns: 0 on success, negative error code on failure.
  */
@@ -1352,16 +1332,16 @@ drm_gpuvm_prepare_range(struct drm_gpuvm *gpuvm, struct drm_exec *exec,
 EXPORT_SYMBOL_GPL(drm_gpuvm_prepare_range);
 
 /**
- * drm_gpuvm_exec_lock() - 锁定 GPUVM 关联的所有 BO 的 dma-resv
+ * drm_gpuvm_exec_lock() - lock all dma-resv of all associated BOs
+ * @vm_exec: the &drm_gpuvm_exec wrapper
  *
- * 中文: 批量获取 &drm_gpuvm 中所有映射的 &drm_gem_objects 的 dma-resv 锁。
- * 使用 drm_exec 框架实现死锁安全的批量锁定。锁定流程：
- * 1. drm_gpuvm_prepare_vm() 锁定 GPUVM 的公共 dma-resv
- * 2. drm_gpuvm_prepare_objects() 锁定所有外部对象的 dma-resv
- * 3. 如果设置了 vm_exec->extra.fn，调用额外对象的锁定回调
- * 上述步骤在 drm_exec_until_all_locked() 循环中重试，直到全部锁定成功。
+ * Acquires all dma-resv locks of all &drm_gem_objects the given
+ * &drm_gpuvm contains mappings of.
  *
- * @vm_exec: &drm_gpuvm_exec 包装器
+ * Additionally, when calling this function with struct drm_gpuvm_exec::extra
+ * being set the driver receives the given @fn callback to lock additional
+ * dma-resv in the context of the &drm_gpuvm_exec instance. Typically, drivers
+ * would call drm_exec_prepare_obj() from within this callback.
  *
  * Returns: 0 on success, negative error code on failure.
  */
@@ -1529,15 +1509,12 @@ drm_gpuvm_validate_locked(struct drm_gpuvm *gpuvm, struct drm_exec *exec)
 }
 
 /**
- * drm_gpuvm_validate() - 验证所有标记为驱逐的 BO
+ * drm_gpuvm_validate() - validate all BOs marked as evicted
+ * @gpuvm: the &drm_gpuvm to validate evicted BOs
+ * @exec: the &drm_exec instance used for locking the GPUVM
  *
- * 中文: 调用 &drm_gpuvm_ops.vm_bo_validate 回调验证给定 &drm_gpuvm 中所有
- * 被标记为驱逐（evicted）的缓冲区对象。根据是否设置 DRM_GPUVM_RESV_PROTECTED
- * 标志，使用内部自旋锁或 dma-resv 锁保护驱逐列表。验证成功的对象会从
- * 驱逐列表中移除。
- *
- * @gpuvm: 要验证驱逐 BO 的 &drm_gpuvm
- * @exec: 用于锁定 GPUVM 的 &drm_exec 实例
+ * Calls the &drm_gpuvm_ops::vm_bo_validate callback for all evicted buffer
+ * objects being mapped in the given &drm_gpuvm.
  *
  * Returns: 0 on success, negative error code on failure.
  */
@@ -1557,17 +1534,13 @@ drm_gpuvm_validate(struct drm_gpuvm *gpuvm, struct drm_exec *exec)
 EXPORT_SYMBOL_GPL(drm_gpuvm_validate);
 
 /**
- * drm_gpuvm_resv_add_fence - 向私有对象和外部对象的 dma-resv 添加 fence
- *
- * 中文: 遍历 drm_exec 锁定的所有 GEM 对象，向每个对象的 dma-resv 添加
- * fence。对于外部对象（extobj）使用 @extobj_usage，对于私有对象使用
- * @private_usage。用于在 GPU 提交完成后同步所有关联缓冲区的访问。
- *
- * @gpuvm: 要添加 fence 的 &drm_gpuvm
- * @exec: &drm_exec 锁定上下文
- * @fence: 要添加的 fence
- * @private_usage: 私有对象的 dma-resv 使用方式
- * @extobj_usage: 外部对象的 dma-resv 使用方式
+ * drm_gpuvm_resv_add_fence - add fence to private and all extobj
+ * dma-resv
+ * @gpuvm: the &drm_gpuvm to add a fence to
+ * @exec: the &drm_exec locking context
+ * @fence: fence to add
+ * @private_usage: private dma-resv usage
+ * @extobj_usage: extobj dma-resv usage
  */
 void
 drm_gpuvm_resv_add_fence(struct drm_gpuvm *gpuvm,
@@ -1589,17 +1562,12 @@ drm_gpuvm_resv_add_fence(struct drm_gpuvm *gpuvm,
 EXPORT_SYMBOL_GPL(drm_gpuvm_resv_add_fence);
 
 /**
- * drm_gpuvm_bo_create() - 创建 &drm_gpuvm_bo 实例
+ * drm_gpuvm_bo_create() - create a new instance of struct drm_gpuvm_bo
+ * @gpuvm: The &drm_gpuvm the @obj is mapped in.
+ * @obj: The &drm_gem_object being mapped in the @gpuvm.
  *
- * 中文: 创建表示 &drm_gpuvm 和 &drm_gem_object 组合的 &drm_gpuvm_bo 实例。
- * 如果驱动程序提供了 &drm_gpuvm_ops.vm_bo_alloc 回调，则使用该回调分配；
- * 否则使用 kzalloc 直接分配。新创建的 vm_bo 会初始化引用计数、获取 GPUVM
- * 和 GEM 对象的引用，并初始化所有链表节点。
- * 注意：创建后尚未添加到任何链表，需通过 drm_gpuvm_bo_obtain_prealloc()
- * 或 drm_gpuvm_bo_obtain_locked() 完成注册。
- *
- * @gpuvm: @obj 映射所在的 &drm_gpuvm
- * @obj: 在 @gpuvm 中映射的 &drm_gem_object
+ * If provided by the driver, this function uses the &drm_gpuvm_ops
+ * vm_bo_alloc() callback to allocate.
  *
  * Returns: a pointer to the &drm_gpuvm_bo on success, NULL on failure
  */
@@ -1691,14 +1659,18 @@ drm_gpuvm_bo_destroy(struct kref *kref)
 }
 
 /**
- * drm_gpuvm_bo_put() - 释放 &drm_gpuvm_bo 引用
+ * drm_gpuvm_bo_put() - drop a struct drm_gpuvm_bo reference
+ * @vm_bo: the &drm_gpuvm_bo to release the reference of
  *
- * 中文: 释放 &drm_gpuvm_bo 的一个引用。当引用计数降至零时，vm_bo 被销毁，
- * 包括从 GEM 的 gpuva 列表、外部对象列表和驱逐列表中移除。因此，如果调用
- * 可能导致引用计数归零，调用者必须持有 GEM 用于 gpuva 列表的锁
- *（dma-resv 锁或 gpuva.lock 互斥锁）。此函数仅可从非原子上下文调用。
+ * This releases a reference to @vm_bo.
  *
- * @vm_bo: 要释放引用的 &drm_gpuvm_bo
+ * If the reference count drops to zero, the &gpuvm_bo is destroyed, which
+ * includes removing it from the GEMs gpuva list. Hence, if a call to this
+ * function can potentially let the reference count drop to zero the caller must
+ * hold the lock that the GEM uses for its gpuva list (either the GEM's
+ * dma-resv or gpuva.lock mutex).
+ *
+ * This function may only be called from non-atomic context.
  *
  * Returns: true if vm_bo was destroyed, false otherwise.
  */
@@ -1862,16 +1834,19 @@ drm_gpuvm_bo_find(struct drm_gpuvm *gpuvm,
 EXPORT_SYMBOL_GPL(drm_gpuvm_bo_find);
 
 /**
- * drm_gpuvm_bo_obtain_locked() - 获取或创建 &drm_gpuvm_bo 实例（需持锁）
+ * drm_gpuvm_bo_obtain_locked() - obtains an instance of the &drm_gpuvm_bo for
+ * the given &drm_gpuvm and &drm_gem_object
+ * @gpuvm: The &drm_gpuvm the @obj is mapped in.
+ * @obj: The &drm_gem_object being mapped in the @gpuvm.
  *
- * 中文: 查找表示给定 &drm_gpuvm 和 &drm_gem_object 组合的 &drm_gpuvm_bo。
- * 如果找到，递增其引用计数；如果未找到，分配新的 &drm_gpuvm_bo 并添加到
- * GEM 对象的 gpuva 列表。注意：此函数会在持锁时分配内存，因此不适用于
- * 立即模式（immediate mode）驱动——后者应使用 drm_gpuvm_bo_obtain_prealloc()。
- * 调用者需持有 GEM 的 gpuva 列表锁。
+ * Find the &drm_gpuvm_bo representing the combination of the given
+ * &drm_gpuvm and &drm_gem_object. If found, increases the reference
+ * count of the &drm_gpuvm_bo accordingly. If not found, allocates a new
+ * &drm_gpuvm_bo.
  *
- * @gpuvm: @obj 映射所在的 &drm_gpuvm
- * @obj: 在 @gpuvm 中映射的 &drm_gem_object
+ * Requires the lock for the GEMs gpuva list.
+ *
+ * A new &drm_gpuvm_bo is added to the GEMs gpuva list.
  *
  * Returns: a pointer to the &drm_gpuvm_bo on success, an ERR_PTR on failure
  */
@@ -1905,15 +1880,20 @@ drm_gpuvm_bo_obtain_locked(struct drm_gpuvm *gpuvm,
 EXPORT_SYMBOL_GPL(drm_gpuvm_bo_obtain_locked);
 
 /**
- * drm_gpuvm_bo_obtain_prealloc() - 使用预分配结构获取 &drm_gpuvm_bo 实例
+ * drm_gpuvm_bo_obtain_prealloc() - obtains an instance of the &drm_gpuvm_bo
+ * for the given &drm_gpuvm and &drm_gem_object
+ * @__vm_bo: A pre-allocated struct drm_gpuvm_bo.
  *
- * 中文: 用于立即模式（immediate mode）驱动。先查找现有的 &drm_gpuvm_bo，
- * 如果找到则递增其引用计数并递减 @__vm_bo 的引用计数；如果未找到则直接
- * 返回预分配的 @__vm_bo 并将其添加到 GEM 的 gpuva 列表。
- * @__vm_bo 在调用前不得已在 gpuva、evict 或 extobj 列表中。
- * 此方法避免了在持有锁时分配内存。
+ * Find the &drm_gpuvm_bo representing the combination of the given
+ * &drm_gpuvm and &drm_gem_object. If found, increases the reference
+ * count of the found &drm_gpuvm_bo accordingly, while the @__vm_bo reference
+ * count is decreased. If not found @__vm_bo is returned without further
+ * increase of the reference count.
  *
- * @__vm_bo: 预分配的 struct drm_gpuvm_bo
+ * The provided @__vm_bo must not already be in the gpuva, evict, or extobj
+ * lists prior to calling this method.
+ *
+ * A new &drm_gpuvm_bo is added to the GEMs gpuva list.
  *
  * Returns: a pointer to the found &drm_gpuvm_bo or @__vm_bo if no existing
  * &drm_gpuvm_bo was found
@@ -1967,15 +1947,12 @@ drm_gpuvm_bo_extobj_add(struct drm_gpuvm_bo *vm_bo)
 EXPORT_SYMBOL_GPL(drm_gpuvm_bo_extobj_add);
 
 /**
- * drm_gpuvm_bo_evict() - 在 GPUVM 的驱逐列表中添加/移除 &drm_gpuvm_bo
+ * drm_gpuvm_bo_evict() - add / remove a &drm_gpuvm_bo to / from the &drm_gpuvms
+ * evicted list
+ * @vm_bo: the &drm_gpuvm_bo to add or remove
+ * @evict: indicates whether the object is evicted
  *
- * 中文: 根据 @evict 参数将 &drm_gpuvm_bo 添加到 GPUVM 的驱逐列表或从中移除。
- * 驱逐列表用于跟踪需要重新验证的缓冲区对象。注意：如果使用 DRM_GPUVM_RESV_PROTECTED
- * 标志且对象为外部对象，不能直接操作驱逐列表，因为这种情况下驱逐列表由 VM 的
- * 公共 dma-resv 锁保护。
- *
- * @vm_bo: 要添加或移除的 &drm_gpuvm_bo
- * @evict: true 表示添加到驱逐列表，false 表示从驱逐列表移除
+ * Adds a &drm_gpuvm_bo to or removes it from the &drm_gpuvm's evicted list.
  */
 void
 drm_gpuvm_bo_evict(struct drm_gpuvm_bo *vm_bo, bool evict)
@@ -2029,15 +2006,16 @@ __drm_gpuva_insert(struct drm_gpuvm *gpuvm,
 }
 
 /**
- * drm_gpuva_insert() - 将 &drm_gpuva 插入 GPU VA 空间
+ * drm_gpuva_insert() - insert a &drm_gpuva
+ * @gpuvm: the &drm_gpuvm to insert the &drm_gpuva in
+ * @va: the &drm_gpuva to insert
  *
- * 中文: 将具有给定地址和范围的 &drm_gpuva 插入 &drm_gpuvm 的红黑树中。
- * 在执行插入前会验证范围的有效性，包括溢出检查、mm_range 检查以及是否
- * 与内核保留区域重叠。如果插入成功，会递增 GPUVM 的引用计数。
- * 此函数可与 drm_gpuvm_for_each_va_safe() 等安全迭代函数配合使用。
+ * Insert a &drm_gpuva with a given address and range into a
+ * &drm_gpuvm.
  *
- * @gpuvm: 要插入 &drm_gpuva 的 &drm_gpuvm
- * @va: 要插入的 &drm_gpuva
+ * It is safe to use this function using the safe versions of iterating the GPU
+ * VA space, such as drm_gpuvm_for_each_va_safe() and
+ * drm_gpuvm_for_each_va_range_safe().
  *
  * Returns: 0 on success, negative error code on failure.
  */
@@ -2073,13 +2051,14 @@ __drm_gpuva_remove(struct drm_gpuva *va)
 }
 
 /**
- * drm_gpuva_remove() - 从 GPU VA 空间移除 &drm_gpuva
+ * drm_gpuva_remove() - remove a &drm_gpuva
+ * @va: the &drm_gpuva to remove
  *
- * 中文: 从底层红黑树中移除指定的 &drm_gpuva。会阻止移除内核保留节点
- *（kernel_alloc_node）。移除后递减 GPUVM 的引用计数。
- * 此函数可与 drm_gpuvm_for_each_va_safe() 等安全迭代函数配合使用。
+ * This removes the given &va from the underlying tree.
  *
- * @va: 要移除的 &drm_gpuva
+ * It is safe to use this function using the safe versions of iterating the GPU
+ * VA space, such as drm_gpuvm_for_each_va_safe() and
+ * drm_gpuvm_for_each_va_range_safe().
  */
 void
 drm_gpuva_remove(struct drm_gpuva *va)
@@ -2098,15 +2077,18 @@ drm_gpuva_remove(struct drm_gpuva *va)
 EXPORT_SYMBOL_GPL(drm_gpuva_remove);
 
 /**
- * drm_gpuva_link() - 将 &drm_gpuva 链接到 &drm_gpuvm_bo
+ * drm_gpuva_link() - link a &drm_gpuva
+ * @va: the &drm_gpuva to link
+ * @vm_bo: the &drm_gpuvm_bo to add the &drm_gpuva to
  *
- * 中文: 将给定的 GPUVA 添加到 &drm_gpuvm_bo 的 GPU VA 列表中。每次添加
- * 都会获取 &drm_gpuvm_bo 的一个额外引用。调用者必须使用 dma-resv 锁或
- * gpuva.lock 互斥锁保护 GEM 的 GPUVA 列表免受并发访问。
- * 这是建立 GPUVA 与 GEM 对象关联的关键步骤。
+ * This adds the given &va to the GPU VA list of the &drm_gpuvm_bo and the
+ * &drm_gpuvm_bo to the &drm_gem_object it is associated with.
  *
- * @va: 要链接的 &drm_gpuva
- * @vm_bo: 要添加 &drm_gpuva 的 &drm_gpuvm_bo
+ * For every &drm_gpuva entry added to the &drm_gpuvm_bo an additional
+ * reference of the latter is taken.
+ *
+ * This function expects the caller to protect the GEM's GPUVA list against
+ * concurrent access using either the GEM's dma-resv or gpuva.lock mutex.
  */
 void
 drm_gpuva_link(struct drm_gpuva *va, struct drm_gpuvm_bo *vm_bo)
@@ -2127,14 +2109,21 @@ drm_gpuva_link(struct drm_gpuva *va, struct drm_gpuvm_bo *vm_bo)
 EXPORT_SYMBOL_GPL(drm_gpuva_link);
 
 /**
- * drm_gpuva_unlink() - 取消 &drm_gpuva 与 &drm_gpuvm_bo 的链接
+ * drm_gpuva_unlink() - unlink a &drm_gpuva
+ * @va: the &drm_gpuva to unlink
  *
- * 中文: 从 &drm_gpuvm_bo 的 GPU VA 列表中移除指定的 GPUVA。如果这是该
- * &drm_gpuvm_bo 中的最后一个 GPUVA，也会将 &drm_gpuvm_bo 从 GEM 对象的
- * gpuva 列表中移除。每次移除都会递减 &drm_gpuvm_bo 的引用计数。
- * 调用者必须使用 dma-resv 锁或 gpuva.lock 互斥锁保护 GEM 的 GPUVA 列表。
+ * This removes the given &va from the GPU VA list of the &drm_gem_object it is
+ * associated with.
  *
- * @va: 要取消链接的 &drm_gpuva
+ * This removes the given &va from the GPU VA list of the &drm_gpuvm_bo and
+ * the &drm_gpuvm_bo from the &drm_gem_object it is associated with in case
+ * this call unlinks the last &drm_gpuva from the &drm_gpuvm_bo.
+ *
+ * For every &drm_gpuva entry removed from the &drm_gpuvm_bo a reference of
+ * the latter is dropped.
+ *
+ * This function expects the caller to protect the GEM's GPUVA list against
+ * concurrent access using either the GEM's dma-resv or gpuva.lock mutex.
  */
 void
 drm_gpuva_unlink(struct drm_gpuva *va)

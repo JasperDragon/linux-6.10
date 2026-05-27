@@ -27,25 +27,6 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-
-/*
- * 文件名: drm_ioc32.c
- *
- * 中文描述: 32位兼容 IOCTL 处理程序
- *
- * 本文件实现了 DRM 子系统的 32 位兼容 IOCTL（输入输出控制）处理逻辑。
- * 当 64 位内核上运行 32 位用户空间程序时，数据结构的大小和对齐方式可能不同
- * （如指针大小不同），需要特殊的兼容层来进行数据格式转换（marshalling）。
- *
- * 核心功能：
- *   1. 为传统的 DRM IOCTL 提供 32/64 位兼容转换
- *   2. 处理 VBlank 等待、版本查询、客户端信息等 IOCTL 的兼容性
- *   3. 对于没有明确兼容处理程序的 IOCTL，直接转发给 drm_ioctl() 处理
- *
- * 处理的 IOCTL 包括：VERSION、GET_UNIQUE、GET_CLIENT、GET_STATS、
- * SET_UNIQUE、UPDATE_DRAW、WAIT_VBLANK、MODE_ADDFB2 等。
- */
-
 #include <linux/compat.h>
 #include <linux/nospec.h>
 #include <linux/ratelimit.h>
@@ -108,16 +89,6 @@ typedef struct drm_version_32 {
 	u32 desc;		  /* User-space buffer to hold desc */
 } drm_version32_t;
 
-/*
- * compat_drm_version - 32/64 位兼容的 DRM_VERSION IOCTL
- * @file: 设备文件
- * @cmd: IOCTL 命令
- * @arg: 32 位用户参数
- *
- * 转换 32 位 drm_version32_t 结构到 64 位 drm_version 结构，
- * 调用实际处理函数，再将结果转换回 32 位格式。
- * 关键转换：32 位指针通过 compat_ptr() 转换为 64 位指针。
- */
 static int compat_drm_version(struct file *file, unsigned int cmd,
 			      unsigned long arg)
 {
@@ -159,14 +130,6 @@ typedef struct drm_unique32 {
 	u32 unique;	/* Unique name for driver instantiation */
 } drm_unique32_t;
 
-/*
- * compat_drm_getunique - 32/64 位兼容的 DRM_GET_UNIQUE IOCTL
- * @file: 设备文件
- * @cmd: IOCTL 命令
- * @arg: 32 位用户参数
- *
- * 获取 DRM 设备的唯一标识符（如 PCI 总线地址）的兼容版本。
- */
 static int compat_drm_getunique(struct file *file, unsigned int cmd,
 				unsigned long arg)
 {
@@ -194,11 +157,6 @@ static int compat_drm_getunique(struct file *file, unsigned int cmd,
 	return 0;
 }
 
-/*
- * compat_drm_setunique - 已废弃的 DRM_SET_UNIQUE 兼容处理
- *
- * 此 IOCTL 已废弃，直接返回 -EINVAL。
- */
 static int compat_drm_setunique(struct file *file, unsigned int cmd,
 				unsigned long arg)
 {
@@ -215,14 +173,6 @@ typedef struct drm_client32 {
 	u32 iocs;	/* Ioctl count */
 } drm_client32_t;
 
-/*
- * compat_drm_getclient - 32/64 位兼容的 DRM_GET_CLIENT IOCTL
- * @file: 设备文件
- * @cmd: IOCTL 命令
- * @arg: 32 位用户参数
- *
- * 获取 DRM 客户端信息（进程 ID、用户 ID、认证状态等）的兼容版本。
- */
 static int compat_drm_getclient(struct file *file, unsigned int cmd,
 				unsigned long arg)
 {
@@ -262,11 +212,6 @@ typedef struct drm_stats32 {
 	} data[15];
 } drm_stats32_t;
 
-/*
- * compat_drm_getstats - 已废弃的 DRM_GET_STATS 兼容处理
- *
- * getstats 功能已废弃，直接清空用户空间缓冲区并返回 0。
- */
 static int compat_drm_getstats(struct file *file, unsigned int cmd,
 			       unsigned long arg)
 {
@@ -278,11 +223,6 @@ static int compat_drm_getstats(struct file *file, unsigned int cmd,
 	return 0;
 }
 
-/*
- * compat_drm_update_draw - 已废弃的 DRM_UPDATE_DRAW 兼容处理
- *
- * update_draw 功能已废弃，直接返回 0 成功。
- */
 #if defined(CONFIG_X86)
 typedef struct drm_update_draw32 {
 	drm_drawable_t handle;
@@ -318,15 +258,6 @@ typedef union drm_wait_vblank32 {
 	struct drm_wait_vblank_reply32 reply;
 } drm_wait_vblank32_t;
 
-/*
- * compat_drm_wait_vblank - 32/64 位兼容的 DRM_WAIT_VBLANK IOCTL
- * @file: 设备文件
- * @cmd: IOCTL 命令
- * @arg: 32 位用户参数
- *
- * 等待垂直消隐期（VBlank）的兼容版本。32 位和 64 位的
- * drm_wait_vblank 结构体布局相同，因此只需进行简单的拷贝转换。
- */
 static int compat_drm_wait_vblank(struct file *file, unsigned int cmd,
 				  unsigned long arg)
 {
@@ -355,15 +286,6 @@ static int compat_drm_wait_vblank(struct file *file, unsigned int cmd,
 	return err;
 }
 
-/*
- * compat_drm_mode_addfb2 - 32/64 位兼容的 DRM_MODE_ADDFB2 IOCTL
- * @file: 设备文件
- * @cmd: IOCTL 命令
- * @arg: 32 位用户参数
- *
- * 添加 framebuffer 的兼容版本。由于 drm_mode_fb_cmd232_t 在 32 位
- * 和 64 位下的布局不同（有 packed 对齐），需要分段拷贝用户数据。
- */
 #if defined(CONFIG_X86)
 typedef struct drm_mode_fb_cmd232 {
 	u32 fb_id;
@@ -425,22 +347,18 @@ static struct {
 };
 
 /**
- * drm_compat_ioctl - DRM 驱动的 32 位 IOCTL 兼容处理程序
- * @filp: 调用此 IOCTL 的文件
- * @cmd: IOCTL 命令号
- * @arg: 用户参数
+ * drm_compat_ioctl - 32bit IOCTL compatibility handler for DRM drivers
+ * @filp: file this ioctl is called on
+ * @cmd: ioctl cmd number
+ * @arg: user argument
  *
- * 兼容处理程序，负责在 64 位内核上处理来自 32 位用户空间的 IOCTL 调用。
- * 实际的 IOCTL 处理转发给 drm_ioctl()，同时根据需要对数据结构进行
- * 适当的编组（marshalling）转换（如指针大小和结构体对齐差异）。
+ * Compatibility handler for 32 bit userspace running on 64 kernels. All actual
+ * IOCTL handling is forwarded to drm_ioctl(), while marshalling structures as
+ * appropriate. Note that this only handles DRM core IOCTLs, if the driver has
+ * botched IOCTL itself, it must handle those by wrapping this function.
  *
- * 此处理程序仅处理 DRM 核心 IOCTL。如果驱动有自定义 IOCTL，
- * 需要通过包装此函数自行处理兼容性问题。
- *
- * 对于那些没有明确兼容处理程序的 IOCTL，假设其数据结构在 32/64 位
- * 下布局相同，直接转发给 drm_ioctl() 处理。
- *
- * 返回：0 成功，负错误码失败
+ * Returns:
+ * Zero on success, negative error code on failure.
  */
 long drm_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {

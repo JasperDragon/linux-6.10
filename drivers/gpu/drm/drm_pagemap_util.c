@@ -3,32 +3,6 @@
  * Copyright © 2025 Intel Corporation
  */
 
-/*
- * 中文注释: DRM 页面映射工具 (Page Mapping Utilities)
- *
- * 本文件提供了 DRM 子系统的高级页面映射管理工具, 包括页面映射缓存
- * (pagemap cache) 和回收器 (shrinker), 以及设备互联组 (interconnect
- * group) 管理。
- *
- * 核心组件:
- *   1. drm_pagemap_cache: 单条目页面映射缓存。管理一个活跃 (引用计数 > 0)
- *      或非活跃 (引用计数 == 0) 的页面映射。非活跃页面映射可被回收器
- *      回收或重新激活使用。
- *   2. drm_pagemap_shrinker: 页面映射回收器。在内存压力下自动回收
- *      未使用的页面映射, 减少内存占用。通过 Linux 内核的 shrinker
- *      框架实现。
- *   3. drm_pagemap_owner / drm_pagemap_peer: 设备互联组管理。用于
- *      识别和共享具有快速互联 (fast interconnect) 的 peer 之间的
- *      共同页面映射所有者, 优化共享内存场景。
- *
- * 典型用法:
- *   1. 创建 shrinker: drm_pagemap_shrinker_create_devm()
- *   2. 创建 cache: drm_pagemap_cache_create_devm(shrinker)
- *   3. 查找缓存: drm_pagemap_lock_lookup() + drm_pagemap_get_from_cache()
- *   4. 设置缓存: drm_pagemap_cache_set_pagemap()
- *   5. 获取活跃: drm_pagemap_get_from_cache_if_active()
- */
-
 #include <linux/slab.h>
 
 #include <drm/drm_drv.h>
@@ -104,11 +78,6 @@ static void drm_pagemap_cache_fini(void *arg)
 }
 
 /**
- * 中文注释: 创建设备托管的 drm_pagemap_cache
- * 分配并初始化一个设备托管的页面映射缓存。缓存在设备移除时自动销毁,
- * 届时所有非活跃的 drm_pagemap 也会被销毁。缓存持有 shrinker 指针,
- * 用于将非活跃页面映射加入回收列表。
- *
  * drm_pagemap_cache_create_devm() - Create a drm_pagemap_cache
  * @shrinker: Pointer to a struct drm_pagemap_shrinker.
  *
@@ -167,11 +136,6 @@ EXPORT_SYMBOL(drm_pagemap_cache_create_devm);
  */
 
 /**
- * 中文注释: 锁定 drm_pagemap_cache 以执行查找
- * 获取缓存的查找互斥锁。查找操作应在锁定状态下进行, 以确保"
- * 查找失败 -> 创建新 pagemap -> 设置到缓存"的原子性, 避免
- * 并发查找引起不必要的重复创建。
- *
  * drm_pagemap_cache_lock_lookup() - Lock a drm_pagemap_cache for lookup.
  * @cache: The drm_pagemap_cache to lock.
  *
@@ -184,10 +148,6 @@ int drm_pagemap_cache_lock_lookup(struct drm_pagemap_cache *cache)
 EXPORT_SYMBOL(drm_pagemap_cache_lock_lookup);
 
 /**
- * 中文注释: 解锁 drm_pagemap_cache (查找后)
- * 释放之前通过 drm_pagemap_cache_lock_lookup() 获取的互斥锁,
- * 允许其他查找操作继续进行。
- *
  * drm_pagemap_cache_unlock_lookup() - Unlock a drm_pagemap_cache after lookup.
  * @cache: The drm_pagemap_cache to unlock.
  */
@@ -198,17 +158,6 @@ void drm_pagemap_cache_unlock_lookup(struct drm_pagemap_cache *cache)
 EXPORT_SYMBOL(drm_pagemap_cache_unlock_lookup);
 
 /**
- * 中文注释: 从缓存中查找 drm_pagemap
- * 缓存的查找逻辑:
- *   1. 如果缓存中有活跃的 pagemap (引用计数 > 0), 直接返回 (增加引用)
- *   2. 如果有非活跃的 pagemap, 尝试从回收器列表中取消并重新初始化:
- *      a. 等待 "queued" completion (确保 pagemap 已加入回收列表)
- *      b. 从回收器列表中取消该 pagemap
- *      c. 重新初始化 (drm_pagemap_reinit)
- *      d. 设置回缓存
- *   3. 如果没有 pagemap 或重新激活失败, 返回 NULL 表示调用者应创建新
- *      的 pagemap 并插入缓存
- *
  * drm_pagemap_get_from_cache() - Lookup of drm_pagemaps.
  * @cache: The cache used for lookup.
  *
@@ -270,11 +219,6 @@ retry:
 EXPORT_SYMBOL(drm_pagemap_get_from_cache);
 
 /**
- * 中文注释: 将 drm_pagemap 分配给缓存
- * 在 drm_pagemap_get_from_cache() 返回 NULL 后调用此函数来填充
- * 缓存。使用 swap 安全地替换缓存中的 pagemap 指针, 并重设
- * completion 信号量以备后续等待。此函数必须在持有查找锁时调用。
- *
  * drm_pagemap_cache_set_pagemap() - Assign a drm_pagemap to a drm_pagemap_cache
  * @cache: The cache to assign the drm_pagemap to.
  * @dpagemap: The drm_pagemap to assign.
@@ -297,11 +241,6 @@ void drm_pagemap_cache_set_pagemap(struct drm_pagemap_cache *cache, struct drm_p
 EXPORT_SYMBOL(drm_pagemap_cache_set_pagemap);
 
 /**
- * 中文注释: 快速的活跃 drm_pagemap 查找
- * 非阻塞地检查缓存中是否存在活跃的 drm_pagemap (引用计数 > 0)。
- * 如果存在则增加引用计数并返回。此函数不需要持有查找锁, 适用于
- * 仅需在活跃状态下获取 pagemap 的快速路径场景。
- *
  * drm_pagemap_get_from_cache_if_active() - Quick lookup of active drm_pagemaps
  * @cache: The cache to lookup from.
  *
@@ -341,11 +280,6 @@ static bool drm_pagemap_shrinker_cancel(struct drm_pagemap *dpagemap)
 
 #ifdef CONFIG_PROVE_LOCKING
 /**
- * 中文注释: lockdep 检测函数 - 用于 drm_pagemap_shrinker_add()
- * 在可能调用 drm_pagemap_shrinker_add() 的代码路径中调用此函数,
- * 可以提前检测锁依赖问题。在 PROVE_LOCKING 配置下, might_lock()
- * 会验证锁获取顺序是否可能导致死锁。
- *
  * drm_pagemap_shrinker_might_lock() - lockdep test for drm_pagemap_shrinker_add()
  * @dpagemap: The drm pagemap.
  *
@@ -369,13 +303,6 @@ void drm_pagemap_shrinker_might_lock(struct drm_pagemap *dpagemap)
 #endif
 
 /**
- * 中文注释: 将 drm_pagemap 添加到回收器列表或直接销毁
- * 当页面映射不再活跃 (引用计数降为零) 时调用此函数。
- * 如果 pagemap 有关联的缓存且设备仍存在, 将其添加到回收器列表,
- * 以便在内存压力下被回收 (复用而非销毁)。
- * 如果设备已移除或没有关联缓存, 则直接销毁 pagemap。
- * 同时触发 completion 通知等待的 drm_pagemap_get_from_cache()。
- *
  * drm_pagemap_shrinker_add() - Add a drm_pagemap to the shrinker list or destroy
  * @dpagemap: The drm_pagemap.
  *
@@ -477,12 +404,6 @@ static void drm_pagemap_shrinker_fini(void *arg)
 }
 
 /**
- * 中文注释: 创建并注册页面映射回收器 (设备托管)
- * 分配并注册一个 Linux shrinker, 在系统内存压力下自动回收未使用的
- * drm_pagemap。回收器通过 drm_device 托管, 在设备移除时自动注销。
- * shrinker 的 count_objects 返回待回收的 pagemap 数量,
- * scan_objects 执行实际的回收操作 (销毁 pagemap 并释放内存)。
- *
  * drm_pagemap_shrinker_create_devm() - Create and register a pagemap shrinker
  * @drm: The drm device
  *
@@ -542,11 +463,6 @@ static void drm_pagemap_owner_release(struct kref *kref)
 }
 
 /**
- * 中文注释: 停止参与设备互联组
- * 当页面映射被移除时调用此函数, 表示该 peer 不再需要参与互联组。
- * 从 owner_list 中移除 peer, 释放 owner 的引用计数。当 owner 的
- * 引用计数降为零时, 自动释放 owner 结构体 (通过 kref 机制)。
- *
  * drm_pagemap_release_owner() - Stop participating in an interconnect group
  * @peer: Pointer to the struct drm_pagemap_peer used when joining the group
  *
@@ -585,18 +501,6 @@ EXPORT_SYMBOL(drm_pagemap_release_owner);
 typedef bool (*interconnect_fn)(struct drm_pagemap_peer *peer1, struct drm_pagemap_peer *peer2);
 
 /**
- * 中文注释: 加入设备互联组
- * 通过反复调用 @has_interconnect 回调函数, 确定 @peer 与 owner_list
- * 上其他 peer 之间是否具有快速互联 (fast interconnect)。如果找到
- * 具有快速互联的 peer 集合, 它们将共享同一个 drm_pagemap_owner。
- * 如果 @peer 与所有其他 peer 都没有快速互联, 则为其分配一个新的
- * 唯一 owner。
- *
- * 互联组的目的是优化共享内存场景: 具有快速互联的设备之间可以共用
- * 页面映射, 减少重复映射的开销。
- *
- * 当 peer 不再参与互联组时, 应调用 drm_pagemap_release_owner()。
- *
  * drm_pagemap_acquire_owner() - Join an interconnect group
  * @peer: A struct drm_pagemap_peer keeping track of the device interconnect
  * @owner_list: Pointer to the owner_list, keeping track of all interconnects

@@ -21,16 +21,6 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-/*
- * drm_bridge.c — 显示桥接芯片链管理。
- *
- * Bridge 代表 Encoder 与 Connector 之间的转换芯片链:
- *   - 协议转换: LVDS→eDP, HDMI→MIPI DSI, RGB→LVDS...
- *   - 信号调理: 红驱动 (redriver), 重定时器 (retimer)
- *   - 链式串联: drm_bridge_attach() 构建 encoder→bridge→...→connector
- *   - Bridge state: drm_bridge_state 参与 atomic commit
- */
-
 #include <linux/debugfs.h>
 #include <linux/err.h>
 #include <linux/export.h>

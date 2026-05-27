@@ -9,29 +9,6 @@
  * of such GNU licence.
  */
 
-/*
- * drm_writeback.c -- 写回连接器管理核心
- *
- * 写回连接器（Writeback Connector）是一种特殊类型的连接器，允许将 CRTC
- * 的输出直接写入内存缓冲区（Framebuffer），而不是发送到物理显示设备。
- * 它在 GPU 渲染输出捕获、显示回录、虚拟显示等场景中非常有用。
- *
- * 核心职责包括：
- *   1. 提供将 CRTC 输出写入内存缓冲区的硬件抽象
- *   2. 管理写回作业的生命周期（创建、排队、完成、清理）
- *   3. 通过 DMA fence 机制向用户空间通知写回完成事件
- *   4. 定义写回相关属性：WRITEBACK_FB_ID、WRITEBACK_PIXEL_FORMATS、
- *      WRITEBACK_OUT_FENCE_PTR
- *
- * 关键 API：
- *   - drm_writeback_connector_init(): 写回连接器初始化
- *   - drm_writeback_connector_init_with_encoder(): 使用自定义编码器初始化
- *   - drm_writeback_queue_job(): 排队写回作业
- *   - drm_writeback_signal_completion(): 通知写回完成
- *   - drm_writeback_get_out_fence(): 获取写回完成 fence
- *   - drm_writeback_cleanup_job(): 清理写回作业
- */
-
 #include <linux/dma-fence.h>
 #include <linux/export.h>
 
@@ -168,20 +145,6 @@ static int create_writeback_properties(struct drm_device *dev)
 static const struct drm_encoder_funcs drm_writeback_encoder_funcs = {
 	.destroy = drm_encoder_cleanup,
 };
-
-/*
- * drm_writeback_connector_init -- 初始化写回连接器及其属性
- *
- * 创建并初始化写回连接器。该函数会：
- *   1. 创建写回连接器特有的属性（WRITEBACK_FB_ID、WRITEBACK_PIXEL_FORMATS、
- *      WRITEBACK_OUT_FENCE_PTR），如果尚未创建
- *   2. 初始化连接器为 DRM_MODE_CONNECTOR_WRITEBACK 类型
- *   3. 正确初始化属性值
- *   4. 自动创建并初始化一个内部编码器（DRM_MODE_ENCODER_VIRTUAL 类型）
- *   5. 设置编码器的 helper 函数表
- *
- * 返回值：成功返回 0，失败返回负的错误码。
- */
 
 /**
  * drm_writeback_connector_init - Initialize a writeback connector and its properties
@@ -489,20 +452,6 @@ int drm_writeback_prepare_job(struct drm_writeback_job *job)
 }
 EXPORT_SYMBOL(drm_writeback_prepare_job);
 
-/*
- * drm_writeback_queue_job -- 排队写回作业以供后续信号通知
- *
- * 将连接器状态中的写回作业添加到写回连接器的作业队列中。该函数
- * 接管写回作业的所有权，并将 conn_state->writeback_job 置为 NULL。
- * 调用者在此函数返回后不能再访问该作业。
- *
- * 驱动必须确保写回作业的排队顺序与硬件完成的顺序完全一致（也与
- * drm_writeback_signal_completion 的通知顺序一致）。
- *
- * 每次调用 drm_writeback_queue_job() 都必定对应一次
- * drm_writeback_signal_completion() 调用。
- */
-
 /**
  * drm_writeback_queue_job - Queue a writeback job for later signalling
  * @wb_connector: The writeback connector to queue a job on
@@ -572,18 +521,6 @@ static void cleanup_work(struct work_struct *work)
 	drm_writeback_cleanup_job(job);
 }
 
-/*
- * drm_writeback_signal_completion -- 通知写回作业完成
- *
- * 驱动在硬件完成写回操作后调用此函数，以通知内核写回作业已完成。
- * 此函数可在中断上下文中调用。它会：
- *   1. 从作业队列中取出最早排队的作业
- *   2. 通过 DMA fence 信号通知用户空间写回完成
- *   3. 通过工作队列延迟清理作业（因为释放 framebuffer 引用可能睡眠）
- *
- * 驱动必须确保硬件按排队顺序完成写回作业。
- */
-
 /**
  * drm_writeback_signal_completion - Signal the completion of a writeback job
  * @wb_connector: The writeback connector whose job is complete
@@ -633,18 +570,6 @@ drm_writeback_signal_completion(struct drm_writeback_connector *wb_connector,
 	queue_work(system_long_wq, &job->cleanup_work);
 }
 EXPORT_SYMBOL(drm_writeback_signal_completion);
-
-/*
- * drm_writeback_get_out_fence -- 获取写回完成通知的 DMA fence
- *
- * 创建并返回一个 DMA fence，用于在写回操作完成时通知用户空间。
- * 用户空间在提交写回请求时，通过 WRITEBACK_OUT_FENCE_PTR 属性
- * 提供的用户空间指针，内核将与此 fence 关联的文件描述符写入该指针。
- * 用户空间应在写回 fence 信号发出后才能发起新的涉及相同 CRTC、Plane
- * 或 Connector 的提交。
- *
- * 返回值：成功返回 fence 指针，失败返回 NULL。
- */
 
 struct dma_fence *
 drm_writeback_get_out_fence(struct drm_writeback_connector *wb_connector)

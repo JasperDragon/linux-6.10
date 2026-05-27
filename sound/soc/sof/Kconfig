@@ -303,3 +303,4 @@ source "sound/soc/sof/intel/Kconfig"
 source "sound/soc/sof/mediatek/Kconfig"
 
 endif
+source "sound/soc/sof/xtensa/Kconfig"

@@ -10,32 +10,6 @@
  * Copyright (c) 2003-2004 IBM Corp.
  */
 
-/*
- * DRM Sysfs 接口 - 为 DRM 设备和连接器提供 sysfs 文件系统支持
- *
- * 本文件实现了 DRM 框架的 sysfs 接口，通过 sysfs 文件系统暴露 DRM 设备
- * 和连接器的属性。主要功能包括：
- *
- *   设备类管理：
- *     - drm_sysfs_init() / drm_sysfs_destroy() - DRM 设备类的创建和销毁
- *     - drm_sysfs_minor_alloc() - 分配给设备节点的 sysfs 设备结构
- *
- *   连接器属性（通过 /sys/class/drm/cardN-connector/）：
- *     - status：连接器状态（connected/disconnected）
- *     - enabled：编码器是否已连接
- *     - dpms：DPMS 电源状态
- *     - edid：读取 EDID 原始数据
- *     - modes：列出支持的显示模式
- *
- *   事件通知：
- *     - drm_sysfs_hotplug_event() - 发送 HOTPLUG=1 的 uevent
- *     - drm_sysfs_connector_hotplug_event() - 连接器热插拔事件
- *     - drm_sysfs_connector_property_event() - 连接器属性变更事件
- *     - drm_sysfs_lease_event() - 租赁变更事件
- *
- *   其他：Type-C 连接器关联、引导显示设备标识等
- */
-
 #include <linux/acpi.h>
 #include <linux/component.h>
 #include <linux/device.h>
@@ -158,15 +132,14 @@ static const struct component_ops typec_connector_ops = {
 static CLASS_ATTR_STRING(version, S_IRUGO, "drm 1.1.0 20060810");
 
 /**
- * drm_sysfs_init - 初始化 sysfs 辅助功能
+ * drm_sysfs_init - initialize sysfs helpers
  *
- * 创建 DRM 设备类（drm class），该设备类是所有其他顶层 DRM sysfs
- * 对象的隐式父节点。DRM 设备、连接器等对象都会在 /sys/class/drm/
- * 下创建相应的子目录。
+ * This is used to create the DRM class, which is the implicit parent of any
+ * other top-level DRM sysfs objects.
  *
- * 必须调用 drm_sysfs_destroy() 来释放分配的资源。
+ * You must call drm_sysfs_destroy() to release the allocated resources.
  *
- * 返回：成功返回 0，失败返回负错误码。
+ * Return: 0 on success, negative error code on failure.
  */
 int drm_sysfs_init(void)
 {
@@ -190,11 +163,9 @@ int drm_sysfs_init(void)
 }
 
 /**
- * drm_sysfs_destroy - 销毁 DRM 设备类
+ * drm_sysfs_destroy - destroys DRM class
  *
- * 销毁由 drm_sysfs_init() 创建的 DRM 设备类（drm class），
- * 包括移除 ACPI 注册和版本属性文件，最后释放类对象。
- * 此函数在模块卸载时调用，以清理 sysfs 相关资源。
+ * Destroy the DRM device class.
  */
 void drm_sysfs_destroy(void)
 {
@@ -459,16 +430,6 @@ void drm_sysfs_lease_event(struct drm_device *dev)
 	kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, envp);
 }
 
-/*
- * drm_sysfs_hotplug_event - 生成 DRM 热插拔 uevent 事件
- * @dev: DRM 设备
- *
- * 向用户空间发送 DRM 设备的热插拔事件 uevent，设置环境变量
- * HOTPLUG=1。用户空间的设备管理器（如 systemd-udev）接收到此
- * 事件后会触发相应的处理逻辑。
- *
- * 新的连接器状态变更应使用 drm_sysfs_connector_hotplug_event()。
- */
 /**
  * drm_sysfs_hotplug_event - generate a DRM uevent
  * @dev: DRM device
@@ -491,14 +452,6 @@ void drm_sysfs_hotplug_event(struct drm_device *dev)
 }
 EXPORT_SYMBOL(drm_sysfs_hotplug_event);
 
-/*
- * drm_sysfs_connector_hotplug_event - 生成连接器热插拔 uevent 事件
- * @connector: 发生变化的连接器
- *
- * 向用户空间发送指定连接器的热插拔事件 uevent，包含环境变量
- * HOTPLUG=1 和 CONNECTOR=<connector_id>。用户空间通过监听此事件
- * 可以及时更新显示配置。
- */
 /**
  * drm_sysfs_connector_hotplug_event - generate a DRM uevent for any connector
  * change
@@ -524,15 +477,6 @@ void drm_sysfs_connector_hotplug_event(struct drm_connector *connector)
 }
 EXPORT_SYMBOL(drm_sysfs_connector_hotplug_event);
 
-/*
- * drm_sysfs_connector_property_event - 生成连接器属性变更 uevent 事件
- * @connector: 属性发生变化的连接器
- * @property: 发生变化的连接器属性
- *
- * 向用户空间发送指定连接器属性的变更事件 uevent，包含 HOTPLUG=1、
- * CONNECTOR=<id> 和 PROPERTY=<id> 环境变量。用于通知用户空间
- * 连接器的某个属性值已发生变化，需要重新读取。
- */
 /**
  * drm_sysfs_connector_property_event - generate a DRM uevent for connector
  * property change
@@ -646,16 +590,6 @@ err_free:
 	return ERR_PTR(r);
 }
 
-/*
- * drm_class_device_register - 在 DRM sysfs 类中注册新设备
- * @dev: 要注册的设备
- *
- * 在 DRM sysfs 类中注册一个新的 struct device。主要用于 TTM
- * （透明传输管理）子系统，为其全局设置提供 sysfs 入口点。
- * 普通驱动不应使用此函数。
- *
- * 返回：0 表示成功，负错误码表示失败。
- */
 /**
  * drm_class_device_register - register new device with the DRM sysfs class
  * @dev: device to register
@@ -674,13 +608,6 @@ int drm_class_device_register(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(drm_class_device_register);
 
-/*
- * drm_class_device_unregister - 从 DRM sysfs 类中注销设备
- * @dev: 要注销的设备
- *
- * 从 DRM sysfs 类中注销指定的 struct device。与 drm_class_device_register()
- * 对应，主要用于 TTM 子系统的 sysfs 入口清理。
- */
 /**
  * drm_class_device_unregister - unregister device with the DRM sysfs class
  * @dev: device to unregister

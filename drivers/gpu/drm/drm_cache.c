@@ -27,32 +27,6 @@
 /*
  * Authors: Thomas Hellström <thomas-at-tungstengraphics-dot-com>
  */
-
-/*
- * 中文注释: DRM CPU 缓存管理 (Cache Management)
- *
- * 本文件实现了 DRM 子系统的 CPU 缓存管理功能, 包括缓存刷新 (cache
- * flush) 和高效内存拷贝操作。这些操作对于确保 GPU 和 CPU 之间数据
- * 一致性至关重要。
- *
- * 主要功能:
- *   1. drm_clflush_pages: 刷新指定页数组的 CPU 数据缓存行 (dcache)
- *   2. drm_clflush_sg: 刷新散聚列表 (scatter-gather) 中所有页的缓存
- *   3. drm_clflush_virt_range: 刷新指定虚拟地址范围的缓存行
- *   4. drm_need_swiotlb: 判断是否需要使用 SWIOTLB (Xen 等场景)
- *   5. drm_memcpy_from_wc: 从可能为 write-combining (WC) 的源内存
- *      执行高效拷贝, 使用非临时指令 (movntdqa) 避免缓存污染
- *
- * 架构支持:
- *   - x86: 使用 clflush/clflushopt 指令进行缓存刷新, 使用 MOVNTDQA
- *     进行非临时加载 (NT load) 以避免缓存污染
- *   - powerpc: 使用 flush_dcache_range() 刷新缓存
- *   - 其他架构: 发出警告 (需要实现架构特定的支持)
- *
- * 缓存刷新使用内存屏障 (mfence/sfence) 保证顺序, 因为 clflushopt
- * 是无序指令。
- */
-
 #include <linux/cc_platform.h>
 #include <linux/export.h>
 #include <linux/highmem.h>
@@ -102,12 +76,6 @@ static void drm_cache_flush_clflush(struct page *pages[],
 #endif
 
 /**
- * 中文注释: 刷新一组页面的数据缓存行
- * 刷新数组中每个页面所对应的所有 CPU 数据缓存行。在 x86 上优先使用
- * CLFLUSH 指令 (逐个页面刷新), 如果不支持则使用 wbinvd_on_all_cpus()
- * (全局缓存无效化, 开销较大)。在 powerpc 上使用 flush_dcache_range()。
- * 确保 GPU 和 CPU 之间共享内存的数据一致性。
- *
  * drm_clflush_pages - Flush dcache lines of a set of pages.
  * @pages: List of pages to be flushed.
  * @num_pages: Number of pages in the array.
@@ -149,10 +117,6 @@ drm_clflush_pages(struct page *pages[], unsigned long num_pages)
 EXPORT_SYMBOL(drm_clflush_pages);
 
 /**
- * 中文注释: 刷新散聚列表中所有页面的缓存行
- * 遍历散聚列表 (scatter-gather table) 中的所有页面, 刷新每个页面
- * 对应的数据缓存行。在 x86 上使用 CLFLUSH + 内存屏障确保顺序。
- *
  * drm_clflush_sg - Flush dcache lines pointing to a scather-gather.
  * @st: struct sg_table.
  *
@@ -182,11 +146,6 @@ drm_clflush_sg(struct sg_table *st)
 EXPORT_SYMBOL(drm_clflush_sg);
 
 /**
- * 中文注释: 刷新指定虚拟地址范围的缓存行
- * 刷新从 @addr 开始的 @length 字节范围内的所有缓存行。将起始地址
- * 向下对齐到缓存行边界, 然后逐缓存行执行 clflushopt, 最后再刷新
- * 末尾字节以保证序列化。全程使用内存屏障确保刷新的顺序正确性。
- *
  * drm_clflush_virt_range - Flush dcache lines of a region
  * @addr: Initial kernel memory address.
  * @length: Region size.
@@ -218,17 +177,7 @@ drm_clflush_virt_range(void *addr, unsigned long length)
 }
 EXPORT_SYMBOL(drm_clflush_virt_range);
 
-/**
- * 中文注释: 判断是否需要使用 SWIOTLB
- * 检查当前系统是否需要软件 I/O TLB 反弹缓冲 (SWIOTLB)。以下情况
- * 需要 SWIOTLB:
- *   1. Xen 半虚拟化主机 (Xen PV domain): DMA 传输需要反弹缓冲
- *   2. 内存加密启用 (如 AMD SEV): 原因与 Xen 类似
- *   3. 系统中存在超出 DMA 寻址范围的内存: 如果 I/O 内存的物理地址
- *      超过了指定的 dma_bits 寻址范围, 则需要 SWIOTLB
- *
- * bool drm_need_swiotlb(int dma_bits)
- */
+bool drm_need_swiotlb(int dma_bits)
 {
 	struct resource *tmp;
 	resource_size_t max_iomem = 0;
@@ -341,13 +290,6 @@ static void __drm_memcpy_from_wc(void *dst, const void *src, unsigned long len)
 }
 
 /**
- * 中文注释: 从可能为 WC (Write-Combining) 的源执行最优 memcpy
- * 从可能为 write-combining 属性的内存区域执行拷贝, 优先使用架构
- * 优化的非临时加载指令 (MOVNTDQA), 以避免缓存污染。在 x86 上,
- * MOVNTDQA 指令直接从内存加载到 XMM 寄存器而不填充缓存行, 这对于
- * 从 WC 内存读数特别高效 (WC 内存通常用于帧缓冲区等 GPU 内存)。
- * 如果架构不支持或源/目标不是 WC, 回退到普通 memcpy。
- *
  * drm_memcpy_from_wc - Perform the fastest available memcpy from a source
  * that may be WC.
  * @dst: The destination pointer
@@ -381,14 +323,8 @@ void drm_memcpy_from_wc(struct iosys_map *dst,
 }
 EXPORT_SYMBOL(drm_memcpy_from_wc);
 
-/**
- * 中文注释: WC memcpy 的一次性早期初始化
- * 在启动早期检查 CPU 是否支持 MOVNTDQA 指令 (SSE4.1 扩展) 以及
- * 是否运行在虚拟机中。在虚拟机中 VEX 前缀指令可能无法被模拟, 因此
- * 禁用在虚拟机中使用 MOVNTDQA。在裸机上如果 CPU 支持则启用
- * MOVNTDQA 加速路径。
- *
- * void drm_memcpy_init_early(void)
+/*
+ * drm_memcpy_init_early - One time initialization of the WC memcpy code
  */
 void drm_memcpy_init_early(void)
 {

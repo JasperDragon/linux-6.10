@@ -5,35 +5,6 @@
  * Copyright 2016 Noralf Trønnes
  */
 
-/*
- * MIPI DBI（Display Bus Interface）LCD 控制器支持
- *
- * 本文件实现了 MIPI DBI 兼容显示控制器的通用辅助库。MIPI DBI 是
- * MIPI 联盟定义的一种显示总线接口标准，广泛用于小型 LCD 显示屏。
- *
- * MIPI DBI 有三种实现类型：
- *   A. Motorola 6800 类型并行总线
- *   B. Intel 8080 类型并行总线
- *   C. SPI 类型，有三种子选项：
- *      1. 9位模式，Data/Command 信号作为第9位
- *      2. 与上述相同，但以16位发送
- *      3. 8位模式，Data/Command 信号使用独立的 D/CX 引脚
- *
- * 当前只支持 MIPI Type 1 显示（需要完整的帧内存）和 Type C 的
- * 选项1和选项3（通过 mipi_dbi_spi_init() 初始化）。
- *
- * 符合 MIPI 标准的控制器通常使用寄存器 0x2A 和 0x2B 设置更新区域，
- * 使用寄存器 0x2C 写入帧内存。
- *
- * 本库提供的主要功能包括：
- *   - DCS 命令读写（mipi_dbi_command_read/buf）
- *   - 帧缓冲区复制和格式转换（mipi_dbi_buf_copy）
- *   - 显示初始化、电源管理和重置
- *   - SPI 传输封装
- *   - CRTC/平面/连接器的辅助函数
- *   - 调试接口
- */
-
 #include <linux/backlight.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
@@ -147,17 +118,15 @@ static bool mipi_dbi_command_is_read(struct mipi_dbi *dbi, u8 cmd)
 }
 
 /**
- * mipi_dbi_command_read - MIPI DCS 读取命令
- * @dbi: MIPI DBI 结构体
- * @cmd: 命令码
- * @val: 读取到的值
+ * mipi_dbi_command_read - MIPI DCS read command
+ * @dbi: MIPI DBI structure
+ * @cmd: Command
+ * @val: Value read
  *
- * 向控制器发送 MIPI DCS 读取命令。在执行读取之前，会验证该命令
- * 是否在控制器的可读命令列表中，以防止对不支持读取的控制器或
- * 命令执行读取操作。
+ * Send MIPI DCS read command to the controller.
  *
- * 返回：
- * 成功返回零，失败返回负错误码。
+ * Returns:
+ * Zero on success, negative error code on failure.
  */
 int mipi_dbi_command_read(struct mipi_dbi *dbi, u8 cmd, u8 *val)
 {
@@ -172,18 +141,14 @@ int mipi_dbi_command_read(struct mipi_dbi *dbi, u8 cmd, u8 *val)
 EXPORT_SYMBOL(mipi_dbi_command_read);
 
 /**
- * mipi_dbi_command_buf - 带数组参数的 MIPI DCS 命令
- * @dbi: MIPI DBI 结构体
- * @cmd: 命令码
- * @data: 参数缓冲区
- * @len: 缓冲区长度
+ * mipi_dbi_command_buf - MIPI DCS command with parameter(s) in an array
+ * @dbi: MIPI DBI structure
+ * @cmd: Command
+ * @data: Parameter buffer
+ * @len: Buffer length
  *
- * 向控制器发送 MIPI DCS 命令及其参数。命令码和参数字节会通过
- * dbi->command() 回调发送。注意，SPI 传输需要 DMA 安全的缓冲区，
- * 因此该函数会复制命令码到独立的内存中。
- *
- * 返回：
- * 成功返回零，失败返回负错误码。
+ * Returns:
+ * Zero on success, negative error code on failure.
  */
 int mipi_dbi_command_buf(struct mipi_dbi *dbi, u8 cmd, u8 *data, size_t len)
 {
@@ -225,22 +190,16 @@ int mipi_dbi_command_stackbuf(struct mipi_dbi *dbi, u8 cmd, const u8 *data,
 EXPORT_SYMBOL(mipi_dbi_command_stackbuf);
 
 /**
- * mipi_dbi_buf_copy - 复制帧缓冲区，必要时进行格式转换
- * @dst: 目标缓冲区
- * @src: 源缓冲区
- * @fb: 源帧缓冲区
- * @clip: 要复制区域的裁剪矩形
- * @swap: 为 true 时交换 16 位值的高位字节和低位字节
- * @fmtcnv_state: 格式转换状态
+ * mipi_dbi_buf_copy - Copy a framebuffer, transforming it if necessary
+ * @dst: The destination buffer
+ * @src: The source buffer
+ * @fb: The source framebuffer
+ * @clip: Clipping rectangle of the area to be copied
+ * @swap: When true, swap MSB/LSB of 16-bit values
+ * @fmtcnv_state: Format-conversion state
  *
- * 将帧缓冲区内容复制到目标缓冲区，并根据目标显示控制器的格式
- * 需求进行必要的颜色格式转换。支持的转换包括：
- *   - RGB565 -> RGB565（可选字节交换）
- *   - RGB888 -> RGB888（直接复制）
- *   - XRGB8888 -> RGB565/RGB888（格式降位转换）
- *
- * 返回：
- * 成功返回零，失败返回负错误码。
+ * Returns:
+ * Zero on success, negative error code on failure.
  */
 int mipi_dbi_buf_copy(void *dst, struct iosys_map *src, struct drm_framebuffer *fb,
 		      struct drm_rect *clip, bool swap,
@@ -355,13 +314,13 @@ err_msg:
 }
 
 /**
- * drm_mipi_dbi_crtc_helper_mode_valid - MIPI DBI 模式验证辅助函数
- * @crtc: CRTC 对象
- * @mode: 要测试的显示模式
+ * drm_mipi_dbi_crtc_helper_mode_valid - MIPI DBI mode-valid helper
+ * @crtc: The CRTC
+ * @mode: The mode to test
  *
- * 验证给定的显示模式是否与 MIPI DBI 的硬件显示器兼容。
- * 驱动可以使用此函数作为 struct &drm_crtc_helper_funcs.mode_valid
- * 回调函数。
+ * This function validates a given display mode against the MIPI DBI's hardware
+ * display. Drivers can use this as their struct &drm_crtc_helper_funcs.mode_valid
+ * callback.
  */
 enum drm_mode_status drm_mipi_dbi_crtc_helper_mode_valid(struct drm_crtc *crtc,
 							 const struct drm_display_mode *mode)
@@ -373,16 +332,16 @@ enum drm_mode_status drm_mipi_dbi_crtc_helper_mode_valid(struct drm_crtc *crtc,
 EXPORT_SYMBOL(drm_mipi_dbi_crtc_helper_mode_valid);
 
 /**
- * drm_mipi_dbi_plane_helper_atomic_check - MIPI DBI 平面检查辅助函数
- * @plane: 要检查的平面
- * @state: 原子状态
+ * drm_mipi_dbi_plane_helper_atomic_check - MIPI DBI plane check helper
+ * @plane: Plane to check
+ * @state: Atomic state
  *
- * 对 MIPI DBI 设备的主平面执行默认检查。该函数会验证平面状态
- * 是否满足要求（如无缩放、无旋转等）。驱动可以使用此函数作为
- * struct &drm_crtc_helper_funcs.atomic_check 回调函数。
+ * This function performs the default checks on the primary plane
+ * of a MIPI DBI device. Drivers can use this as their
+ * struct &drm_crtc_helper_funcs.atomic_check callback.
  *
- * 返回：
- * 成功返回 0，否则返回负 errno 码。
+ * Returns:
+ * 0 on success, or a negative errno code otherwise.
  */
 int drm_mipi_dbi_plane_helper_atomic_check(struct drm_plane *plane,
 					   struct drm_atomic_state *state)
@@ -408,13 +367,12 @@ int drm_mipi_dbi_plane_helper_atomic_check(struct drm_plane *plane,
 EXPORT_SYMBOL(drm_mipi_dbi_plane_helper_atomic_check);
 
 /**
- * drm_mipi_dbi_plane_helper_atomic_update - 显示更新辅助函数
- * @plane: 平面
- * @state: 原子状态
+ * drm_mipi_dbi_plane_helper_atomic_update - Display update helper
+ * @plane: Plane
+ * @state: Atomic state
  *
- * 处理帧缓冲区的刷新和 vblank 事件。该函数会计算新老状态的损伤
- * 区域（damage），并将变化的部分刷新到显示控制器。驱动可以使用
- * 此函数作为 struct &drm_plane_helper_funcs.atomic_update 回调。
+ * This function handles framebuffer flushing and vblank events. Drivers can use
+ * this as their struct &drm_plane_helper_funcs.atomic_update callback.
  */
 void drm_mipi_dbi_plane_helper_atomic_update(struct drm_plane *plane,
 					     struct drm_atomic_state *state)
@@ -464,16 +422,17 @@ static void mipi_dbi_blank(struct mipi_dbi_dev *dbidev)
 }
 
 /**
- * drm_mipi_dbi_crtc_helper_atomic_check - MIPI DBI CRTC 检查辅助函数
- * @crtc: 要检查的 CRTC
- * @state: 原子状态
+ * drm_mipi_dbi_crtc_helper_atomic_check - MIPI DBI CRTC check helper
+ * @crtc: CRTC to check
+ * @state: Atomic state
  *
- * 对 MIPI DBI 设备的 CRTC 执行默认检查，确保主平面已正确设置。
- * 驱动可以使用此函数作为 struct &drm_crtc_helper_funcs.atomic_check
- * 回调函数。
+ * This function performs the default checks on the CRTC of a MIPI DBI
+ * device and ensures that the primary plane as been set up correctly.
+ * Drivers can use this as their struct &drm_crtc_helper_funcs.atomic_check
+ * callback.
  *
- * 返回：
- * 成功返回 0，否则返回负 errno 码。
+ * Returns:
+ * 0 on success, or a negative errno code otherwise.
  */
 int drm_mipi_dbi_crtc_helper_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
@@ -493,17 +452,13 @@ out:
 EXPORT_SYMBOL(drm_mipi_dbi_crtc_helper_atomic_check);
 
 /**
- * drm_mipi_dbi_crtc_helper_atomic_disable - MIPI DBI CRTC 禁用辅助函数
- * @crtc: 要禁用的 CRTC
- * @state: 原子状态
+ * drm_mipi_dbi_crtc_helper_atomic_disable - MIPI DBI CRTC disable helper
+ * @crtc: CRTC to disable
+ * @state: Atomic state
  *
- * 禁用 MIPI DBI 设备的显示输出。该函数会：
- *   1. 如果有背光，关闭背光；否则清空显示内存（黑屏）
- *   2. 如果使用稳压器，关闭稳压器电源
- *   3. 如果使用 I/O 稳压器，关闭 I/O 稳压器电源
- *
- * 驱动可以使用此函数作为 struct &drm_crtc_helper_funcs.atomic_disable
- * 回调函数。
+ * This function disables backlight if present, if not the display memory is
+ * blanked. The regulator is disabled if in use. Drivers can use this as their
+ * struct &drm_crtc_helper_funcs.atomic_disable callback.
  */
 void drm_mipi_dbi_crtc_helper_atomic_disable(struct drm_crtc *crtc,
 					     struct drm_atomic_state *state)
@@ -523,16 +478,15 @@ void drm_mipi_dbi_crtc_helper_atomic_disable(struct drm_crtc *crtc,
 EXPORT_SYMBOL(drm_mipi_dbi_crtc_helper_atomic_disable);
 
 /**
- * drm_mipi_dbi_connector_helper_get_modes - 复制 MIPI DBI 模式到连接器
- * @connector: 连接器
+ * drm_mipi_dbi_connector_helper_get_modes - Duplicates the MIPI DBI mode for the connector
+ * @connector: The connector
  *
- * 将 MIPI DBI 的固定显示模式复制到连接器的模式列表中。由于 MIPI DBI
- * 设备通常使用固定分辨率的显示屏，该函数提供了一种简单的方式来设置
- * 连接器模式。驱动可以使用此函数作为 &drm_connector_helper_funcs->get_modes
- * 回调函数。
+ * Sets the connecto rmodes from the MIPI DBI mode. Drivers can use this as their
+ * &drm_connector_helper_funcs->get_mods callback. See drm_gem_destroy_shadow_plane_state()
+ * for additional details.
  *
- * 返回：
- * 创建的模式数量。
+ * Returns:
+ * The number of created modes.
  */
 int drm_mipi_dbi_connector_helper_get_modes(struct drm_connector *connector)
 {
@@ -560,24 +514,19 @@ static int mipi_dbi_rotate_mode(struct drm_display_mode *mode,
 }
 
 /**
- * drm_mipi_dbi_dev_init - MIPI DBI 设备初始化
- * @dbidev: 要初始化的 MIPI DBI 设备结构体
- * @mode: 硬件显示模式
- * @format: 硬件颜色格式（DRM_FORMAT\_\*）
- * @rotation: 初始旋转角度（逆时针度数）
- * @tx_buf_size: 分配的发送缓冲区大小（至少为此值）
+ * drm_mipi_dbi_dev_init - MIPI DBI device initialization
+ * @dbidev: MIPI DBI device structure to initialize
+ * @mode: Hardware display mode
+ * @format: Hardware color format (DRM_FORMAT\_\*).
+ * @rotation: Initial rotation in degrees Counter Clock Wise
+ * @tx_buf_size: Allocate a transmit buffer of at least this size.
  *
- * 初始化 MIPI DBI 设备。该函数会：
- *   1. 验证 dbi->command 回调已设置
- *   2. 分配发送缓冲区（如果 tx_buf_size 为 0，则自动计算
- *      足以传输一整帧的大小）
- *   3. 复制并处理显示模式（根据旋转角度交换宽高）
- *   4. 保存像素格式
+ * Initializes a MIPI-DBI device. The minimum size of the transmit buffer
+ * in @tx_buf_size is optional. Pass 0 to allocate enough memory to transmit
+ * a single scanline of the display.
  *
- * @tx_buf_size 是可选的。传入 0 将分配足以传输显示一整行的内存。
- *
- * 返回：
- * 成功返回零，失败返回负错误码。
+ * Returns:
+ * Zero on success, negative error code on failure.
  */
 int drm_mipi_dbi_dev_init(struct mipi_dbi_dev *dbidev, const struct drm_display_mode *mode,
 			  u32 format, unsigned int rotation, size_t tx_buf_size)
@@ -618,14 +567,10 @@ int drm_mipi_dbi_dev_init(struct mipi_dbi_dev *dbidev, const struct drm_display_
 EXPORT_SYMBOL(drm_mipi_dbi_dev_init);
 
 /**
- * mipi_dbi_hw_reset - 控制器的硬件复位
- * @dbi: MIPI DBI 结构体
+ * mipi_dbi_hw_reset - Hardware reset of controller
+ * @dbi: MIPI DBI structure
  *
- * 如果设置了 &mipi_dbi->reset GPIO，则对控制器执行硬件复位。
- * 复位时序：
- *   1. 将复位引脚拉低至少 20us
- *   2. 将复位引脚拉高
- *   3. 等待 120ms 让控制器完成启动
+ * Reset controller if the &mipi_dbi->reset gpio is set.
  */
 void mipi_dbi_hw_reset(struct mipi_dbi *dbi)
 {
@@ -640,18 +585,16 @@ void mipi_dbi_hw_reset(struct mipi_dbi *dbi)
 EXPORT_SYMBOL(mipi_dbi_hw_reset);
 
 /**
- * mipi_dbi_display_is_on - 检查显示器是否已开启
- * @dbi: MIPI DBI 结构体
+ * mipi_dbi_display_is_on - Check if display is on
+ * @dbi: MIPI DBI structure
  *
- * 该函数读取电源模式寄存器（如果可读）来检查显示输出是否已开启。
- * 这可以用来判断引导加载程序是否已开启了显示器，从而避免在启用
- * 显示管道时出现闪烁。
+ * This function checks the Power Mode register (if readable) to see if
+ * display output is turned on. This can be used to see if the bootloader
+ * has already turned on the display avoiding flicker when the pipeline is
+ * enabled.
  *
- * 如果显示器已被引导加载程序初始化并开启，驱动程序可以跳过复位
- * 和初始化序列，直接接管显示输出，实现无闪烁切换。
- *
- * 返回：
- * 如果可以确认显示器已开启则返回 true，否则返回 false。
+ * Returns:
+ * true if the display can be verified to be on, false otherwise.
  */
 bool mipi_dbi_display_is_on(struct mipi_dbi *dbi)
 {
@@ -725,17 +668,14 @@ static int mipi_dbi_poweron_reset_conditional(struct mipi_dbi_dev *dbidev, bool 
 }
 
 /**
- * mipi_dbi_poweron_reset - MIPI DBI 上电和复位
- * @dbidev: MIPI DBI 设备结构体
+ * mipi_dbi_poweron_reset - MIPI DBI poweron and reset
+ * @dbidev: MIPI DBI device structure
  *
- * 该函数执行完整的显示控制器上电和复位流程：
- *   1. 使能稳压器（如果使用）
- *   2. 使能 I/O 稳压器（如果使用）
- *   3. 执行硬件复位（通过 GPIO）
- *   4. 发送软件复位命令（DCS 软复位）
+ * This function enables the regulator if used and does a hardware and software
+ * reset.
  *
- * 返回：
- * 成功返回零，失败返回负错误码。
+ * Returns:
+ * Zero on success, or a negative error code.
  */
 int mipi_dbi_poweron_reset(struct mipi_dbi_dev *dbidev)
 {
@@ -744,16 +684,16 @@ int mipi_dbi_poweron_reset(struct mipi_dbi_dev *dbidev)
 EXPORT_SYMBOL(mipi_dbi_poweron_reset);
 
 /**
- * mipi_dbi_poweron_conditional_reset - MIPI DBI 上电和条件复位
- * @dbidev: MIPI DBI 设备结构体
+ * mipi_dbi_poweron_conditional_reset - MIPI DBI poweron and conditional reset
+ * @dbidev: MIPI DBI device structure
  *
- * 该函数使能稳压器，然后根据显示器当前状态决定是否执行复位：
- *   - 如果显示器已开启（由引导加载程序初始化），则跳过复位，
- *     实现无闪烁启动
- *   - 如果显示器未开启，执行完整的硬件和软件复位
+ * This function enables the regulator if used and if the display is off, it
+ * does a hardware and software reset. If mipi_dbi_display_is_on() determines
+ * that the display is on, no reset is performed.
  *
- * 返回：
- * 控制器被复位时返回 0，显示器已开启时返回 1，失败时返回负错误码。
+ * Returns:
+ * Zero if the controller was reset, 1 if the display was already on, or a
+ * negative error code.
  */
 int mipi_dbi_poweron_conditional_reset(struct mipi_dbi_dev *dbidev)
 {
@@ -764,18 +704,13 @@ EXPORT_SYMBOL(mipi_dbi_poweron_conditional_reset);
 #if IS_ENABLED(CONFIG_SPI)
 
 /**
- * mipi_dbi_spi_cmd_max_speed - 获取最大 SPI 总线速度
- * @spi: SPI 设备
- * @len: 传输缓冲区长度
+ * mipi_dbi_spi_cmd_max_speed - get the maximum SPI bus speed
+ * @spi: SPI device
+ * @len: The transfer buffer length.
  *
- * 许多控制器标称最大速度为 10MHz，但实际上可以运行在更高的速度。
- * 为了提高可靠性，像素数据以最大速度传输，而命令和配置数据以
- * 10MHz 传输，防止传输异常影响初始化设置。
- *
- * 返回：
- * 如果传输长度超过 64 字节（通常为像素数据），返回 0 表示使用
- * SPI 控制器的默认速度。否则返回 10MHz 和控制器最大速度中的
- * 较小值。
+ * Many controllers have a max speed of 10MHz, but can be pushed way beyond
+ * that. Increase reliability by running pixel data at max speed and the rest
+ * at 10MHz, preventing transfer glitches from messing up the init settings.
  */
 u32 mipi_dbi_spi_cmd_max_speed(struct spi_device *spi, size_t len)
 {
@@ -1162,37 +1097,38 @@ static int mipi_dbi_typec3_command(struct mipi_dbi *dbi, u8 *cmd,
 }
 
 /**
- * mipi_dbi_spi_init - 初始化 MIPI DBI SPI 接口
- * @spi: SPI 设备
- * @dbi: 要初始化的 MIPI DBI 结构体
- * @dc: D/C GPIO（可选）
+ * mipi_dbi_spi_init - Initialize MIPI DBI SPI interface
+ * @spi: SPI device
+ * @dbi: MIPI DBI structure to initialize
+ * @dc: D/C gpio (optional)
  *
- * 初始化 MIPI DBI 的 SPI 接口。该函数设置 &mipi_dbi->command 回调，
- * 并启用常用读取命令的 &mipi_dbi->read_commands。之后应调用
- * mipi_dbi_dev_init() 或驱动特定的初始化函数。
+ * This function sets &mipi_dbi->command, enables &mipi_dbi->read_commands for the
+ * usual read commands. It should be followed by a call to mipi_dbi_dev_init() or
+ * a driver-specific init.
  *
- * 接口类型选择：
- *   - 如果设置了 @dc GPIO，则使用 Type C Option 3（D/C 为独立引脚）
- *   - 如果未设置 @dc，则使用 Type C Option 1（D/C 作为第9位）
+ * If @dc is set, a Type C Option 3 interface is assumed, if not
+ * Type C Option 1.
  *
- * 字节序处理：
- * MIPI DBI 串行接口是大端（big endian）的，而帧缓冲区在内存中
- * 存储为小端（little endian）格式（%DRM_FORMAT_BIG_ENDIAN 不支持）。
+ * If the command is %MIPI_DCS_WRITE_MEMORY_START and the pixel format is RGB565, endianness has
+ * to be taken into account. The MIPI DBI serial interface is big endian and framebuffers are
+ * assumed stored in memory as little endian (%DRM_FORMAT_BIG_ENDIAN is not supported).
  *
- *   Option 1（D/C 作为位）：缓冲区逐字节发送，16位缓冲区在传输前
- *                         需要字节交换。
- *   Option 3（D/C 作为 GPIO）：如果 SPI 控制器支持 16 位每字，则
- *                           缓冲区可直接发送。否则调用者需要自行
- *                           在调用 mipi_dbi_command_buf() 之前交换
- *                           字节，并以 8 bpw 发送。
+ * This is how endianness is handled:
  *
- * 端序处理针对 %DRM_FORMAT_RGB565 帧缓冲区进行了优化。
+ * Option 1 (D/C as a bit): The buffer is sent on the wire byte by byte so the 16-bit buffer is
+ *                          byteswapped before transfer.
  *
- * 如果接口为 Option 1 且 SPI 控制器不支持 9 位每字，缓冲区将以
- * 9 个 8 位字的形式发送，必要时用 MIPI DCS no-op 命令填充。
+ * Option 3 (D/C as a gpio): If the SPI controller supports 16 bits per word the buffer can be
+ *                           sent as-is. If not the caller is responsible for swapping the bytes
+ *                           before calling mipi_dbi_command_buf() and the buffer is sent 8 bpw.
  *
- * 返回：
- * 成功返回零，失败返回负错误码。
+ * This handling is optimised for %DRM_FORMAT_RGB565 framebuffers.
+ *
+ * If the interface is Option 1 and the SPI controller doesn't support 9 bits per word,
+ * the buffer is sent as 9x 8-bit words, padded with MIPI DCS no-op commands if necessary.
+ *
+ * Returns:
+ * Zero on success, negative error code on failure.
  */
 int mipi_dbi_spi_init(struct spi_device *spi, struct mipi_dbi *dbi,
 		      struct gpio_desc *dc)
@@ -1246,23 +1182,19 @@ int mipi_dbi_spi_init(struct spi_device *spi, struct mipi_dbi *dbi,
 EXPORT_SYMBOL(mipi_dbi_spi_init);
 
 /**
- * mipi_dbi_spi_transfer - SPI 传输辅助函数
- * @spi: SPI 设备
- * @speed_hz: 速度覆盖值（可选，0 表示使用默认值）
- * @bpw: 每字位数
- * @buf: 要传输的缓冲区
- * @len: 缓冲区长度
+ * mipi_dbi_spi_transfer - SPI transfer helper
+ * @spi: SPI device
+ * @speed_hz: Override speed (optional)
+ * @bpw: Bits per word
+ * @buf: Buffer to transfer
+ * @len: Buffer length
  *
- * 此 SPI 传输辅助函数将 @buf 的传输分割为 SPI 控制器驱动可以
- * 处理的块大小。调用此函数前必须先锁定 SPI 总线。
+ * This SPI transfer helper breaks up the transfer of @buf into chunks which
+ * the SPI controller driver can handle. The SPI bus must be locked when
+ * calling this.
  *
- * 注意：
- *   - 根据 SPI 验证规则，传输长度必须对齐到字大小（w_size），
- *     因此最大块大小会向下对齐到 2 的倍数
- *   - 该函数通过循环逐个发送数据块，直到所有数据都传输完毕
- *
- * 返回：
- * 成功返回零，失败返回负错误码。
+ * Returns:
+ * Zero on success, negative error code on failure.
  */
 int mipi_dbi_spi_transfer(struct spi_device *spi, u32 speed_hz,
 			  u8 bpw, const void *buf, size_t len)
@@ -1427,18 +1359,13 @@ static const struct file_operations mipi_dbi_debugfs_command_fops = {
 };
 
 /**
- * mipi_dbi_debugfs_init - 创建 debugfs 条目
+ * mipi_dbi_debugfs_init - Create debugfs entries
  * @minor: DRM minor
  *
- * 该函数创建一个名为 'command' 的 debugfs 文件，用于向控制器发送
- * 命令或读取命令的返回值。这个调试接口对于开发阶段的显示控制器
- * 调试非常有用，可以直接通过文件系统与硬件交互。
+ * This function creates a 'command' debugfs file for sending commands to the
+ * controller or getting the read command values.
+ * Drivers can use this as their &drm_driver->debugfs_init callback.
  *
- * 写操作：向该文件写入十六进制值可以发送 DCS 命令和参数
- * 读操作：读取该文件会遍历所有可读命令并返回它们的当前值
- *
- * 如果控制器不支持读取命令，则文件只有写权限。
- * 驱动可以使用此函数作为 &drm_driver->debugfs_init 回调。
  */
 void mipi_dbi_debugfs_init(struct drm_minor *minor)
 {

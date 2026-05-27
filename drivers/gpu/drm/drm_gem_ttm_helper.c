@@ -1,22 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-/*
- * 中文注释: DRM GEM TTM 辅助函数 (GEM TTM Helper)
- *
- * 本文件实现了基于 TTM (Translation Table Maps) 的 GEM 缓冲区对象
- * 辅助函数。TTM 是 DRM 子系统中的通用内存管理框架, 支持多种内存
- * 类型 (系统内存、TT 页表内存、VRAM 视频内存等) 和对象迁移。
- *
- * 提供的功能:
- *   - drm_gem_ttm_print_info: 打印 TTM 缓冲区对象信息 (用于 debugfs)
- *   - drm_gem_ttm_vmap / vunmap: TTM 缓冲区对象的内核态映射管理
- *   - drm_gem_ttm_mmap: TTM 缓冲区对象的用户态映射 (mmap)
- *   - drm_gem_ttm_dumb_map_offset: Dumb 缓冲区的偏移量查询
- *
- * 这些函数通常被用作 drm_gem_object_funcs 中的回调函数, 是 TTM 驱动
- * 实现标准 GEM 接口的通用构建块。
- */
-
 #include <linux/export.h>
 #include <linux/module.h>
 
@@ -33,12 +16,6 @@
  */
 
 /**
- * 中文注释: 打印 TTM 缓冲区对象信息 (用于 debugfs)
- * 输出 TTM 缓冲区对象的放置位置 (placement) 信息, 包括内存类型
- * (system/tt/vram/priv) 和缓存属性 (cached/uncached/wc) 等。
- * 如果缓冲区有总线偏移 (bus.offset), 也会一并输出。
- * 可用作 drm_gem_object_funcs.print_info 回调函数。
- *
  * drm_gem_ttm_print_info() - Print &ttm_buffer_object info for debugfs
  * @p: DRM printer
  * @indent: Tab indentation level
@@ -77,11 +54,6 @@ void drm_gem_ttm_print_info(struct drm_printer *p, unsigned int indent,
 EXPORT_SYMBOL(drm_gem_ttm_print_info);
 
 /**
- * 中文注释: 映射 TTM 缓冲区对象到内核地址空间
- * 通过 ttm_bo_vmap() 将 GEM/TTM 缓冲区映射到内核地址空间。
- * 映射结果通过 struct iosys_map 返回, 该结构可以表示系统内存
- * 或 I/O 内存的虚拟地址。可用作 drm_gem_object_funcs.vmap 回调。
- *
  * drm_gem_ttm_vmap() - vmap &ttm_buffer_object
  * @gem: GEM object.
  * @map: [out] returns the dma-buf mapping.
@@ -102,10 +74,6 @@ int drm_gem_ttm_vmap(struct drm_gem_object *gem,
 EXPORT_SYMBOL(drm_gem_ttm_vmap);
 
 /**
- * 中文注释: 取消映射 TTM 缓冲区对象
- * 通过 ttm_bo_vunmap() 取消之前通过 drm_gem_ttm_vmap() 建立的内核
- * 映射。可用作 drm_gem_object_funcs.vunmap 回调。
- *
  * drm_gem_ttm_vunmap() - vunmap &ttm_buffer_object
  * @gem: GEM object.
  * @map: dma-buf mapping.
@@ -123,11 +91,6 @@ void drm_gem_ttm_vunmap(struct drm_gem_object *gem,
 EXPORT_SYMBOL(drm_gem_ttm_vunmap);
 
 /**
- * 中文注释: 映射 TTM 缓冲区对象到用户地址空间 (mmap)
- * 通过 ttm_bo_mmap_obj() 将 TTM 缓冲区对象映射到用户空间。
- * TTM 拥有自己的对象引用计数, 因此需要在映射后释放 GEM 引用,
- * 避免双重计数。可用作 drm_gem_object_funcs.mmap 回调。
- *
  * drm_gem_ttm_mmap() - mmap &ttm_buffer_object
  * @gem: GEM object.
  * @vma: vm area.
@@ -156,11 +119,6 @@ int drm_gem_ttm_mmap(struct drm_gem_object *gem,
 EXPORT_SYMBOL(drm_gem_ttm_mmap);
 
 /**
- * 中文注释: 实现 TTM 驱动的 dumb_map_offset 回调
- * 通过 GEM 句柄查找对象, 并返回其 VMA 偏移节点地址 (即用户空间
- * mmap 时使用的偏移量)。TTM 在内部管理这些偏移量的分配。
- * 适用于基于 TTM 的 GEM 驱动程序实现 dumb 缓冲区的偏移查询。
- *
  * drm_gem_ttm_dumb_map_offset() - Implements struct &drm_driver.dumb_map_offset
  * @file:	DRM file pointer.
  * @dev:	DRM device.

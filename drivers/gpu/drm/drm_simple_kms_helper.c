@@ -3,25 +3,6 @@
  * Copyright (C) 2016 Noralf Trønnes
  */
 
-/*
- * DRM 简单显示管线（Simple Display Pipeline）辅助函数
- *
- * 本文件为简单显示硬件提供了一个精简的 KMS 驱动框架。对于不需要复杂
- * 多 CRTC、多平面或高级特性的简单显示控制器（如嵌入式系统的显示控制器、
- * 简单的 USB 显示适配器等），可以使用此框架快速实现 KMS 驱动。
- *
- * 该框架通过 struct drm_simple_display_pipe 将 CRTC、主平面（primary plane）
- * 和编码器（encoder）组合成一个单一的数据结构，简化了管线的初始化和操作。
- *
- * 主要功能：
- *   - drm_simple_display_pipe_init：初始化简单显示管线
- *   - drm_simple_encoder_init：初始化简单编码器
- *   - drm_simple_display_pipe_attach_bridge：附加桥接器
- *
- * 驱动通过实现 &drm_simple_display_pipe_funcs 回调来提供硬件特定的操作，
- * 如 enable/disable/update/check 等。
- */
-
 #include <linux/export.h>
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -39,18 +20,6 @@ static const struct drm_encoder_funcs drm_simple_encoder_funcs_cleanup = {
 	.destroy = drm_encoder_cleanup,
 };
 
-/**
- * drm_simple_encoder_init - 初始化简单编码器
- * @dev: DRM 设备
- * @encoder: 要初始化的编码器
- * @encoder_type: 编码器类型（如 DRM_MODE_ENCODER_NONE）
- *
- * 初始化一个简化版的编码器，使用默认的清理函数 drm_encoder_cleanup。
- * 这是 drm_simple_display_pipe 框架的一部分，适用于简单显示管线。
- *
- * 返回值：
- * 成功返回 0，失败返回负的错误码。
- */
 int drm_simple_encoder_init(struct drm_device *dev,
 			    struct drm_encoder *encoder,
 			    int encoder_type)
@@ -356,18 +325,6 @@ static const struct drm_plane_funcs drm_simple_kms_plane_funcs = {
 	.format_mod_supported   = drm_simple_kms_format_mod_supported,
 };
 
-/**
- * drm_simple_display_pipe_attach_bridge - 为简单显示管线附加桥接器
- * @pipe: 简单显示管线
- * @bridge: 要附加的桥接器
- *
- * 将一个 DRM 桥接器（bridge）附加到简单显示管线的编码器上。
- * 桥接器用于连接编码器与连接器之间的外部显示芯片（如 HDMI 转换器、
- * LVDS 发送器等）。
- *
- * 返回值：
- * 成功返回 0，失败返回负的错误码。
- */
 int drm_simple_display_pipe_attach_bridge(struct drm_simple_display_pipe *pipe,
 					  struct drm_bridge *bridge)
 {
@@ -375,33 +332,12 @@ int drm_simple_display_pipe_attach_bridge(struct drm_simple_display_pipe *pipe,
 }
 EXPORT_SYMBOL(drm_simple_display_pipe_attach_bridge);
 
-/**
- * drm_simple_display_pipe_init - 初始化简单显示管线
- * @dev: DRM 设备
- * @pipe: 简单显示管线
- * @funcs: 显示管线操作函数（可选）
- * @formats: 支持的像素格式列表
- * @format_count: 格式数量
- * @format_modifiers: 格式修饰符列表（可选）
- * @connector: 连接器（可选，可以为 NULL）
- *
- * 初始化一个包含 CRTC、主平面和编码器的简单显示管线。此函数会：
- *   1. 初始化主平面（primary plane）并注册到 DRM 核心
- *   2. 初始化 CRTC 并注册到 DRM 核心
- *   3. 初始化编码器（encoder）
- *   4. 如果提供了连接器，将编码器连接到连接器
- *
- * 适用于嵌入式系统和简单显示控制器的驱动开发。
- *
- * 返回值：
- * 成功返回 0，失败返回负的错误码。
- */
 int drm_simple_display_pipe_init(struct drm_device *dev,
-				 struct drm_simple_display_pipe *pipe,
-				 const struct drm_simple_display_pipe_funcs *funcs,
-				 const uint32_t *formats, unsigned int format_count,
-				 const uint64_t *format_modifiers,
-				 struct drm_connector *connector)
+			struct drm_simple_display_pipe *pipe,
+			const struct drm_simple_display_pipe_funcs *funcs,
+			const uint32_t *formats, unsigned int format_count,
+			const uint64_t *format_modifiers,
+			struct drm_connector *connector)
 {
 	struct drm_encoder *encoder = &pipe->encoder;
 	struct drm_plane *plane = &pipe->plane;

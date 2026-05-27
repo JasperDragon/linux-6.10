@@ -4,22 +4,6 @@
 /* YNL-GEN kernel source */
 /* To regenerate run: tools/net/ynl/ynl-regen.sh */
 
-/*
- * 文件名: drm_ras_nl.c
- *
- * 中文描述: RAS Generic Netlink 操作表与策略定义
- *
- * 本文件是 YNL-GEN（YAML Netlink Generator）工具自动生成的代码，
- * 源文件为 Documentation/netlink/specs/drm_ras.yaml。
- *
- * 文件定义了 drm_ras Generic Netlink 家族的操作列表和属性策略：
- *   1. DRM_RAS_CMD_LIST_NODES - 列出所有 RAS 节点（dump 操作）
- *   2. DRM_RAS_CMD_GET_ERROR_COUNTER - 获取错误计数器（支持 doit 和 dump 两种模式）
- *
- * 每个操作都关联了对应的 NLA（Netlink Attribute）策略定义，用于验证
- * 用户空间传入的属性类型和格式。
- */
-
 #include <net/netlink.h>
 #include <net/genetlink.h>
 

@@ -21,30 +21,6 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-/*
- * drm_panel.c -- 显示面板管理核心
- *
- * 本文件提供 DRM 显示面板的抽象层，允许面板驱动程序向中央注册表注册
- * 面板对象，显示控制器驱动可以通过查找机制获取对应面板。面板是最终
- * 显示输出的硬件设备（如 LCD 屏幕、OLED 屏幕等）。
- *
- * 核心职责包括：
- *   1. 面板生命周期管理：初始化、注册、注销、引用计数
- *   2. 电源序列管理：prepare（上电/解复位）、enable（打开显示）、
- *      disable（关闭显示）、unprepare（断电）
- *   3. 显示模式查询：通过 get_modes() 回调获取面板支持的显示模式
- *   4. 背光管理：通过设备树自动关联背光设备
- *   5. Panel Follower 机制：允许触摸屏等外设跟随面板的电源状态
- *
- * 关键 API：
- *   - drm_panel_init(): 面板初始化
- *   - drm_panel_add() / drm_panel_remove(): 面板注册/注销
- *   - drm_panel_prepare() / drm_panel_unprepare(): 面板电源开/关
- *   - drm_panel_enable() / drm_panel_disable(): 面板显示启用/禁用
- *   - drm_panel_get_modes(): 获取面板支持的显示模式
- *   - of_drm_find_panel(): 通过设备树节点查找面板
- */
-
 #include <linux/backlight.h>
 #include <linux/err.h>
 #include <linux/export.h>
@@ -67,14 +43,6 @@ static LIST_HEAD(panel_list);
  *
  * For easy integration into drivers using the &drm_bridge infrastructure please
  * take look at drm_panel_bridge_add() and devm_drm_panel_bridge_add().
- */
-
-/*
- * drm_panel_init -- 初始化面板结构体
- *
- * 初始化面板结构体以备后续通过 drm_panel_add() 注册。设置面板的
- * 父设备、操作函数指针和连接器类型。连接器类型必须有效（不能为
- * DRM_MODE_CONNECTOR_Unknown），否则会发出警告。
  */
 
 /**
@@ -102,14 +70,6 @@ void drm_panel_init(struct drm_panel *panel, struct device *dev,
 	panel->connector_type = connector_type;
 }
 EXPORT_SYMBOL(drm_panel_init);
-
-/*
- * drm_panel_add -- 将面板添加到全局注册表
- *
- * 将面板添加到全局面板列表，使显示驱动可以通过面板查找机制
- *（如 of_drm_find_panel()）获取该面板的引用。面板必须已经通过
- * drm_panel_init() 初始化。
- */
 
 /**
  * drm_panel_add - add a panel to the global registry
@@ -140,16 +100,6 @@ void drm_panel_remove(struct drm_panel *panel)
 	mutex_unlock(&panel_lock);
 }
 EXPORT_SYMBOL(drm_panel_remove);
-
-/*
- * drm_panel_prepare -- 面板上电（开启电源）
- *
- * 开启面板电源并解除复位信号，使面板进入可通信状态。该操作后，
- * 可以通过命令总线与面板的集成电路通信。该函数不可失败（在
- * pre_enable 回调链中调用）。之后必定会调用 drm_panel_disable()。
- *
- * 该函数还会通知所有注册的 panel follower（如触摸屏）面板已准备就绪。
- */
 
 /**
  * drm_panel_prepare - power on a panel
@@ -197,16 +147,6 @@ exit:
 	mutex_unlock(&panel->follower_lock);
 }
 EXPORT_SYMBOL(drm_panel_prepare);
-
-/*
- * drm_panel_unprepare -- 面板断电（关闭电源）
- *
- * 完全关闭面板电源：复位面板、关闭电源供应等。该函数调用后，
- * 通常无法再与面板通信，直到下次调用 drm_panel_prepare()。
- *
- * 该函数会先通知所有 panel follower 面板即将断电，再执行面板的
- * unprepare 回调。
- */
 
 /**
  * drm_panel_unprepare - power off a panel
@@ -263,15 +203,6 @@ exit:
 }
 EXPORT_SYMBOL(drm_panel_unprepare);
 
-/*
- * drm_panel_enable -- 启用面板显示
- *
- * 打开面板显示驱动并启用背光，使内容在屏幕上可见。该函数不可失败
- *（在 enable 回调链中调用）。之后必定会调用 drm_panel_disable()。
- *
- * 操作顺序：面板 enable 回调 -> 启用背光 -> 通知 follower 面板已启用。
- */
-
 /**
  * drm_panel_enable - enable a panel
  * @panel: DRM panel
@@ -323,14 +254,6 @@ exit:
 	mutex_unlock(&panel->follower_lock);
 }
 EXPORT_SYMBOL(drm_panel_enable);
-
-/*
- * drm_panel_disable -- 禁用面板显示
- *
- * 关闭面板背光或禁用显示驱动。对于智能面板（smart panel），此操作后
- * 仍应能通过命令总线与面板通信（与 unprepare 的区别）。该函数会先
- * 通知 follower 面板即将禁用，再关闭背光，最后执行面板 disable 回调。
- */
 
 /**
  * drm_panel_disable - disable a panel
@@ -390,16 +313,6 @@ exit:
 	mutex_unlock(&panel->follower_lock);
 }
 EXPORT_SYMBOL(drm_panel_disable);
-
-/*
- * drm_panel_get_modes -- 探测面板支持的显示模式
- *
- * 从面板获取支持的显示模式，并自动将这些模式添加到面板所连接的
- * 连接器中。驱动通过 panel->funcs->get_modes 回调来实现具体的
- * 模式探测逻辑（通常从 EDID 或设备树读取）。
- *
- * 返回值：成功返回可用模式数量，失败（无可用模式）返回 0。
- */
 
 /**
  * drm_panel_get_modes - probe the available display modes of a panel

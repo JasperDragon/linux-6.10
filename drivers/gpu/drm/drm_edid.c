@@ -28,62 +28,6 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-/*
- * DRM EDID 解析与管理 - 实现显示识别数据（EDID）的读取、解析和管理
- *
- * 本文件是 DRM 框架中最大的源文件之一（约 7600+ 行），实现了完整的
- * EDID（Extended Display Identification Data，扩展显示识别数据）处理
- * 功能。EDID 是显示器等显示设备通过 DDC（Display Data Channel）通道
- * 提供的描述数据块，包含显示器的分辨率支持、色彩特性、音频能力、
- * 物理尺寸、制造信息等详细参数。
- *
- * 核心功能模块：
- *
- *   1. EDID 读取：
- *      - drm_get_edid() / drm_edid_read_ddc() - 通过 DDC/I2C 读取 EDID
- *      - drm_edid_read_custom() - 使用自定义读取函数的 EDID 读取
- *      - drm_edid_read_base_block() - 仅读取 EDID 基础块
- *      - drm_probe_ddc() - 探测 DDC 总线是否存在
- *
- *   2. EDID 验证：
- *      - drm_edid_header_is_valid() - 检查 EDID 头部（8 字节固定标识）
- *      - drm_edid_is_valid() / drm_edid_valid() - 完整 EDID 校验和验证
- *
- *   3. EDID 解析 - 显示器信息：
- *      - drm_edid_get_monitor_name() - 提取显示器名称
- *      - drm_edid_get_panel_id() - 提取面板 ID
- *      - drm_edid_get_product_id() - 提取产品标识信息
- *      - drm_edid_has_quirk() - 检查 EDID 已知问题修正标志
- *
- *   4. EDID 解析 - 显示模式：
- *      - drm_add_edid_modes() - 从 EDID 添加所有支持的显示模式
- *      - drm_mode_find_dmt() - 在 DMT 模式表中查找标准模式
- *      - drm_match_cea_mode() - 匹配 CEA 标准时序
- *      - drm_display_mode_from_cea_vic() - 从 CEA VIC 创建显示模式
- *
- *   5. EDID 解析 - 音频与 HDMI：
- *      - drm_edid_to_sad() - 解析短音频描述符
- *      - drm_edid_to_speaker_allocation() - 解析扬声器配置
- *      - drm_detect_hdmi_monitor() - 检测是否为 HDMI 监视器
- *      - drm_detect_monitor_audio() - 检测显示器是否支持音频
- *      - drm_hdmi_avi_infoframe_from_display_mode() - 生成 AVI InfoFrame
- *
- *   6. EDID 管理：
- *      - drm_edid_alloc() / drm_edid_free() / drm_edid_dup() - EDID 内存管理
- *      - drm_edid_override_connector_update() - 应用 EDID 覆盖
- *      - drm_connector_update_edid_property() - 更新连接器 EDID 属性
- *      - drm_edid_connector_update() - 使用 EDID 更新连接器信息
- *
- *   7. EDID 已知问题修正（Quirks）：
- *      针对实际硬件中存在的各种 EDID 缺陷提供修正，包括时序修正、
- *      色彩深度修正、非桌面显示设备检测等。
- *
- * 参考标准：
- *   - EDID: VESA Enhanced Extended Display Identification Data Standard
- *   - CEA-861: 消费电子协会数字视频接口标准
- *   - DisplayID: VESA Display Identification Data Standard
- */
-
 #include <linux/bitfield.h>
 #include <linux/byteorder/generic.h>
 #include <linux/cec.h>
@@ -1853,15 +1797,6 @@ static void edid_header_fix(void *edid)
 	memcpy(edid, edid_header, sizeof(edid_header));
 }
 
-/*
- * drm_edid_header_is_valid - 检查 EDID 基础块的头部是否有效
- * @_edid: 指向原始 EDID 基础块的指针
- *
- * 检查 EDID 的 8 字节头部标识（固定值 00 FF FF FF FF FF FF 00）。
- * 返回一个分数表示头部完整性，8 分表示完全匹配，0 分表示完全错误。
- *
- * 返回：8（头部完美）到 0（完全错误）之间的分数。
- */
 /**
  * drm_edid_header_is_valid - sanity check the header of the base EDID block
  * @_edid: pointer to raw base EDID block
@@ -2119,15 +2054,6 @@ static bool drm_edid_block_valid(void *_block, int block_num, bool print_bad_edi
 	return valid;
 }
 
-/*
- * drm_edid_is_valid - 检查完整的 EDID 数据是否有效（包括扩展块）
- * @edid: EDID 数据指针
- *
- * 验证整个 EDID 记录，包括基础块和所有扩展块。对每个块进行
- * 头部检查和校验和验证。用于需要确保 EDID 数据完全有效的场景。
- *
- * 返回：如果 EDID 数据有效返回 true，否则返回 false。
- */
 /**
  * drm_edid_is_valid - sanity check EDID data
  * @edid: EDID data
@@ -2154,15 +2080,6 @@ bool drm_edid_is_valid(struct edid *edid)
 }
 EXPORT_SYMBOL(drm_edid_is_valid);
 
-/*
- * drm_edid_valid - 检查 drm_edid 容器的有效性
- * @drm_edid: EDID 容器数据结构
- *
- * 验证 drm_edid 容器中的数据。交叉检查块计数与分配大小是否匹配，
- * 并对所有块进行校验和验证。这是使用 drm_edid 容器时的推荐验证方法。
- *
- * 返回：如果 EDID 数据有效返回 true，否则返回 false。
- */
 /**
  * drm_edid_valid - sanity check EDID data
  * @drm_edid: EDID data
@@ -2402,16 +2319,6 @@ int drm_edid_override_reset(struct drm_connector *connector)
 	return 0;
 }
 
-/*
- * drm_edid_override_connector_update - 从覆盖/固件 EDID 添加显示模式
- * @connector: 正在探测的连接器
- *
- * 如果存在覆盖或固件 EDID，从中添加显示模式。仅用作回退方案，
- * 当 drm_helper_probe_single_connector_modes() 在 drm_get_edid() 期间
- * DDC 探测失败，导致覆盖/固件 EDID 被跳过时使用。
- *
- * 返回：添加的模式数量，如果未找到则返回 0。
- */
 /**
  * drm_edid_override_connector_update - add modes from override/firmware EDID
  * @connector: connector we're probing
@@ -2585,16 +2492,6 @@ fail:
 	return NULL;
 }
 
-/*
- * drm_edid_raw - 获取原始 EDID 数据的指针
- * @drm_edid: drm_edid 容器
- *
- * 从 drm_edid 容器中获取原始 EDID 数据的指针。
- * 此函数仅用于过渡迁移，应避免使用。新的代码应直接使用
- * drm_edid 容器提供的封装函数。
- *
- * 返回：指向原始 EDID 数据的指针，失败时返回 NULL。
- */
 /**
  * drm_edid_raw - Get a pointer to the raw EDID data.
  * @drm_edid: drm_edid container
@@ -2638,19 +2535,6 @@ static const struct drm_edid *_drm_edid_alloc(const void *edid, size_t size)
 	return drm_edid;
 }
 
-/*
- * drm_edid_alloc - 分配新的 drm_edid 容器
- * @edid: 指向原始 EDID 数据的指针
- * @size: 为 EDID 分配的内存大小
- *
- * 分配并初始化一个新的 drm_edid 容器。内部会复制 EDID 数据，
- * 因此调用者可以释放原始数据。不要从 EDID 自身计算大小，
- * 必须通过 @size 参数传递实际分配大小。
- *
- * 返回的指针必须使用 drm_edid_free() 释放。
- *
- * 返回：指向新 drm_edid 容器的指针，失败时返回 NULL。
- */
 /**
  * drm_edid_alloc - Allocate a new drm_edid container
  * @edid: Pointer to raw EDID data
@@ -2684,15 +2568,6 @@ const struct drm_edid *drm_edid_alloc(const void *edid, size_t size)
 }
 EXPORT_SYMBOL(drm_edid_alloc);
 
-/*
- * drm_edid_dup - 复制 drm_edid 容器
- * @drm_edid: 要复制的 EDID
- *
- * 创建 drm_edid 容器的完整副本，包括内部 EDID 数据的深拷贝。
- * 返回的指针必须使用 drm_edid_free() 释放。
- *
- * 返回：drm_edid 容器的副本，失败时返回 NULL。
- */
 /**
  * drm_edid_dup - Duplicate a drm_edid container
  * @drm_edid: EDID to duplicate
@@ -2710,13 +2585,6 @@ const struct drm_edid *drm_edid_dup(const struct drm_edid *drm_edid)
 }
 EXPORT_SYMBOL(drm_edid_dup);
 
-/*
- * drm_edid_free - 释放 drm_edid 容器
- * @drm_edid: 要释放的 EDID
- *
- * 释放由 drm_edid_alloc() 或 drm_edid_dup() 分配的 drm_edid 容器，
- * 包括其内部的 EDID 数据。如果传入 NULL，此函数无操作。
- */
 /**
  * drm_edid_free - Free the drm_edid container
  * @drm_edid: EDID to free
@@ -2731,15 +2599,6 @@ void drm_edid_free(const struct drm_edid *drm_edid)
 }
 EXPORT_SYMBOL(drm_edid_free);
 
-/*
- * drm_probe_ddc - 探测 DDC 总线是否存在
- * @adapter: 要探测的 I2C 适配器
- *
- * 通过尝试从 DDC 地址读取一个字节来检测显示器是否连接。
- * 常用于在尝试完整读取 EDID 之前快速检测显示设备的存在。
- *
- * 返回：如果 DDC 响应返回 true，否则返回 false。
- */
 /**
  * drm_probe_ddc() - probe DDC presence
  * @adapter: I2C adapter to probe
@@ -2755,17 +2614,6 @@ drm_probe_ddc(struct i2c_adapter *adapter)
 }
 EXPORT_SYMBOL(drm_probe_ddc);
 
-/*
- * drm_get_edid - 获取 EDID 数据（传统接口）
- * @connector: 正在探测的连接器
- * @adapter: 用于 DDC 的 I2C 适配器
- *
- * 通过指定的 I2C 通道读取 EDID 数据。如果成功，将 EDID 附加到
- * 连接器的 edid 属性中。这是传统的 EDID 读取接口，新的代码应
- * 优先使用 drm_edid_read() 或 drm_edid_read_ddc()。
- *
- * 返回：指向有效 EDID 的指针，如果未找到则返回 NULL。
- */
 /**
  * drm_get_edid - get EDID data, if available
  * @connector: connector we're probing
@@ -2793,26 +2641,6 @@ struct edid *drm_get_edid(struct drm_connector *connector,
 }
 EXPORT_SYMBOL(drm_get_edid);
 
-/*
- * drm_edid_read_custom - 使用自定义块读取函数读取 EDID 数据
- * @connector: 要使用的连接器
- * @read_block: EDID 块读取函数
- * @context: 传递给块读取函数的私有数据
- *
- * 当 DDC 总线连接的 I2C 适配器隐藏在一个提供不同接口的设备后面时，
- * 可以使用此函数通过自定义块读取函数获取 EDID 数据。
- *
- * 注意：在一般情况下，内核可以在 I2C 级别访问 DDC 总线，驱动应尽
- * 合理努力将其暴露为 I2C 适配器，并使用 drm_edid_read() 或
- * drm_edid_read_ddc() 而不是滥用此函数。
- *
- * EDID 可以被 debugfs override_edid 或固件 EDID 覆盖（优先级从高到低）。
- * 存在任一覆盖时，将跳过实际的 EDID 读取。
- *
- * 返回的指针必须使用 drm_edid_free() 释放。
- *
- * 返回：指向 EDID 的指针，如果探测/读取失败则返回 NULL。
- */
 /**
  * drm_edid_read_custom - Read EDID data using given EDID block read function
  * @connector: Connector to use
@@ -2859,19 +2687,6 @@ const struct drm_edid *drm_edid_read_custom(struct drm_connector *connector,
 }
 EXPORT_SYMBOL(drm_edid_read_custom);
 
-/*
- * drm_edid_read_ddc - 使用指定的 I2C 适配器读取 EDID 数据
- * @connector: 要使用的连接器
- * @adapter: 用于 DDC 的 I2C 适配器
- *
- * 通过指定的 I2C 适配器读取 EDID 数据。如果连接器强制关闭则跳过。
- * 优先使用 drm_connector_init_with_ddc() 初始化 connector->ddc
- * 并使用 drm_edid_read() 而不是直接调用此函数。
- *
- * 返回的指针必须使用 drm_edid_free() 释放。
- *
- * 返回：指向 EDID 的指针，如果探测/读取失败则返回 NULL。
- */
 /**
  * drm_edid_read_ddc - Read EDID data using given I2C adapter
  * @connector: Connector to use
@@ -2909,20 +2724,6 @@ const struct drm_edid *drm_edid_read_ddc(struct drm_connector *connector,
 }
 EXPORT_SYMBOL(drm_edid_read_ddc);
 
-/*
- * drm_edid_read - 通过连接器的 I2C 适配器读取 EDID 数据
- * @connector: 要使用的连接器
- *
- * 使用连接器预设的 DDC I2C 适配器读取 EDID 数据。
- * 要求在连接器初始化时通过 drm_connector_init_with_ddc() 设置 DDC。
- * 这是推荐使用的 EDID 读取接口。
- *
- * EDID 可以被 debugfs override_edid 或固件 EDID 覆盖。
- *
- * 返回的指针必须使用 drm_edid_free() 释放。
- *
- * 返回：指向 EDID 的指针，如果探测/读取失败则返回 NULL。
- */
 /**
  * drm_edid_read - Read EDID data using connector's I2C adapter
  * @connector: Connector to use
@@ -2946,14 +2747,6 @@ const struct drm_edid *drm_edid_read(struct drm_connector *connector)
 }
 EXPORT_SYMBOL(drm_edid_read);
 
-/*
- * drm_edid_get_product_id - 从 EDID 获取供应商和产品标识
- * @drm_edid: EDID 数据
- * @id: 输出参数，存放产品标识信息
- *
- * 从 EDID 基础块中提取制造商名称、产品代码和序列号等产品标识信息。
- * 如果 EDID 无效或大小不足，则将 id 清零。
- */
 /**
  * drm_edid_get_product_id - Get the vendor and product identification
  * @drm_edid: EDID
@@ -2982,15 +2775,6 @@ static void decode_date(struct seq_buf *s, const struct drm_edid_product_id *id)
 		seq_buf_printf(s, "week/year of manufacture: %d/%d", week, year);
 }
 
-/*
- * drm_edid_print_product_id - 打印解码后的产品标识信息
- * @p: DRM 打印机
- * @id: EDID 产品标识
- * @raw: 如果为 true，同时打印原始十六进制数据
- *
- * 将 EDID 中的产品标识信息解码为可读格式并输出，包括制造商名称、
- * 产品代码、序列号和生产日期。参考 VESA E-EDID 1.4 第 3.4 节。
- */
 /**
  * drm_edid_print_product_id - Print decoded product id to printer
  * @p: drm printer
@@ -3020,19 +2804,6 @@ void drm_edid_print_product_id(struct drm_printer *p,
 }
 EXPORT_SYMBOL(drm_edid_print_product_id);
 
-/*
- * drm_edid_get_panel_id - 从 EDID 获取面板 ID
- * @drm_edid: 包含面板 ID 的 EDID 数据
- *
- * 使用 EDID 的第一个数据块提取面板 ID。该 ID 是一个 32 位值
- * （16 位制造商 ID + 16 位制造商自定义 ID），每种面板型号应具有
- * 不同的 ID 值。常用于面板检测和匹配。
- *
- * 返回：32 位面板 ID，每种面板型号各不相同。
- *         如果 EDID 大小不足一个基础块则返回 0。
- *         参见 drm_edid_encode_panel_id() 和 drm_edid_decode_panel_id()
- *         了解 ID 结构的详细信息。
- */
 /**
  * drm_edid_get_panel_id - Get a panel's ID from EDID
  * @drm_edid: EDID that contains panel ID.
@@ -3073,25 +2844,6 @@ u32 drm_edid_get_panel_id(const struct drm_edid *drm_edid)
 }
 EXPORT_SYMBOL(drm_edid_get_panel_id);
 
-/*
- * drm_edid_read_base_block - 读取面板的 EDID 基础块
- * @adapter: 用于 DDC 的 I2C 适配器
- *
- * 返回包含面板 EDID 第一个块的 drm_edid 容器。
- *
- * 此函数用于可能存在多个面板的设备早期探测阶段。由于只在早期使用，
- * 它假定面板的 EDID 是正确的（至少基础块是正确的，不处理覆盖）。
- *
- * 注意：此函数与 drm_do_get_edid() 都会读取 EDID，但两者之间
- * 没有缓存。由于只读取第一个块，额外开销在可接受范围内。
- *
- * 警告：仅在连接器未知时使用此函数（例如面板早期探测期间）。
- * 读取的 EDID 是临时数据，应被后续完整 EDID 读取替换。
- *
- * 调用者应在使用后调用 drm_edid_free() 释放。
- *
- * 返回：指向包含 EDID 基础块的 drm_edid 指针，失败时返回 NULL。
- */
 /**
  * drm_edid_read_base_block - Get a panel's EDID base block
  * @adapter: I2C adapter to use for DDC
@@ -3140,16 +2892,15 @@ const struct drm_edid *drm_edid_read_base_block(struct i2c_adapter *adapter)
 EXPORT_SYMBOL(drm_edid_read_base_block);
 
 /**
- * drm_get_edid_switcheroo - 为双 GPU 切换输出获取 EDID 数据（传统接口）
- * @connector: 正在探测的连接器
- * @adapter: 用于 DDC 的 I2C 适配器
+ * drm_get_edid_switcheroo - get EDID data for a vga_switcheroo output
+ * @connector: connector we're probing
+ * @adapter: I2C adapter to use for DDC
  *
- * 针对使用同一组输出的双 GPU 笔记本电脑的 drm_get_edid() 封装。
- * 此封装添加了必要的 vga_switcheroo 调用，以临时将 DDC 切换
- * 到正在检索 EDID 的 GPU。这在可切换图形（Optimus/PowerXpress）
- * 系统中是必需的，因为 DDC 线路由其中一个 GPU 控制。
+ * Wrapper around drm_get_edid() for laptops with dual GPUs using one set of
+ * outputs. The wrapper adds the requisite vga_switcheroo calls to temporarily
+ * switch DDC to the GPU which is retrieving EDID.
  *
- * 返回：有效的 EDID 指针，如果未找到则返回 %NULL。
+ * Return: Pointer to valid EDID or %NULL if we couldn't find any.
  */
 struct edid *drm_get_edid_switcheroo(struct drm_connector *connector,
 				     struct i2c_adapter *adapter)
@@ -3170,18 +2921,15 @@ struct edid *drm_get_edid_switcheroo(struct drm_connector *connector,
 EXPORT_SYMBOL(drm_get_edid_switcheroo);
 
 /**
- * drm_edid_read_switcheroo - 为双 GPU 切换输出获取 EDID 数据（新接口）
- * @connector: 正在探测的连接器
- * @adapter: 用于 DDC 的 I2C 适配器
+ * drm_edid_read_switcheroo - get EDID data for a vga_switcheroo output
+ * @connector: connector we're probing
+ * @adapter: I2C adapter to use for DDC
  *
- * 针对使用同一组输出的双 GPU 笔记本电脑的 drm_edid_read_ddc() 封装。
- * 此封装添加了必要的 vga_switcheroo 调用，以临时将 DDC 切换
- * 到正在检索 EDID 的 GPU。
+ * Wrapper around drm_edid_read_ddc() for laptops with dual GPUs using one set
+ * of outputs. The wrapper adds the requisite vga_switcheroo calls to
+ * temporarily switch DDC to the GPU which is retrieving EDID.
  *
- * 与 drm_get_edid_switcheroo() 的区别在于此函数返回新的
- * drm_edid 容器，推荐在新代码中使用。
- *
- * 返回：有效的 EDID 指针，如果未找到则返回 %NULL。
+ * Return: Pointer to valid EDID or %NULL if we couldn't find any.
  */
 const struct drm_edid *drm_edid_read_switcheroo(struct drm_connector *connector,
 						struct i2c_adapter *adapter)
@@ -3202,13 +2950,10 @@ const struct drm_edid *drm_edid_read_switcheroo(struct drm_connector *connector,
 EXPORT_SYMBOL(drm_edid_read_switcheroo);
 
 /**
- * drm_edid_duplicate - 复制 EDID 及其扩展块
- * @edid: 要复制的 EDID
+ * drm_edid_duplicate - duplicate an EDID and the extensions
+ * @edid: EDID to duplicate
  *
- * 创建 EDID 数据（包括基础块和所有扩展块）的完整副本。
- * 使用 kmemdup() 分配内存并复制数据。
- *
- * 返回：复制后的 EDID 指针，分配失败时返回 NULL。
+ * Return: Pointer to duplicated EDID or NULL on allocation failure.
  */
 struct edid *drm_edid_duplicate(const struct edid *edid)
 {
@@ -3249,18 +2994,6 @@ static bool drm_edid_has_internal_quirk(struct drm_connector *connector,
 	return connector->display_info.quirks & BIT(quirk);
 }
 
-/*
- * drm_edid_has_quirk - 检查 EDID 是否具有指定的已知问题修正标志
- * @connector: 要检查的连接器
- * @quirk: 要检查的修正标志
- *
- * 不同的显示器在 EDID 数据中可能存在各种缺陷（如错误的时序参数、
- * 错误的物理尺寸、颜色深度报告不准确等）。此函数检查连接器是否
- * 被标记了指定的修正标志，驱动程序可以根据这些标志进行相应的
- * 补偿处理。
- *
- * 返回：如果存在该修正标志返回 true，否则返回 false。
- */
 bool drm_edid_has_quirk(struct drm_connector *connector, enum drm_edid_quirk quirk)
 {
 	return connector->display_info.quirks & BIT(quirk);
@@ -3324,19 +3057,16 @@ mode_is_rb(const struct drm_display_mode *mode)
 }
 
 /*
- * drm_mode_find_dmt - 在 DMT（显示器时序标准）模式表中查找并复制匹配的显示模式
- * @dev: DRM 设备，用于模式内存分配
- * @hsize: 水平分辨率（像素宽度）
- * @vsize: 垂直分辨率（像素高度）
- * @fresh: 刷新率（Hz）
- * @rb: 是否使用缩减消隐（Reduced Blanking）
+ * drm_mode_find_dmt - Create a copy of a mode if present in DMT
+ * @dev: Device to duplicate against
+ * @hsize: Mode width
+ * @vsize: Mode height
+ * @fresh: Mode refresh rate
+ * @rb: Mode reduced-blanking-ness
  *
- * 遍历 DMT（Display Monitor Timings）标准模式表，查找与指定参数
- * （分辨率、刷新率、消隐模式）完全匹配的显示模式。DMT 是 VESA 组织
- * 定义的显示器标准时序规范，涵盖了从 VGA 到超高清的多种标准分辨率。
+ * Walk the DMT mode list looking for a match for the given parameters.
  *
- * 返回：匹配模式的副本（通过 drm_mode_duplicate 分配），未找到时返回 NULL。
- *         调用者负责释放返回的模式对象。
+ * Return: A newly allocated copy of the mode, or NULL if not found.
  */
 struct drm_display_mode *drm_mode_find_dmt(struct drm_device *dev,
 					   int hsize, int vsize, int fresh,
@@ -4649,17 +4379,11 @@ static u8 drm_match_cea_mode_clock_tolerance(const struct drm_display_mode *to_m
 }
 
 /**
- * drm_match_cea_mode - 查找与给定显示模式匹配的 CEA 标准模式
- * @to_match: 要匹配的显示模式
+ * drm_match_cea_mode - look for a CEA mode matching given mode
+ * @to_match: display mode
  *
- * 在 CEA-861 标准模式表中查找与指定显示模式时序相匹配的条目。
- * CEA 模式表定义了消费电子领域常用的标准分辨率与刷新率组合，
- * 如 480p、720p、1080i、1080p、2160p（4K）等。
- *
- * 匹配时考虑时序参数（像素时钟、行/列数）和标志位，
- * 以及画面宽高比（如果已设置）。
- *
- * 返回：匹配模式的 CEA 视频 ID（VIC），如果未找到匹配则返回 0。
+ * Return: The CEA Video ID (VIC) of the mode or 0 if it isn't a CEA-861
+ * mode.
  */
 u8 drm_match_cea_mode(const struct drm_display_mode *to_match)
 {
@@ -4928,14 +4652,13 @@ static int do_y420vdb_modes(struct drm_connector *connector,
 }
 
 /**
- * drm_display_mode_from_cea_vic() - 根据 CEA VIC 创建对应的显示模式
- * @dev: DRM 设备
- * @video_code: CEA VIC（视频标识码）
+ * drm_display_mode_from_cea_vic() - return a mode for CEA VIC
+ * @dev: DRM device
+ * @video_code: CEA VIC of the mode
  *
- * 在 CEA-861 标准模式表中查找指定 VIC 对应的模式参数，
- * 并创建一个新的 drm_display_mode 对象。
+ * Creates a new mode matching the specified CEA VIC.
  *
- * 返回：成功返回新的 drm_display_mode 对象，失败返回 NULL
+ * Returns: A new drm_display_mode on success or NULL on failure
  */
 struct drm_display_mode *
 drm_display_mode_from_cea_vic(struct drm_device *dev,
@@ -5846,15 +5569,13 @@ match_identity(const struct detailed_timing *timing, void *data)
 }
 
 /**
- * drm_edid_match - 检查 EDID 是否与给定的标识信息匹配
- * @drm_edid: EDID 数据
- * @ident: 要匹配的 EDID 标识信息结构体
+ * drm_edid_match - match drm_edid with given identity
+ * @drm_edid: EDID
+ * @ident: the EDID identity to match with
  *
- * 检查给定的 EDID 是否与指定的标识信息相匹配。首先比较面板 ID，
- * 如果面板 ID 匹配且提供了显示器名称，则进一步遍历详细描述符块
- * 进行名称匹配。
+ * Check if the EDID matches with the given identity.
  *
- * 返回：如果 EDID 与给定标识匹配则返回 true，否则返回 false。
+ * Return: True if the given identity matched with EDID, false otherwise.
  */
 bool drm_edid_match(const struct drm_edid *drm_edid,
 		    const struct drm_edid_ident *ident)
@@ -5909,17 +5630,11 @@ static int get_monitor_name(const struct drm_edid *drm_edid, char name[13])
 }
 
 /**
- * drm_edid_get_monitor_name - 从 EDID 中获取显示器的名称
- * @edid: 显示器的 EDID 信息
- * @name: 用于存储显示器名称的字符数组指针
- * @bufsize: 名称缓冲区的大小（至少应为 14 个字符）
+ * drm_edid_get_monitor_name - fetch the monitor name from the edid
+ * @edid: monitor EDID information
+ * @name: pointer to a character array to hold the name of the monitor
+ * @bufsize: The size of the name buffer (should be at least 14 chars.)
  *
- * 从 EDID 的详细描述符块中提取显示器的名称。根据 EDID 标准，
- * 显示器名称存储在类型为 0xFC 的详细描述符中，最多支持 13 个字符。
- * 调用者需确保 name 缓冲区有足够的空间（推荐至少 14 字节）。
- *
- * 注意：此函数使用传统 edid 指针接口，新的代码应优先使用
- * drm_edid 容器接口。
  */
 void drm_edid_get_monitor_name(const struct edid *edid, char *name, int bufsize)
 {
@@ -6096,17 +5811,15 @@ static int _drm_edid_to_sad(const struct drm_edid *drm_edid,
 }
 
 /**
- * drm_edid_to_sad - 从 EDID 中提取短音频描述符（SAD）
- * @edid: 要解析的 EDID 数据
- * @sads: 输出参数，指向提取到的 SAD 数组的指针
+ * drm_edid_to_sad - extracts SADs from EDID
+ * @edid: EDID to parse
+ * @sads: pointer that will be set to the extracted SADs
  *
- * 在 CEA 扩展块中查找并提取短音频描述符（Short Audio Descriptor）。
- * SAD 描述了显示器支持的音频编码格式、采样率、声道数等信息，
- * 是 HDMI 音频功能协商的关键数据。
+ * Looks for CEA EDID block and extracts SADs (Short Audio Descriptors) from it.
  *
- * 注意：返回的指针需要使用 kfree() 释放。
+ * Note: The returned pointer needs to be freed using kfree().
  *
- * 返回：找到的 SAD 数量，失败时返回负数。
+ * Return: The number of found SADs or negative number on error.
  */
 int drm_edid_to_sad(const struct edid *edid, struct cea_sad **sads)
 {
@@ -6143,17 +5856,16 @@ static int _drm_edid_to_speaker_allocation(const struct drm_edid *drm_edid,
 }
 
 /**
- * drm_edid_to_speaker_allocation - 从 EDID 中提取扬声器配置数据块
- * @edid: 要解析的 EDID 数据
- * @sadb: 输出参数，指向提取到的扬声器配置数据块的指针
+ * drm_edid_to_speaker_allocation - extracts Speaker Allocation Data Blocks from EDID
+ * @edid: EDID to parse
+ * @sadb: pointer to the speaker block
  *
- * 在 CEA 扩展块中查找并提取扬声器配置数据块（Speaker Allocation Data Block）。
- * 该数据块描述了显示设备内置扬声器的布局和配置，例如前置左/右、
- * 后置环绕、低音炮等声道配置信息，用于音频系统的正确声道映射。
+ * Looks for CEA EDID block and extracts the Speaker Allocation Data Block from it.
  *
- * 注意：返回的指针需要使用 kfree() 释放。
+ * Note: The returned pointer needs to be freed using kfree().
  *
- * 返回：找到的扬声器配置块数量，失败时返回负数。
+ * Return: The number of found Speaker Allocation Blocks or negative number on
+ * error.
  */
 int drm_edid_to_speaker_allocation(const struct edid *edid, u8 **sadb)
 {
@@ -6165,19 +5877,12 @@ int drm_edid_to_speaker_allocation(const struct edid *edid, u8 **sadb)
 EXPORT_SYMBOL(drm_edid_to_speaker_allocation);
 
 /**
- * drm_av_sync_delay - 计算 HDMI/DP 显示设备的音视频同步延迟
- * @connector: 与 HDMI/DP 显示设备关联的连接器
- * @mode: 当前的显示模式
+ * drm_av_sync_delay - compute the HDMI/DP sink audio-video sync delay
+ * @connector: connector associated with the HDMI/DP sink
+ * @mode: the display mode
  *
- * 根据 EDID 中提供的音频延迟和视频延迟信息，计算 HDMI 或 DisplayPort
- * 显示设备的音视频同步延迟。延迟值以毫秒为单位，用于音频视频接收器（AVR）
- * 或源设备进行唇音同步调整。
- *
- * 延迟信息来自 EDID CTA-861 扩展块中的视频延迟和音频延迟字段，
- * 分隔行和逐行两种模式分别记录。
- *
- * 返回：HDMI/DP 显示设备的音视频同步延迟（毫秒），如果显示设备不支持
- *         音频或视频则返回 0。
+ * Return: The HDMI/DP sink's audio-video sync delay in milliseconds or 0 if
+ * the sink doesn't support audio or video.
  */
 int drm_av_sync_delay(struct drm_connector *connector,
 		      const struct drm_display_mode *mode)
@@ -6235,17 +5940,15 @@ static bool _drm_detect_hdmi_monitor(const struct drm_edid *drm_edid)
 }
 
 /**
- * drm_detect_hdmi_monitor - 检测显示器是否为 HDMI 设备
- * @edid: 显示器的 EDID 信息
+ * drm_detect_hdmi_monitor - detect whether monitor is HDMI
+ * @edid: monitor EDID information
  *
- * 根据 CEA-861-B 标准解析 CEA 扩展块，检查是否包含 HDMI 供应商
- * 特定数据块（VSDB, Vendor Specific Data Block）。HDMI VSDB 包含
- * 唯一的 IEEE 注册标识符（0x000C03），用于标识 HDMI 设备。
+ * Parse the CEA extension according to CEA-861-B.
  *
- * 驱动程序如果已将 EDID 解析的模式添加到 drm_display_info 中，
- * 应优先使用 &drm_display_info.is_hdmi 而不是调用此函数。
+ * Drivers that have added the modes parsed from EDID to drm_display_info
+ * should use &drm_display_info.is_hdmi instead of calling this function.
  *
- * 返回：如果显示器是 HDMI 设备则返回 true，否则返回 false。
+ * Return: True if the monitor is HDMI, false if not or unknown.
  */
 bool drm_detect_hdmi_monitor(const struct edid *edid)
 {
@@ -6298,17 +6001,16 @@ end:
 }
 
 /**
- * drm_detect_monitor_audio - 检测显示器是否支持音频
- * @edid: 要扫描的 EDID 数据块
+ * drm_detect_monitor_audio - check monitor audio capability
+ * @edid: EDID block to scan
  *
- * 通过解析 CEA 扩展块来检测显示器是否支持音频输出。
- * 检测逻辑：
- *   1. 首先检查 CEA 扩展块的"基本音频"标志位
- *   2. 然后遍历 CTA 音频数据块，查找具体支持的音频格式
- * 如果显示器声明了"基本音频"支持或包含 CEA 音频扩展块，
- * 则认为至少具有基本音频能力。
+ * Monitor should have CEA extension block.
+ * If monitor has 'basic audio', but no CEA audio blocks, it's 'basic
+ * audio' only. If there is any audio extension block and supported
+ * audio format, assume at least 'basic audio' support, even if 'basic
+ * audio' is not defined in EDID.
  *
- * 返回：如果显示器支持音频则返回 true，否则返回 false。
+ * Return: True if the monitor supports audio, false otherwise.
  */
 bool drm_detect_monitor_audio(const struct edid *edid)
 {
@@ -6320,18 +6022,13 @@ EXPORT_SYMBOL(drm_detect_monitor_audio);
 
 
 /**
- * drm_default_rgb_quant_range - 获取默认的 RGB 量化范围
- * @mode: 显示模式
+ * drm_default_rgb_quant_range - default RGB quantization range
+ * @mode: display mode
  *
- * 根据 CEA-861 标准确定指定显示模式的默认 RGB 量化范围。
- * HDMI 标准定义了两种量化范围：
- *   - 有限范围（Limited Range）：16-235，用于消费级视频
- *   - 全范围（Full Range）：0-255，用于计算机显示器
+ * Determine the default RGB quantization range for the mode,
+ * as specified in CEA-861.
  *
- * 对于 CEA 标准模式，除 VIC 1（640x480@60Hz）外，其他模式默认
- * 使用有限量化范围。非 CEA 模式默认使用全范围。
- *
- * 返回：模式的默认 RGB 量化范围
+ * Return: The default RGB quantization range for the mode
  */
 enum hdmi_quantization_range
 drm_default_rgb_quant_range(const struct drm_display_mode *mode)
@@ -7441,20 +7138,18 @@ unlock:
 }
 
 /**
- * drm_edid_connector_update - 使用 EDID 更新连接器信息
- * @connector: DRM 连接器
- * @drm_edid: EDID 数据
+ * drm_edid_connector_update - Update connector information from EDID
+ * @connector: Connector
+ * @drm_edid: EDID
  *
- * 根据传入的 EDID 数据更新连接器的显示信息，包括：
- *   - 显示特性（drm_display_info）：色彩深度、颜色格式、量化范围等
- *   - ELD（EDID Like Data）：音频能力描述，用于 HDMI 音频输出
- *   - HDR 元数据：HDR 静态元数据（如 SMPTE ST 2086）
- *   - 相关属性：如 tile 信息（多显示器拼接）、色彩空间等
+ * Update the connector display info, ELD, HDR metadata, relevant properties,
+ * etc. from the passed in EDID.
  *
- * 如果 EDID 为 NULL，则重置所有信息。
- * 必须在调用 drm_edid_connector_add_modes() 之前调用此函数。
+ * If EDID is NULL, reset the information.
  *
- * 返回：成功返回 0，失败返回负错误码。
+ * Must be called before calling drm_edid_connector_add_modes().
+ *
+ * Return: 0 on success, negative error on errors.
  */
 int drm_edid_connector_update(struct drm_connector *connector,
 			      const struct drm_edid *drm_edid)
@@ -7468,16 +7163,16 @@ int drm_edid_connector_update(struct drm_connector *connector,
 EXPORT_SYMBOL(drm_edid_connector_update);
 
 /**
- * drm_edid_connector_add_modes - 从 EDID 属性中更新探测到的显示模式
- * @connector: DRM 连接器
+ * drm_edid_connector_add_modes - Update probed modes from the EDID property
+ * @connector: Connector
  *
- * 从先前通过 drm_edid_connector_update() 更新的 EDID 属性中
- * 提取显示模式，并将其添加到连接器的探测模式列表中。
+ * Add the modes from the previously updated EDID property to the connector
+ * probed modes list.
  *
- * 必须先调用 drm_edid_connector_update() 来更新 EDID 属性，
- * 然后才能调用此函数添加模式。
+ * drm_edid_connector_update() must have been called before this to update the
+ * EDID property.
  *
- * 返回：添加的模式数量，如果未能找到任何模式则返回 0。
+ * Return: The number of modes added, or 0 if we couldn't find any.
  */
 int drm_edid_connector_add_modes(struct drm_connector *connector)
 {
@@ -7497,17 +7192,20 @@ int drm_edid_connector_add_modes(struct drm_connector *connector)
 EXPORT_SYMBOL(drm_edid_connector_add_modes);
 
 /**
- * drm_connector_update_edid_property - 更新连接器的 EDID 属性
- * @connector: DRM 连接器
- * @edid: EDID 数据的新值
+ * drm_connector_update_edid_property - update the edid property of a connector
+ * @connector: drm connector
+ * @edid: new value of the edid property
  *
- * 创建一个新的 blob 模式集对象，并将其 ID 分配给连接器的 EDID 属性。
- * 同时，由于我们还从 EDID 的 DisplayID 块中解析 tile（拼接）信息，
- * 因此也在此处设置连接器的 tile 属性。
+ * This function creates a new blob modeset object and assigns its id to the
+ * connector's edid property.
+ * Since we also parse tile information from EDID's displayID block, we also
+ * set the connector's tile property here. See drm_connector_set_tile_property()
+ * for more details.
  *
- * 此函数已弃用。请使用 drm_edid_connector_update() 替代。
+ * This function is deprecated. Use drm_edid_connector_update() instead.
  *
- * 返回：成功返回 0，失败返回负错误码。
+ * Returns:
+ * Zero on success, negative errno on failure.
  */
 int drm_connector_update_edid_property(struct drm_connector *connector,
 				       const struct edid *edid)
@@ -7519,16 +7217,17 @@ int drm_connector_update_edid_property(struct drm_connector *connector,
 EXPORT_SYMBOL(drm_connector_update_edid_property);
 
 /**
- * drm_add_edid_modes - 从 EDID 数据中添加显示模式
- * @connector: 正在探测的连接器
- * @edid: EDID 数据
+ * drm_add_edid_modes - add modes from EDID data, if available
+ * @connector: connector we're probing
+ * @edid: EDID data
  *
- * 将指定的显示模式添加到连接器的模式列表中。同时填充
- * @connector 中的 &drm_display_info 结构和 ELD 数据。
+ * Add the specified modes to the connector's mode list. Also fills out the
+ * &drm_display_info structure and ELD in @connector with any information which
+ * can be derived from the edid.
  *
- * 此函数已弃用。请使用 drm_edid_connector_add_modes() 替代。
+ * This function is deprecated. Use drm_edid_connector_add_modes() instead.
  *
- * 返回：添加的模式数量，如果未能找到任何模式则返回 0。
+ * Return: The number of modes added or 0 if we couldn't find any.
  */
 int drm_add_edid_modes(struct drm_connector *connector, struct edid *edid)
 {
@@ -7550,16 +7249,15 @@ int drm_add_edid_modes(struct drm_connector *connector, struct edid *edid)
 EXPORT_SYMBOL(drm_add_edid_modes);
 
 /**
- * drm_add_modes_noedid - 为没有 EDID 的连接器添加默认显示模式
- * @connector: 正在探测的连接器
- * @hdisplay: 水平显示上限（像素）
- * @vdisplay: 垂直显示上限（像素）
+ * drm_add_modes_noedid - add modes for the connectors without EDID
+ * @connector: connector we're probing
+ * @hdisplay: the horizontal display limit
+ * @vdisplay: the vertical display limit
  *
- * 当显示器无法提供 EDID 数据时（例如通过 VGA 连接或 EDID 读取失败），
- * 使用此函数添加标准的 DMT 模式作为备选。该函数遍历 DMT 模式表，
- * 仅添加分辨率不超过指定限制的模式。
+ * Add the specified modes to the connector's mode list. Only when the
+ * hdisplay/vdisplay is not beyond the given limit, it will be added.
  *
- * 返回：添加的模式数量，如果未能找到任何模式则返回 0。
+ * Return: The number of modes added or 0 if we couldn't find any.
  */
 int drm_add_modes_noedid(struct drm_connector *connector,
 			 unsigned int hdisplay, unsigned int vdisplay)
@@ -7657,23 +7355,13 @@ static u8 vic_for_avi_infoframe(const struct drm_connector *connector, u8 vic)
 }
 
 /**
- * drm_hdmi_avi_infoframe_from_display_mode() - 根据 DRM 显示模式填充 HDMI AVI InfoFrame
- * @frame: HDMI AVI InfoFrame 结构体
- * @connector: DRM 连接器
- * @mode: DRM 显示模式
+ * drm_hdmi_avi_infoframe_from_display_mode() - fill an HDMI AVI infoframe with
+ *                                              data from a DRM display mode
+ * @frame: HDMI AVI infoframe
+ * @connector: the connector
+ * @mode: DRM display mode
  *
- * 根据给定的显示模式和各连接器的显示信息，初始化并填充 HDMI AVI
- * （Auxiliary Video Information）InfoFrame 的所有字段，包括：
- *    - 像素重复标志
- *    - CEA VIC 和 HDMI VIC 视频标识码
- *    - 画面宽高比（4:3、16:9 等）
- *    - 色彩格式和内容类型
- *    - 3D 结构信息等
- *
- * AVI InfoFrame 是 HDMI 传输中描述视频信号格式的关键数据包，
- * 接收端（显示器/AVR）根据此信息正确解析和显示视频信号。
- *
- * 返回：成功返回 0，失败返回负错误码。
+ * Return: 0 on success or a negative error code on failure.
  */
 int
 drm_hdmi_avi_infoframe_from_display_mode(struct hdmi_avi_infoframe *frame,
@@ -7745,18 +7433,12 @@ drm_hdmi_avi_infoframe_from_display_mode(struct hdmi_avi_infoframe *frame,
 EXPORT_SYMBOL(drm_hdmi_avi_infoframe_from_display_mode);
 
 /**
- * drm_hdmi_avi_infoframe_quant_range() - 填充 HDMI AVI InfoFrame 的量化范围信息
- * @frame: HDMI AVI InfoFrame 结构体
- * @connector: DRM 连接器
- * @mode: DRM 显示模式
- * @rgb_quant_range: RGB 量化范围（Q 值）
- *
- * 根据显示设备的能力和当前显示模式，设置 AVI InfoFrame 中的
- * RGB 量化范围（Q）和 Y 范围（YQ）字段。
- *
- * 遵循 CEA-861 规范：如果显示设备不支持 Q 位选择，源设备不应
- * 发送非零 Q 值，除非该值与模式的默认 RGB 量化范围一致。
- * HDMI 2.0 推荐在 Q 值与默认范围一致时发送非零 Q 值。
+ * drm_hdmi_avi_infoframe_quant_range() - fill the HDMI AVI infoframe
+ *                                        quantization range information
+ * @frame: HDMI AVI infoframe
+ * @connector: the connector
+ * @mode: DRM display mode
+ * @rgb_quant_range: RGB quantization range (Q)
  */
 void
 drm_hdmi_avi_infoframe_quant_range(struct hdmi_avi_infoframe *frame,
@@ -7833,20 +7515,17 @@ s3d_structure_from_display_mode(const struct drm_display_mode *mode)
 }
 
 /**
- * drm_hdmi_vendor_infoframe_from_display_mode() - 根据显示模式填充 HDMI 供应商 InfoFrame
- * @frame: HDMI 供应商 InfoFrame 结构体
- * @connector: DRM 连接器
- * @mode: DRM 显示模式
+ * drm_hdmi_vendor_infoframe_from_display_mode() - fill an HDMI infoframe with
+ * data from a DRM display mode
+ * @frame: HDMI vendor infoframe
+ * @connector: the connector
+ * @mode: DRM display mode
  *
- * 根据指定的显示模式填充 HDMI 供应商特定 InfoFrame。
- * 只有在使用 4K（超高清）或立体 3D 模式时才需要发送 HDMI
- * 供应商 InfoFrame。对于其他模式，此函数返回 -EINVAL，
- * 调用者可以安全地忽略此错误。
+ * Note that there's is a need to send HDMI vendor infoframes only when using a
+ * 4k or stereoscopic 3D mode. So when giving any other mode as input this
+ * function will return -EINVAL, error that can be safely ignored.
  *
- * HDMI 供应商 InfoFrame 用于传输 HDMI 特有的扩展信息，
- * 如 4K 视频定时（HDMI VIC）和 3D 结构信息。
- *
- * 返回：成功返回 0，失败返回负错误码（-EINVAL 表示不需要此 InfoFrame）。
+ * Return: 0 on success or a negative error code on failure.
  */
 int
 drm_hdmi_vendor_infoframe_from_display_mode(struct hdmi_vendor_infoframe *frame,
@@ -7973,14 +7652,10 @@ static void _drm_update_tile_info(struct drm_connector *connector,
 }
 
 /**
- * drm_edid_is_digital - 检查 EDID 是否来自数字显示器
- * @drm_edid: EDID 数据
+ * drm_edid_is_digital - is digital?
+ * @drm_edid: The EDID
  *
- * 检查 EDID 基础块中的输入参数，判断显示器是否为数字接口。
- * 数字显示器包括 HDMI、DisplayPort、DVI、eDP、MIPI DSI 等。
- * 模拟接口（如 VGA）的 EDID 中此位不会被设置。
- *
- * 返回：如果输入为数字信号则返回 true，否则返回 false。
+ * Return true if input is digital.
  */
 bool drm_edid_is_digital(const struct drm_edid *drm_edid)
 {

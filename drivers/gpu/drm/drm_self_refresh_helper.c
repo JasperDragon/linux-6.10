@@ -5,25 +5,6 @@
  * Authors:
  * Sean Paul <seanpaul@chromium.org>
  */
-
-/*
- * DRM 面板自刷新（Self Refresh）辅助函数
- *
- * 本文件实现了面板自刷新（SR）的辅助框架，利用 DRM 原子接口帮助驱动
- * 轻松实现面板自刷新支持。适用于在不需要更新显示内容时，让面板进入
- * 低功耗的自刷新模式（如 PSR - Panel Self Refresh）。
- *
- * 核心机制：
- *   - 驱动在加载/卸载时通过 drm_self_refresh_helper_init/cleanup 初始化和清理
- *   - 连接器将 &drm_connector_state.self_refresh_aware 设置为 true 表示支持 SR
- *   - 辅助框架监控显示活动，在空闲时自动触发进入 SR 模式
- *   - 有任何原子更新影响处于 SR 状态的管线时，SR 会自动退出
- *   - 使用 EWMA（指数加权移动平均）来计算进入/退出 SR 的延迟时间
- *
- * 在 SR 期间，驱动可以选择完全关闭 CRTC/编码器/桥接器硬件，或检查
- * &drm_crtc_state.self_refresh_active 来决定部分关闭以节省功耗。
- */
-
 #include <linux/average.h>
 #include <linux/bitops.h>
 #include <linux/export.h>
@@ -150,17 +131,16 @@ out_drop_locks:
 }
 
 /**
- * drm_self_refresh_helper_update_avg_times - 更新 CRTC 的自刷新平均时间
- * @state: 刚应用到硬件的状态
- * @commit_time_ms: 此次提交完成所花费的时间（毫秒）
- * @new_self_refresh_mask: 在新状态中 self_refresh_active 为 true 的 CRTC 位掩码
+ * drm_self_refresh_helper_update_avg_times - Updates a crtc's SR time averages
+ * @state: the state which has just been applied to hardware
+ * @commit_time_ms: the amount of time in ms that this commit took to complete
+ * @new_self_refresh_mask: bitmask of crtc's that have self_refresh_active in
+ *    new state
  *
- * 在 &drm_mode_config_funcs.atomic_commit_tail 之后调用，此函数在自刷新
- * 状态转换时更新进入/退出自刷新的平均时间。这些平均值将用于计算
- * 在显示活动结束后延迟多久才进入自刷新模式。
- *
- * 使用 EWMA（指数加权移动平均）算法来计算平均时间，能自适应地
- * 跟踪面板性能的变化。
+ * Called after &drm_mode_config_funcs.atomic_commit_tail, this function will
+ * update the average entry/exit self refresh times on self refresh transitions.
+ * These averages will be used when calculating how long to delay before
+ * entering self refresh mode after activity.
  */
 void
 drm_self_refresh_helper_update_avg_times(struct drm_atomic_state *state,
@@ -193,19 +173,17 @@ drm_self_refresh_helper_update_avg_times(struct drm_atomic_state *state,
 EXPORT_SYMBOL(drm_self_refresh_helper_update_avg_times);
 
 /**
- * drm_self_refresh_helper_alter_state - 在自刷新退出时修改原子状态
- * @state: 当前正在检查的状态
+ * drm_self_refresh_helper_alter_state - Alters the atomic state for SR exit
+ * @state: the state currently being checked
  *
- * 在 atomic check 结束时调用。此函数检查状态中与自刷新退出不兼容的标志
- * 并进行修改。虽然这看起来有点"欺骗性"（用户空间期望一件事而实际做了另一件），
- * 但为了将自刷新完全对用户空间透明，这是必要的。
+ * Called at the end of atomic check. This function checks the state for flags
+ * incompatible with self refresh exit and changes them. This is a bit
+ * disingenuous since userspace is expecting one thing and we're giving it
+ * another. However in order to keep self refresh entirely hidden from
+ * userspace, this is required.
  *
- * 具体操作包括：
- *   - 如果状态中有 CRTC 处于自刷新状态而请求了异步更新，则强制回退到同步模式
- *   - 对于所有不在自刷新状态的 CRTC，重新调度自刷新进入定时器
- *
- * 最后，此函数会重新调度自刷新进入的工作任务，使得在期望的延迟后
- * 可以重新进入 PSR（面板自刷新）模式。
+ * At the end, we queue up the self refresh entry work so we can enter PSR after
+ * the desired delay.
  */
 void drm_self_refresh_helper_alter_state(struct drm_atomic_state *state)
 {
@@ -247,17 +225,10 @@ void drm_self_refresh_helper_alter_state(struct drm_atomic_state *state)
 EXPORT_SYMBOL(drm_self_refresh_helper_alter_state);
 
 /**
- * drm_self_refresh_helper_init - 初始化 CRTC 的自刷新辅助框架
- * @crtc: 支持自刷新显示器的 CRTC
+ * drm_self_refresh_helper_init - Initializes self refresh helpers for a crtc
+ * @crtc: the crtc which supports self refresh supported displays
  *
- * 为给定的 CRTC 初始化自刷新辅助框架。分配并初始化自刷新数据结构，
- * 包含进入/退出延迟的平均时间计算器和延迟进入工作队列。
- *
- * 初始化时会用种子值（200ms）预填充 EWMA 平均值，使平均值在一开始
- * 就是非零的合理值。随着时间的推移，平均值会收敛到真实值。
- *
- * 返回值：
- * 成功返回 0，失败返回负的错误码。
+ * Returns zero if successful or -errno on failure
  */
 int drm_self_refresh_helper_init(struct drm_crtc *crtc)
 {
@@ -292,12 +263,8 @@ int drm_self_refresh_helper_init(struct drm_crtc *crtc)
 EXPORT_SYMBOL(drm_self_refresh_helper_init);
 
 /**
- * drm_self_refresh_helper_cleanup - 清理 CRTC 的自刷新辅助框架
- * @crtc: 要清理的 CRTC
- *
- * 取消调度尚未执行的进入自刷新工作任务，释放自刷新数据结构，
- * 并将 CRTC 的 self_refresh_data 设置为 NULL。
- * 应当与 drm_self_refresh_helper_init() 成对调用。
+ * drm_self_refresh_helper_cleanup - Cleans up self refresh helpers for a crtc
+ * @crtc: the crtc to cleanup
  */
 void drm_self_refresh_helper_cleanup(struct drm_crtc *crtc)
 {
